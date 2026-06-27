@@ -1,0 +1,26 @@
+# EQ-Exec config — copy to config.yaml and fill in YOUR OWN values. Keep config.yaml private
+# (it holds broker credentials). config.yaml is gitignored.
+
+live: false              # false = DRY-RUN (no orders sent). Set true ONLY after demo-testing.
+broker: tradovate
+
+tradovate:
+  env: demo              # demo | live   (always start with demo)
+  # Tradovate API credentials. Get these from Tradovate (API add-on) or via the EQ vendor OAuth.
+  name: "YOUR_USERNAME"
+  password: "YOUR_PASSWORD"
+  app_id: "EQ-Exec"
+  app_version: "0.1.0"
+  cid: "YOUR_API_CID"
+  sec: "YOUR_API_SECRET"
+  device_id: ""          # optional; some accounts need a deviceId for MFA
+  accounts: []           # [] = every account on the login; or ["MyApexAcct", ...] to limit
+
+# When to flatten. 24-hour "HH:MM" in the timezone below.
+schedule:
+  tz: "America/New_York"
+  cutoffs:
+    - "15:55"            # example: flatten 5 min before the 16:00 ET cash close
+
+poll_seconds: 20         # how often the clock is checked
+log_file: "eqexec.log"
