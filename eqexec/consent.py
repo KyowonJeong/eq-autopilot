@@ -11,7 +11,7 @@ import json
 import os
 import time
 
-CONSENT_VERSION = "1"
+CONSENT_VERSION = "2"   # bumped: added "personal device only / no VPS" clause (Topstep ToS)
 
 CONSENT_TEXT = """
 ================ EQ-Exec — please read before using ================
@@ -29,6 +29,11 @@ WHAT EDGEQUANT IS NOT
   EdgeQuant does NOT manage your account, does NOT receive or store your API keys, and does NOT
   place trades for you. EdgeQuant only provides this software and (optionally) a signal. It is
   not your broker, not an investment adviser, and not an asset manager.
+
+RUN IT ON YOUR OWN DEVICE
+  You run this only on your personal device, per your firm's rules (e.g. Topstep: API access is
+  allowed only from your personal device — no VPS, VPN, or remote servers). You are responsible
+  for following your prop firm's terms, including any limits on automated entry on funded accounts.
 
 KEEP YOUR SAFETY NET ON
   This tool is best-effort, not a guarantee. You agree to keep your broker's own native flatten /

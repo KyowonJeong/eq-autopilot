@@ -22,6 +22,9 @@ once you've confirmed on demo that it reads your positions and the flatten plan 
 
 ## Safety model
 - **Default dry-run.** `live: false` → logs the flatten plan, sends no orders.
+- **Personal device only.** Topstep allows API access only from your personal device — **no VPS,
+  VPN, or remote servers**. Run this on your own computer. (Also: API automated *entry* is not
+  allowed on Live Funded accounts — this tool's funded use is **flatten/close only**.)
 - **Hard cutoff is local.** Works even if EdgeQuant sends nothing.
 - **Confirm-after-act.** Re-reads positions after flattening; alerts loudly if not flat.
 - **Pair it with your broker's native flatten** (e.g. Tradovate "Flatten Today") as a backstop —
