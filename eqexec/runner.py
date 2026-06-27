@@ -16,6 +16,7 @@ import sys
 from . import config as cfgmod
 from . import consent
 from .broker.base import FlattenResult
+from .broker.ibkr import IBKRBroker
 from .broker.projectx import ProjectXBroker
 from .broker.tradovate import TradovateBroker
 from .scheduler import CutoffScheduler
@@ -40,6 +41,8 @@ def _build_broker(cfg):
         return ProjectXBroker(cfg.projectx)
     if cfg.broker == "tradovate":
         return TradovateBroker(cfg.tradovate)
+    if cfg.broker == "ibkr":
+        return IBKRBroker(cfg.ibkr)
     raise ValueError(f"unsupported broker: {cfg.broker}")
 
 

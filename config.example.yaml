@@ -2,7 +2,7 @@
 # (it holds broker credentials). config.yaml is gitignored.
 
 live: false              # false = DRY-RUN (no orders sent). Set true ONLY after demo-testing.
-broker: projectx         # projectx (Topstep, Phase 1)  |  tradovate (Lucid/Apex, Phase 2)
+broker: projectx         # projectx (Topstep)  |  tradovate (Apex/Tradovate firms)  |  ibkr
 
 # ── ProjectX (TopstepX). Get an API key from your ProjectX/TopstepX account (API add-on). ──
 projectx:
@@ -22,6 +22,14 @@ tradovate:
   sec: ""
   device_id: ""
   accounts: []
+
+# ── IBKR (own-capital account). Only used when broker: ibkr. Needs TWS/IB Gateway running
+#    locally with the API enabled (pip install ib_insync). ──
+ibkr:
+  host: "127.0.0.1"
+  port: 7497             # 7497 TWS paper / 7496 TWS live / 4002 Gateway paper / 4001 Gateway live
+  client_id: 11
+  accounts: []           # [] = all; or ["U1234567"] to limit
 
 # When to flatten. 24-hour "HH:MM" in the timezone below.
 schedule:
