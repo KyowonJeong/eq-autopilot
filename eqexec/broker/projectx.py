@@ -124,3 +124,33 @@ class ProjectXBroker(BrokerAdapter):
         self.authenticate()
         self._accounts()
         return True
+
+    # ── entry (order placement) — for the optional auto-ENTRY path. dry_run sends nothing. ──
+    def place_entry(self, account_id, contract_id: str, side, size: int, *,
+                    order_type: int = 2, limit_price=None, stop_price=None,
+                    stop_loss_ticks=None, take_profit_ticks=None, custom_tag=None,
+                    dry_run: bool = True):
+        """Place an entry order via POST /api/Order/place (shapes confirmed against the docs).
+          side: 'BUY'/'LONG'/0  or  'SELL'/'SHORT'/1   (0=Bid/buy, 1=Ask/sell)
+          order_type: 2=Market (default), 1=Limit, 4=Stop
+          stop_loss_ticks / take_profit_ticks: optional protective bracket (in ticks).
+        Returns the dict {"orderId", ...} on live, or the request body (no order sent) on dry_run."""
+        _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
+        s = side.upper() if isinstance(side, str) else side
+        if s not in _SIDE:
+            raise ValueError(f"bad side {side!r} (use BUY/LONG/0 or SELL/SHORT/1)")
+        body = {"accountId": int(account_id), "contractId": contract_id,
+                "type": int(order_type), "side": _SIDE[s], "size": int(size)}
+        if limit_price is not None:
+            body["limitPrice"] = limit_price
+        if stop_price is not None:
+            body["stopPrice"] = stop_price
+        if custom_tag:
+            body["customTag"] = custom_tag
+        if stop_loss_ticks is not None:                 # bracket: type 4 = Stop
+            body["stopLossBracket"] = {"ticks": int(stop_loss_ticks), "type": 4}
+        if take_profit_ticks is not None:               # bracket: type 1 = Limit
+            body["takeProfitBracket"] = {"ticks": int(take_profit_ticks), "type": 1}
+        if dry_run:
+            return {"dry_run": True, "would_place": body}
+        return self._post("/api/Order/place", body)
