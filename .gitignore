@@ -1,4 +1,5 @@
 config.yaml
+consent.json
 *.log
 venv/
 __pycache__/

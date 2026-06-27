@@ -1,0 +1,115 @@
+"""ProjectX Gateway adapter (Phase 1 — Topstep / TopstepX).
+
+ProjectX is multi-tenant: each firm has its own base URL. TopstepX = https://api.topstepx.com.
+Endpoints (ProjectX Gateway docs — see PLAN.md). VERIFY against a TopstepX demo/eval account
+before live: account search shape, position `type` long/short mapping, and that closeContract
+fully flattens. dry_run=True sends NO close calls.
+"""
+from __future__ import annotations
+
+import time
+
+import requests
+
+from .base import BrokerAdapter, FlattenResult, Position
+
+_TIMEOUT = (10, 30)
+_TOKEN_TTL = 24 * 60 * 60       # ProjectX session token ~24h
+_RENEW_MARGIN = 60 * 60         # re-auth 1h before expiry
+_LONG = 1                       # position.type: 1 = long, 2 = short  (VERIFY)
+
+
+class ProjectXBroker(BrokerAdapter):
+    name = "projectx"
+
+    def __init__(self, cfg):
+        self.cfg = cfg                       # eqexec.config.ProjectXCfg
+        self.base = cfg.base_url.rstrip("/")
+        self._token: str | None = None
+        self._token_at: float = 0.0
+
+    # ── auth ──────────────────────────────────────────────────────────────
+    def authenticate(self) -> None:
+        r = requests.post(f"{self.base}/api/Auth/loginKey",
+                          json={"userName": self.cfg.user_name, "apiKey": self.cfg.api_key},
+                          timeout=_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+        if not d.get("success") or not d.get("token"):
+            raise RuntimeError(f"ProjectX auth failed (errorCode={d.get('errorCode')}): "
+                               f"{d.get('errorMessage') or d}")
+        self._token, self._token_at = d["token"], time.time()
+
+    def _ensure_token(self) -> None:
+        if self._token is None or (time.time() - self._token_at) > (_TOKEN_TTL - _RENEW_MARGIN):
+            self.authenticate()
+
+    def _post(self, path: str, body: dict):
+        self._ensure_token()
+        r = requests.post(f"{self.base}{path}",
+                          headers={"Authorization": f"Bearer {self._token}",
+                                   "Content-Type": "application/json"},
+                          json=body, timeout=_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+    # ── reads ─────────────────────────────────────────────────────────────
+    def _accounts(self) -> list[dict]:
+        d = self._post("/api/Account/search", {"onlyActiveAccounts": True})   # VERIFY shape
+        accts = d.get("accounts", d if isinstance(d, list) else [])
+        want = {a.lower() for a in (self.cfg.accounts or [])}
+        if want:
+            accts = [a for a in accts
+                     if str(a.get("name", "")).lower() in want or str(a.get("id")) in want]
+        return accts
+
+    def list_open_positions(self) -> list[Position]:
+        out: list[Position] = []
+        for a in self._accounts():
+            aid = a.get("id")
+            d = self._post("/api/Position/searchOpen", {"accountId": aid})
+            for p in d.get("positions", []):
+                size = int(p.get("size", 0) or 0)
+                if size == 0:
+                    continue
+                net = size if p.get("type") == _LONG else -size
+                out.append(Position(
+                    account_id=str(aid),
+                    account_name=a.get("name", str(aid)),
+                    symbol=str(p.get("contractId")),
+                    net_qty=net,
+                    raw={**p, "_accountId": aid},
+                ))
+        return out
+
+    # ── act ───────────────────────────────────────────────────────────────
+    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+        plan = self.list_open_positions()
+        res = FlattenResult(dry_run=dry_run, planned=list(plan))
+        if dry_run or not plan:
+            return res
+        for pos in plan:
+            try:
+                # closeContract market-closes the entire position for {accountId, contractId}.
+                self._post("/api/Position/closeContract", {
+                    "accountId": int(pos.raw["_accountId"]),
+                    "contractId": pos.raw.get("contractId"),
+                })
+            except Exception as e:
+                res.errors.append(f"{pos.account_name}/{pos.symbol}: {e}")
+        # Confirm-after-act: re-read; anything still open is an error to alert on loudly.
+        try:
+            still = self.list_open_positions()
+            res.closed = [p for p in plan if not any(
+                s.account_id == p.account_id and s.symbol == p.symbol for s in still)]
+            for p in still:
+                res.errors.append(f"STILL OPEN after flatten: {p.account_name}/{p.symbol} "
+                                  f"net={p.net_qty}")
+        except Exception as e:
+            res.errors.append(f"post-flatten position re-check failed: {e}")
+        return res
+
+    def healthcheck(self) -> bool:
+        self.authenticate()
+        self._accounts()
+        return True

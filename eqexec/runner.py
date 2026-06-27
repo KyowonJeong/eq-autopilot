@@ -14,7 +14,9 @@ import logging
 import sys
 
 from . import config as cfgmod
+from . import consent
 from .broker.base import FlattenResult
+from .broker.projectx import ProjectXBroker
 from .broker.tradovate import TradovateBroker
 from .scheduler import CutoffScheduler
 
@@ -34,6 +36,8 @@ def _log(cfg) -> logging.Logger:
 
 
 def _build_broker(cfg):
+    if cfg.broker == "projectx":
+        return ProjectXBroker(cfg.projectx)
     if cfg.broker == "tradovate":
         return TradovateBroker(cfg.tradovate)
     raise ValueError(f"unsupported broker: {cfg.broker}")
@@ -72,15 +76,14 @@ def main(argv=None) -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true", help="flatten once now and exit (test)")
     ap.add_argument("--healthcheck", action="store_true", help="auth + list positions and exit")
+    ap.add_argument("--accept", action="store_true", help="accept the consent terms non-interactively")
     args = ap.parse_args(argv)
 
     cfg = cfgmod.load(args.config)
     lg = _log(cfg)
     broker = _build_broker(cfg)
-    lg.info(f"EQ-Exec start — broker={cfg.broker} env={cfg.tradovate.env} "
-            f"live={cfg.live} cutoffs={cfg.schedule.cutoffs} tz={cfg.schedule.tz}")
-    if cfg.live and cfg.tradovate.env == "demo":
-        lg.warning("live=true but env=demo — orders go to the DEMO account, not your funded one.")
+    lg.info(f"EQ-Exec start — broker={cfg.broker} live={cfg.live} "
+            f"cutoffs={cfg.schedule.cutoffs} tz={cfg.schedule.tz}")
 
     if args.healthcheck:
         broker.authenticate()
@@ -88,6 +91,10 @@ def main(argv=None) -> int:
         lg.info(f"healthcheck OK — {len(pos)} open position(s): "
                 + (", ".join(f"{p.account_name}/{p.symbol} net={p.net_qty}" for p in pos) or "(flat)"))
         return 0
+
+    # Consent gate — anything that acts (or simulates acting) requires explicit, recorded consent.
+    if not consent.ensure(assume_yes=args.accept):
+        return 2
 
     if args.once:
         res = _flatten(lg, broker, cfg, "manual")

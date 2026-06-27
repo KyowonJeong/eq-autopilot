@@ -2,19 +2,26 @@
 # (it holds broker credentials). config.yaml is gitignored.
 
 live: false              # false = DRY-RUN (no orders sent). Set true ONLY after demo-testing.
-broker: tradovate
+broker: projectx         # projectx (Topstep, Phase 1)  |  tradovate (Lucid/Apex, Phase 2)
 
+# ── ProjectX (TopstepX). Get an API key from your ProjectX/TopstepX account (API add-on). ──
+projectx:
+  base_url: "https://api.topstepx.com"   # ProjectX is per-firm; this is TopstepX
+  user_name: "YOUR_TOPSTEPX_USERNAME"
+  api_key: "YOUR_PROJECTX_API_KEY"
+  accounts: []           # [] = every active account; or ["PRACTICEACCT123", ...] to limit
+
+# ── Tradovate (Phase 2 — Lucid/Apex/etc.). Only used when broker: tradovate. ──
 tradovate:
-  env: demo              # demo | live   (always start with demo)
-  # Tradovate API credentials. Get these from Tradovate (API add-on) or via the EQ vendor OAuth.
-  name: "YOUR_USERNAME"
-  password: "YOUR_PASSWORD"
+  env: demo              # demo | live
+  name: ""
+  password: ""
   app_id: "EQ-Exec"
   app_version: "0.1.0"
-  cid: "YOUR_API_CID"
-  sec: "YOUR_API_SECRET"
-  device_id: ""          # optional; some accounts need a deviceId for MFA
-  accounts: []           # [] = every account on the login; or ["MyApexAcct", ...] to limit
+  cid: ""
+  sec: ""
+  device_id: ""
+  accounts: []
 
 # When to flatten. 24-hour "HH:MM" in the timezone below.
 schedule:
@@ -22,5 +29,5 @@ schedule:
   cutoffs:
     - "15:55"            # example: flatten 5 min before the 16:00 ET cash close
 
-poll_seconds: 20         # how often the clock is checked
+poll_seconds: 20
 log_file: "eqexec.log"
