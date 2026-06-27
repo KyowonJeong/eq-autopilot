@@ -95,3 +95,28 @@ class IBKRBroker(BrokerAdapter):
 
     def healthcheck(self) -> bool:
         return self._connect().isConnected()
+
+    # ── entry (order placement) — optional auto-ENTRY path. UNTESTED. dry_run sends nothing. ──
+    def place_entry(self, *, symbol: str, expiry: str, side, size: int, exchange: str = "CME",
+                    order_type: str = "MKT", limit_price=None, account=None, dry_run: bool = True):
+        """Futures entry on IBKR via ib_insync. side: 'BUY'/'SELL'; order_type: 'MKT' or 'LMT'.
+        Builds + qualifies a Future(symbol, expiry, exchange) and places the order. Protective
+        stop-loss / take-profit brackets to be added once there's a paper/live test. dry_run
+        returns the plan and sends nothing."""
+        s = (side.upper() if isinstance(side, str) else side)
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"bad side {side!r} (use BUY or SELL)")
+        plan = {"symbol": symbol, "expiry": expiry, "exchange": exchange, "side": s,
+                "size": int(size), "order_type": order_type.upper(), "limit_price": limit_price,
+                "account": account}
+        if dry_run:
+            return {"dry_run": True, "would_place": plan}
+        ib = self._connect()
+        from ib_insync import Future, LimitOrder, MarketOrder
+        contract = Future(symbol, expiry, exchange)
+        ib.qualifyContracts(contract)
+        order = (MarketOrder(s, int(size)) if order_type.upper() == "MKT"
+                 else LimitOrder(s, int(size), float(limit_price)))
+        if account:
+            order.account = account
+        return ib.placeOrder(contract, order)
