@@ -16,7 +16,9 @@ from .base import BrokerAdapter, FlattenResult, Position
 _TIMEOUT = (10, 30)
 _TOKEN_TTL = 24 * 60 * 60       # ProjectX session token ~24h
 _RENEW_MARGIN = 60 * 60         # re-auth 1h before expiry
-_LONG = 1                       # position.type: 1 = long, 2 = short  (VERIFY)
+_LONG = 1                       # position.type: 1=long, 2=short (docs don't state it; common ProjectX
+                                # convention). Only affects the displayed net sign — closeContract
+                                # flattens the whole position regardless, so a wrong guess is cosmetic.
 
 
 class ProjectXBroker(BrokerAdapter):
@@ -51,11 +53,20 @@ class ProjectXBroker(BrokerAdapter):
                                    "Content-Type": "application/json"},
                           json=body, timeout=_TIMEOUT)
         r.raise_for_status()
-        return r.json()
+        d = r.json()
+        # ProjectX returns HTTP 200 even on logical failures — the response's success/errorCode
+        # is the real status (confirmed against gateway.docs.projectx.com). Treat success:false
+        # as an error so a failed flatten/read never passes silently.
+        if isinstance(d, dict) and d.get("success") is False:
+            raise RuntimeError(f"ProjectX {path} failed (errorCode={d.get('errorCode')}): "
+                               f"{d.get('errorMessage') or d}")
+        return d
 
     # ── reads ─────────────────────────────────────────────────────────────
     def _accounts(self) -> list[dict]:
-        d = self._post("/api/Account/search", {"onlyActiveAccounts": True})   # VERIFY shape
+        # POST /api/Account/search {onlyActiveAccounts} -> {accounts:[{id,name,balance,canTrade,
+        # isVisible}], success, errorCode, errorMessage}  (confirmed against the docs)
+        d = self._post("/api/Account/search", {"onlyActiveAccounts": True})
         accts = d.get("accounts", d if isinstance(d, list) else [])
         want = {a.lower() for a in (self.cfg.accounts or [])}
         if want:
