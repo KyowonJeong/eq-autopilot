@@ -18,7 +18,18 @@ except Exception:
 from eqexec.config import ProjectXCfg
 from eqexec.broker.projectx import ProjectXBroker
 
-APP_DIR = os.path.expanduser("~/Library/Application Support/EQAutopilot")
+def _app_dir():
+    """Per-OS config dir: Windows %APPDATA%, macOS Application Support, else ~/.config."""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "EQAutopilot")
+
+
+APP_DIR = _app_dir()
 os.makedirs(APP_DIR, exist_ok=True)
 CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
@@ -91,30 +102,45 @@ T = {
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 운영 시작", "en": "Start autopilot"},
     "auto_stop": {"ko": "자동 운영 중지", "en": "Stop autopilot"},
-    "auto_note": {"ko": "※ 앱이 떠 있고 맥이 깨어 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
-                  "en": "※ App must stay open and Mac awake. Closes the chosen account daily at that time."},
+    "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
+                  "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
 
 
-KC_SERVICE = "EQAutopilot"   # macOS Keychain service name
+KC_SERVICE = "EQAutopilot"   # Keychain / Credential-Manager service name
+_IS_MAC = sys.platform == "darwin"
 
 
 def _kc_save(account, secret):
-    """Store the API key in the macOS Keychain (OS-encrypted, login-protected) — not on disk."""
+    """Store the API key in the OS secret store (never on disk): macOS Keychain via `security`,
+    Windows/Linux via the `keyring` lib (Windows Credential Manager / Secret Service)."""
     if not secret:
         return
+    if _IS_MAC:
+        try:
+            subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
+                            "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, timeout=8)
+        except Exception:
+            pass
+        return
     try:
-        subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
-                        "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, timeout=8)
+        import keyring
+        keyring.set_password(KC_SERVICE, account or "default", secret)
     except Exception:
         pass
 
 
 def _kc_load(account):
+    if _IS_MAC:
+        try:
+            r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", account or "default",
+                                "-s", KC_SERVICE, "-w"], capture_output=True, text=True, timeout=8)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
     try:
-        r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", account or "default",
-                            "-s", KC_SERVICE, "-w"], capture_output=True, text=True, timeout=8)
-        return r.stdout.strip() if r.returncode == 0 else ""
+        import keyring
+        return keyring.get_password(KC_SERVICE, account or "default") or ""
     except Exception:
         return ""
 
@@ -501,7 +527,7 @@ class App:
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
         self.log(f"\n▶ autopilot ON — daily {cutoff} ET · account [{sc or 'all'}] · "
-                 f"{'LIVE' if live else 'dry-run'}. (keep the app open & Mac awake)")
+                 f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
         self.log(f"   {self.t('warn_mix')}")
         threading.Thread(target=self._auto_loop, args=(cutoff, user, key, sc, live), daemon=True).start()
 
