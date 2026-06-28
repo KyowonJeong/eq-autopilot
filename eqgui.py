@@ -386,12 +386,35 @@ class App:
             _t.sleep(15)
 
 
+def _bind_clipboard(root):
+    """macOS: bind Cmd+C/V/X/A so copy/paste/cut/select-all work in Entry fields (PyInstaller Tk
+    doesn't wire these by default → paste was dead)."""
+    def gen(ev):
+        def h(e):
+            try:
+                e.widget.event_generate(ev)
+            except Exception:
+                pass
+            return "break"
+        return h
+    def selall(e):
+        try:
+            e.widget.select_range(0, "end"); e.widget.icursor("end")
+        except Exception:
+            pass
+        return "break"
+    for seq, ev in (("<Command-c>", "<<Copy>>"), ("<Command-v>", "<<Paste>>"), ("<Command-x>", "<<Cut>>")):
+        root.bind_all(seq, gen(ev))
+    root.bind_all("<Command-a>", selall)
+
+
 def main():
     root = tk.Tk()
     try:
         ttk.Style().theme_use("aqua")
     except Exception:
         pass
+    _bind_clipboard(root)
     App(root)
     root.mainloop()
 
