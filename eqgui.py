@@ -34,6 +34,10 @@ def _resource(name):
 T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
+    "warn_mix": {"ko": "⚠ 자동 청산은 사용 계좌의 모든 포지션을 일괄 청산합니다. "
+                       "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
+                 "en": "⚠ Auto-close flattens EVERY position on the chosen account. "
+                       "Don't mix other trades on it — use a dedicated account."},
     "lang": {"ko": "언어", "en": "Language"},
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
@@ -203,7 +207,9 @@ class App:
         ttk.Button(links, text=self.t("btn_home"), command=lambda: webbrowser.open(URL_HOME)).pack(side="left")
         ttk.Button(links, text=self.t("btn_join"), command=lambda: webbrowser.open(URL_JOIN)).pack(side="left", padx=6)
         ttk.Button(links, text=self.t("btn_free"), command=lambda: webbrowser.open(URL_FREE)).pack(side="left")
-        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(6, 10))
+        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(6, 4))
+        tk.Label(frm, text=self.t("warn_mix"), foreground="#b00020", wraplength=660,
+                 justify="left", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=self.t("user"), width=18).pack(side="left")
@@ -391,7 +397,9 @@ class App:
     def flatten(self, live):
         if not self._creds_ok() or not self._consent_ok(): return
         sc = self._scope()
-        if live and not messagebox.askyesno(self.t("live_confirm"), f"LIVE flatten.\nAccount: {sc or '⚠ ALL'}\nProceed?"):
+        if live and not messagebox.askyesno(
+                self.t("live_confirm"),
+                f"LIVE flatten.\nAccount: {sc or '⚠ ALL'}\n\n{self.t('warn_mix')}\n\nProceed?"):
             return
         self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} flatten ({sc or 'all'}) ──")
         def w():
@@ -472,6 +480,7 @@ class App:
         self.b_auto.config(text=self.t("auto_stop"))
         self.log(f"\n▶ autopilot ON — daily {cutoff} ET · account [{sc or 'all'}] · "
                  f"{'LIVE' if live else 'dry-run'}. (keep the app open & Mac awake)")
+        self.log(f"   {self.t('warn_mix')}")
         threading.Thread(target=self._auto_loop, args=(cutoff, user, key, sc, live), daemon=True).start()
 
     def _auto_loop(self, cutoff, user, key, sc, live):
