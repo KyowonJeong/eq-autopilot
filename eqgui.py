@@ -24,7 +24,9 @@ CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
 URL_HOME = "https://edgequant.app"
 URL_JOIN = "https://app.edgequant.app/?nav=registration"
-URL_FREE = "https://discord.gg/jwU4fkfvU"   # public Discord (free → channel join → free token)
+# Free path = join a public signal channel → bot gives a free token. Two channels to choose from.
+URL_FREE_DC = "https://discord.gg/jwU4fkfvU"        # public Discord invite (discord_gate._PUBLIC_INVITE)
+URL_FREE_TG = "https://t.me/+EpF27gYYhIRjNTJi"      # public Telegram invite (telegram_gate._PUBLIC_INVITE)
 
 
 def _resource(name):
@@ -42,6 +44,8 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
+    "free_msg": {"ko": "공개 시그널 채널에 입장하면 봇이 무료 토큰을 발급합니다.\n채널을 선택하세요:",
+                 "en": "Join a public signal channel and the bot issues a free token.\nPick a channel:"},
     "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
@@ -206,7 +210,7 @@ class App:
         links = ttk.Frame(frm); links.pack(fill="x", pady=(4, 0))
         ttk.Button(links, text=self.t("btn_home"), command=lambda: webbrowser.open(URL_HOME)).pack(side="left")
         ttk.Button(links, text=self.t("btn_join"), command=lambda: webbrowser.open(URL_JOIN)).pack(side="left", padx=6)
-        ttk.Button(links, text=self.t("btn_free"), command=lambda: webbrowser.open(URL_FREE)).pack(side="left")
+        ttk.Button(links, text=self.t("btn_free"), command=self._open_free).pack(side="left")
         ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(6, 4))
         tk.Label(frm, text=self.t("warn_mix"), foreground="#b00020", wraplength=660,
                  justify="left", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(0, 8))
@@ -275,6 +279,24 @@ class App:
         self.out.pack(fill="both", expand=True, pady=(6, 0))
         self.log(self.t("ready"))
         self._async_load_key(d.get("user", ""))
+
+    def _open_free(self):
+        """Let the user pick Discord or Telegram for the free public signal channel."""
+        win = tk.Toplevel(self.root)
+        win.title(self.t("btn_free"))
+        win.transient(self.root); win.resizable(False, False); win.grab_set()
+        ttk.Label(win, text=self.t("free_msg"), wraplength=320, justify="left",
+                  padding=16).pack(fill="x")
+        bf = ttk.Frame(win, padding=(16, 0, 16, 16)); bf.pack(fill="x")
+
+        def go(url):
+            webbrowser.open(url); win.destroy()
+        ttk.Button(bf, text="Discord", command=lambda: go(URL_FREE_DC)).pack(
+            side="left", expand=True, fill="x", padx=(0, 4))
+        ttk.Button(bf, text="Telegram", command=lambda: go(URL_FREE_TG)).pack(
+            side="left", expand=True, fill="x", padx=(4, 0))
+        win.update_idletasks()
+        win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 90}")
 
     def _set_lang(self, *_):
         self.lang = "en" if self.langbox.get() == "English" else "ko"
