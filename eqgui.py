@@ -108,18 +108,15 @@ T = {
     "auto_on_ind": {"ko": "  ● 자동 운영 ON  ", "en": "  ● Autopilot ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sec_sig": {"ko": "자동 진입 (실시간 신호)", "en": "Auto-entry (live signal)"},
-    "sig_feed": {"ko": "신호 피드", "en": "Signal feed"},
-    "sig_size": {"ko": "수량", "en": "Size"},
-    "sig_close": {"ko": "진입 후 N초 뒤 자동 청산", "en": "Auto-close N s after entry"},
-    "sig_live": {"ko": "실제 진입/청산 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
+    "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
     "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sig_note": {"ko": "※ 위 '진입' 섹션의 계약ID·'사용 계좌'로 진입합니다. 신호가 오면 그 방향+손절가로 "
-                       "자동 진입하고, 설정 시 N초 뒤 자동 청산. 0이면 청산 안 함.",
-                 "en": "※ Enters on the 'Entry' section's contract ID + chosen account. On a signal it "
-                       "enters that direction with the signal's stop, then auto-closes after N s (0 = off)."},
+    "sig_note": {"ko": "※ 위 '진입' 섹션의 계약ID·수량·'사용 계좌'로 진입합니다. 신호가 오면 그 방향+손절가로 "
+                       "자동 진입합니다.",
+                 "en": "※ Enters on the 'Entry' section's contract ID + size + chosen account, in the "
+                       "signal's direction with the signal's stop."},
     "sig_need_contract": {"ko": "먼저 '진입' 섹션에 계약ID를 넣으세요(계약 조회).",
                           "en": "Set a contract ID in the 'Entry' section first (Find contract)."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
@@ -343,22 +340,11 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_sig"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         sg = ttk.Frame(frm); sg.pack(fill="x", pady=3)
-        ttk.Label(sg, text=self.t("sig_feed")).pack(side="left")
-        self.sig_feed = ttk.Entry(sg); self.sig_feed.insert(0, FEED_URL)
-        self.sig_feed.pack(side="left", fill="x", expand=True, padx=(2, 8))
-        sg2 = ttk.Frame(frm); sg2.pack(fill="x", pady=3)
-        ttk.Label(sg2, text=self.t("sig_size")).pack(side="left")
-        self.sig_size = ttk.Spinbox(sg2, from_=1, to=50, width=5); self.sig_size.set("1")
-        self.sig_size.pack(side="left", padx=(2, 12))
-        ttk.Label(sg2, text=self.t("sig_close")).pack(side="left")
-        self.sig_close = ttk.Spinbox(sg2, from_=0, to=3600, width=6); self.sig_close.set("10")
-        self.sig_close.pack(side="left", padx=(2, 12))
         self.sig_live = tk.IntVar()
-        ttk.Checkbutton(sg2, text=self.t("sig_live"), variable=self.sig_live).pack(side="left")
-        sg3 = ttk.Frame(frm); sg3.pack(fill="x", pady=3)
-        self.b_sig = ttk.Button(sg3, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
+        ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live).pack(side="left", padx=(0, 12))
+        self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
                                 command=self.toggle_sig); self.b_sig.pack(side="left")
-        self.sig_ind = tk.Label(sg3, font=("Helvetica", 11, "bold"))
+        self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
         self.sig_ind.pack(side="left", padx=(10, 0))
         self._set_sig_ind(self._sig_on)
         ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
@@ -655,27 +641,22 @@ class App:
         contract = self.contract.get().strip()
         if not contract:
             messagebox.showwarning(self.t("input_needed"), self.t("sig_need_contract")); return
-        url = self.sig_feed.get().strip() or FEED_URL
         user, key = self.user.get().strip(), self.key.get().strip()
         try:
-            size = int(self.sig_size.get())
+            size = int(self.size.get())          # reuse the Entry section's quantity
         except ValueError:
             size = 1
-        try:
-            close_after = int(self.sig_close.get())
-        except ValueError:
-            close_after = 0
         live = bool(self.sig_live.get())
         self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
         self._set_sig_ind(True)
         self.log(f"\n▶ signal watch ON — {contract} · account [{sc}] · size {size} · "
-                 f"close +{close_after}s · {'LIVE' if live else 'dry-run'}. polling {url}")
+                 f"{'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
         threading.Thread(target=self._sig_loop,
-                         args=(url, user, key, sc, contract, size, close_after, live),
+                         args=(FEED_URL, user, key, sc, contract, size, live),
                          daemon=True).start()
 
-    def _sig_loop(self, url, user, key, sc, contract, size, close_after, live):
+    def _sig_loop(self, url, user, key, sc, contract, size, live):
         import time as _t
         import requests
         last_id = None
@@ -708,24 +689,6 @@ class App:
                             self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
                     else:
                         self.log(f"   ✅ entered: {res}")
-                    if close_after > 0:
-                        self.log(f"   ⏳ auto-close in {close_after}s …")
-                        for _ in range(close_after):
-                            if not self._sig_on:
-                                break
-                            _t.sleep(1)
-                        fres = b.flatten_all(dry_run=not live)
-                        if not live:
-                            self.log("   DRY-RUN close plan: " + (", ".join(
-                                f"{p.account_name}/{p.symbol}" for p in fres.planned) or "—"))
-                        else:
-                            self.log("   closed: " + (", ".join(
-                                f"{p.account_name}/{p.symbol}" for p in fres.closed) or "—"))
-                            if fres.cancelled:
-                                self.log(f"   cancelled orders: {len(fres.cancelled)}")
-                            for e in fres.errors:
-                                self.log(f"   ⚠ {e}")
-                            self.log("   ✅ flat" if not fres.errors else "   ⚠ INCOMPLETE — check broker!")
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")
             _t.sleep(SIG_POLL_SECS)
