@@ -1,0 +1,389 @@
+# EQ Autopilot — standalone GUI (Topstep / ProjectX). v4: KO/EN language toggle + single-account
+# scope + full persistence. Runs on the user's own machine with their own key.
+import os
+import threading
+import queue
+import subprocess
+import datetime as _dt
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+from eqexec.config import ProjectXCfg
+from eqexec.broker.projectx import ProjectXBroker
+
+APP_DIR = os.path.expanduser("~/Library/Application Support/EQAutopilot")
+os.makedirs(APP_DIR, exist_ok=True)
+CFG_PATH = os.path.join(APP_DIR, "config.yaml")
+
+T = {
+    "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
+                 "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
+    "lang": {"ko": "언어", "en": "Language"},
+    "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
+    "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
+    "show": {"ko": "보기", "en": "Show"},
+    "scope": {"ko": "사용 계좌", "en": "Account"},
+    "all": {"ko": "(전체 계좌)", "en": "(all accounts)"},
+    "scope_note": {"ko": "※ '사용 계좌'에 지정한 계좌에만 청산/진입이 적용됩니다. (전체 = 모든 활성 계좌)",
+                   "en": "※ Only the chosen account is flattened/entered. (all = every active account)"},
+    "btn_conn": {"ko": "연결 테스트", "en": "Test connection"},
+    "btn_accts": {"ko": "계좌 목록 불러오기", "en": "Load accounts"},
+    "sec_flat": {"ko": "청산 (Flatten — 사용 계좌의 열린 포지션 닫기)",
+                 "en": "Flatten (close open positions on the chosen account)"},
+    "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
+    "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
+    "sec_entry": {"ko": "진입 (Entry — 수동 테스트, 사용 계좌)", "en": "Entry (manual test, chosen account)"},
+    "contract": {"ko": "계약ID", "en": "Contract ID"},
+    "side": {"ko": "방향", "en": "Side"},
+    "size": {"ko": "수량", "en": "Size"},
+    "sl": {"ko": "손절틱", "en": "SL ticks"},
+    "dry_entry": {"ko": "모의 진입 (Dry-run)", "en": "Dry-run entry"},
+    "live_entry": {"ko": "⚠ 실제 진입 (LIVE)", "en": "⚠ LIVE entry"},
+    "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
+                "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
+    "ready": {"ko": "준비됨. 키 입력 → '계좌 목록 불러오기'로 사용 계좌 선택 → 연결 테스트/청산/진입.",
+              "en": "Ready. Enter key → 'Load accounts' → pick an account → test/close/enter."},
+    "need_creds": {"ko": "Username과 API Key를 모두 입력하세요.", "en": "Enter both Username and API Key."},
+    "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
+    "live_confirm": {"ko": "실거래 확인", "en": "Confirm LIVE"},
+    "input_needed": {"ko": "입력 필요", "en": "Input needed"},
+    "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
+                  "en": "Entry requires a single account in 'Account' (not all)."},
+    "sec_auto": {"ko": "자동 운영 (매일 자동 청산)", "en": "Autopilot (daily auto-close)"},
+    "cutoff": {"ko": "청산 시각(ET)", "en": "Close time (ET)"},
+    "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
+    "auto_start": {"ko": "자동 운영 시작", "en": "Start autopilot"},
+    "auto_stop": {"ko": "자동 운영 중지", "en": "Stop autopilot"},
+    "auto_note": {"ko": "※ 앱이 떠 있고 맥이 깨어 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
+                  "en": "※ App must stay open and Mac awake. Closes the chosen account daily at that time."},
+}
+
+
+KC_SERVICE = "EQAutopilot"   # macOS Keychain service name
+
+
+def _kc_save(account, secret):
+    """Store the API key in the macOS Keychain (OS-encrypted, login-protected) — not on disk."""
+    if not secret:
+        return
+    try:
+        subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
+                        "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, check=True)
+    except Exception:
+        pass
+
+
+def _kc_load(account):
+    try:
+        r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", account or "default",
+                            "-s", KC_SERVICE, "-w"], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _load():
+    try:
+        import yaml
+        with open(CFG_PATH) as f:
+            d = yaml.safe_load(f) or {}
+        px = d.get("projectx", {}); a = px.get("accounts") or []
+        user = px.get("user_name", "")
+        key = _kc_load(user) or px.get("api_key", "")   # Keychain first; migrate old plaintext if any
+        return {"user": user, "key": key, "acct": (a[0] if a else ""), "lang": d.get("lang", "ko")}
+    except Exception:
+        return {"user": "", "key": "", "acct": "", "lang": "ko"}
+
+
+def _save(user, key, acct, lang):
+    _kc_save(user, key)                                  # key → Keychain only
+    try:
+        import yaml
+        with open(CFG_PATH, "w") as f:
+            yaml.safe_dump({"live": False, "broker": "projectx", "lang": lang,
+                            "projectx": {"base_url": "https://api.topstepx.com", "user_name": user,
+                                         "api_key": "", "accounts": ([acct] if acct else [])}}, f)
+    except Exception:
+        pass
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("EQ Autopilot")
+        root.geometry("700x700")
+        self.q = queue.Queue()
+        self.lang = _load()["lang"]
+        self.frm = None
+        self._auto_on = False
+        self._build()
+        root.after(120, self._drain)
+
+    def t(self, k):
+        return T[k][self.lang]
+
+    def _build(self):
+        d = _load()
+        if self.frm is not None:
+            self.frm.destroy()
+        frm = ttk.Frame(self.root, padding=14); frm.pack(fill="both", expand=True); self.frm = frm
+
+        top = ttk.Frame(frm); top.pack(fill="x")
+        ttk.Label(top, text="EQ Autopilot — Topstep (ProjectX)", font=("Helvetica", 16, "bold")).pack(side="left")
+        ttk.Label(top, text=self.t("lang")).pack(side="right", padx=(0, 4))
+        self.langbox = ttk.Combobox(top, values=["한국어", "English"], width=9, state="readonly")
+        self.langbox.set("English" if self.lang == "en" else "한국어")
+        self.langbox.pack(side="right"); self.langbox.bind("<<ComboboxSelected>>", self._set_lang)
+        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(2, 10))
+
+        r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
+        ttk.Label(r1, text=self.t("user"), width=18).pack(side="left")
+        self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True); self.user.insert(0, d["user"])
+        r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
+        ttk.Label(r2, text=self.t("key"), width=18).pack(side="left")
+        self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True); self.key.insert(0, d["key"])
+        self.show = tk.IntVar()
+        ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
+
+        r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
+        ttk.Label(r3, text=self.t("scope"), width=18).pack(side="left")
+        self.scope = ttk.Combobox(r3, values=[self.t("all")], state="normal")
+        self.scope.set(d["acct"] or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
+        ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
+
+        row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
+        self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
+        self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.accounts); self.b_acc.pack(side="left", padx=6)
+
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_flat"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        cf = ttk.Frame(frm); cf.pack(fill="x", pady=3)
+        ttk.Button(cf, text=self.t("dry_close"), command=lambda: self.flatten(False)).pack(side="left")
+        ttk.Button(cf, text=self.t("live_close"), command=lambda: self.flatten(True)).pack(side="left", padx=8)
+
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_entry"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        ef = ttk.Frame(frm); ef.pack(fill="x", pady=3)
+        ttk.Label(ef, text=self.t("contract")).pack(side="left")
+        self.contract = ttk.Entry(ef, width=22); self.contract.pack(side="left", padx=(2, 8))
+        ttk.Label(ef, text=self.t("side")).pack(side="left")
+        self.side = ttk.Combobox(ef, values=["LONG", "SHORT"], width=7, state="readonly"); self.side.set("LONG")
+        self.side.pack(side="left", padx=(2, 8))
+        ttk.Label(ef, text=self.t("size")).pack(side="left")
+        self.size = ttk.Spinbox(ef, from_=1, to=50, width=5); self.size.set("1"); self.size.pack(side="left", padx=(2, 8))
+        ttk.Label(ef, text=self.t("sl")).pack(side="left")
+        self.sl = ttk.Entry(ef, width=6); self.sl.pack(side="left", padx=2)
+        ef3 = ttk.Frame(frm); ef3.pack(fill="x", pady=3)
+        ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False)).pack(side="left")
+        ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True)).pack(side="left", padx=8)
+
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        af = ttk.Frame(frm); af.pack(fill="x", pady=3)
+        ttk.Label(af, text=self.t("cutoff")).pack(side="left")
+        self.cutoff = ttk.Entry(af, width=7); self.cutoff.insert(0, "14:00"); self.cutoff.pack(side="left", padx=(2, 10))
+        self.auto_live = tk.IntVar()
+        ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live).pack(side="left", padx=(0, 10))
+        self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._auto_on else self.t("auto_start"),
+                                 command=self.toggle_auto); self.b_auto.pack(side="left")
+        ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
+
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        self.consent = tk.IntVar()
+        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent")).pack(anchor="w")
+        self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
+        self.out.pack(fill="both", expand=True, pady=(6, 0))
+        self.log(self.t("ready"))
+
+    def _set_lang(self, *_):
+        self.lang = "en" if self.langbox.get() == "English" else "ko"
+        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang)
+        self._build()
+
+    def _toggle(self):
+        self.key.config(show="" if self.show.get() else "•")
+
+    def log(self, m): self.q.put(m)
+
+    def _drain(self):
+        while not self.q.empty():
+            try:
+                self.out.insert("end", self.q.get() + "\n"); self.out.see("end")
+            except Exception:
+                pass
+        self.root.after(120, self._drain)
+
+    def _scope(self):
+        s = self.scope.get().strip()
+        return "" if s in ("", self.t("all"), T["all"]["ko"], T["all"]["en"]) else s
+
+    def _broker(self):
+        sc = self._scope()
+        return ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
+                                          user_name=self.user.get().strip(), api_key=self.key.get().strip(),
+                                          accounts=([sc] if sc else [])))
+
+    def _busy(self, on):
+        for b in (self.b_hc, self.b_acc):
+            b.config(state="disabled" if on else "normal")
+
+    def _creds_ok(self):
+        if not self.user.get().strip() or not self.key.get().strip():
+            messagebox.showwarning(self.t("input_needed"), self.t("need_creds")); return False
+        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang); return True
+
+    def _consent_ok(self):
+        if not self.consent.get():
+            messagebox.showwarning(self.t("need_consent"), self.t("need_consent")); return False
+        return True
+
+    def _fill_scope(self, names):
+        cur = self.scope.get()
+        self.scope["values"] = [self.t("all")] + names
+        if cur not in ([self.t("all")] + names):
+            self.scope.set(self.t("all"))
+
+    def _run(self, fn):
+        self._busy(True)
+        def wrap():
+            try:
+                fn()
+            except Exception as e:
+                self.log(f"❌ {e}")
+            finally:
+                self.root.after(0, lambda: self._busy(False))
+        threading.Thread(target=wrap, daemon=True).start()
+
+    def healthcheck(self):
+        if not self._creds_ok(): return
+        self.log("\n── connection test ──")
+        def w():
+            b = self._broker(); b.authenticate()
+            names = [str(a.get("name")) for a in b._accounts()]
+            self.root.after(0, lambda: self._fill_scope(names))
+            pos = b.list_open_positions(); sc = self._scope()
+            self.log(f"✅ connected ({sc or 'all'}) — open positions: {len(pos)}")
+            for p in pos: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
+            if not pos: self.log("   (flat)")
+        self._run(w)
+
+    def accounts(self):
+        if not self._creds_ok(): return
+        self.log("\n── accounts ──")
+        def w():
+            b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
+                                           user_name=self.user.get().strip(), api_key=self.key.get().strip()))
+            accts = b._accounts()
+            names = [str(a.get("name")) for a in accts]
+            self.root.after(0, lambda: self._fill_scope(names))
+            for a in accts:
+                self.log(f"   • name={a.get('name')}  id={a.get('id')}  bal={a.get('balance')}  canTrade={a.get('canTrade')}")
+        self._run(w)
+
+    def flatten(self, live):
+        if not self._creds_ok() or not self._consent_ok(): return
+        sc = self._scope()
+        if live and not messagebox.askyesno(self.t("live_confirm"), f"LIVE flatten.\nAccount: {sc or '⚠ ALL'}\nProceed?"):
+            return
+        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} flatten ({sc or 'all'}) ──")
+        def w():
+            b = self._broker(); res = b.flatten_all(dry_run=not live)
+            if not res.planned:
+                self.log("no open positions (flat)."); return
+            for p in res.planned: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
+            if not live:
+                self.log("DRY-RUN — no orders sent.")
+            else:
+                self.log("closed: " + (", ".join(f"{p.account_name}/{p.symbol}" for p in res.closed) or "—"))
+                for e in res.errors: self.log(f"   ⚠ {e}")
+                self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
+        self._run(w)
+
+    def entry(self, live):
+        if not self._creds_ok() or not self._consent_ok(): return
+        sc = self._scope()
+        if not sc:
+            messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
+        contract = self.contract.get().strip()
+        if not contract:
+            messagebox.showwarning(self.t("input_needed"), self.t("contract")); return
+        side, size = self.side.get(), int(self.size.get())
+        slv = self.sl.get().strip(); sl_ticks = int(slv) if slv.isdigit() else None
+        if live and not messagebox.askyesno(self.t("live_confirm"), f"LIVE entry.\n{side} {size} @ {contract}\nAccount: {sc}\nProceed?"):
+            return
+        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} entry: {side} {size} {contract} ({sc}) ──")
+        def w():
+            b = self._broker()
+            match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
+            if not match:
+                self.log(f"❌ account '{sc}' not found — use 'Load accounts'."); return
+            aid = match[0]["id"]
+            r = b.place_entry(account_id=aid, contract_id=contract, side=side, size=size, order_type=2,
+                              stop_loss_ticks=sl_ticks, custom_tag="EQ-Autopilot-test", dry_run=not live)
+            self.log(f"DRY-RUN — would place: {r.get('would_place')}" if not live else f"✅ order sent: {r}")
+        self._run(w)
+
+    def toggle_auto(self):
+        if self._auto_on:
+            self._auto_on = False
+            self.b_auto.config(text=self.t("auto_start"))
+            self.log("⏹ autopilot stopped.")
+            return
+        if not self._creds_ok() or not self._consent_ok():
+            return
+        cutoff = self.cutoff.get().strip()
+        if len(cutoff) != 5 or cutoff[2] != ":" or not (cutoff[:2] + cutoff[3:]).isdigit():
+            messagebox.showwarning(self.t("input_needed"), "HH:MM"); return
+        user, key, sc = self.user.get().strip(), self.key.get().strip(), self._scope()
+        live = bool(self.auto_live.get())
+        self._auto_on = True
+        self.b_auto.config(text=self.t("auto_stop"))
+        self.log(f"\n▶ autopilot ON — daily {cutoff} ET · account [{sc or 'all'}] · "
+                 f"{'LIVE' if live else 'dry-run'}. (keep the app open & Mac awake)")
+        threading.Thread(target=self._auto_loop, args=(cutoff, user, key, sc, live), daemon=True).start()
+
+    def _auto_loop(self, cutoff, user, key, sc, live):
+        import time as _t
+        tz = ZoneInfo("America/New_York") if ZoneInfo else None
+        fired = None
+        while self._auto_on:
+            now = _dt.datetime.now(tz)
+            today = now.strftime("%Y-%m-%d")
+            if now.strftime("%H:%M") >= cutoff and fired != today:
+                fired = today
+                self.log(f"\n⏰ {cutoff} ET → auto-close ([{sc or 'all'}], {'LIVE' if live else 'dry-run'})")
+                try:
+                    b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
+                                                   api_key=key, accounts=([sc] if sc else [])))
+                    res = b.flatten_all(dry_run=not live)
+                    if not res.planned:
+                        self.log("   no open positions (flat).")
+                    elif not live:
+                        self.log("   DRY-RUN plan: " + ", ".join(f"{p.account_name}/{p.symbol}" for p in res.planned))
+                    else:
+                        self.log("   closed: " + (", ".join(f"{p.account_name}/{p.symbol}" for p in res.closed) or "—"))
+                        for e in res.errors:
+                            self.log(f"   ⚠ {e}")
+                        if not res.errors:
+                            self.log("   ✅ flat")
+                except Exception as e:
+                    self.log(f"   ❌ auto-close failed — {e}")
+            _t.sleep(15)
+
+
+def main():
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("aqua")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
