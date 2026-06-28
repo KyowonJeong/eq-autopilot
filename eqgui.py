@@ -95,8 +95,11 @@ T = {
     "live_entry": {"ko": "⚠ 실제 진입 (LIVE)", "en": "⚠ LIVE entry"},
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
-    "ready": {"ko": "준비됨. 키 입력 → '계좌 목록 불러오기'로 사용 계좌 선택 → 연결 테스트/청산/진입.",
-              "en": "Ready. Enter key → 'Load accounts' → pick an account → test/close/enter."},
+    "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
+              "en": "Ready. Enter key → 'Test connection' → the rest unlocks once it passes."},
+    "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·진입·자동 기능이 활성화됩니다.",
+                   "en": "※ Pass 'Test connection' first to unlock close / entry / automation."},
+    "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
     "need_creds": {"ko": "Username과 API Key를 모두 입력하세요.", "en": "Enter both Username and API Key."},
     "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
     "live_confirm": {"ko": "실거래 확인", "en": "Confirm LIVE"},
@@ -215,6 +218,7 @@ class App:
         self._auto_on = False
         self._sig_on = False
         self._unlocked = False
+        self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
         self._build()
         root.after(120, self._drain)
 
@@ -301,19 +305,26 @@ class App:
         row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
         self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
         self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.accounts); self.b_acc.pack(side="left", padx=6)
+        # 동의 — 연결 테스트 '바로 밑'(실행 동작 전 필요)
+        self.consent = tk.IntVar()
+        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent")).pack(anchor="w", pady=(6, 0))
+        ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_flat"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         cf = ttk.Frame(frm); cf.pack(fill="x", pady=3)
-        ttk.Button(cf, text=self.t("dry_close"), command=lambda: self.flatten(False)).pack(side="left")
-        ttk.Button(cf, text=self.t("live_close"), command=lambda: self.flatten(True)).pack(side="left", padx=8)
+        self.b_flat_dry = ttk.Button(cf, text=self.t("dry_close"), command=lambda: self.flatten(False))
+        self.b_flat_dry.pack(side="left")
+        self.b_flat_live = ttk.Button(cf, text=self.t("live_close"), command=lambda: self.flatten(True))
+        self.b_flat_live.pack(side="left", padx=8)
 
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_entry"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         ef = ttk.Frame(frm); ef.pack(fill="x", pady=3)
         ttk.Label(ef, text=self.t("contract")).pack(side="left")
         self.contract = ttk.Entry(ef, width=20); self.contract.pack(side="left", padx=(2, 4))
-        ttk.Button(ef, text=self.t("find_contract"), width=8, command=self.find_contract).pack(side="left", padx=(0, 8))
+        self.b_find = ttk.Button(ef, text=self.t("find_contract"), width=8, command=self.find_contract)
+        self.b_find.pack(side="left", padx=(0, 8))
         ttk.Label(ef, text=self.t("side")).pack(side="left")
         self.side = ttk.Combobox(ef, values=["LONG", "SHORT"], width=7, state="readonly"); self.side.set("LONG")
         self.side.pack(side="left", padx=(2, 8))
@@ -322,8 +333,10 @@ class App:
         ttk.Label(ef, text=self.t("sl")).pack(side="left")
         self.sl = ttk.Entry(ef, width=10); self.sl.pack(side="left", padx=2)
         ef3 = ttk.Frame(frm); ef3.pack(fill="x", pady=3)
-        ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False)).pack(side="left")
-        ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True)).pack(side="left", padx=8)
+        self.b_entry_dry = ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False))
+        self.b_entry_dry.pack(side="left")
+        self.b_entry_live = ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True))
+        self.b_entry_live.pack(side="left", padx=8)
 
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
@@ -353,12 +366,24 @@ class App:
                   justify="left").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
-        self.consent = tk.IntVar()
-        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent")).pack(anchor="w")
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
+
+        # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
+        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_find,
+                             self.b_entry_dry, self.b_entry_live, self.b_auto, self.b_sig]
+        self._set_actions_enabled(self._connected)
         self.log(self.t("ready"))
         self._async_load_key(d.get("user", ""))
+
+    def _set_actions_enabled(self, on):
+        """연결 테스트 통과 시에만 청산·진입·자동 버튼을 활성화한다."""
+        st = "normal" if on else "disabled"
+        for b in getattr(self, "_action_btns", []):
+            try:
+                b.config(state=st)
+            except Exception:
+                pass
 
     def _open_free(self):
         """Let the user pick Discord or Telegram for the free public signal channel."""
@@ -440,8 +465,9 @@ class App:
                                           accounts=([sc] if sc else [])))
 
     def _busy(self, on):
-        for b in (self.b_hc, self.b_acc):
-            b.config(state="disabled" if on else "normal")
+        # 작업 중엔 연결 테스트도 잠그고, 끝나면 연결 여부에 맞춰 실행 버튼 복원.
+        self.b_hc.config(state="disabled" if on else "normal")
+        self._set_actions_enabled(False if on else self._connected)
 
     def _creds_ok(self):
         if not self.user.get().strip() or not self.key.get().strip():
@@ -481,6 +507,8 @@ class App:
             self.log(f"✅ connected ({sc or 'all'}) — open positions: {len(pos)}")
             for p in pos: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
             if not pos: self.log("   (flat)")
+            self._connected = True                # 통과 → 나머지 기능 활성화(_busy 복원이 반영)
+            self.log("🔓 " + self.t("conn_ok"))
         self._run(w)
 
     def accounts(self):
