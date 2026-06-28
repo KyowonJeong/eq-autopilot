@@ -89,8 +89,14 @@ def main(argv=None) -> int:
             f"cutoffs={cfg.schedule.cutoffs} tz={cfg.schedule.tz}")
 
     if args.healthcheck:
-        broker.authenticate()
-        pos = broker.list_open_positions()
+        try:
+            broker.authenticate()
+            pos = broker.list_open_positions()
+        except Exception as e:
+            lg.error(f"healthcheck FAILED — {e}")
+            lg.error("→ check user_name / api_key (and that the ProjectX API subscription + 'Link' "
+                     "are active). Regenerate the key if needed, then retry.")
+            return 1
         lg.info(f"healthcheck OK — {len(pos)} open position(s): "
                 + (", ".join(f"{p.account_name}/{p.symbol} net={p.net_qty}" for p in pos) or "(flat)"))
         return 0
