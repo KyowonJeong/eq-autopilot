@@ -26,6 +26,7 @@ T = {
     "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
+    "paste": {"ko": "붙여넣기", "en": "Paste"},
     "scope": {"ko": "사용 계좌", "en": "Account"},
     "all": {"ko": "(전체 계좌)", "en": "(all accounts)"},
     "scope_note": {"ko": "※ '사용 계좌'에 지정한 계좌에만 청산/진입이 적용됩니다. (전체 = 모든 활성 계좌)",
@@ -157,6 +158,7 @@ class App:
         r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
         ttk.Label(r2, text=self.t("key"), width=18).pack(side="left")
         self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True); self.key.insert(0, d["key"])
+        ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
         self.show = tk.IntVar()
         ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
 
@@ -214,6 +216,13 @@ class App:
         self.lang = "en" if self.langbox.get() == "English" else "ko"
         _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang)
         self._build()
+
+    def _paste_key(self):
+        try:
+            self.key.delete(0, "end")
+            self.key.insert(0, self.root.clipboard_get().strip())
+        except Exception:
+            pass
 
     def _toggle(self):
         self.key.config(show="" if self.show.get() else "•")
@@ -387,25 +396,64 @@ class App:
 
 
 def _bind_clipboard(root):
-    """macOS: bind Cmd+C/V/X/A so copy/paste/cut/select-all work in Entry fields (PyInstaller Tk
-    doesn't wire these by default → paste was dead)."""
-    def gen(ev):
-        def h(e):
+    """macOS/PyInstaller Tk doesn't wire Cmd+C/V/X/A → paste was dead. Implement them directly
+    against the system clipboard (clipboard_get/append) and bind on several modifier names."""
+    def _paste(e):
+        w = e.widget
+        try:
             try:
-                e.widget.event_generate(ev)
+                w.delete("sel.first", "sel.last")
             except Exception:
                 pass
-            return "break"
-        return h
-    def selall(e):
+            w.insert("insert", root.clipboard_get())
+        except Exception:
+            pass
+        return "break"
+
+    def _copy(e):
+        try:
+            s = e.widget.selection_get()
+            root.clipboard_clear(); root.clipboard_append(s)
+        except Exception:
+            pass
+        return "break"
+
+    def _cut(e):
+        _copy(e)
+        try:
+            e.widget.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        return "break"
+
+    def _all(e):
         try:
             e.widget.select_range(0, "end"); e.widget.icursor("end")
         except Exception:
             pass
         return "break"
-    for seq, ev in (("<Command-c>", "<<Copy>>"), ("<Command-v>", "<<Paste>>"), ("<Command-x>", "<<Cut>>")):
-        root.bind_all(seq, gen(ev))
-    root.bind_all("<Command-a>", selall)
+
+    for keych, fn in (("v", _paste), ("c", _copy), ("x", _cut), ("a", _all)):
+        for mod in ("Command", "Mod1", "Control"):
+            for kc in (keych, keych.upper()):
+                try:
+                    root.bind_all(f"<{mod}-{kc}>", fn)
+                except Exception:
+                    pass
+    # Standard Edit menu (gives macOS menu access + native routing as a fallback).
+    try:
+        mb = tk.Menu(root)
+        em = tk.Menu(mb, tearoff=0)
+
+        def _ev(name):
+            return lambda: (root.focus_get().event_generate(name) if root.focus_get() else None)
+        for label, acc, ev in (("Cut", "Cmd+X", "<<Cut>>"), ("Copy", "Cmd+C", "<<Copy>>"),
+                               ("Paste", "Cmd+V", "<<Paste>>"), ("Select All", "Cmd+A", "<<SelectAll>>")):
+            em.add_command(label=label, accelerator=acc, command=_ev(ev))
+        mb.add_cascade(label="Edit", menu=em)
+        root.config(menu=mb)
+    except Exception:
+        pass
 
 
 def main():
