@@ -24,6 +24,7 @@ class FlattenResult:
     dry_run: bool
     planned: list[Position] = field(default_factory=list)   # positions we intend to close
     closed: list[Position] = field(default_factory=list)    # confirmed closed (live only)
+    cancelled: list[str] = field(default_factory=list)      # working orders cancelled (live only)
     errors: list[str] = field(default_factory=list)
 
     @property

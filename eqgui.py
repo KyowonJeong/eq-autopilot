@@ -84,7 +84,7 @@ T = {
     "find_contract": {"ko": "계약 조회", "en": "Find contract"},
     "side": {"ko": "방향", "en": "Side"},
     "size": {"ko": "수량", "en": "Size"},
-    "sl": {"ko": "손절틱", "en": "SL ticks"},
+    "sl": {"ko": "손절가", "en": "Stop price"},
     "dry_entry": {"ko": "모의 진입 (Dry-run)", "en": "Dry-run entry"},
     "live_entry": {"ko": "⚠ 실제 진입 (LIVE)", "en": "⚠ LIVE entry"},
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
@@ -102,6 +102,8 @@ T = {
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 운영 시작", "en": "Start autopilot"},
     "auto_stop": {"ko": "자동 운영 중지", "en": "Stop autopilot"},
+    "auto_on_ind": {"ko": "  ● 자동 운영 ON  ", "en": "  ● Autopilot ON  "},
+    "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -216,6 +218,15 @@ class App:
     def t(self, k):
         return T[k][self.lang]
 
+    def _set_auto_ind(self, on):
+        """Green lit pill while autopilot runs; gray when off."""
+        try:
+            self.auto_ind.config(text=self.t("auto_on_ind") if on else self.t("auto_off_ind"),
+                                 fg="white" if on else "#666",
+                                 bg="#22a722" if on else "#dddddd")
+        except Exception:
+            pass
+
     def _build(self):
         d = _load()
         if self.frm is not None:
@@ -282,7 +293,7 @@ class App:
         ttk.Label(ef, text=self.t("size")).pack(side="left")
         self.size = ttk.Spinbox(ef, from_=1, to=50, width=5); self.size.set("1"); self.size.pack(side="left", padx=(2, 8))
         ttk.Label(ef, text=self.t("sl")).pack(side="left")
-        self.sl = ttk.Entry(ef, width=6); self.sl.pack(side="left", padx=2)
+        self.sl = ttk.Entry(ef, width=10); self.sl.pack(side="left", padx=2)
         ef3 = ttk.Frame(frm); ef3.pack(fill="x", pady=3)
         ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False)).pack(side="left")
         ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True)).pack(side="left", padx=8)
@@ -296,6 +307,9 @@ class App:
         ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live).pack(side="left", padx=(0, 10))
         self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._auto_on else self.t("auto_start"),
                                  command=self.toggle_auto); self.b_auto.pack(side="left")
+        self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
+        self.auto_ind.pack(side="left", padx=(10, 0))
+        self._set_auto_ind(self._auto_on)
         ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -452,15 +466,15 @@ class App:
         self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} flatten ({sc or 'all'}) ──")
         def w():
             b = self._broker(); res = b.flatten_all(dry_run=not live)
-            if not res.planned:
-                self.log("no open positions (flat)."); return
             for p in res.planned: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
             if not live:
-                self.log("DRY-RUN — no orders sent.")
-            else:
-                self.log("closed: " + (", ".join(f"{p.account_name}/{p.symbol}" for p in res.closed) or "—"))
-                for e in res.errors: self.log(f"   ⚠ {e}")
-                self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
+                self.log("DRY-RUN — no orders sent." if res.planned else "no open positions (flat).")
+                return
+            self.log("closed: " + (", ".join(f"{p.account_name}/{p.symbol}" for p in res.closed) or "—"))
+            if res.cancelled:
+                self.log(f"cancelled orders: {len(res.cancelled)}")
+            for e in res.errors: self.log(f"   ⚠ {e}")
+            self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
         self._run(w)
 
     def entry(self, live):
@@ -472,10 +486,17 @@ class App:
         if not contract:
             messagebox.showwarning(self.t("input_needed"), self.t("contract")); return
         side, size = self.side.get(), int(self.size.get())
-        slv = self.sl.get().strip(); sl_ticks = int(slv) if slv.isdigit() else None
-        if live and not messagebox.askyesno(self.t("live_confirm"), f"LIVE entry.\n{side} {size} @ {contract}\nAccount: {sc}\nProceed?"):
+        slv = self.sl.get().strip()
+        try:
+            sl_price = float(slv) if slv else None
+        except ValueError:
+            messagebox.showwarning(self.t("input_needed"), self.t("sl") + " = 21450.0"); return
+        sl_txt = f"\nStop: {sl_price}" if sl_price is not None else ""
+        if live and not messagebox.askyesno(self.t("live_confirm"),
+                f"LIVE entry.\n{side} {size} @ {contract}{sl_txt}\nAccount: {sc}\nProceed?"):
             return
-        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} entry: {side} {size} {contract} ({sc}) ──")
+        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} entry: {side} {size} {contract} "
+                 f"(SL@{sl_price if sl_price is not None else '—'}) ({sc}) ──")
         def w():
             b = self._broker()
             match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
@@ -483,8 +504,13 @@ class App:
                 self.log(f"❌ account '{sc}' not found — use 'Load accounts'."); return
             aid = match[0]["id"]
             r = b.place_entry(account_id=aid, contract_id=contract, side=side, size=size, order_type=2,
-                              stop_loss_ticks=sl_ticks, custom_tag="EQ-Autopilot-test", dry_run=not live)
-            self.log(f"DRY-RUN — would place: {r.get('would_place')}" if not live else f"✅ order sent: {r}")
+                              stop_loss_price=sl_price, custom_tag="EQ-Autopilot-test", dry_run=not live)
+            if not live:
+                self.log(f"DRY-RUN — entry: {r.get('would_place')}")
+                if r.get("would_place_stop"):
+                    self.log(f"DRY-RUN — stop:  {r.get('would_place_stop')}")
+            else:
+                self.log(f"✅ order sent: {r}")
         self._run(w)
 
     def find_contract(self):
@@ -515,6 +541,7 @@ class App:
         if self._auto_on:
             self._auto_on = False
             self.b_auto.config(text=self.t("auto_start"))
+            self._set_auto_ind(False)
             self.log("⏹ autopilot stopped.")
             return
         if not self._creds_ok() or not self._consent_ok():
@@ -526,6 +553,7 @@ class App:
         live = bool(self.auto_live.get())
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
+        self._set_auto_ind(True)
         self.log(f"\n▶ autopilot ON — daily {cutoff} ET · account [{sc or 'all'}] · "
                  f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
         self.log(f"   {self.t('warn_mix')}")

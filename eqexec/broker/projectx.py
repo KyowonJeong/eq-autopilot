@@ -81,6 +81,16 @@ class ProjectXBroker(BrokerAdapter):
         d = self._post("/api/Contract/search", {"searchText": text, "live": bool(live)})
         return d.get("contracts", d if isinstance(d, list) else [])
 
+    def _open_orders(self, account_id) -> list[dict]:
+        """POST /api/Order/searchOpen {accountId} -> {orders:[{id, ...}]}. Working (resting) orders
+        — e.g. a protective stop left behind after a position closes."""
+        d = self._post("/api/Order/searchOpen", {"accountId": account_id})
+        return d.get("orders", d if isinstance(d, list) else [])
+
+    def _cancel_order(self, account_id, order_id) -> None:
+        """POST /api/Order/cancel {accountId, orderId}. Cancel one working order."""
+        self._post("/api/Order/cancel", {"accountId": int(account_id), "orderId": order_id})
+
     def list_open_positions(self) -> list[Position]:
         out: list[Position] = []
         for a in self._accounts():
@@ -104,7 +114,7 @@ class ProjectXBroker(BrokerAdapter):
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
         plan = self.list_open_positions()
         res = FlattenResult(dry_run=dry_run, planned=list(plan))
-        if dry_run or not plan:
+        if dry_run:
             return res
         for pos in plan:
             try:
@@ -115,6 +125,21 @@ class ProjectXBroker(BrokerAdapter):
                 })
             except Exception as e:
                 res.errors.append(f"{pos.account_name}/{pos.symbol}: {e}")
+        # "Flat" = no positions AND no working orders. Cancel any resting orders (e.g. a protective
+        # stop left behind after the position closed) so a leftover stop can't re-open a position
+        # next session. Best-effort: failures are logged, never block the position close above.
+        for a in self._accounts():
+            aid = a.get("id")
+            try:
+                for o in self._open_orders(aid):
+                    oid = o.get("id")
+                    try:
+                        self._cancel_order(aid, oid)
+                        res.cancelled.append(f"{a.get('name', aid)}:{oid}")
+                    except Exception as e:
+                        res.errors.append(f"cancel order {oid} failed: {e}")
+            except Exception as e:
+                res.errors.append(f"{a.get('name', aid)}: open-order read failed: {e}")
         # Confirm-after-act: re-read; anything still open is an error to alert on loudly.
         try:
             still = self.list_open_positions()
@@ -135,19 +160,23 @@ class ProjectXBroker(BrokerAdapter):
     # ── entry (order placement) — for the optional auto-ENTRY path. dry_run sends nothing. ──
     def place_entry(self, account_id, contract_id: str, side, size: int, *,
                     order_type: int = 2, limit_price=None, stop_price=None,
-                    stop_loss_ticks=None, take_profit_ticks=None, custom_tag=None,
-                    dry_run: bool = True):
+                    stop_loss_ticks=None, stop_loss_price=None, take_profit_ticks=None,
+                    custom_tag=None, dry_run: bool = True):
         """Place an entry order via POST /api/Order/place (shapes confirmed against the docs).
           side: 'BUY'/'LONG'/0  or  'SELL'/'SHORT'/1   (0=Bid/buy, 1=Ask/sell)
           order_type: 2=Market (default), 1=Limit, 4=Stop
-          stop_loss_ticks / take_profit_ticks: optional protective bracket (in ticks).
-        Returns the dict {"orderId", ...} on live, or the request body (no order sent) on dry_run."""
+          stop_loss_ticks  — protective bracket, distance in TICKS from fill (broker-managed OCO).
+          stop_loss_price  — protective stop at an ABSOLUTE price. Placed as a SEPARATE Stop order
+                             on the opposite side after the entry (the daily flatten cancels any
+                             leftover working order). Prefer this when the signal gives a price.
+        Returns the order dict(s) on live, or the request body/bodies (nothing sent) on dry_run."""
         _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
         s = side.upper() if isinstance(side, str) else side
         if s not in _SIDE:
             raise ValueError(f"bad side {side!r} (use BUY/LONG/0 or SELL/SHORT/1)")
+        side_code = _SIDE[s]
         body = {"accountId": int(account_id), "contractId": contract_id,
-                "type": int(order_type), "side": _SIDE[s], "size": int(size)}
+                "type": int(order_type), "side": side_code, "size": int(size)}
         if limit_price is not None:
             body["limitPrice"] = limit_price
         if stop_price is not None:
@@ -158,6 +187,22 @@ class ProjectXBroker(BrokerAdapter):
             body["stopLossBracket"] = {"ticks": int(stop_loss_ticks), "type": 4}
         if take_profit_ticks is not None:               # bracket: type 1 = Limit
             body["takeProfitBracket"] = {"ticks": int(take_profit_ticks), "type": 1}
+
+        # Absolute-price protective stop = a standalone Stop (type 4) on the OPPOSITE side.
+        stop_body = None
+        if stop_loss_price is not None:
+            stop_body = {"accountId": int(account_id), "contractId": contract_id,
+                         "type": 4, "side": 1 - side_code, "size": int(size),
+                         "stopPrice": float(stop_loss_price)}
+            if custom_tag:
+                stop_body["customTag"] = f"{custom_tag}-SL"
+
         if dry_run:
-            return {"dry_run": True, "would_place": body}
-        return self._post("/api/Order/place", body)
+            return {"dry_run": True, "would_place": body, "would_place_stop": stop_body}
+        entry = self._post("/api/Order/place", body)
+        if stop_body is None:
+            return entry
+        try:
+            return {"entry": entry, "stop": self._post("/api/Order/place", stop_body)}
+        except Exception as e:
+            return {"entry": entry, "stop_error": str(e)}
