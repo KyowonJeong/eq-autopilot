@@ -111,17 +111,17 @@ T = {
     "auto_on_ind": {"ko": "  ● 자동 운영 ON  ", "en": "  ● Autopilot ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sec_sig": {"ko": "자동 진입 (실시간 신호)", "en": "Auto-entry (live signal)"},
+    "sig_symbol": {"ko": "실행 종목", "en": "Symbol"},
     "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
     "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sig_note": {"ko": "※ 위 '진입' 섹션의 계약ID·수량·'사용 계좌'로 진입합니다. 신호가 오면 그 방향+손절가로 "
-                       "자동 진입합니다.",
-                 "en": "※ Enters on the 'Entry' section's contract ID + size + chosen account, in the "
-                       "signal's direction with the signal's stop."},
-    "sig_need_contract": {"ko": "먼저 '진입' 섹션에 계약ID를 넣으세요(계약 조회).",
-                          "en": "Set a contract ID in the 'Entry' section first (Find contract)."},
+    "sig_note": {"ko": "※ 계약ID는 신호 종목(또는 '실행 종목')으로 현재 계약을 자동 조회해 채웁니다 — 직접 안 넣어도 됩니다. "
+                       "비우면 신호 종목(예: NQ) 사용, 마이크로면 MNQ 입력. 수량·사용 계좌는 위 '진입' 섹션 값.",
+                 "en": "※ The contract ID is auto-resolved from the signal's symbol (or 'Symbol') — no need to "
+                       "type it. Blank = the signal's symbol (e.g. NQ); for micro use MNQ. Size + account come "
+                       "from the 'Entry' section."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -343,6 +343,9 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_sig"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         sg = ttk.Frame(frm); sg.pack(fill="x", pady=3)
+        ttk.Label(sg, text=self.t("sig_symbol")).pack(side="left")
+        self.sig_symbol = ttk.Combobox(sg, values=["MNQ", "NQ"], width=8); self.sig_symbol.set("MNQ")
+        self.sig_symbol.pack(side="left", padx=(2, 12))
         self.sig_live = tk.IntVar()
         ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live).pack(side="left", padx=(0, 12))
         self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
@@ -641,9 +644,7 @@ class App:
         sc = self._scope()
         if not sc:
             messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
-        contract = self.contract.get().strip()
-        if not contract:
-            messagebox.showwarning(self.t("input_needed"), self.t("sig_need_contract")); return
+        symbol = self.sig_symbol.get().strip()   # blank → use the signal's instrument
         user, key = self.user.get().strip(), self.key.get().strip()
         try:
             size = int(self.size.get())          # reuse the Entry section's quantity
@@ -653,13 +654,21 @@ class App:
         self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
         self._set_sig_ind(True)
-        self.log(f"\n▶ signal watch ON — {contract} · account [{sc}] · size {size} · "
-                 f"{'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
+        self.log(f"\n▶ signal watch ON — symbol [{symbol or 'from signal'}] · account [{sc}] · "
+                 f"size {size} · {'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
         threading.Thread(target=self._sig_loop,
-                         args=(FEED_URL, user, key, sc, contract, size, live),
+                         args=(FEED_URL, user, key, sc, symbol, size, live),
                          daemon=True).start()
 
-    def _sig_loop(self, url, user, key, sc, contract, size, live):
+    def _resolve_contract(self, b, symbol):
+        """현재(활성) 계약ID를 종목으로 자동 조회. 활성 우선, 없으면 첫 결과."""
+        cs = b.search_contracts(symbol)
+        if not cs:
+            return None
+        active = next((c.get("id") for c in cs if c.get("activeContract")), None)
+        return active or cs[0].get("id")
+
+    def _sig_loop(self, url, user, key, sc, symbol, size, live):
         import time as _t
         import requests
         last_id = None
@@ -673,11 +682,16 @@ class App:
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid
                 direction, stop = sig.get("direction"), sig.get("stop_price")
+                sym = symbol or (sig.get("instrument") or "")
                 self.log(f"\n📶 signal {sid}: {direction} {sig.get('instrument')} stop@{stop} "
-                         f"→ {'LIVE' if live else 'dry-run'} entry on {contract} [{sc}]")
+                         f"→ resolving {sym} → {'LIVE' if live else 'dry-run'} entry [{sc}]")
                 try:
                     b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
                                                    api_key=key, accounts=[sc]))
+                    contract = self._resolve_contract(b, sym)
+                    if not contract:
+                        self.log(f"   ❌ no active contract found for '{sym}'."); continue
+                    self.log(f"   contract: {contract}")
                     match = [a for a in b._accounts()
                              if str(a.get("name")) == sc or str(a.get("id")) == sc]
                     if not match:
