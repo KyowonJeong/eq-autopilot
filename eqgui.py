@@ -4,9 +4,10 @@ import os
 import threading
 import queue
 import subprocess
+import hashlib
 import datetime as _dt
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -27,6 +28,14 @@ T = {
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
     "paste": {"ko": "붙여넣기", "en": "Paste"},
+    "unlock": {"ko": "🔓 잠금해제", "en": "🔓 Unlock"},
+    "lock": {"ko": "🔒 잠금", "en": "🔒 Lock"},
+    "pin_new": {"ko": "키 변경용 PIN을 새로 설정하세요 (숫자/문자):",
+                "en": "Set a PIN (needed to change the key):"},
+    "pin_enter": {"ko": "PIN 입력:", "en": "Enter PIN:"},
+    "pin_wrong": {"ko": "PIN이 틀립니다.", "en": "Wrong PIN."},
+    "locked_msg": {"ko": "키를 보거나 바꾸려면 먼저 '잠금해제'(PIN)를 하세요.",
+                   "en": "Unlock (PIN) first to view or change the key."},
     "scope": {"ko": "사용 계좌", "en": "Account"},
     "all": {"ko": "(전체 계좌)", "en": "(all accounts)"},
     "scope_note": {"ko": "※ '사용 계좌'에 지정한 계좌에만 청산/진입이 적용됩니다. (전체 = 모든 활성 계좌)",
@@ -88,6 +97,19 @@ def _kc_load(account):
         return ""
 
 
+def _pin_hash():
+    return _kc_load("__eqpin__")
+
+
+def _pin_set(pin):
+    _kc_save("__eqpin__", hashlib.sha256(pin.encode()).hexdigest())
+
+
+def _pin_ok(pin):
+    h = _pin_hash()
+    return bool(h) and hashlib.sha256(pin.encode()).hexdigest() == h
+
+
 def _load():
     try:
         import yaml
@@ -124,8 +146,8 @@ class App:
         self.lang = _load()["lang"]
         self.frm = None
         self._auto_on = False
+        self._unlocked = False
         self._build()
-        self._async_load_key(_load().get("user", ""))
         root.after(120, self._drain)
 
     def _async_load_key(self, user):
@@ -133,8 +155,15 @@ class App:
         def w():
             k = _kc_load(user)
             if k:
-                self.root.after(0, lambda: (self.key.delete(0, "end"), self.key.insert(0, k)))
+                self.root.after(0, lambda: self._set_key(k))
         threading.Thread(target=w, daemon=True).start()
+
+    def _set_key(self, text):
+        """Set the (readonly) key field's value programmatically."""
+        self.key.config(state="normal")
+        self.key.delete(0, "end"); self.key.insert(0, text)
+        if not self._unlocked:
+            self.key.config(state="readonly")
 
     def t(self, k):
         return T[k][self.lang]
@@ -158,7 +187,10 @@ class App:
         self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True); self.user.insert(0, d["user"])
         r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
         ttk.Label(r2, text=self.t("key"), width=18).pack(side="left")
-        self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True); self.key.insert(0, d["key"])
+        self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True)
+        self.key.insert(0, d["key"]); self.key.config(state="readonly")
+        self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
+        self.b_lock.pack(side="left", padx=(4, 0))
         ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
         self.show = tk.IntVar()
         ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
@@ -213,13 +245,37 @@ class App:
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
         self.log(self.t("ready"))
+        self._async_load_key(d.get("user", ""))
 
     def _set_lang(self, *_):
         self.lang = "en" if self.langbox.get() == "English" else "ko"
         _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang)
+        self._unlocked = False
         self._build()
 
+    def _unlock(self):
+        if self._unlocked:                                   # → re-lock
+            self._unlocked = False
+            self.show.set(0)
+            self.key.config(state="readonly", show="•")
+            self.b_lock.config(text=self.t("unlock"))
+            return
+        if not _pin_hash():                                  # first time → set a PIN
+            p = simpledialog.askstring("PIN", self.t("pin_new"), show="*", parent=self.root)
+            if not p:
+                return
+            _pin_set(p)
+        else:
+            p = simpledialog.askstring("PIN", self.t("pin_enter"), show="*", parent=self.root)
+            if not p or not _pin_ok(p):
+                messagebox.showwarning("PIN", self.t("pin_wrong")); return
+        self._unlocked = True
+        self.key.config(state="normal")
+        self.b_lock.config(text=self.t("lock"))
+
     def _paste_key(self):
+        if not self._unlocked:
+            messagebox.showinfo("PIN", self.t("locked_msg")); return
         try:
             self.key.delete(0, "end")
             self.key.insert(0, self.root.clipboard_get().strip())
@@ -227,6 +283,9 @@ class App:
             pass
 
     def _toggle(self):
+        if not self._unlocked:
+            self.show.set(0)
+            messagebox.showinfo("PIN", self.t("locked_msg")); return
         self.key.config(show="" if self.show.get() else "•")
 
     def log(self, m): self.q.put(m)
