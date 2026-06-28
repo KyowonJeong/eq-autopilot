@@ -39,7 +39,10 @@ URL_JOIN = "https://app.edgequant.app/?nav=registration"
 URL_FREE_DC = "https://discord.gg/jwU4fkfvU"        # public Discord invite (discord_gate._PUBLIC_INVITE)
 URL_FREE_TG = "https://t.me/+EpF27gYYhIRjNTJi"      # public Telegram invite (telegram_gate._PUBLIC_INVITE)
 # EdgeQuant signal feed the auto-entry loop polls (Streamlit static serving).
-FEED_URL = "https://app.edgequant.app/app/static/autopilot_signal.json"
+# 🔒 Secret path (not a public URL) — the token must match autopilot_feed._FEED_TOKEN on the server.
+# ⚠ Shared secret: fine for the private test, but a freely-distributed app leaks it → replace with
+#   per-member token auth before public release. Rotate this with the server token together.
+FEED_URL = "https://app.edgequant.app/app/static/sig-REDACTED-RETIRED-TOKEN.json"
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 
 
