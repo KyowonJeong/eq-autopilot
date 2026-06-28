@@ -72,7 +72,7 @@ def _kc_save(account, secret):
         return
     try:
         subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
-                        "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, check=True)
+                        "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, timeout=8)
     except Exception:
         pass
 
@@ -80,7 +80,7 @@ def _kc_save(account, secret):
 def _kc_load(account):
     try:
         r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", account or "default",
-                            "-s", KC_SERVICE, "-w"], capture_output=True, text=True)
+                            "-s", KC_SERVICE, "-w"], capture_output=True, text=True, timeout=8)
         return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
         return ""
@@ -93,8 +93,10 @@ def _load():
             d = yaml.safe_load(f) or {}
         px = d.get("projectx", {}); a = px.get("accounts") or []
         user = px.get("user_name", "")
-        key = _kc_load(user) or px.get("api_key", "")   # Keychain first; migrate old plaintext if any
-        return {"user": user, "key": key, "acct": (a[0] if a else ""), "lang": d.get("lang", "ko")}
+        # Key is loaded from Keychain ASYNC (after the window is up) so the GUI never blocks on
+        # the `security` subprocess at startup. _load() stays fast (yaml only).
+        return {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
+                "lang": d.get("lang", "ko")}
     except Exception:
         return {"user": "", "key": "", "acct": "", "lang": "ko"}
 
@@ -121,7 +123,16 @@ class App:
         self.frm = None
         self._auto_on = False
         self._build()
+        self._async_load_key(_load().get("user", ""))
         root.after(120, self._drain)
+
+    def _async_load_key(self, user):
+        """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
+        def w():
+            k = _kc_load(user)
+            if k:
+                self.root.after(0, lambda: (self.key.delete(0, "end"), self.key.insert(0, k)))
+        threading.Thread(target=w, daemon=True).start()
 
     def t(self, k):
         return T[k][self.lang]
