@@ -1,6 +1,8 @@
 # EQ Autopilot — standalone GUI (Topstep / ProjectX). v4: KO/EN language toggle + single-account
 # scope + full persistence. Runs on the user's own machine with their own key.
 import os
+import sys
+import webbrowser
 import threading
 import queue
 import subprocess
@@ -20,10 +22,22 @@ APP_DIR = os.path.expanduser("~/Library/Application Support/EQAutopilot")
 os.makedirs(APP_DIR, exist_ok=True)
 CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
+URL_HOME = "https://edgequant.app"
+URL_JOIN = "https://app.edgequant.app/?nav=registration"
+URL_FREE = "https://discord.gg/jwU4fkfvU"   # public Discord (free → channel join → free token)
+
+
+def _resource(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
 T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
     "lang": {"ko": "언어", "en": "Language"},
+    "btn_home": {"ko": "홈페이지", "en": "Website"},
+    "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
+    "btn_free": {"ko": "무료 사용", "en": "Use free"},
     "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
@@ -175,12 +189,21 @@ class App:
         frm = ttk.Frame(self.root, padding=14); frm.pack(fill="both", expand=True); self.frm = frm
 
         top = ttk.Frame(frm); top.pack(fill="x")
+        try:
+            self._logo = tk.PhotoImage(file=_resource("eqlogo.png"))
+            ttk.Label(top, image=self._logo).pack(side="left", padx=(0, 8))
+        except Exception:
+            self._logo = None
         ttk.Label(top, text="EQ Autopilot — Topstep (ProjectX)", font=("Helvetica", 16, "bold")).pack(side="left")
         ttk.Label(top, text=self.t("lang")).pack(side="right", padx=(0, 4))
         self.langbox = ttk.Combobox(top, values=["한국어", "English"], width=9, state="readonly")
         self.langbox.set("English" if self.lang == "en" else "한국어")
         self.langbox.pack(side="right"); self.langbox.bind("<<ComboboxSelected>>", self._set_lang)
-        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(2, 10))
+        links = ttk.Frame(frm); links.pack(fill="x", pady=(4, 0))
+        ttk.Button(links, text=self.t("btn_home"), command=lambda: webbrowser.open(URL_HOME)).pack(side="left")
+        ttk.Button(links, text=self.t("btn_join"), command=lambda: webbrowser.open(URL_JOIN)).pack(side="left", padx=6)
+        ttk.Button(links, text=self.t("btn_free"), command=lambda: webbrowser.open(URL_FREE)).pack(side="left")
+        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(6, 10))
 
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=self.t("user"), width=18).pack(side="left")
