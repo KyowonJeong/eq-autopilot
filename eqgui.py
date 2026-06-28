@@ -119,13 +119,11 @@ T = {
     "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sig_note": {"ko": "※ 자동 진입은 MNQ(마이크로 NQ)로 실행합니다. 현재 계약은 자동 조회 — 계약ID 입력 불필요. "
-                       "신호가 오면 그 방향+손절가로 진입하고, 수량·사용 계좌는 위 '진입' 섹션 값을 씁니다. "
+    "sig_note": {"ko": "※ 신호의 방향·손절가·수량(MNQ)으로 자동 진입합니다. '사용 계좌'만 고르면 됩니다. "
                        "이미 포지션이 있으면 중복 진입하지 않습니다(두 군데서 켜도 2배 진입 방지).",
-                 "en": "※ Auto-entry trades MNQ (micro NQ); the current contract is auto-resolved (no contract "
-                       "ID needed). On a signal it enters that direction with the signal's stop; size + account "
-                       "come from the 'Entry' section. It won't enter if a position is already open (no doubling "
-                       "even if run in two places)."},
+                 "en": "※ Enters automatically using the signal's direction, stop, and size (MNQ); just pick the "
+                       "account. It won't enter if a position is already open (no doubling even if run in two "
+                       "places)."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -670,20 +668,17 @@ class App:
         sc = self._scope()
         if not sc:
             messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
+        # 자동 진입은 '진입(수동)' 섹션과 완전 무관 — 계약(MNQ)·수량·손절가 모두 신호에서 받는다.
         symbol = "MNQ"                           # auto-trading is MNQ only (not NQ)
         user, key = self.user.get().strip(), self.key.get().strip()
-        try:
-            size = int(self.size.get())          # reuse the Entry section's quantity
-        except ValueError:
-            size = 1
         live = bool(self.sig_live.get())
         self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
         self._set_sig_ind(True)
         self.log(f"\n▶ signal watch ON — {symbol} · account [{sc}] · "
-                 f"size {size} · {'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
+                 f"size from signal · {'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
         threading.Thread(target=self._sig_loop,
-                         args=(FEED_URL, user, key, sc, symbol, size, live),
+                         args=(FEED_URL, user, key, sc, symbol, live),
                          daemon=True).start()
 
     def _resolve_contract(self, b, symbol):
@@ -694,7 +689,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    def _sig_loop(self, url, user, key, sc, symbol, size, live):
+    def _sig_loop(self, url, user, key, sc, symbol, live):
         import time as _t
         import requests
         last_id = None
@@ -708,9 +703,15 @@ class App:
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid
                 direction, stop = sig.get("direction"), sig.get("stop_price")
+                try:
+                    size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
+                except (TypeError, ValueError):
+                    size = 0
                 sym = symbol or (sig.get("instrument") or "")
-                self.log(f"\n📶 signal {sid}: {direction} {sig.get('instrument')} stop@{stop} "
+                self.log(f"\n📶 signal {sid}: {direction} {sig.get('instrument')} x{size} stop@{stop} "
                          f"→ resolving {sym} → {'LIVE' if live else 'dry-run'} entry [{sc}]")
+                if size <= 0:
+                    self.log("   ⏭ signal has no contract count (no entry_ref?) — skipping."); continue
                 try:
                     b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
                                                    api_key=key, accounts=[sc]))
