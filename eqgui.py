@@ -38,7 +38,8 @@ T = {
     "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
     "sec_entry": {"ko": "진입 (Entry — 수동 테스트, 사용 계좌)", "en": "Entry (manual test, chosen account)"},
-    "contract": {"ko": "계약ID", "en": "Contract ID"},
+    "contract": {"ko": "계약ID/심볼", "en": "Contract ID/symbol"},
+    "find_contract": {"ko": "계약 조회", "en": "Find contract"},
     "side": {"ko": "방향", "en": "Side"},
     "size": {"ko": "수량", "en": "Size"},
     "sl": {"ko": "손절틱", "en": "SL ticks"},
@@ -182,7 +183,8 @@ class App:
         ttk.Label(frm, text=self.t("sec_entry"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         ef = ttk.Frame(frm); ef.pack(fill="x", pady=3)
         ttk.Label(ef, text=self.t("contract")).pack(side="left")
-        self.contract = ttk.Entry(ef, width=22); self.contract.pack(side="left", padx=(2, 8))
+        self.contract = ttk.Entry(ef, width=20); self.contract.pack(side="left", padx=(2, 4))
+        ttk.Button(ef, text=self.t("find_contract"), width=8, command=self.find_contract).pack(side="left", padx=(0, 8))
         ttk.Label(ef, text=self.t("side")).pack(side="left")
         self.side = ttk.Combobox(ef, values=["LONG", "SHORT"], width=7, state="readonly"); self.side.set("LONG")
         self.side.pack(side="left", padx=(2, 8))
@@ -345,6 +347,30 @@ class App:
             r = b.place_entry(account_id=aid, contract_id=contract, side=side, size=size, order_type=2,
                               stop_loss_ticks=sl_ticks, custom_tag="EQ-Autopilot-test", dry_run=not live)
             self.log(f"DRY-RUN — would place: {r.get('would_place')}" if not live else f"✅ order sent: {r}")
+        self._run(w)
+
+    def find_contract(self):
+        if not self._creds_ok(): return
+        term = self.contract.get().strip()
+        if not term:
+            messagebox.showwarning(self.t("input_needed"), "MNQ / NQ / GC …"); return
+        self.log(f"\n── contract search: {term} ──")
+        def w():
+            b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
+                                           user_name=self.user.get().strip(), api_key=self.key.get().strip()))
+            cs = b.search_contracts(term)
+            if not cs:
+                self.log("   no contracts found."); return
+            active = None
+            for c in cs:
+                act = c.get("activeContract")
+                self.log(f"   • {c.get('id')}   {c.get('name')}   active={act}")
+                if act and active is None:
+                    active = c.get("id")
+            pick = active or cs[0].get("id")
+            if pick:
+                self.root.after(0, lambda: (self.contract.delete(0, "end"), self.contract.insert(0, pick)))
+                self.log(f"→ filled: {pick}")
         self._run(w)
 
     def toggle_auto(self):

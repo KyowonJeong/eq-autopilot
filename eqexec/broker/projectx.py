@@ -74,6 +74,13 @@ class ProjectXBroker(BrokerAdapter):
                      if str(a.get("name", "")).lower() in want or str(a.get("id")) in want]
         return accts
 
+    def search_contracts(self, text: str, live: bool = False) -> list[dict]:
+        """POST /api/Contract/search {searchText, live} -> {contracts:[{id, name, description,
+        tickSize, tickValue, activeContract, ...}]}. Used to resolve the current front-month
+        contractId for a symbol (e.g. 'MNQ') so the user doesn't hand-type an expired code."""
+        d = self._post("/api/Contract/search", {"searchText": text, "live": bool(live)})
+        return d.get("contracts", d if isinstance(d, list) else [])
+
     def list_open_positions(self) -> list[Position]:
         out: list[Position] = []
         for a in self._accounts():
