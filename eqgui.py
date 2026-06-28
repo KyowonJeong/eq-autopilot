@@ -120,10 +120,12 @@ T = {
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sig_note": {"ko": "※ 자동 진입은 MNQ(마이크로 NQ)로 실행합니다. 현재 계약은 자동 조회 — 계약ID 입력 불필요. "
-                       "신호가 오면 그 방향+손절가로 진입하고, 수량·사용 계좌는 위 '진입' 섹션 값을 씁니다.",
+                       "신호가 오면 그 방향+손절가로 진입하고, 수량·사용 계좌는 위 '진입' 섹션 값을 씁니다. "
+                       "이미 포지션이 있으면 중복 진입하지 않습니다(두 군데서 켜도 2배 진입 방지).",
                  "en": "※ Auto-entry trades MNQ (micro NQ); the current contract is auto-resolved (no contract "
                        "ID needed). On a signal it enters that direction with the signal's stop; size + account "
-                       "come from the 'Entry' section."},
+                       "come from the 'Entry' section. It won't enter if a position is already open (no doubling "
+                       "even if run in two places)."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -721,6 +723,15 @@ class App:
                     if not match:
                         self.log(f"   ❌ account '{sc}' not found."); continue
                     aid = match[0]["id"]
+                    # 중복 진입 방지: 그 계좌에 이미 포지션이 있으면 건너뛴다(다른 인스턴스/다른 기기가
+                    # 먼저 진입했거나 미청산). 두 군데서 켜놔도 2배로 안 들어가게.
+                    existing = b.list_open_positions()
+                    if existing:
+                        if live:
+                            self.log(f"   ⏭ already in a position ({len(existing)}) — "
+                                     f"skipping to avoid doubling.")
+                            continue
+                        self.log(f"   (note) already in a position ({len(existing)}) — LIVE would skip.")
                     res = b.place_entry(account_id=aid, contract_id=contract, side=direction,
                                         size=size, order_type=2, stop_loss_price=stop,
                                         custom_tag="EQ-Autopilot-signal", dry_run=not live)
