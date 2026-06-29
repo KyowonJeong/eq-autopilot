@@ -56,6 +56,52 @@ def _feed_url(token):
     return f"{APP_BASE}/sig-{token}.json"
 
 
+# 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
+_BROKERS = ["projectx", "ibkr", "bybit", "bitget", "ninjatrader"]
+_BROKER_SPEC = {
+    "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX Username", "f2": "ProjectX API Key",
+                    "f3": None, "acct": True, "futures": True},
+    "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (예: 127.0.0.1)", "f2": None,
+                    "f3": "Port (7497/7496)", "acct": True, "futures": True, "preview": True},
+    "bybit":       {"label": "Bybit (USDT perp)", "f1": "API Key", "f2": "API Secret",
+                    "f3": "Testnet (1=on)", "acct": False, "futures": False, "preview": True},
+    "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
+                    "f3": "Passphrase", "acct": False, "futures": False, "preview": True},
+    "ninjatrader": {"label": "NinjaTrader (ATI)", "f1": "NT 계좌 (비우면 전체)", "f2": None,
+                    "f3": None, "acct": False, "futures": False, "preview": True},
+}
+
+
+def _broker_label(b):
+    return _BROKER_SPEC.get(b, {}).get("label", b)
+
+
+def _build_broker(broker, f1, f2, f3, accounts):
+    """선택된 브로커의 어댑터를 만든다(위젯 비의존 — 스레드에서도 안전).
+    f1/f2/f3 = 연결 필드(브로커별 의미). accounts = 계좌/스코프 리스트."""
+    acc = [a for a in (accounts or []) if a]
+    if broker == "projectx":
+        return ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
+                                          user_name=f1, api_key=f2, accounts=acc))
+    if broker == "ibkr":
+        from eqexec.broker.ibkr import IBKRBroker
+        from eqexec.config import IBKRCfg
+        return IBKRBroker(IBKRCfg(host=(f1 or "127.0.0.1"), port=int(f3 or 7497), accounts=acc))
+    if broker == "bybit":
+        from eqexec.broker.bybit import BybitBroker
+        from eqexec.config import BybitCfg
+        return BybitBroker(BybitCfg(api_key=f1, api_secret=f2, testnet=(str(f3).strip() == "1")))
+    if broker == "bitget":
+        from eqexec.broker.bitget import BitgetBroker
+        from eqexec.config import BitgetCfg
+        return BitgetBroker(BitgetCfg(api_key=f1, api_secret=f2, passphrase=f3))
+    if broker == "ninjatrader":
+        from eqexec.broker.ninjatrader import NinjaTraderBroker
+        from eqexec.config import NinjaTraderCfg
+        return NinjaTraderBroker(NinjaTraderCfg(accounts=([f1] if f1 else [])))
+    raise ValueError(f"unknown broker {broker!r}")
+
+
 def _resource(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
@@ -63,6 +109,9 @@ def _resource(name):
 T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
+    "broker": {"ko": "브로커", "en": "Broker"},
+    "broker_preview": {"ko": "(미검증 — 테스트넷/Sim 먼저)", "en": "(unverified — testnet/Sim first)"},
+    "acct_topstep_only": {"ko": "계좌 목록은 Topstep 전용입니다.", "en": "Account list is Topstep-only."},
     "token": {"ko": "멤버십 토큰", "en": "Membership token"},
     "token_get": {"ko": "토큰 받기", "en": "Get token"},
     "gate_none": {"ko": "멤버십 토큰을 입력하세요 (무료 사용 → 채널에서 발급).",
@@ -82,8 +131,10 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "공개 시그널 채널에 입장하면 봇이 무료 토큰을 발급합니다.\n채널을 선택하세요:",
-                 "en": "Join a public signal channel and the bot issues a free token.\nPick a channel:"},
+    "free_msg": {"ko": "공개 시그널 채널에 입장 → 봇 명령으로 무료 토큰을 받아 위 '멤버십 토큰'칸에 "
+                       "붙여넣으면 자동 청산이 열립니다. (정식 출시 시 자동 발급)\n채널을 선택하세요:",
+                 "en": "Join a public signal channel → get a free token from the bot and paste it in the "
+                       "'Membership token' box to unlock auto-close. (auto-issued at launch)\nPick a channel:"},
     "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
@@ -211,19 +262,30 @@ def _load():
         # Key is loaded from Keychain ASYNC (after the window is up) so the GUI never blocks on
         # the `security` subprocess at startup. _load() stays fast (yaml only).
         return {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
-                "lang": d.get("lang", "ko"), "token": d.get("token", "")}
+                "lang": d.get("lang", "ko"), "token": d.get("token", ""),
+                "broker": d.get("broker", "projectx"), "f1": d.get("f1", user),
+                "f3": d.get("f3", "")}
     except Exception:
-        return {"user": "", "key": "", "acct": "", "lang": "ko", "token": ""}
+        return {"user": "", "key": "", "acct": "", "lang": "ko", "token": "",
+                "broker": "projectx", "f1": "", "f3": ""}
 
 
-def _save(user, key, acct, lang, token=None):
-    _kc_save(user, key)                                  # key → Keychain only
-    if token is None:                                    # preserve existing membership token
-        token = _load().get("token", "")
+def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None):
+    _kc_save(user, key)                                  # secret(f2) → Keychain only
+    cur = _load()
+    if token is None:
+        token = cur.get("token", "")
+    if broker is None:
+        broker = cur.get("broker", "projectx")
+    if f1 is None:
+        f1 = cur.get("f1", user)
+    if f3 is None:
+        f3 = cur.get("f3", "")
     try:
         import yaml
         with open(CFG_PATH, "w") as f:
-            yaml.safe_dump({"live": False, "broker": "projectx", "lang": lang, "token": token,
+            yaml.safe_dump({"live": False, "broker": broker, "lang": lang, "token": token,
+                            "f1": f1, "f3": f3,
                             "projectx": {"base_url": "https://api.topstepx.com", "user_name": user,
                                          "api_key": "", "accounts": ([acct] if acct else [])}}, f)
     except Exception:
@@ -242,6 +304,7 @@ class App:
         self._sig_on = False
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
+        self._broker_name = _load().get("broker", "projectx")
         self._token = _load().get("token", "")
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
@@ -260,7 +323,9 @@ class App:
         threading.Thread(target=w, daemon=True).start()
 
     def _set_key(self, text):
-        """Set the (readonly) key field's value programmatically."""
+        """Set the (readonly) secret field's value programmatically (브로커에 비밀 필드 없으면 무시)."""
+        if not hasattr(self, "key"):
+            return
         self.key.config(state="normal")
         self.key.delete(0, "end"); self.key.insert(0, text)
         if not self._unlocked:
@@ -291,6 +356,10 @@ class App:
         d = _load()
         if self.frm is not None:
             self.frm.destroy()
+        # 브로커별로 만들어지는 위젯 속성 정리(파괴된 위젯의 stale 참조 방지).
+        for _a in ("key", "f3", "scope", "b_lock"):
+            if hasattr(self, _a):
+                delattr(self, _a)
         frm = ttk.Frame(self.root, padding=14); frm.pack(fill="both", expand=True); self.frm = frm
 
         top = ttk.Frame(frm); top.pack(fill="x")
@@ -299,7 +368,8 @@ class App:
             ttk.Label(top, image=self._logo).pack(side="left", padx=(0, 8))
         except Exception:
             self._logo = None
-        ttk.Label(top, text="EQ Autopilot — Topstep (ProjectX)", font=("Helvetica", 16, "bold")).pack(side="left")
+        ttk.Label(top, text=f"EQ Autopilot — {_broker_label(self._broker_name)}",
+                  font=("Helvetica", 16, "bold")).pack(side="left")
         ttk.Label(top, text=self.t("lang")).pack(side="right", padx=(0, 4))
         self.langbox = ttk.Combobox(top, values=["한국어", "English"], width=9, state="readonly")
         self.langbox.set("English" if self.lang == "en" else "한국어")
@@ -321,24 +391,46 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
+        spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
+        # 브로커 선택
+        rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
+        ttk.Label(rb, text=self.t("broker"), width=18).pack(side="left")
+        self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _BROKERS],
+                                      state="readonly", width=22)
+        self.brokerbox.set(_broker_label(self._broker_name)); self.brokerbox.pack(side="left")
+        self.brokerbox.bind("<<ComboboxSelected>>", self._on_broker)
+        if spec.get("preview"):
+            ttk.Label(rb, text=self.t("broker_preview"), foreground="#b06f00").pack(side="left", padx=(8, 0))
+        # f1 (브로커별 1번 필드)
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
-        ttk.Label(r1, text=self.t("user"), width=18).pack(side="left")
-        self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True); self.user.insert(0, d["user"])
-        r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
-        ttk.Label(r2, text=self.t("key"), width=18).pack(side="left")
-        self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True)
-        self.key.insert(0, d["key"]); self.key.config(state="readonly")
-        self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
-        self.b_lock.pack(side="left", padx=(4, 0))
-        ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
-        self.show = tk.IntVar()
-        ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
-
-        r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
-        ttk.Label(r3, text=self.t("scope"), width=18).pack(side="left")
-        self.scope = ttk.Combobox(r3, values=[self.t("all")], state="normal")
-        self.scope.set(d["acct"] or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
-        ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
+        ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
+        self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True)
+        self.user.insert(0, d.get("f1") or d.get("user") or "")
+        # f2 (비밀 — PIN 잠금) — 있는 브로커만
+        if spec.get("f2"):
+            r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
+            ttk.Label(r2, text=spec["f2"], width=18).pack(side="left")
+            self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True)
+            self.key.insert(0, d["key"]); self.key.config(state="readonly")
+            self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
+            self.b_lock.pack(side="left", padx=(4, 0))
+            ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
+            self.show = tk.IntVar()
+            ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
+        # f3 (추가 필드) — 있는 브로커만
+        if spec.get("f3"):
+            r3e = ttk.Frame(frm); r3e.pack(fill="x", pady=3)
+            ttk.Label(r3e, text=spec["f3"], width=18).pack(side="left")
+            _mask = "•" if ("Secret" in spec["f3"] or "Passphrase" in spec["f3"]) else ""
+            self.f3 = ttk.Entry(r3e, show=_mask); self.f3.pack(side="left", fill="x", expand=True)
+            self.f3.insert(0, d.get("f3", ""))
+        # 계좌 스코프 — 계좌 개념 있는 브로커만(Topstep/IBKR)
+        if spec.get("acct"):
+            r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
+            ttk.Label(r3, text=self.t("scope"), width=18).pack(side="left")
+            self.scope = ttk.Combobox(r3, values=[self.t("all")], state="normal")
+            self.scope.set(d["acct"] or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
+            ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
 
         row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
         self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
@@ -439,15 +531,18 @@ class App:
         auto = bool(master and caps.get("autoentry"))
         live_ok = not g.get("force_dry_run", True)
 
+        fut = bool(_BROKER_SPEC.get(self._broker_name, {}).get("futures"))  # 진입/신호=선물(Topstep)만
+        topstep = self._broker_name == "projectx"
+
         def en(b, ok):
             try:
                 b.config(state="normal" if ok else "disabled")
             except Exception:
                 pass
-        en(self.b_acc, conn); en(self.b_find, conn)
+        en(self.b_acc, conn and topstep); en(self.b_find, conn and fut)
         en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
-        en(self.b_entry_dry, man); en(self.b_entry_live, man and live_ok)
-        en(self.b_sig, auto)
+        en(self.b_entry_dry, man and fut); en(self.b_entry_live, man and fut and live_ok)
+        en(self.b_sig, auto and fut)
         for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
             try:
                 if not live_ok:
@@ -481,7 +576,7 @@ class App:
 
     def _save_token(self, *_):
         self._token = self.token_e.get().strip()
-        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang, token=self._token)
+        self._persist()
         self._heartbeat()
 
     def _heartbeat(self, periodic=False):
@@ -539,9 +634,30 @@ class App:
         win.update_idletasks()
         win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 90}")
 
+    def _secret(self):
+        return self.key.get().strip() if hasattr(self, "key") else ""
+
+    def _f3(self):
+        return self.f3.get().strip() if hasattr(self, "f3") else ""
+
+    def _persist(self):
+        _save(self.user.get().strip(), self._secret(), self._scope(), self.lang,
+              token=self._token, broker=self._broker_name, f1=self.user.get().strip(), f3=self._f3())
+
+    def _on_broker(self, *_):
+        sel = self.brokerbox.get()
+        for b in _BROKERS:
+            if _broker_label(b) == sel:
+                self._broker_name = b
+                break
+        self._connected = False
+        self._unlocked = False
+        self._persist()
+        self._build()
+
     def _set_lang(self, *_):
         self.lang = "en" if self.langbox.get() == "English" else "ko"
-        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang)
+        self._persist()
         self._unlocked = False
         self._build()
 
@@ -591,14 +707,15 @@ class App:
         self.root.after(120, self._drain)
 
     def _scope(self):
+        if not hasattr(self, "scope"):
+            return ""
         s = self.scope.get().strip()
         return "" if s in ("", self.t("all"), T["all"]["ko"], T["all"]["en"]) else s
 
     def _broker(self):
         sc = self._scope()
-        return ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
-                                          user_name=self.user.get().strip(), api_key=self.key.get().strip(),
-                                          accounts=([sc] if sc else [])))
+        return _build_broker(self._broker_name, self.user.get().strip(), self._secret(),
+                             self._f3(), [sc] if sc else [])
 
     def _busy(self, on):
         # 작업 중엔 연결 테스트도 잠그고, 끝나면 연결 여부에 맞춰 실행 버튼 복원.
@@ -606,9 +723,10 @@ class App:
         self._set_actions_enabled(False if on else self._connected)
 
     def _creds_ok(self):
-        if not self.user.get().strip() or not self.key.get().strip():
+        spec = _BROKER_SPEC.get(self._broker_name, {})
+        if not self.user.get().strip() or (spec.get("f2") and not self._secret()):
             messagebox.showwarning(self.t("input_needed"), self.t("need_creds")); return False
-        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang); return True
+        self._persist(); return True
 
     def _consent_ok(self):
         if not self.consent.get():
@@ -616,6 +734,8 @@ class App:
         return True
 
     def _fill_scope(self, names):
+        if not hasattr(self, "scope"):
+            return
         cur = self.scope.get()
         self.scope["values"] = [self.t("all")] + names
         if cur not in ([self.t("all")] + names):
@@ -636,9 +756,13 @@ class App:
         if not self._creds_ok(): return
         self.log("\n── connection test ──")
         def w():
-            b = self._broker(); b.authenticate()
-            names = [str(a.get("name")) for a in b._accounts()]
-            self.root.after(0, lambda: self._fill_scope(names))
+            b = self._broker(); b.healthcheck()
+            if self._broker_name == "projectx":      # Topstep만 계좌목록 채움
+                try:
+                    names = [str(a.get("name")) for a in b._accounts()]
+                    self.root.after(0, lambda: self._fill_scope(names))
+                except Exception:
+                    pass
             pos = b.list_open_positions(); sc = self._scope()
             self.log(f"✅ connected ({sc or 'all'}) — open positions: {len(pos)}")
             for p in pos: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
@@ -648,11 +772,12 @@ class App:
         self._run(w)
 
     def accounts(self):
+        if self._broker_name != "projectx":
+            messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
         if not self._creds_ok(): return
         self.log("\n── accounts ──")
         def w():
-            b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
-                                           user_name=self.user.get().strip(), api_key=self.key.get().strip()))
+            b = self._broker()
             accts = b._accounts()
             names = [str(a.get("name")) for a in accts]
             self.root.after(0, lambda: self._fill_scope(names))
@@ -682,6 +807,8 @@ class App:
         self._run(w)
 
     def entry(self, live):
+        if not _BROKER_SPEC.get(self._broker_name, {}).get("futures"):
+            messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
         if not self._creds_ok() or not self._consent_ok(): return
         sc = self._scope()
         if not sc:
@@ -753,17 +880,19 @@ class App:
         cutoff = self.cutoff.get().strip()
         if len(cutoff) != 5 or cutoff[2] != ":" or not (cutoff[:2] + cutoff[3:]).isdigit():
             messagebox.showwarning(self.t("input_needed"), "HH:MM"); return
-        user, key, sc = self.user.get().strip(), self.key.get().strip(), self._scope()
+        broker, f1, f2, f3, sc = (self._broker_name, self.user.get().strip(), self._secret(),
+                                  self._f3(), self._scope())
         live = bool(self.auto_live.get())
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
         self._set_auto_ind(True)
-        self.log(f"\n▶ autopilot ON — daily {cutoff} ET · account [{sc or 'all'}] · "
+        self.log(f"\n▶ autopilot ON — daily {cutoff} ET · {_broker_label(broker)} [{sc or 'all'}] · "
                  f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
         self.log(f"   {self.t('warn_mix')}")
-        threading.Thread(target=self._auto_loop, args=(cutoff, user, key, sc, live), daemon=True).start()
+        threading.Thread(target=self._auto_loop, args=(cutoff, broker, f1, f2, f3, sc, live),
+                         daemon=True).start()
 
-    def _auto_loop(self, cutoff, user, key, sc, live):
+    def _auto_loop(self, cutoff, broker, f1, f2, f3, sc, live):
         import time as _t
         tz = ZoneInfo("America/New_York") if ZoneInfo else None
         fired = None
@@ -774,8 +903,7 @@ class App:
                 fired = today
                 self.log(f"\n⏰ {cutoff} ET → auto-close ([{sc or 'all'}], {'LIVE' if live else 'dry-run'})")
                 try:
-                    b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
-                                                   api_key=key, accounts=([sc] if sc else [])))
+                    b = _build_broker(broker, f1, f2, f3, [sc] if sc else [])
                     res = b.flatten_all(dry_run=not live)
                     if not res.planned:
                         self.log("   no open positions (flat).")
@@ -799,6 +927,8 @@ class App:
             self._set_sig_ind(False)
             self.log("⏹ signal watch stopped.")
             return
+        if not _BROKER_SPEC.get(self._broker_name, {}).get("futures"):
+            messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
         if not self._creds_ok() or not self._consent_ok():
             return
         sc = self._scope()
