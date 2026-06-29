@@ -61,7 +61,7 @@ def _feed_url(token):
 # 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
 _BROKERS = ["projectx", "ibkr", "bybit", "bitget", "ninjatrader"]
 _BROKER_SPEC = {
-    "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX Username", "f2": "ProjectX API Key",
+    "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
     "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (예: 127.0.0.1)", "f2": None,
                     "f3": "Port (7497/7496)", "acct": True, "futures": True, "preview": True},
@@ -141,7 +141,7 @@ T = {
                        "box above to unlock auto-close.\n"
                        "• Telegram: the bot DMs the token to you instantly.\n"
                        "• Discord: log in with Discord on the web, then copy it on the 'EQ Autopilot' page."},
-    "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
+    "user": {"ko": "TopstepX user email", "en": "TopstepX user email"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
     "paste": {"ko": "붙여넣기", "en": "Paste"},
@@ -178,7 +178,7 @@ T = {
     "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·진입·자동 기능이 활성화됩니다.",
                    "en": "※ Pass 'Test connection' first to unlock close / entry / automation."},
     "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
-    "need_creds": {"ko": "Username과 API Key를 모두 입력하세요.", "en": "Enter both Username and API Key."},
+    "need_creds": {"ko": "이메일과 API Key를 모두 입력하세요.", "en": "Enter both email and API Key."},
     "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
     "live_confirm": {"ko": "실거래 확인", "en": "Confirm LIVE"},
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
