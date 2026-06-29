@@ -165,20 +165,12 @@ T = {
                  "en": "Flatten (close open positions on the chosen account)"},
     "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
-    "sec_entry": {"ko": "진입 (Entry — 수동 테스트, 사용 계좌)", "en": "Entry (manual test, chosen account)"},
-    "contract": {"ko": "계약ID/심볼", "en": "Contract ID/symbol"},
-    "find_contract": {"ko": "계약 조회", "en": "Find contract"},
-    "side": {"ko": "방향", "en": "Side"},
-    "size": {"ko": "수량", "en": "Size"},
-    "sl": {"ko": "손절가", "en": "Stop price"},
-    "dry_entry": {"ko": "모의 진입 (Dry-run)", "en": "Dry-run entry"},
-    "live_entry": {"ko": "⚠ 실제 진입 (LIVE)", "en": "⚠ LIVE entry"},
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
               "en": "Ready. Enter key → 'Test connection' → the rest unlocks once it passes."},
-    "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·진입·자동 기능이 활성화됩니다.",
-                   "en": "※ Pass 'Test connection' first to unlock close / entry / automation."},
+    "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·자동 진입 기능이 활성화됩니다.",
+                   "en": "※ Pass 'Test connection' first to unlock close / auto-entry."},
     "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
     "need_creds": {"ko": "이메일과 API Key를 모두 입력하세요.", "en": "Enter both email and API Key."},
     "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
@@ -457,26 +449,6 @@ class App:
         self.b_flat_live.pack(side="left", padx=8)
 
         ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_entry"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        ef = ttk.Frame(frm); ef.pack(fill="x", pady=3)
-        ttk.Label(ef, text=self.t("contract")).pack(side="left")
-        self.contract = ttk.Entry(ef, width=20); self.contract.pack(side="left", padx=(2, 4))
-        self.b_find = ttk.Button(ef, text=self.t("find_contract"), width=8, command=self.find_contract)
-        self.b_find.pack(side="left", padx=(0, 8))
-        ttk.Label(ef, text=self.t("side")).pack(side="left")
-        self.side = ttk.Combobox(ef, values=["LONG", "SHORT"], width=7, state="readonly"); self.side.set("LONG")
-        self.side.pack(side="left", padx=(2, 8))
-        ttk.Label(ef, text=self.t("size")).pack(side="left")
-        self.size = ttk.Spinbox(ef, from_=1, to=50, width=5); self.size.set("1"); self.size.pack(side="left", padx=(2, 8))
-        ttk.Label(ef, text=self.t("sl")).pack(side="left")
-        self.sl = ttk.Entry(ef, width=10); self.sl.pack(side="left", padx=2)
-        ef3 = ttk.Frame(frm); ef3.pack(fill="x", pady=3)
-        self.b_entry_dry = ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False))
-        self.b_entry_dry.pack(side="left")
-        self.b_entry_live = ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True))
-        self.b_entry_live.pack(side="left", padx=8)
-
-        ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
         ttk.Label(af, text=self.t("cutoff")).pack(side="left")
@@ -510,8 +482,7 @@ class App:
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
-        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_find,
-                             self.b_entry_dry, self.b_entry_live, self.b_auto, self.b_sig]
+        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig]
         self._apply_gating()
         self.log(self.t("ready"))
         self._async_load_key(d.get("user", ""))
@@ -535,11 +506,10 @@ class App:
         master = conn and g.get("ok") and g.get("enabled")
         caps = g.get("caps", {})
         use = bool(master and caps.get("use"))
-        man = bool(master and caps.get("manualentry"))
         auto = bool(master and caps.get("autoentry"))
         live_ok = not g.get("force_dry_run", True)
 
-        fut = bool(_BROKER_SPEC.get(self._broker_name, {}).get("futures"))  # 진입/신호=선물(Topstep)만
+        fut = bool(_BROKER_SPEC.get(self._broker_name, {}).get("futures"))  # 자동 진입=선물(Topstep)만
         topstep = self._broker_name == "projectx"
 
         def en(b, ok):
@@ -547,9 +517,8 @@ class App:
                 b.config(state="normal" if ok else "disabled")
             except Exception:
                 pass
-        en(self.b_acc, conn and topstep); en(self.b_find, conn and fut)
+        en(self.b_acc, conn and topstep)
         en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
-        en(self.b_entry_dry, man and fut); en(self.b_entry_live, man and fut and live_ok)
         en(self.b_sig, auto and fut)
         for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
             try:
@@ -816,68 +785,6 @@ class App:
                 self.log(f"cancelled orders: {len(res.cancelled)}")
             for e in res.errors: self.log(f"   ⚠ {e}")
             self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
-        self._run(w)
-
-    def entry(self, live):
-        if not _BROKER_SPEC.get(self._broker_name, {}).get("futures"):
-            messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
-        if not self._creds_ok() or not self._consent_ok(): return
-        sc = self._scope()
-        if not sc:
-            messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
-        contract = self.contract.get().strip()
-        if not contract:
-            messagebox.showwarning(self.t("input_needed"), self.t("contract")); return
-        side, size = self.side.get(), int(self.size.get())
-        slv = self.sl.get().strip()
-        try:
-            sl_price = float(slv) if slv else None
-        except ValueError:
-            messagebox.showwarning(self.t("input_needed"), self.t("sl") + " = 21450.0"); return
-        sl_txt = f"\nStop: {sl_price}" if sl_price is not None else ""
-        if live and not messagebox.askyesno(self.t("live_confirm"),
-                f"LIVE entry.\n{side} {size} @ {contract}{sl_txt}\nAccount: {sc}\nProceed?"):
-            return
-        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} entry: {side} {size} {contract} "
-                 f"(SL@{sl_price if sl_price is not None else '—'}) ({sc}) ──")
-        def w():
-            b = self._broker()
-            match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
-            if not match:
-                self.log(f"❌ account '{sc}' not found — use 'Load accounts'."); return
-            aid = match[0]["id"]
-            r = b.place_entry(account_id=aid, contract_id=contract, side=side, size=size, order_type=2,
-                              stop_loss_price=sl_price, custom_tag="EQ-Autopilot-test", dry_run=not live)
-            if not live:
-                self.log(f"DRY-RUN — entry: {r.get('would_place')}")
-                if r.get("would_place_stop"):
-                    self.log(f"DRY-RUN — stop:  {r.get('would_place_stop')}")
-            else:
-                self.log(f"✅ order sent: {r}")
-        self._run(w)
-
-    def find_contract(self):
-        if not self._creds_ok(): return
-        term = self.contract.get().strip()
-        if not term:
-            messagebox.showwarning(self.t("input_needed"), "MNQ / NQ / GC …"); return
-        self.log(f"\n── contract search: {term} ──")
-        def w():
-            b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
-                                           user_name=self.user.get().strip(), api_key=self.key.get().strip()))
-            cs = b.search_contracts(term)
-            if not cs:
-                self.log("   no contracts found."); return
-            active = None
-            for c in cs:
-                act = c.get("activeContract")
-                self.log(f"   • {c.get('id')}   {c.get('name')}   active={act}")
-                if act and active is None:
-                    active = c.get("id")
-            pick = active or cs[0].get("id")
-            if pick:
-                self.root.after(0, lambda: (self.contract.delete(0, "end"), self.contract.insert(0, pick)))
-                self.log(f"→ filled: {pick}")
         self._run(w)
 
     def toggle_auto(self):
