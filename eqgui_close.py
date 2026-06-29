@@ -527,8 +527,9 @@ class App:
 
 
 def _bind_clipboard(root):
-    """macOS/PyInstaller Tk doesn't wire Cmd+C/V/X/A → paste was dead. Implement them directly
-    against the system clipboard (clipboard_get/append) and bind on several modifier names."""
+    """Cut/Copy/Paste/Select-All을 위젯 클래스의 가상이벤트에 한 번씩 바인딩한다. 클래스에 걸면
+    Tk 기본 핸들러를 대체하므로 OS 키(Cmd/Ctrl+V → <<Paste>>)가 정확히 한 번만 붙여넣는다.
+    (raw 키 bind_all 방식은 기본 붙여넣기 위에 덧붙여 '두 번' 붙는 문제가 있었다.)"""
     def _paste(e):
         w = e.widget
         try:
@@ -564,13 +565,15 @@ def _bind_clipboard(root):
             pass
         return "break"
 
-    for keych, fn in (("v", _paste), ("c", _copy), ("x", _cut), ("a", _all)):
-        for mod in ("Command", "Mod1", "Control"):
-            for kc in (keych, keych.upper()):
-                try:
-                    root.bind_all(f"<{mod}-{kc}>", fn)
-                except Exception:
-                    pass
+    # 위젯 '클래스'의 가상이벤트(<<Paste>> 등)에 바인딩 → Tk 기본 핸들러를 대체. OS가 Cmd/Ctrl+V를
+    # <<Paste>>로 매핑하므로 _paste가 딱 한 번만 실행된다(이전 bind_all 방식은 두 번 붙던 버그).
+    for cls in ("Entry", "TEntry", "Text"):
+        for ev, fn in (("<<Paste>>", _paste), ("<<Copy>>", _copy),
+                       ("<<Cut>>", _cut), ("<<SelectAll>>", _all)):
+            try:
+                root.bind_class(cls, ev, fn)
+            except Exception:
+                pass
     # Standard Edit menu (gives macOS menu access + native routing as a fallback).
     try:
         mb = tk.Menu(root)
