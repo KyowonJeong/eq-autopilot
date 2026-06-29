@@ -51,11 +51,13 @@ HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5
 
 
 def _hb_url(token):
-    return f"{APP_BASE}/hb-{token}.json"
+    import autopilot_crypto
+    return f"{APP_BASE}/hb-{autopilot_crypto.path_id(token)}.json"
 
 
 def _feed_url(token):
-    return f"{APP_BASE}/sig-{token}.json"
+    import autopilot_crypto
+    return f"{APP_BASE}/sig-{autopilot_crypto.path_id(token)}.json"
 
 
 # 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
@@ -598,8 +600,12 @@ class App:
                 try:
                     import requests
                     import time as _t
+                    import autopilot_crypto
                     r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=8)
-                    hb = r.json() if r.ok else {}
+                    try:
+                        hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
+                    except Exception:
+                        hb = {"ok": False, "reason": "decrypt failed"}
                     if not hb.get("ok"):
                         gate["reason"] = hb.get("reason") or "locked"
                     elif hb.get("exp") and _t.time() > hb["exp"]:
@@ -967,11 +973,12 @@ class App:
     def _sig_loop(self, url, user, key, sc, symbol, live):
         import time as _t
         import requests
+        import autopilot_crypto
         last_id = None
         while self._sig_on:
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
-                sig = r.json() if r.ok else {}
+                sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
             except Exception as e:
                 self.log(f"   signal feed error: {e}"); _t.sleep(SIG_POLL_SECS); continue
             sid = sig.get("id")

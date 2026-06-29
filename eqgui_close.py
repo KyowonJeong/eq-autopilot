@@ -45,7 +45,8 @@ HB_REFRESH_MS = 5 * 60 * 1000
 
 
 def _hb_url(token):
-    return f"{APP_BASE}/hb-{token}.json"
+    import autopilot_crypto
+    return f"{APP_BASE}/hb-{autopilot_crypto.path_id(token)}.json"
 
 
 def _resource(name):
@@ -410,8 +411,12 @@ class App:
                 try:
                     import requests
                     import time as _t
+                    import autopilot_crypto
                     r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=8)
-                    hb = r.json() if r.ok else {}
+                    try:
+                        hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
+                    except Exception:
+                        hb = {"ok": False, "reason": "decrypt failed"}
                     if not hb.get("ok"):
                         gate["reason"] = hb.get("reason") or "locked"
                     elif hb.get("exp") and _t.time() > hb["exp"]:
