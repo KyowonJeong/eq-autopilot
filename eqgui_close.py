@@ -1,5 +1,6 @@
-# EQ Autopilot — standalone GUI (Topstep / ProjectX). v4: KO/EN language toggle + single-account
-# scope + full persistence. Runs on the user's own machine with their own key.
+# EQ Auto-Close — standalone GUI (Topstep / ProjectX). AUTO-CLOSE ONLY build (no entry/signal):
+# connect → pick account → flatten (dry/LIVE) → daily auto-close at a set time. Derived from eqgui.py.
+# KO/EN, single-account scope, key in OS secret store. Runs on the user's machine with their own key.
 import os
 import sys
 import webbrowser
@@ -38,12 +39,6 @@ URL_JOIN = "https://app.edgequant.app/?nav=registration"
 # Free path = join a public signal channel → bot gives a free token. Two channels to choose from.
 URL_FREE_DC = "https://discord.gg/jwU4fkfvU"        # public Discord invite (discord_gate._PUBLIC_INVITE)
 URL_FREE_TG = "https://t.me/+EpF27gYYhIRjNTJi"      # public Telegram invite (telegram_gate._PUBLIC_INVITE)
-# EdgeQuant signal feed the auto-entry loop polls (Streamlit static serving).
-# 🔒 Secret path (not a public URL) — the token must match autopilot_feed._FEED_TOKEN on the server.
-# ⚠ Shared secret: fine for the private test, but a freely-distributed app leaks it → replace with
-#   per-member token auth before public release. Rotate this with the server token together.
-FEED_URL = "https://app.edgequant.app/app/static/sig-REDACTED-RETIRED-TOKEN.json"
-SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 
 
 def _resource(name):
@@ -85,27 +80,17 @@ T = {
                  "en": "Flatten (close open positions on the chosen account)"},
     "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
-    "sec_entry": {"ko": "진입 (Entry — 수동 테스트, 사용 계좌)", "en": "Entry (manual test, chosen account)"},
-    "contract": {"ko": "계약ID/심볼", "en": "Contract ID/symbol"},
-    "find_contract": {"ko": "계약 조회", "en": "Find contract"},
-    "side": {"ko": "방향", "en": "Side"},
-    "size": {"ko": "수량", "en": "Size"},
-    "sl": {"ko": "손절가", "en": "Stop price"},
-    "dry_entry": {"ko": "모의 진입 (Dry-run)", "en": "Dry-run entry"},
-    "live_entry": {"ko": "⚠ 실제 진입 (LIVE)", "en": "⚠ LIVE entry"},
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
               "en": "Ready. Enter key → 'Test connection' → the rest unlocks once it passes."},
-    "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·진입·자동 기능이 활성화됩니다.",
-                   "en": "※ Pass 'Test connection' first to unlock close / entry / automation."},
+    "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·자동 청산 기능이 활성화됩니다.",
+                   "en": "※ Pass 'Test connection' first to unlock close / auto-close."},
     "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
     "need_creds": {"ko": "Username과 API Key를 모두 입력하세요.", "en": "Enter both Username and API Key."},
     "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
     "live_confirm": {"ko": "실거래 확인", "en": "Confirm LIVE"},
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
-    "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
-                  "en": "Entry requires a single account in 'Account' (not all)."},
     "sec_auto": {"ko": "자동 청산 (매일 지정 시각)", "en": "Auto-close (daily at the set time)"},
     "cutoff": {"ko": "청산 시각(ET)", "en": "Close time (ET)"},
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
@@ -113,17 +98,6 @@ T = {
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
     "auto_on_ind": {"ko": "  ● 자동 청산 ON  ", "en": "  ● Auto-close ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sec_sig": {"ko": "자동 진입 (실시간 신호 · MNQ)", "en": "Auto-entry (live signal · MNQ)"},
-    "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
-    "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
-    "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
-    "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
-    "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sig_note": {"ko": "※ 신호의 방향·손절가·수량(MNQ)으로 자동 진입합니다. '사용 계좌'만 고르면 됩니다. "
-                       "이미 포지션이 있으면 중복 진입하지 않습니다(두 군데서 켜도 2배 진입 방지).",
-                 "en": "※ Enters automatically using the signal's direction, stop, and size (MNQ); just pick the "
-                       "account. It won't enter if a position is already open (no doubling even if run in two "
-                       "places)."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -210,13 +184,12 @@ def _save(user, key, acct, lang):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("EQ Autopilot")
-        root.geometry("720x860")
+        root.title("EQ Auto-Close")
+        root.geometry("700x640")
         self.q = queue.Queue()
         self.lang = _load()["lang"]
         self.frm = None
         self._auto_on = False
-        self._sig_on = False
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
         self._build()
@@ -249,15 +222,6 @@ class App:
         except Exception:
             pass
 
-    def _set_sig_ind(self, on):
-        """Green lit pill while the signal-watch loop runs; gray when off."""
-        try:
-            self.sig_ind.config(text=self.t("sig_on_ind") if on else self.t("sig_off_ind"),
-                                fg="white" if on else "#666",
-                                bg="#22a722" if on else "#dddddd")
-        except Exception:
-            pass
-
     def _build(self):
         d = _load()
         if self.frm is not None:
@@ -270,7 +234,7 @@ class App:
             ttk.Label(top, image=self._logo).pack(side="left", padx=(0, 8))
         except Exception:
             self._logo = None
-        ttk.Label(top, text="EQ Autopilot — Topstep (ProjectX)", font=("Helvetica", 16, "bold")).pack(side="left")
+        ttk.Label(top, text="EQ 자동 청산 — Topstep (ProjectX)", font=("Helvetica", 16, "bold")).pack(side="left")
         ttk.Label(top, text=self.t("lang")).pack(side="right", padx=(0, 4))
         self.langbox = ttk.Combobox(top, values=["한국어", "English"], width=9, state="readonly")
         self.langbox.set("English" if self.lang == "en" else "한국어")
@@ -319,26 +283,6 @@ class App:
         self.b_flat_live.pack(side="left", padx=8)
 
         ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_entry"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        ef = ttk.Frame(frm); ef.pack(fill="x", pady=3)
-        ttk.Label(ef, text=self.t("contract")).pack(side="left")
-        self.contract = ttk.Entry(ef, width=20); self.contract.pack(side="left", padx=(2, 4))
-        self.b_find = ttk.Button(ef, text=self.t("find_contract"), width=8, command=self.find_contract)
-        self.b_find.pack(side="left", padx=(0, 8))
-        ttk.Label(ef, text=self.t("side")).pack(side="left")
-        self.side = ttk.Combobox(ef, values=["LONG", "SHORT"], width=7, state="readonly"); self.side.set("LONG")
-        self.side.pack(side="left", padx=(2, 8))
-        ttk.Label(ef, text=self.t("size")).pack(side="left")
-        self.size = ttk.Spinbox(ef, from_=1, to=50, width=5); self.size.set("1"); self.size.pack(side="left", padx=(2, 8))
-        ttk.Label(ef, text=self.t("sl")).pack(side="left")
-        self.sl = ttk.Entry(ef, width=10); self.sl.pack(side="left", padx=2)
-        ef3 = ttk.Frame(frm); ef3.pack(fill="x", pady=3)
-        self.b_entry_dry = ttk.Button(ef3, text=self.t("dry_entry"), command=lambda: self.entry(False))
-        self.b_entry_dry.pack(side="left")
-        self.b_entry_live = ttk.Button(ef3, text=self.t("live_entry"), command=lambda: self.entry(True))
-        self.b_entry_live.pack(side="left", padx=8)
-
-        ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
         ttk.Label(af, text=self.t("cutoff")).pack(side="left")
@@ -353,31 +297,17 @@ class App:
         ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_sig"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        sg = ttk.Frame(frm); sg.pack(fill="x", pady=3)
-        self.sig_live = tk.IntVar()
-        ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live).pack(side="left", padx=(0, 12))
-        self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
-                                command=self.toggle_sig); self.b_sig.pack(side="left")
-        self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
-        self.sig_ind.pack(side="left", padx=(10, 0))
-        self._set_sig_ind(self._sig_on)
-        ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
-                  justify="left").pack(anchor="w")
-
-        ttk.Separator(frm).pack(fill="x", pady=8)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
-        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_find,
-                             self.b_entry_dry, self.b_entry_live, self.b_auto, self.b_sig]
+        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto]
         self._set_actions_enabled(self._connected)
         self.log(self.t("ready"))
         self._async_load_key(d.get("user", ""))
 
     def _set_actions_enabled(self, on):
-        """연결 테스트 통과 시에만 청산·진입·자동 버튼을 활성화한다."""
+        """연결 테스트 통과 시에만 청산·자동 청산 버튼을 활성화한다."""
         st = "normal" if on else "disabled"
         for b in getattr(self, "_action_btns", []):
             try:
@@ -545,66 +475,6 @@ class App:
             self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
         self._run(w)
 
-    def entry(self, live):
-        if not self._creds_ok() or not self._consent_ok(): return
-        sc = self._scope()
-        if not sc:
-            messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
-        contract = self.contract.get().strip()
-        if not contract:
-            messagebox.showwarning(self.t("input_needed"), self.t("contract")); return
-        side, size = self.side.get(), int(self.size.get())
-        slv = self.sl.get().strip()
-        try:
-            sl_price = float(slv) if slv else None
-        except ValueError:
-            messagebox.showwarning(self.t("input_needed"), self.t("sl") + " = 21450.0"); return
-        sl_txt = f"\nStop: {sl_price}" if sl_price is not None else ""
-        if live and not messagebox.askyesno(self.t("live_confirm"),
-                f"LIVE entry.\n{side} {size} @ {contract}{sl_txt}\nAccount: {sc}\nProceed?"):
-            return
-        self.log(f"\n── {'⚠ LIVE' if live else 'dry-run'} entry: {side} {size} {contract} "
-                 f"(SL@{sl_price if sl_price is not None else '—'}) ({sc}) ──")
-        def w():
-            b = self._broker()
-            match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
-            if not match:
-                self.log(f"❌ account '{sc}' not found — use 'Load accounts'."); return
-            aid = match[0]["id"]
-            r = b.place_entry(account_id=aid, contract_id=contract, side=side, size=size, order_type=2,
-                              stop_loss_price=sl_price, custom_tag="EQ-Autopilot-test", dry_run=not live)
-            if not live:
-                self.log(f"DRY-RUN — entry: {r.get('would_place')}")
-                if r.get("would_place_stop"):
-                    self.log(f"DRY-RUN — stop:  {r.get('would_place_stop')}")
-            else:
-                self.log(f"✅ order sent: {r}")
-        self._run(w)
-
-    def find_contract(self):
-        if not self._creds_ok(): return
-        term = self.contract.get().strip()
-        if not term:
-            messagebox.showwarning(self.t("input_needed"), "MNQ / NQ / GC …"); return
-        self.log(f"\n── contract search: {term} ──")
-        def w():
-            b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com",
-                                           user_name=self.user.get().strip(), api_key=self.key.get().strip()))
-            cs = b.search_contracts(term)
-            if not cs:
-                self.log("   no contracts found."); return
-            active = None
-            for c in cs:
-                act = c.get("activeContract")
-                self.log(f"   • {c.get('id')}   {c.get('name')}   active={act}")
-                if act and active is None:
-                    active = c.get("id")
-            pick = active or cs[0].get("id")
-            if pick:
-                self.root.after(0, lambda: (self.contract.delete(0, "end"), self.contract.insert(0, pick)))
-                self.log(f"→ filled: {pick}")
-        self._run(w)
-
     def toggle_auto(self):
         if self._auto_on:
             self._auto_on = False
@@ -654,97 +524,6 @@ class App:
                 except Exception as e:
                     self.log(f"   ❌ auto-close failed — {e}")
             _t.sleep(15)
-
-    # ── auto-ENTRY on EdgeQuant signal ──────────────────────────────────────
-    def toggle_sig(self):
-        if self._sig_on:
-            self._sig_on = False
-            self.b_sig.config(text=self.t("sig_start"))
-            self._set_sig_ind(False)
-            self.log("⏹ signal watch stopped.")
-            return
-        if not self._creds_ok() or not self._consent_ok():
-            return
-        sc = self._scope()
-        if not sc:
-            messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
-        # 자동 진입은 '진입(수동)' 섹션과 완전 무관 — 계약(MNQ)·수량·손절가 모두 신호에서 받는다.
-        symbol = "MNQ"                           # auto-trading is MNQ only (not NQ)
-        user, key = self.user.get().strip(), self.key.get().strip()
-        live = bool(self.sig_live.get())
-        self._sig_on = True
-        self.b_sig.config(text=self.t("sig_stop"))
-        self._set_sig_ind(True)
-        self.log(f"\n▶ signal watch ON — {symbol} · account [{sc}] · "
-                 f"size from signal · {'LIVE' if live else 'dry-run'}. polling {FEED_URL}")
-        threading.Thread(target=self._sig_loop,
-                         args=(FEED_URL, user, key, sc, symbol, live),
-                         daemon=True).start()
-
-    def _resolve_contract(self, b, symbol):
-        """현재(활성) 계약ID를 종목으로 자동 조회. 활성 우선, 없으면 첫 결과."""
-        cs = b.search_contracts(symbol)
-        if not cs:
-            return None
-        active = next((c.get("id") for c in cs if c.get("activeContract")), None)
-        return active or cs[0].get("id")
-
-    def _sig_loop(self, url, user, key, sc, symbol, live):
-        import time as _t
-        import requests
-        last_id = None
-        while self._sig_on:
-            try:
-                r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
-                sig = r.json() if r.ok else {}
-            except Exception as e:
-                self.log(f"   signal feed error: {e}"); _t.sleep(SIG_POLL_SECS); continue
-            sid = sig.get("id")
-            if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
-                last_id = sid
-                direction, stop = sig.get("direction"), sig.get("stop_price")
-                try:
-                    size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
-                except (TypeError, ValueError):
-                    size = 0
-                sym = symbol or (sig.get("instrument") or "")
-                self.log(f"\n📶 signal {sid}: {direction} {sig.get('instrument')} x{size} stop@{stop} "
-                         f"→ resolving {sym} → {'LIVE' if live else 'dry-run'} entry [{sc}]")
-                if size <= 0:
-                    self.log("   ⏭ signal has no contract count (no entry_ref?) — skipping."); continue
-                try:
-                    b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
-                                                   api_key=key, accounts=[sc]))
-                    contract = self._resolve_contract(b, sym)
-                    if not contract:
-                        self.log(f"   ❌ no active contract found for '{sym}'."); continue
-                    self.log(f"   contract: {contract}")
-                    match = [a for a in b._accounts()
-                             if str(a.get("name")) == sc or str(a.get("id")) == sc]
-                    if not match:
-                        self.log(f"   ❌ account '{sc}' not found."); continue
-                    aid = match[0]["id"]
-                    # 중복 진입 방지: 그 계좌에 이미 포지션이 있으면 건너뛴다(다른 인스턴스/다른 기기가
-                    # 먼저 진입했거나 미청산). 두 군데서 켜놔도 2배로 안 들어가게.
-                    existing = b.list_open_positions()
-                    if existing:
-                        if live:
-                            self.log(f"   ⏭ already in a position ({len(existing)}) — "
-                                     f"skipping to avoid doubling.")
-                            continue
-                        self.log(f"   (note) already in a position ({len(existing)}) — LIVE would skip.")
-                    res = b.place_entry(account_id=aid, contract_id=contract, side=direction,
-                                        size=size, order_type=2, stop_loss_price=stop,
-                                        custom_tag="EQ-Autopilot-signal", dry_run=not live)
-                    if not live:
-                        self.log(f"   DRY-RUN entry: {res.get('would_place')}")
-                        if res.get("would_place_stop"):
-                            self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
-                    else:
-                        self.log(f"   ✅ entered: {res}")
-                except Exception as e:
-                    self.log(f"   ❌ signal entry failed: {e}")
-            _t.sleep(SIG_POLL_SECS)
 
 
 def _bind_clipboard(root):
