@@ -36,9 +36,16 @@ CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
 URL_HOME = "https://edgequant.app"
 URL_JOIN = "https://app.edgequant.app/?nav=registration"
-# Free path = join a public signal channel → bot gives a free token. Two channels to choose from.
-URL_FREE_DC = "https://discord.gg/jwU4fkfvU"        # public Discord invite (discord_gate._PUBLIC_INVITE)
-URL_FREE_TG = "https://t.me/+EpF27gYYhIRjNTJi"      # public Telegram invite (telegram_gate._PUBLIC_INVITE)
+# '토큰 받기' = 무료(public) 멤버십 토큰 발급 경로.
+URL_FREE_DC = "https://app.edgequant.app/"                  # 웹 로그인(디스코드) → 토큰 표시
+URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token" # 봇이 토큰 DM
+# 멤버십 게이팅 — 앱이 토큰으로 hb-<token>.json(권한 스냅샷)을 폴링. 자동 청산엔 'use' 권한만 필요.
+APP_BASE = "https://app.edgequant.app/app/static"
+HB_REFRESH_MS = 5 * 60 * 1000
+
+
+def _hb_url(token):
+    return f"{APP_BASE}/hb-{token}.json"
 
 
 def _resource(name):
@@ -48,6 +55,17 @@ def _resource(name):
 T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
+    "token": {"ko": "멤버십 토큰", "en": "Membership token"},
+    "token_get": {"ko": "토큰 받기", "en": "Get token"},
+    "gate_none": {"ko": "멤버십 토큰을 입력하세요 ('토큰 받기' → 채널에서 발급).",
+                  "en": "Enter a membership token ('Get token' → issued in the channel)."},
+    "gate_locked": {"ko": "잠김 — 토큰이 유효하지 않거나 만료/철회됨 (fail-closed).",
+                    "en": "Locked — token invalid or expired/revoked (fail-closed)."},
+    "gate_master_off": {"ko": "잠김 — 관리자가 Autopilot을 꺼둠 (마스터 OFF).",
+                        "en": "Locked — Autopilot disabled by admin (master OFF)."},
+    "gate_ok": {"ko": "멤버십: {tier} · 자동 청산 {u}{dry}",
+                "en": "Membership: {tier} · auto-close {u}{dry}"},
+    "gate_dry": {"ko": " · 강제 모의(LIVE 잠금)", "en": " · forced dry-run (LIVE locked)"},
     "warn_mix": {"ko": "⚠ 자동 청산은 사용 계좌의 모든 포지션을 일괄 청산합니다. "
                        "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
                  "en": "⚠ Auto-close flattens EVERY position on the chosen account. "
@@ -164,17 +182,19 @@ def _load():
         # Key is loaded from Keychain ASYNC (after the window is up) so the GUI never blocks on
         # the `security` subprocess at startup. _load() stays fast (yaml only).
         return {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
-                "lang": d.get("lang", "ko")}
+                "lang": d.get("lang", "ko"), "token": d.get("token", "")}
     except Exception:
-        return {"user": "", "key": "", "acct": "", "lang": "ko"}
+        return {"user": "", "key": "", "acct": "", "lang": "ko", "token": ""}
 
 
-def _save(user, key, acct, lang):
+def _save(user, key, acct, lang, token=None):
     _kc_save(user, key)                                  # key → Keychain only
+    if token is None:
+        token = _load().get("token", "")
     try:
         import yaml
         with open(CFG_PATH, "w") as f:
-            yaml.safe_dump({"live": False, "broker": "projectx", "lang": lang,
+            yaml.safe_dump({"live": False, "broker": "projectx", "lang": lang, "token": token,
                             "projectx": {"base_url": "https://api.topstepx.com", "user_name": user,
                                          "api_key": "", "accounts": ([acct] if acct else [])}}, f)
     except Exception:
@@ -192,8 +212,12 @@ class App:
         self._auto_on = False
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
+        self._token = _load().get("token", "")
+        self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
+                      "caps": {"use": False}, "reason": "no token"}
         self._build()
         root.after(120, self._drain)
+        root.after(800, lambda: self._heartbeat(periodic=True))   # 멤버십 권한 주기 갱신
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -247,6 +271,15 @@ class App:
         tk.Label(frm, text=self.t("warn_mix"), foreground="#b00020", wraplength=660,
                  justify="left", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
+        # 멤버십 토큰(게이팅) + 권한 상태
+        rt = ttk.Frame(frm); rt.pack(fill="x", pady=3)
+        ttk.Label(rt, text=self.t("token"), width=18).pack(side="left")
+        self.token_e = ttk.Entry(rt); self.token_e.pack(side="left", fill="x", expand=True)
+        self.token_e.insert(0, d.get("token", "")); self.token_e.bind("<FocusOut>", self._save_token)
+        ttk.Button(rt, text=self.t("token_get"), width=9, command=self._open_free).pack(side="left", padx=(4, 0))
+        self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
+        self.gate_lbl.pack(anchor="w", pady=(0, 4))
+
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=self.t("user"), width=18).pack(side="left")
         self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True); self.user.insert(0, d["user"])
@@ -288,7 +321,8 @@ class App:
         ttk.Label(af, text=self.t("cutoff")).pack(side="left")
         self.cutoff = ttk.Entry(af, width=7); self.cutoff.insert(0, "14:00"); self.cutoff.pack(side="left", padx=(2, 10))
         self.auto_live = tk.IntVar()
-        ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live).pack(side="left", padx=(0, 10))
+        self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
+        self.cb_auto_live.pack(side="left", padx=(0, 10))
         self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._auto_on else self.t("auto_start"),
                                  command=self.toggle_auto); self.b_auto.pack(side="left")
         self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
@@ -300,18 +334,102 @@ class App:
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
-        # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
         self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto]
-        self._set_actions_enabled(self._connected)
+        self._apply_gating()
         self.log(self.t("ready"))
         self._async_load_key(d.get("user", ""))
 
     def _set_actions_enabled(self, on):
-        """연결 테스트 통과 시에만 청산·자동 청산 버튼을 활성화한다."""
-        st = "normal" if on else "disabled"
-        for b in getattr(self, "_action_btns", []):
+        """_busy()용. 작업 중(on=False)엔 전부 잠그고, 끝나면 게이팅 상태로 복원."""
+        if not on:
+            for b in getattr(self, "_action_btns", []):
+                try:
+                    b.config(state="disabled")
+                except Exception:
+                    pass
+        else:
+            self._apply_gating()
+
+    def _apply_gating(self):
+        """연결(_connected) + 멤버십 하트비트(_gate)로 청산·자동청산 버튼을 결정. 자동 청산='use' 권한.
+        force_dry_run=LIVE 잠금. 토큰무효/만료/마스터OFF=전부 잠금(fail-closed). 계좌목록=연결만 필요."""
+        g, conn = self._gate, self._connected
+        master = conn and g.get("ok") and g.get("enabled")
+        use = bool(master and g.get("caps", {}).get("use"))
+        live_ok = not g.get("force_dry_run", True)
+
+        def en(b, ok):
             try:
-                b.config(state=st)
+                b.config(state="normal" if ok else "disabled")
+            except Exception:
+                pass
+        en(self.b_acc, conn)
+        en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
+        try:
+            if not live_ok:
+                self.auto_live.set(0); self.cb_auto_live.config(state="disabled")
+            else:
+                self.cb_auto_live.config(state="normal")
+        except Exception:
+            pass
+        self._update_gate_label()
+
+    def _update_gate_label(self):
+        g = self._gate
+        if not (self._token or "").strip():
+            txt, col = self.t("gate_none"), "#888"
+        elif not g.get("ok"):
+            r = g.get("reason")
+            txt, col = self.t("gate_locked") + (f" ({r})" if r else ""), "#b00020"
+        elif not g.get("enabled"):
+            txt, col = self.t("gate_master_off"), "#b00020"
+        else:
+            txt = self.t("gate_ok").format(
+                tier=g.get("tier", "—"), u="✓" if g.get("caps", {}).get("use") else "✗",
+                dry=self.t("gate_dry") if g.get("force_dry_run") else "")
+            col = "#1a7f37"
+        try:
+            self.gate_lbl.config(text=txt, foreground=col)
+        except Exception:
+            pass
+
+    def _save_token(self, *_):
+        self._token = self.token_e.get().strip()
+        _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang, token=self._token)
+        self._heartbeat()
+
+    def _heartbeat(self, periodic=False):
+        """멤버십 토큰으로 hb-<token>.json을 읽어 권한(_gate) 갱신. 실패/만료/철회 = fail-closed."""
+        tok = (self.token_e.get().strip() if hasattr(self, "token_e") else self._token)
+        self._token = tok
+
+        def w():
+            gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
+                    "caps": {"use": False}, "reason": "no token"}
+            if tok:
+                try:
+                    import requests
+                    import time as _t
+                    r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=8)
+                    hb = r.json() if r.ok else {}
+                    if not hb.get("ok"):
+                        gate["reason"] = hb.get("reason") or "locked"
+                    elif hb.get("exp") and _t.time() > hb["exp"]:
+                        gate["reason"] = "expired"
+                    else:
+                        ap = hb.get("autopilot", {})
+                        gate = {"ok": True, "tier": hb.get("tier", "—"),
+                                "enabled": bool(ap.get("enabled")),
+                                "force_dry_run": bool(ap.get("force_dry_run", True)),
+                                "caps": ap.get("caps", {}) or {}, "reason": ""}
+                except Exception as e:
+                    gate["reason"] = f"heartbeat error: {e}"
+            self._gate = gate
+            self.root.after(0, self._apply_gating)
+        threading.Thread(target=w, daemon=True).start()
+        if periodic:
+            try:
+                self.root.after(HB_REFRESH_MS, lambda: self._heartbeat(periodic=True))
             except Exception:
                 pass
 
