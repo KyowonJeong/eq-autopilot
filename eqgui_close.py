@@ -75,13 +75,13 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "무료 멤버십 토큰 받는 곳을 고르세요. 받은 토큰을 위 '멤버십 토큰' 칸에 "
-                       "붙여넣으면 자동 청산이 열립니다.\n"
-                       "• Telegram: 봇이 토큰을 바로 DM 합니다.\n"
-                       "• Discord: 로그인하면 토큰 발급 + 무료 시그널 채널에 자동 가입됩니다.",
-                 "en": "Pick where to get your free membership token. Paste it into the 'Membership token' "
-                       "box above to unlock auto-close.\n"
-                       "• Telegram: the bot DMs you the token.\n"
+    "free_msg": {"ko": "이 버튼을 누르면 ① 무료 멤버십 토큰 발급 + ② 무료 시그널 방 가입이 됩니다.\n"
+                       "받은 토큰을 위 '멤버십 토큰' 칸에 붙여넣으면 자동 청산이 열립니다.\n"
+                       "• Telegram: 봇이 토큰 + 방 초대 링크를 DM 합니다.\n"
+                       "• Discord: 로그인하면 토큰 발급 + 무료 시그널 서버에 자동 가입됩니다.",
+                 "en": "Clicking gets you ① a free membership token + ② joins the free signal room.\n"
+                       "Paste the token into the 'Membership token' box above to unlock auto-close.\n"
+                       "• Telegram: the bot DMs you the token + a room invite.\n"
                        "• Discord: log in → token issued + auto-joined to the free signal server."},
     "user": {"ko": "TopstepX user email", "en": "TopstepX user email"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
