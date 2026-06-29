@@ -51,6 +51,30 @@ class IBKRCfg:
 
 
 @dataclass
+class BybitCfg:
+    api_key: str = ""
+    api_secret: str = ""
+    testnet: bool = False
+    category: str = "linear"          # linear = USDT perps
+    settle_coin: str = "USDT"
+
+
+@dataclass
+class BitgetCfg:
+    api_key: str = ""
+    api_secret: str = ""
+    passphrase: str = ""
+    product_type: str = "USDT-FUTURES"
+
+
+@dataclass
+class NinjaTraderCfg:
+    # Auto-close via NT8 ATI/OIF — NT8 must be running with AT Interface enabled.
+    incoming_dir: str = ""            # blank → <Documents>/NinjaTrader 8/incoming
+    accounts: list[str] = field(default_factory=list)   # blank → FLATTENEVERYTHING (all)
+
+
+@dataclass
 class ScheduleCfg:
     tz: str = "America/New_York"
     cutoffs: list[str] = field(default_factory=list)   # ["HH:MM", ...]
