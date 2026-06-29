@@ -983,8 +983,20 @@ class App:
                 except (TypeError, ValueError):
                     size = 0
                 sym = symbol or (sig.get("instrument") or "")
-                self.log(f"\n📶 signal {sid}: {direction} {sig.get('instrument')} x{size} stop@{stop} "
-                         f"→ resolving {sym} → {'LIVE' if live else 'dry-run'} entry [{sc}]")
+                # 캡처 순간 로그 — 보낸 시각(피드 published_at) · 받은 시각(now) · 지연 · 포지션 정보.
+                import datetime as _dtl
+                _recv = _dtl.datetime.now()
+                _pub = sig.get("published_at")
+                try:
+                    _sent = _dtl.datetime.fromtimestamp(float(_pub)) if _pub else None
+                    _lat = f"{_recv.timestamp() - float(_pub):.1f}s"
+                except (TypeError, ValueError):
+                    _sent, _lat = None, "?"
+                self.log(f"\n📶 신호 캡처 [{sid}] — {sig.get('instrument') or sym} {direction} x{size}")
+                self.log(f"   포지션: {direction} · 수량 {size} (MNQ) · 손절 {stop} · 진입참조 {sig.get('entry_ref')}")
+                self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
+                         f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
+                self.log(f"   → {sym} 계약 조회 → {'LIVE' if live else 'dry-run'} 진입 [{sc}]")
                 if size <= 0:
                     self.log("   ⏭ signal has no contract count (no entry_ref?) — skipping."); continue
                 try:
