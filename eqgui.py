@@ -35,9 +35,11 @@ CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
 URL_HOME = "https://edgequant.app"
 URL_JOIN = "https://app.edgequant.app/?nav=registration"
-# Free path = join a public signal channel → bot gives a free token. Two channels to choose from.
-URL_FREE_DC = "https://discord.gg/jwU4fkfvU"        # public Discord invite (discord_gate._PUBLIC_INVITE)
-URL_FREE_TG = "https://t.me/+EpF27gYYhIRjNTJi"      # public Telegram invite (telegram_gate._PUBLIC_INVITE)
+# '토큰 받기' = 무료(public) 멤버십 토큰 자동 발급 경로. 채널 입장/타자 불필요.
+#   Telegram: 봇 딥링크(start=token) → 봇이 토큰을 바로 DM.
+#   Discord : 웹에서 디스코드로 로그인 → 'EQ Autopilot' 페이지의 '내 멤버십 토큰'에서 복사.
+URL_FREE_DC = "https://app.edgequant.app/"               # 웹 로그인(디스코드) → 토큰 표시
+URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token"  # 봇이 토큰 DM
 # EdgeQuant membership gating — the app holds a per-member TOKEN and polls two PER-MEMBER static
 # files (Streamlit static serving): the heartbeat (permissions snapshot) and the signal feed.
 #   hb-<token>.json   → {ok, tier, autopilot:{enabled, force_dry_run, caps, brokers}, exp}
@@ -131,10 +133,14 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "공개 시그널 채널에 입장 → 봇 명령으로 무료 토큰을 받아 위 '멤버십 토큰'칸에 "
-                       "붙여넣으면 자동 청산이 열립니다. (정식 출시 시 자동 발급)\n채널을 선택하세요:",
-                 "en": "Join a public signal channel → get a free token from the bot and paste it in the "
-                       "'Membership token' box to unlock auto-close. (auto-issued at launch)\nPick a channel:"},
+    "free_msg": {"ko": "무료 멤버십 토큰을 받는 방법을 고르세요. 받은 토큰을 위 '멤버십 토큰'칸에 "
+                       "붙여넣으면 자동 청산이 열립니다.\n"
+                       "• Telegram: 봇이 토큰을 바로 보내드립니다.\n"
+                       "• Discord: 웹에서 디스코드로 로그인 후 'EQ Autopilot' 페이지에서 복사하세요.",
+                 "en": "Pick how to get your free membership token. Paste it into the 'Membership token' "
+                       "box above to unlock auto-close.\n"
+                       "• Telegram: the bot DMs the token to you instantly.\n"
+                       "• Discord: log in with Discord on the web, then copy it on the 'EQ Autopilot' page."},
     "user": {"ko": "TopstepX Username", "en": "TopstepX Username"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
