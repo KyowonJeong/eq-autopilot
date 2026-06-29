@@ -975,6 +975,19 @@ class App:
             except Exception as e:
                 self.log(f"   signal feed error: {e}"); _t.sleep(SIG_POLL_SECS); continue
             sid = sig.get("id")
+            # no-trade(거래 없음) 신호도 새로 오면 '받았다'만 표시(포지션은 안 잡음).
+            if sid and sid != last_id and not (sig.get("tradeable") and sig.get("direction")):
+                last_id = sid
+                import datetime as _dtl0
+                _recv0 = _dtl0.datetime.now()
+                _pub0 = sig.get("published_at")
+                try:
+                    _sent0 = _dtl0.datetime.fromtimestamp(float(_pub0)) if _pub0 else None
+                except (TypeError, ValueError):
+                    _sent0 = None
+                self.log(f"\n📭 신호 수신 [{sid}] — {sig.get('instrument') or ''} · NO-TRADE (거래 없음, 포지션 안 잡음)")
+                self.log(f"   ⏱ 보낸 시각 {_sent0.strftime('%H:%M:%S') if _sent0 else '?'}  ·  "
+                         f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid
                 direction, stop = sig.get("direction"), sig.get("stop_price")
