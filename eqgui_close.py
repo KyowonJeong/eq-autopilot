@@ -277,6 +277,7 @@ class App:
         ttk.Label(rt, text=self.t("token"), width=18).pack(side="left")
         self.token_e = ttk.Entry(rt); self.token_e.pack(side="left", fill="x", expand=True)
         self.token_e.insert(0, d.get("token", "")); self.token_e.bind("<FocusOut>", self._save_token)
+        ttk.Button(rt, text=self.t("paste"), width=8, command=self._paste_token).pack(side="left", padx=(4, 0))
         ttk.Button(rt, text=self.t("token_get"), width=9, command=self._open_free).pack(side="left", padx=(4, 0))
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
@@ -398,6 +399,14 @@ class App:
         self._token = self.token_e.get().strip()
         _save(self.user.get().strip(), self.key.get().strip(), self._scope(), self.lang, token=self._token)
         self._heartbeat()
+
+    def _paste_token(self):
+        try:
+            self.token_e.delete(0, "end")
+            self.token_e.insert(0, self.root.clipboard_get().strip())
+            self._save_token()
+        except Exception:
+            pass
 
     def _heartbeat(self, periodic=False):
         """멤버십 토큰으로 hb-<token>.json을 읽어 권한(_gate) 갱신. 실패/만료/철회 = fail-closed."""
