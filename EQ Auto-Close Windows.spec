@@ -3,7 +3,7 @@
 # (PyInstaller can't cross-compile from macOS). Output: dist/EQ Auto-Close/.
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
+hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
                  'keyring', 'keyring.backends.Windows', 'win32ctypes', 'win32ctypes.pywin32']
 hiddenimports += collect_submodules('eqexec')
 hiddenimports += collect_submodules('keyring')

@@ -3,7 +3,7 @@
 # (homebrew python3.9) — system Tk 8.5 renders a blank window.
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog']
+hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog']
 hiddenimports += collect_submodules('eqexec')
 
 a = Analysis(

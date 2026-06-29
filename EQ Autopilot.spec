@@ -3,7 +3,7 @@
 # system Tk 8.5 renders a blank window. Mirrors "EQ Auto-Close.spec" (mac) but for eqgui.py.
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
+hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
                  'keyring', 'keyring.backends.macOS']
 hiddenimports += collect_submodules('eqexec')
 hiddenimports += collect_submodules('keyring')
