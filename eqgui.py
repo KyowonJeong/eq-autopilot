@@ -38,7 +38,7 @@ URL_JOIN = "https://app.edgequant.app/?nav=registration"
 # '토큰 받기' = 무료(public) 멤버십 토큰 자동 발급 경로. 채널 입장/타자 불필요.
 #   Telegram: 봇 딥링크(start=token) → 봇이 토큰을 바로 DM.
 #   Discord : 웹에서 디스코드로 로그인 → 'EQ Autopilot' 페이지의 '내 멤버십 토큰'에서 복사.
-URL_FREE_DC = "https://app.edgequant.app/"               # 웹 로그인(디스코드) → 토큰 표시
+URL_FREE_DC = "https://discord.com/oauth2/authorize?client_id=1516790855208538152&response_type=code&redirect_uri=https%3A%2F%2Fapp.edgequant.app%2F&scope=identify+guilds.join&state=aptoken"               # 웹 로그인(디스코드) → 토큰 표시
 URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token"  # 봇이 토큰 DM
 # EdgeQuant membership gating — the app holds a per-member TOKEN and polls two PER-MEMBER static
 # files (Streamlit static serving): the heartbeat (permissions snapshot) and the signal feed.
@@ -135,14 +135,14 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "무료 멤버십 토큰을 받는 방법을 고르세요. 받은 토큰을 위 '멤버십 토큰'칸에 "
+    "free_msg": {"ko": "무료 멤버십 토큰 받는 곳을 고르세요. 받은 토큰을 위 '멤버십 토큰' 칸에 "
                        "붙여넣으면 자동 청산이 열립니다.\n"
-                       "• Telegram: 봇이 토큰을 바로 보내드립니다.\n"
-                       "• Discord: 웹에서 디스코드로 로그인 후 'EQ Autopilot' 페이지에서 복사하세요.",
-                 "en": "Pick how to get your free membership token. Paste it into the 'Membership token' "
+                       "• Telegram: 봇이 토큰을 바로 DM 합니다.\n"
+                       "• Discord: 로그인하면 토큰 발급 + 무료 시그널 채널에 자동 가입됩니다.",
+                 "en": "Pick where to get your free membership token. Paste it into the 'Membership token' "
                        "box above to unlock auto-close.\n"
-                       "• Telegram: the bot DMs the token to you instantly.\n"
-                       "• Discord: log in with Discord on the web, then copy it on the 'EQ Autopilot' page."},
+                       "• Telegram: the bot DMs you the token.\n"
+                       "• Discord: log in → token issued + auto-joined to the free signal server."},
     "user": {"ko": "TopstepX user email", "en": "TopstepX user email"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
@@ -609,8 +609,9 @@ class App:
     def _open_free(self):
         """Let the user pick Discord or Telegram for the free public signal channel."""
         win = tk.Toplevel(self.root)
+        win.withdraw()                       # 위치 잡기 전엔 숨김(왼쪽→점프 방지)
         win.title(self.t("btn_free"))
-        win.transient(self.root); win.resizable(False, False); win.grab_set()
+        win.transient(self.root); win.resizable(False, False)
         ttk.Label(win, text=self.t("free_msg"), wraplength=320, justify="left",
                   padding=16).pack(fill="x")
         bf = ttk.Frame(win, padding=(16, 0, 16, 16)); bf.pack(fill="x")
@@ -623,6 +624,8 @@ class App:
             side="left", expand=True, fill="x", padx=(4, 0))
         win.update_idletasks()
         win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 90}")
+        win.deiconify()                      # 최종 위치에서 바로 보임(점프 없음)
+        win.grab_set()
 
     def _secret(self):
         return self.key.get().strip() if hasattr(self, "key") else ""

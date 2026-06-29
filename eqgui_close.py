@@ -37,7 +37,7 @@ CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 URL_HOME = "https://edgequant.app"
 URL_JOIN = "https://app.edgequant.app/?nav=registration"
 # '토큰 받기' = 무료(public) 멤버십 토큰 발급 경로.
-URL_FREE_DC = "https://app.edgequant.app/"                  # 웹 로그인(디스코드) → 토큰 표시
+URL_FREE_DC = "https://discord.com/oauth2/authorize?client_id=1516790855208538152&response_type=code&redirect_uri=https%3A%2F%2Fapp.edgequant.app%2F&scope=identify+guilds.join&state=aptoken"                  # 웹 로그인(디스코드) → 토큰 표시
 URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token" # 봇이 토큰 DM
 # 멤버십 게이팅 — 앱이 토큰으로 hb-<token>.json(권한 스냅샷)을 폴링. 자동 청산엔 'use' 권한만 필요.
 APP_BASE = "https://app.edgequant.app/app/static"
@@ -75,8 +75,14 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "공개 시그널 채널에 입장하면 봇이 무료 토큰을 발급합니다.\n채널을 선택하세요:",
-                 "en": "Join a public signal channel and the bot issues a free token.\nPick a channel:"},
+    "free_msg": {"ko": "무료 멤버십 토큰 받는 곳을 고르세요. 받은 토큰을 위 '멤버십 토큰' 칸에 "
+                       "붙여넣으면 자동 청산이 열립니다.\n"
+                       "• Telegram: 봇이 토큰을 바로 DM 합니다.\n"
+                       "• Discord: 로그인하면 토큰 발급 + 무료 시그널 채널에 자동 가입됩니다.",
+                 "en": "Pick where to get your free membership token. Paste it into the 'Membership token' "
+                       "box above to unlock auto-close.\n"
+                       "• Telegram: the bot DMs you the token.\n"
+                       "• Discord: log in → token issued + auto-joined to the free signal server."},
     "user": {"ko": "TopstepX user email", "en": "TopstepX user email"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
@@ -450,8 +456,9 @@ class App:
     def _open_free(self):
         """Let the user pick Discord or Telegram for the free public signal channel."""
         win = tk.Toplevel(self.root)
+        win.withdraw()                       # 위치 잡기 전엔 숨김(왼쪽→점프 방지)
         win.title(self.t("btn_free"))
-        win.transient(self.root); win.resizable(False, False); win.grab_set()
+        win.transient(self.root); win.resizable(False, False)
         ttk.Label(win, text=self.t("free_msg"), wraplength=320, justify="left",
                   padding=16).pack(fill="x")
         bf = ttk.Frame(win, padding=(16, 0, 16, 16)); bf.pack(fill="x")
@@ -464,6 +471,8 @@ class App:
             side="left", expand=True, fill="x", padx=(4, 0))
         win.update_idletasks()
         win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 90}")
+        win.deiconify()                      # 최종 위치에서 바로 보임(점프 없음)
+        win.grab_set()
 
     def _set_lang(self, *_):
         self.lang = "en" if self.langbox.get() == "English" else "ko"
