@@ -380,6 +380,11 @@ class App:
                 self.cb_auto_live.config(state="normal")
         except Exception:
             pass
+        # fail-closed: 자동 청산이 돌던 중 'use' 권한을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지.
+        if getattr(self, "_auto_on", False) and not use:
+            self._auto_on = False
+            self.b_auto.config(text=self.t("auto_start")); self._set_auto_ind(False)
+            self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
         self._update_gate_label()
 
     def _update_gate_label(self):

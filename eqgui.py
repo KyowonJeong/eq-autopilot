@@ -529,6 +529,16 @@ class App:
                     cb.config(state="normal")
             except Exception:
                 pass
+        # fail-closed: 돌던 루프가 권한을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
+        # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
+        if getattr(self, "_sig_on", False) and not (auto and fut):
+            self._sig_on = False
+            self.b_sig.config(text=self.t("sig_start")); self._set_sig_ind(False)
+            self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
+        if getattr(self, "_auto_on", False) and not use:
+            self._auto_on = False
+            self.b_auto.config(text=self.t("auto_start")); self._set_auto_ind(False)
+            self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
         self._update_gate_label()
 
     def _update_gate_label(self):
