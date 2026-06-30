@@ -19,6 +19,14 @@ _RENEW_MARGIN = 60 * 60         # re-auth 1h before expiry
 _LONG = 1                       # position.type: 1=long, 2=short (docs don't state it; common ProjectX
                                 # convention). Only affects the displayed net sign — closeContract
                                 # flattens the whole position regardless, so a wrong guess is cosmetic.
+_SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
+
+
+def _side_code(side):
+    s = side.upper() if isinstance(side, str) else side
+    if s not in _SIDE:
+        raise ValueError(f"bad side {side!r} (use BUY/LONG/0 or SELL/SHORT/1)")
+    return _SIDE[s]
 
 
 class ProjectXBroker(BrokerAdapter):
@@ -170,11 +178,7 @@ class ProjectXBroker(BrokerAdapter):
                              on the opposite side after the entry (the daily flatten cancels any
                              leftover working order). Prefer this when the signal gives a price.
         Returns the order dict(s) on live, or the request body/bodies (nothing sent) on dry_run."""
-        _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
-        s = side.upper() if isinstance(side, str) else side
-        if s not in _SIDE:
-            raise ValueError(f"bad side {side!r} (use BUY/LONG/0 or SELL/SHORT/1)")
-        side_code = _SIDE[s]
+        side_code = _side_code(side)
         body = {"accountId": int(account_id), "contractId": contract_id,
                 "type": int(order_type), "side": side_code, "size": int(size)}
         if limit_price is not None:
@@ -200,9 +204,36 @@ class ProjectXBroker(BrokerAdapter):
         if dry_run:
             return {"dry_run": True, "would_place": body, "would_place_stop": stop_body}
         entry = self._post("/api/Order/place", body)
-        if stop_body is None:
+        if stop_loss_price is None:
             return entry
+        # Place the protective stop as a separate order; classify a failure so the caller can
+        # decide: a broker rejection (stop_rejected) is permanent → flatten; transient → retry.
+        return {"entry": entry,
+                **self.place_protective_stop(account_id, contract_id, side, size,
+                                             stop_loss_price, custom_tag=custom_tag)}
+
+    def place_protective_stop(self, account_id, contract_id, entry_side, size: int,
+                              stop_price, *, custom_tag=None) -> dict:
+        """(Re)place a standalone protective Stop (type 4) on the side OPPOSITE the entry, at an
+        absolute price — used after a market entry, and retried by the caller on a transient miss.
+        Returns {"stop": <order>} on success, else {"stop_error": str, "stop_rejected": bool}:
+          stop_rejected=True  → broker said no (HTTP 200 success:false) — won't change on retry.
+          stop_rejected=False → transient network/HTTP error — safe to retry."""
+        body = {"accountId": int(account_id), "contractId": contract_id, "type": 4,
+                "side": 1 - _side_code(entry_side), "size": int(size),
+                "stopPrice": float(stop_price)}
+        if custom_tag:
+            body["customTag"] = f"{custom_tag}-SL"
         try:
-            return {"entry": entry, "stop": self._post("/api/Order/place", stop_body)}
-        except Exception as e:
-            return {"entry": entry, "stop_error": str(e)}
+            return {"stop": self._post("/api/Order/place", body)}
+        except requests.RequestException as e:           # timeout / connection / 5xx → transient
+            return {"stop_error": str(e), "stop_rejected": False}
+        except Exception as e:                            # RuntimeError(success:false) → broker reject
+            return {"stop_error": str(e), "stop_rejected": True}
+
+    def close_contract(self, account_id, contract_id) -> dict:
+        """Market-close the whole position for one {account, contract} (POST /api/Position/
+        closeContract). Used to flatten a just-entered position when its protective stop was
+        rejected (so we never sit unprotected)."""
+        return self._post("/api/Position/closeContract",
+                          {"accountId": int(account_id), "contractId": contract_id})

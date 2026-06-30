@@ -48,6 +48,8 @@ URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token"  # 봇이 토큰 DM
 APP_BASE = "https://app.edgequant.app/app/static"
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
+STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
+STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
 
 
 def _hb_url(token):
@@ -833,6 +835,40 @@ class App:
         threading.Thread(target=self._auto_loop, args=(cutoff, broker, f1, f2, f3, sc, live),
                          daemon=True).start()
 
+    def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
+        """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
+        already through the stop) → flatten the position now so we're never unprotected. Transient
+        (network) → retry the stop a few times; if it still won't land, KEEP the position and warn
+        loudly (the 14:00 daily flatten is the backstop)."""
+        import time as _t
+        if res.get("stop_rejected"):
+            self._flatten_unprotected(b, aid, contract, res.get("stop_error"))
+            return
+        # Transient miss — retry just the stop (position stays).
+        self.log(f"   ⚠ 손절 거치 일시 실패({res.get('stop_error')}) — 재시도…")
+        for i in range(STOP_RETRIES):
+            _t.sleep(STOP_RETRY_WAIT)
+            sr = b.place_protective_stop(aid, contract, direction, size, stop,
+                                         custom_tag="EQ-Autopilot-signal")
+            if sr.get("stop"):
+                self.log(f"   🛡 손절 거치 완료(재시도 {i + 1}회차).")
+                return
+            if sr.get("stop_rejected"):                 # transient hardened into a rejection
+                self._flatten_unprotected(b, aid, contract, sr.get("stop_error"))
+                return
+            self.log(f"   … 재시도 {i + 1} 실패: {sr.get('stop_error')}")
+        self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 14:00 일일청산이 백스톱이나, "
+                 "지금 수동으로 손절/확인 권장!")
+
+    def _flatten_unprotected(self, b, aid, contract, why):
+        """Market-close a just-entered position whose protective stop was rejected."""
+        self.log(f"   🛑 손절 거부됨({why}) → 무방비 포지션 즉시 청산")
+        try:
+            b.close_contract(aid, contract)
+            self.log("   ↩ 포지션 청산 완료(손절 불가로 진입 취소).")
+        except Exception as ce:
+            self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
+
     def _auto_loop(self, cutoff, broker, f1, f2, f3, sc, live):
         import time as _t
         tz = ZoneInfo("America/New_York") if ZoneInfo else None
@@ -977,7 +1013,12 @@ class App:
                         if res.get("would_place_stop"):
                             self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
                     else:
-                        self.log(f"   ✅ entered: {res}")
+                        self.log(f"   ✅ 진입 완료: {res.get('entry', res)}")
+                        if res.get("stop"):
+                            self.log("   🛡 보호 손절 거치 완료.")
+                        elif res.get("stop_error"):
+                            self._handle_stop_failure(b, aid, contract, direction, size,
+                                                      stop, res)
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")
             _t.sleep(SIG_POLL_SECS)
