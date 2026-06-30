@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # macOS build of EQ Autopilot. Build with the Tk 8.6 venv (homebrew python3.9) —
 # system Tk 8.5 renders a blank window. Mirrors "EQ Auto-Close.spec" (mac) but for eqgui.py.
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
                  'keyring', 'keyring.backends.macOS', 'nest_asyncio']
@@ -14,7 +14,7 @@ a = Analysis(
     ['eqgui.py'],
     pathex=[],
     binaries=[],
-    datas=[('eqlogo.png', '.')],
+    datas=[('eqlogo.png', '.')] + collect_data_files('tzdata'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

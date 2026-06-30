@@ -871,7 +871,13 @@ class App:
 
     def _auto_loop(self, cutoff, broker, f1, f2, f3, sc, live):
         import time as _t
-        tz = ZoneInfo("America/New_York") if ZoneInfo else None
+        try:
+            tz = ZoneInfo("America/New_York") if ZoneInfo else None
+        except Exception as e:
+            # Windows 등 시스템 tz DB 없고 tzdata 미동봉이면 여기서 죽어 스레드가 조용히 사라진다 →
+            # 청산이 영영 안 됨. 로그로 드러내고 로컬 시각으로라도 동작(시각 확인 필요). (대표 2026-06-30)
+            tz = None
+            self.log(f"⚠ ET 타임존 로드 실패({e!r}) — tzdata 누락 의심. 로컬 시각 기준으로 동작하니 청산 시각 확인!")
         fired = None
         while self._auto_on:
             now = _dt.datetime.now(tz)

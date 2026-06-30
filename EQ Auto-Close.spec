@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # macOS build of EQ Auto-Close (auto-close-only build). Build with the Tk 8.6 venv
 # (homebrew python3.9) — system Tk 8.5 renders a blank window.
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog']
 hiddenimports += collect_submodules('eqexec')
@@ -10,7 +10,7 @@ a = Analysis(
     ['eqgui_close.py'],
     pathex=[],
     binaries=[],
-    datas=[('eqlogo.png', '.')],
+    datas=[('eqlogo.png', '.')] + collect_data_files('tzdata'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

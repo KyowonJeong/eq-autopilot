@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Windows build of EQ Auto-Close (auto-close-only build). Built in CI on windows-latest
 # (PyInstaller can't cross-compile from macOS). Output: dist/EQ Auto-Close/.
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
                  'keyring', 'keyring.backends.Windows', 'win32ctypes', 'win32ctypes.pywin32']
@@ -12,7 +12,7 @@ a = Analysis(
     ['eqgui_close.py'],
     pathex=[],
     binaries=[],
-    datas=[('eqlogo.png', '.')],
+    datas=[('eqlogo.png', '.')] + collect_data_files('tzdata'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
