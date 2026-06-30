@@ -32,6 +32,13 @@ class IBKRBroker(BrokerAdapter):
         if self._ib is not None and self._ib.isConnected():
             return self._ib
         IB, _ = _ib_classes()
+        # ib_insync는 asyncio 이벤트 루프가 필요한데, 앱은 broker 작업을 워커 스레드에서 돌린다.
+        # 그 스레드엔 기본 루프가 없어(연결 실패) → 없으면 새로 만들어 준다(메인 스레드는 영향 없음).
+        import asyncio
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         ib = IB()
         # TWS/Gateway must already be running on the user's machine (API enabled in settings).
         ib.connect(self.cfg.host, int(self.cfg.port), clientId=int(self.cfg.client_id), timeout=15)

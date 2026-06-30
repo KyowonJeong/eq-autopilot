@@ -4,9 +4,11 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 'tkinter.simpledialog',
-                 'keyring', 'keyring.backends.macOS']
+                 'keyring', 'keyring.backends.macOS', 'nest_asyncio']
 hiddenimports += collect_submodules('eqexec')
 hiddenimports += collect_submodules('keyring')
+hiddenimports += collect_submodules('ib_insync')   # IBKR 어댑터(지연 import) — 번들에 포함
+hiddenimports += collect_submodules('eventkit')
 
 a = Analysis(
     ['eqgui.py'],
