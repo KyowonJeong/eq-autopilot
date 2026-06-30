@@ -84,9 +84,15 @@ class BybitBroker(BrokerAdapter):
         for pos in plan:
             try:
                 side = "Sell" if pos.net_qty > 0 else "Buy"        # opposite, reduceOnly
-                self._req("POST", "/v5/order/create", body={
-                    "category": self.category, "symbol": pos.symbol, "side": side,
-                    "orderType": "Market", "qty": str(abs(pos.net_qty)), "reduceOnly": True})
+                body = {"category": self.category, "symbol": pos.symbol, "side": side,
+                        "orderType": "Market",
+                        # Bybit 원본 size 문자열을 그대로(코인 수량 형식 보존 — float 재포맷의 '2.0' 회피).
+                        "qty": str(pos.raw.get("size") or abs(pos.net_qty)),
+                        "reduceOnly": True}
+                _pi = pos.raw.get("positionIdx")                   # 헤지 모드면 필수(one-way=0)
+                if _pi is not None:
+                    body["positionIdx"] = _pi
+                self._req("POST", "/v5/order/create", body=body)
             except Exception as e:
                 res.errors.append(f"{pos.symbol}: {e}")
         time.sleep(1)
