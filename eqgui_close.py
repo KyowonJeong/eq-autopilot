@@ -67,9 +67,9 @@ T = {
     "gate_ok": {"ko": "멤버십: {tier} · 자동 청산 {u}{dry}",
                 "en": "Membership: {tier} · auto-close {u}{dry}"},
     "gate_dry": {"ko": " · 강제 모의(LIVE 잠금)", "en": " · forced dry-run (LIVE locked)"},
-    "warn_mix": {"ko": "⚠ 자동 청산은 사용 계좌의 모든 포지션을 일괄 청산합니다. "
+    "warn_mix": {"ko": "⚠ 청산 시 사용 계좌의 모든 포지션이 일괄 청산됩니다. "
                        "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
-                 "en": "⚠ Auto-close flattens EVERY position on the chosen account. "
+                 "en": "⚠ Closing flattens EVERY position on the chosen account. "
                        "Don't mix other trades on it — use a dedicated account."},
     "lang": {"ko": "언어", "en": "Language"},
     "btn_home": {"ko": "홈페이지", "en": "Website"},
