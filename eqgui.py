@@ -947,7 +947,7 @@ class App:
         import requests
         import autopilot_crypto
         last_id = None
-        entered_once = False   # 이번 세션(자동진입 ON)에 한 번 진입하면 재진입 금지 — 놓쳐도/청산돼도 다시 안 들어감
+        entered_day = None     # 마지막 진입한 '신호 발행 날짜'. 같은 날 재진입 금지, 새 날이면 자동 리셋(내일 새 신호엔 진입)
         while self._sig_on:
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
@@ -970,20 +970,24 @@ class App:
                          f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid    # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지)
-                # 🚫 재진입 금지: 이번 세션에 이미 진입 처리했으면(놓쳤든 청산됐든) 새 신호가 와도 절대 재진입 안 함.
-                if entered_once:
-                    self.log(f"\n⏹ 신호 [{sid}] 무시 — 이번 세션에 이미 진입 처리함(재진입 금지). "
-                             f"다시 하려면 자동진입을 껐다 켜세요.")
-                    _t.sleep(SIG_POLL_SECS)
-                    continue
-                # 🛑 오래된 신호로 실수 진입 방지: 앱을 켜면 피드에 '어제 신호'가 남아 있는데, 그게
-                # 새 신호로 판정돼 즉시 실진입하던 버그. published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이
-                # 아니면 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
+                # 신호 발행 시각 → 나이(신선도) + 발행 '날짜'(하루 1회 재진입 판정)
+                import datetime as _dtd
                 _pub_ts = sig.get("published_at")
                 try:
                     _age = _t.time() - float(_pub_ts) if _pub_ts is not None else None
+                    _sig_day = (_dtd.datetime.fromtimestamp(float(_pub_ts)).date()
+                                if _pub_ts is not None else None)
                 except (TypeError, ValueError):
-                    _age = None
+                    _age, _sig_day = None, None
+                # 🚫 재진입 금지(하루 1회): 이 신호의 '발행 날짜'에 이미 진입했으면 새 신호가 와도 스킵
+                # (놓쳤든 청산됐든 같은 날 재진입 X). 앱을 계속 켜놔도 '다음 날 새 신호'엔 자동으로 다시 진입.
+                if _sig_day is not None and entered_day == _sig_day:
+                    self.log(f"\n⏹ 신호 [{sid}] 무시 — 오늘({_sig_day}) 이미 진입함(재진입 금지). "
+                             f"다음 날 새 신호에 다시 진입합니다.")
+                    _t.sleep(SIG_POLL_SECS)
+                    continue
+                # 🛑 오래된 신호로 실수 진입 방지: published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이 아니면
+                # 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
                 if _age is None or _age > MAX_SIGNAL_AGE_SEC:
                     if _age is None:
                         _why = "발행시각 불명(안전상 스킵)"
@@ -994,7 +998,7 @@ class App:
                     self.log(f"\n⏸ 신호 [{sid}] 진입 안 함 — {_why}. 새 신호를 기다립니다.")
                     _t.sleep(SIG_POLL_SECS)
                     continue
-                entered_once = True   # 프레시 신호를 실제로 처리 → 성공/실패 무관, 이번 세션 재진입 금지
+                entered_day = _sig_day   # 이 날 진입 처리 완료 → 같은 날 재진입 금지(성공/실패 무관)
                 direction, stop = sig.get("direction"), sig.get("stop_price")
                 try:
                     size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
