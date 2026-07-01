@@ -50,6 +50,7 @@ SIG_POLL_SECS = 3                                   # feed poll cadence while th
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
+MAX_SIGNAL_AGE_SEC = 30 * 60                        # 자동진입: 이보다 오래된 신호(예: 어제 것)로는 진입 금지 → 대기
 
 
 def _hb_url(token):
@@ -967,7 +968,22 @@ class App:
                 self.log(f"   ⏱ 보낸 시각 {_sent0.strftime('%H:%M:%S') if _sent0 else '?'}  ·  "
                          f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
-                last_id = sid
+                last_id = sid    # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지)
+                # 🛑 오래된 신호로 실수 진입 방지: 앱을 켜면 피드에 '어제 신호'가 남아 있는데, 그게
+                # 새 신호로 판정돼 즉시 실진입하던 버그. published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이
+                # 아니면 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
+                _pub_ts = sig.get("published_at")
+                try:
+                    _age = _t.time() - float(_pub_ts) if _pub_ts is not None else None
+                except (TypeError, ValueError):
+                    _age = None
+                if _age is None or _age > MAX_SIGNAL_AGE_SEC:
+                    self.log("\n⏸ 신호 [" + str(sid) + "] 진입 안 함 — "
+                             + ("발행시각 불명(안전상 스킵)" if _age is None
+                                else f"{_age / 60:.0f}분 전 발행(오래됨)")
+                             + ". 새 신호를 기다립니다.")
+                    _t.sleep(SIG_POLL_SECS)
+                    continue
                 direction, stop = sig.get("direction"), sig.get("stop_price")
                 try:
                     size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
