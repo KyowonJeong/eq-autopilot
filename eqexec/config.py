@@ -83,7 +83,7 @@ class ScheduleCfg:
 @dataclass
 class Config:
     live: bool = False           # False = dry-run (no orders sent)
-    broker: str = "projectx"     # projectx (Topstep) | tradovate (Apex/Tradovate firms) | ibkr
+    broker: str = "projectx"     # projectx (Topstep) | tradovate (Tradovate-based firms) | ibkr
     projectx: ProjectXCfg = field(default_factory=ProjectXCfg)
     tradovate: TradovateCfg = field(default_factory=TradovateCfg)
     ibkr: IBKRCfg = field(default_factory=IBKRCfg)

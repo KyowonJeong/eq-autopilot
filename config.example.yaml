@@ -2,7 +2,7 @@
 # (it holds broker credentials). config.yaml is gitignored.
 
 live: false              # false = DRY-RUN (no orders sent). Set true ONLY after demo-testing.
-broker: projectx         # projectx (Topstep)  |  tradovate (Apex/Tradovate firms)  |  ibkr
+broker: projectx         # projectx (Topstep)  |  tradovate (Tradovate-based firms)  |  ibkr
 
 # ── ProjectX (TopstepX). Get an API key from your ProjectX/TopstepX account (API add-on). ──
 projectx:
@@ -11,7 +11,7 @@ projectx:
   api_key: "YOUR_PROJECTX_API_KEY"
   accounts: []           # [] = every active account; or ["PRACTICEACCT123", ...] to limit
 
-# ── Tradovate (Phase 2 — Lucid/Apex/etc.). Only used when broker: tradovate. ──
+# ── Tradovate (Phase 2 — Lucid/etc.). Only used when broker: tradovate. ──
 tradovate:
   env: demo              # demo | live
   name: ""

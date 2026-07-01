@@ -1,4 +1,4 @@
-"""Tradovate adapter (Phase 1 — covers Lucid, Apex, and other Tradovate-based prop firms).
+"""Tradovate adapter (Phase 1 — covers Lucid and other Tradovate-based prop firms).
 
 Endpoints (from Tradovate API docs — see PLAN.md). The flatten path and contract resolution
 are marked VERIFY: confirm them against a DEMO account before ever running live. This adapter
