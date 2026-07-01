@@ -50,7 +50,7 @@ SIG_POLL_SECS = 3                                   # feed poll cadence while th
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
-MAX_SIGNAL_AGE_SEC = 30 * 60                        # 자동진입: 이보다 오래된 신호(예: 어제 것)로는 진입 금지 → 대기
+MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
 
 
 def _hb_url(token):
@@ -978,10 +978,13 @@ class App:
                 except (TypeError, ValueError):
                     _age = None
                 if _age is None or _age > MAX_SIGNAL_AGE_SEC:
-                    self.log("\n⏸ 신호 [" + str(sid) + "] 진입 안 함 — "
-                             + ("발행시각 불명(안전상 스킵)" if _age is None
-                                else f"{_age / 60:.0f}분 전 발행(오래됨)")
-                             + ". 새 신호를 기다립니다.")
+                    if _age is None:
+                        _why = "발행시각 불명(안전상 스킵)"
+                    elif _age < 300:
+                        _why = f"발행 {_age:.0f}초 전(1분 초과, 오래됨)"
+                    else:
+                        _why = f"발행 {_age / 60:.0f}분 전(오래됨)"
+                    self.log(f"\n⏸ 신호 [{sid}] 진입 안 함 — {_why}. 새 신호를 기다립니다.")
                     _t.sleep(SIG_POLL_SECS)
                     continue
                 direction, stop = sig.get("direction"), sig.get("stop_price")
