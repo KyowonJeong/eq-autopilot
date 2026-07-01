@@ -947,6 +947,7 @@ class App:
         import requests
         import autopilot_crypto
         last_id = None
+        entered_once = False   # 이번 세션(자동진입 ON)에 한 번 진입하면 재진입 금지 — 놓쳐도/청산돼도 다시 안 들어감
         while self._sig_on:
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
@@ -969,6 +970,12 @@ class App:
                          f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid    # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지)
+                # 🚫 재진입 금지: 이번 세션에 이미 진입 처리했으면(놓쳤든 청산됐든) 새 신호가 와도 절대 재진입 안 함.
+                if entered_once:
+                    self.log(f"\n⏹ 신호 [{sid}] 무시 — 이번 세션에 이미 진입 처리함(재진입 금지). "
+                             f"다시 하려면 자동진입을 껐다 켜세요.")
+                    _t.sleep(SIG_POLL_SECS)
+                    continue
                 # 🛑 오래된 신호로 실수 진입 방지: 앱을 켜면 피드에 '어제 신호'가 남아 있는데, 그게
                 # 새 신호로 판정돼 즉시 실진입하던 버그. published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이
                 # 아니면 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
@@ -987,6 +994,7 @@ class App:
                     self.log(f"\n⏸ 신호 [{sid}] 진입 안 함 — {_why}. 새 신호를 기다립니다.")
                     _t.sleep(SIG_POLL_SECS)
                     continue
+                entered_once = True   # 프레시 신호를 실제로 처리 → 성공/실패 무관, 이번 세션 재진입 금지
                 direction, stop = sig.get("direction"), sig.get("stop_price")
                 try:
                     size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
