@@ -849,7 +849,7 @@ class App:
         for i in range(STOP_RETRIES):
             _t.sleep(STOP_RETRY_WAIT)
             sr = b.place_protective_stop(aid, contract, direction, size, stop,
-                                         custom_tag="EQ-Autopilot-signal")
+                                         custom_tag=f"EQ-AP-{int(_t.time() * 1000)}")   # 매 재시도 유니크
             if sr.get("stop"):
                 self.log(f"   🛡 손절 거치 완료(재시도 {i + 1}회차).")
                 return
@@ -1011,9 +1011,12 @@ class App:
                                      f"skipping to avoid doubling.")
                             continue
                         self.log(f"   (note) already in a position ({len(existing)}) — LIVE would skip.")
+                    # customTag은 ProjectX에서 '계좌당 유일'해야 함 → 고정값 쓰면 두 번째 진입부터
+                    # errorCode=2("custom tag already in use"). 매 진입마다 ms 타임스탬프로 유니크하게.
                     res = b.place_entry(account_id=aid, contract_id=contract, side=direction,
                                         size=size, order_type=2, stop_loss_price=stop,
-                                        custom_tag="EQ-Autopilot-signal", dry_run=not live)
+                                        custom_tag=f"EQ-AP-{int(_recv.timestamp() * 1000)}",
+                                        dry_run=not live)
                     if not live:
                         self.log(f"   DRY-RUN entry: {res.get('would_place')}")
                         if res.get("would_place_stop"):
