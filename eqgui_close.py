@@ -57,6 +57,7 @@ T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
     "token": {"ko": "멤버십 토큰", "en": "Membership token"},
+    "token_show": {"ko": "표시", "en": "Show"},
     "token_get": {"ko": "토큰 받기", "en": "Get token"},
     "gate_none": {"ko": "멤버십 토큰을 입력하세요 ('토큰 받기' → 채널에서 발급).",
                   "en": "Enter a membership token ('Get token' → issued in the channel)."},
@@ -281,8 +282,10 @@ class App:
         # 멤버십 토큰(게이팅) + 권한 상태
         rt = ttk.Frame(frm); rt.pack(fill="x", pady=3)
         ttk.Label(rt, text=self.t("token"), width=18).pack(side="left")
-        self.token_e = ttk.Entry(rt); self.token_e.pack(side="left", fill="x", expand=True)
+        self.token_e = ttk.Entry(rt, show="•")  # 토큰 마스킹(잠금) — 기본 •••, 아래 토글로 표시
+        self.token_e.pack(side="left", fill="x", expand=True)
         self.token_e.insert(0, d.get("token", "")); self.token_e.bind("<FocusOut>", self._save_token)
+        ttk.Button(rt, text=self.t("token_show"), width=6, command=self._toggle_token_show).pack(side="left", padx=(4, 0))
         ttk.Button(rt, text=self.t("paste"), width=8, command=self._paste_token).pack(side="left", padx=(4, 0))
         ttk.Button(rt, text=self.t("token_get"), width=9, command=self._open_free).pack(side="left", padx=(4, 0))
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
@@ -405,6 +408,10 @@ class App:
             self.gate_lbl.config(text=txt, foreground=col)
         except Exception:
             pass
+
+    def _toggle_token_show(self):
+        """토큰 표시/잠금 토글 — 어깨너머·스트리밍 노출 방지(기본 잠금)."""
+        self.token_e.config(show="" if self.token_e.cget("show") else "•")
 
     def _save_token(self, *_):
         self._token = self.token_e.get().strip()
