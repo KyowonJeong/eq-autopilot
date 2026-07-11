@@ -386,7 +386,8 @@ class App:
         self._auto_on = False
         self._sig_on = False
         self._unlocked = False
-        self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
+        self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성 (현재 탭 기준)
+        self._conn_by_asset = {}         # 자산별 연결테스트 통과 기억 — 탭 전환이 리셋 안 시킴
         _d0 = _load()
         self._acfg = _d0["assets"]       # 자산별 설정 {NQ,GC,BTC:{broker,f1,f3,acct,one_r}}
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
@@ -538,7 +539,8 @@ class App:
         self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
         self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.accounts); self.b_acc.pack(side="left", padx=6)
         # 동의 — 연결 테스트 '바로 밑'(실행 동작 전 필요)
-        self.consent = tk.IntVar()
+        if not hasattr(self, "consent"):
+            self.consent = tk.IntVar()               # 탭 전환(재빌드)에도 동의 상태 유지
         ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent")).pack(anchor="w", pady=(6, 0))
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
@@ -555,7 +557,8 @@ class App:
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
         # 청산 시각 = 시스템 세션 마감(자산별 자동, _ASSET_EXITS) — 사용자 입력 제거(2026-07-11).
         ttk.Label(af, text=self.t("auto_sched"), foreground="#888").pack(side="left", padx=(0, 10))
-        self.auto_live = tk.IntVar()
+        if not hasattr(self, "auto_live"):
+            self.auto_live = tk.IntVar()             # 탭 전환에도 LIVE 선택 유지
         self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
         self.cb_auto_live.pack(side="left", padx=(0, 10))
         self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._auto_on else self.t("auto_start"),
@@ -572,7 +575,8 @@ class App:
         self.one_r = ttk.Entry(sg, width=8)
         self.one_r.insert(0, str(self._acur().get("one_r", 600)))
         self.one_r.pack(side="left", padx=(0, 14))
-        self.sig_live = tk.IntVar()
+        if not hasattr(self, "sig_live"):
+            self.sig_live = tk.IntVar()              # 탭 전환에도 LIVE 선택 유지
         self.cb_sig_live = ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live)
         self.cb_sig_live.pack(side="left", padx=(0, 12))
         self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
@@ -658,13 +662,17 @@ class App:
                     cb.config(state="normal")
             except Exception:
                 pass
-        # fail-closed: 돌던 루프가 권한을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
+        # fail-closed: 돌던 루프가 '권한'을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
         # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
-        if getattr(self, "_sig_on", False) and not auto:
+        # ⚠️ 판정은 하트비트 권한만 — 연결(_connected)은 '현재 탭' 상태라 여기 섞으면
+        # 탭 전환이 돌던 루프를 죽인다(대표 2026-07-11 "자산 옮기면 다 리셋" 버그).
+        perm_use = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
+        perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
+        if getattr(self, "_sig_on", False) and not perm_auto:
             self._sig_on = False
             self.b_sig.config(text=self.t("sig_start")); self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
-        if getattr(self, "_auto_on", False) and not use:
+        if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self.b_auto.config(text=self.t("auto_start")); self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
@@ -817,7 +825,8 @@ class App:
         self._save_current_asset()
         self._asset = asset
         self._broker_name = self._acfg[asset]["broker"]
-        self._connected = False
+        # 탭 전환 = 보기 전환일 뿐 — 연결은 자산별 기억 복원, 돌던 루프·체크박스는 안 건드림.
+        self._connected = bool(self._conn_by_asset.get(asset, False))
         self._unlocked = False
         self._build()
 
@@ -828,6 +837,7 @@ class App:
                 self._broker_name = b
                 break
         self._connected = False
+        self._conn_by_asset.pop(self._asset, None)   # 브로커가 바뀌면 연결테스트 다시
         self._unlocked = False
         self._persist()
         self._build()
@@ -945,6 +955,7 @@ class App:
             for p in pos: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
             if not pos: self.log("   (flat)")
             self._connected = True                # 통과 → 나머지 기능 활성화(_busy 복원이 반영)
+            self._conn_by_asset[self._asset] = True   # 탭 전환 후 복귀해도 재연결 불필요
             self.log("🔓 " + self.t("conn_ok"))
         self._run(w)
 
