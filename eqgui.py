@@ -1000,6 +1000,9 @@ class App:
             f1 = (c.get("f1") or "").strip()
             if not f1:
                 continue
+            if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
+                self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동청산 제외.")
+                continue
             _sp = _BROKER_SPEC.get(c["broker"], {})
             acct = (c.get("acct") or "").strip()
             if _sp.get("acct") and not acct:
@@ -1136,6 +1139,9 @@ class App:
             except (TypeError, ValueError):
                 one_r = 0.0
             if not f1 or one_r <= 0:              # 미설정 자산(키 or 1R 없음) 제외
+                continue
+            if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
+                self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동진입 제외.")
                 continue
             _sp = _BROKER_SPEC.get(c["broker"], {})
             acct = (c.get("acct") or "").strip()
@@ -1286,6 +1292,16 @@ class App:
             return None
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
+
+    _HB_BROKER_KEY = {"projectx": "topstep", "ibkr": "ibkr", "bybit": "bybit", "bitget": "bitget"}
+
+    def _broker_allowed(self, broker: str) -> bool:
+        """서버(admin) '브로커별 지원' 토글 반영 — 하트비트 brokers에서 꺼진 브로커는 자동화 제외.
+        brokers 정보가 없으면(구버전 hb 등) 허용(하위호환)."""
+        gb = (self._gate or {}).get("brokers") or {}
+        if not gb:
+            return True
+        return bool(gb.get(self._HB_BROKER_KEY.get(broker, broker), False))
 
     def _live_now(self, live_flag: bool) -> bool:
         """발주 '순간'의 실거래 여부 = 시작 시 선택 AND 현재 게이트의 강제 모의 아님.
