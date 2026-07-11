@@ -1012,7 +1012,7 @@ class App:
             messagebox.showwarning(self.t("input_needed"),
                                    "자동청산할 자산을 최소 하나 설정하세요 (브로커·키)." if self.lang == "ko"
                                    else "Configure at least one asset (broker & key)."); return
-        live = bool(self.auto_live.get())
+        live = bool(self.auto_live.get()) and not self._gate.get("force_dry_run", True)  # 강제 모의 존중
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
         self._set_auto_ind(True)
@@ -1057,11 +1057,12 @@ class App:
         except Exception as ce:
             self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
 
-    def _auto_loop(self, jobs, live):
+    def _auto_loop(self, jobs, live_flag):
         """자산별 세션 마감 자동청산. jobs=[{asset,tz,hour,broker,f1,f2,f3,acct}] — 각 잡은
         자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten.
         같은 선물계좌의 NQ(14 ET)·GC(06 ET)는 세션이 안 겹쳐 flatten_all이 서로를 안 건드리고,
-        BTC 02:00 UTC flatten은 다음(02-06) 세션 신호 발행(예측 계산 수 분)보다 항상 먼저 끝난다."""
+        BTC 02:00 UTC flatten은 다음(02-06) 세션 신호 발행(예측 계산 수 분)보다 항상 먼저 끝난다.
+        실거래 여부는 발화 순간 _live_now로 재판정(강제 dry run 즉시 반영)."""
         import time as _t
         fired = {}                                     # {(asset,hour): 그 tz의 날짜}
         _tzs = {}
@@ -1090,6 +1091,7 @@ class App:
                     self.log(f"\n⏭ {j['asset']} 마감 청산 스킵 — {int((_t.time() - _ea) / 60)}분 전 "
                              f"새 세션 진입(신호 루프가 이전 세션 이미 정리).")
                     continue
+                live = self._live_now(live_flag)   # 발화 순간 재판정(강제 dry run 즉시 반영)
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                 self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
                          f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
@@ -1285,7 +1287,13 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    def _sig_loop(self, url, cfgmap, live):
+    def _live_now(self, live_flag: bool) -> bool:
+        """발주 '순간'의 실거래 여부 = 시작 시 선택 AND 현재 게이트의 강제 모의 아님.
+        어드민이 강제 dry run을 켜면(하트비트 ≤5분 반영) 이미 돌던 루프도 다음 발주부터
+        모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
+        return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
+
+    def _sig_loop(self, url, cfgmap, live_flag):
         # cfgmap = {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
         import time as _t
         import requests
@@ -1325,6 +1333,7 @@ class App:
                     _t.sleep(SIG_POLL_SECS); continue
                 _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
                 f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
+                live = self._live_now(live_flag)   # 발주 순간 재판정(강제 dry run 즉시 반영)
                 # 신호 발행 시각 → 나이(신선도) + 발행 '날짜'(하루 1회 재진입 판정)
                 import datetime as _dtd
                 _pub_ts = sig.get("published_at")
