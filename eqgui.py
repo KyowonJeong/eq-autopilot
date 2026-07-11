@@ -46,6 +46,9 @@ URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token"  # 봇이 토큰 DM
 #   sig-<token>.json  → the signal (direction/stop/contracts), gated by tier on the server side
 # No shared secret: each member's files are written for their own token; revoke = server stops/locks.
 APP_BASE = "https://app.edgequant.app/app/static"
+PUSH_BASE = "https://app.edgequant.app/"           # 공개 트랙레코드 푸시(?profile_push=) + 페이지(?u=)
+TR_LOOKBACK_DAYS = 90                              # 푸시당 체결 조회 범위(서버가 tid로 멱등 병합)
+TR_CHUNK = 40                                      # 청크당 trade 수(URL 길이 안전)
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
 # 자산별 세션 청산 시각(거래봉 마감, 서버 archive_resolver._WINDOW와 동일 상수) — 자동청산은
@@ -200,6 +203,17 @@ T = {
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
     "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
                   "en": "Entry requires a single account in 'Account' (not all)."},
+    "sec_tr": {"ko": "공개 트랙레코드 (Autopilot)", "en": "Public track record (Autopilot)"},
+    "tr_handle": {"ko": "핸들", "en": "Handle"},
+    "tr_name": {"ko": "표시 이름", "en": "Display name"},
+    "tr_public": {"ko": "공개 동의", "en": "Make public"},
+    "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
+    "tr_note": {"ko": "※ 앱이 브로커 체결 기록을 이 컴퓨터에서 R로 변환해 요약만 서버로 보냅니다 — "
+                      "API 키·잔고·계좌금액은 절대 전송 안 됨. 공개 페이지: app.edgequant.app/?u=핸들 "
+                      "(공개 동의 체크 시에만 노출, 언제든 해제 가능).",
+                "en": "※ The app converts your broker fills to R locally and pushes only the summary — "
+                      "API keys, balances and account size are never sent. Public page: "
+                      "app.edgequant.app/?u=<handle> (visible only while 'Make public' is on)."},
     "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
@@ -307,16 +321,21 @@ def _load():
                 acfg[_a].update({"broker": out["broker"], "f1": out["f1"], "f3": out["f3"],
                                  "acct": out["acct"], "one_r": out["one_r"]}); break
     out["assets"] = acfg
+    _p = d.get("profile") or {}
+    out["profile"] = {"handle": _p.get("handle", ""), "name": _p.get("name", ""),
+                      "public": bool(_p.get("public"))}
     return out
 
 
-def _save_full(lang, token, acfg):
-    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token을 yaml에 저장.
-    비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
+def _save_full(lang, token, acfg, profile=None):
+    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token + 공개프로필 설정을
+    yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
     try:
         import yaml
         payload = {"live": False, "lang": lang, "token": token,
                    "assets": {a: dict(c) for a, c in (acfg or {}).items()}}
+        if profile is not None:
+            payload["profile"] = dict(profile)
         with open(CFG_PATH, "w") as f:
             yaml.safe_dump(payload, f)
     except Exception:
@@ -344,6 +363,7 @@ class App:
         self._acfg = _d0["assets"]       # 자산별 설정 {NQ,GC,BTC:{broker,f1,f3,acct,one_r}}
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
         self._broker_name = self._acfg[self._asset]["broker"]
+        self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
         self._token = _d0.get("token", "")
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
@@ -534,12 +554,31 @@ class App:
         ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
 
+        # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
+        _prof = self._profile
+        ttk.Label(tr, text=self.t("tr_handle")).pack(side="left", padx=(0, 4))
+        self.tr_handle = ttk.Entry(tr, width=14)
+        self.tr_handle.insert(0, _prof.get("handle", "")); self.tr_handle.pack(side="left", padx=(0, 10))
+        ttk.Label(tr, text=self.t("tr_name")).pack(side="left", padx=(0, 4))
+        self.tr_name = ttk.Entry(tr, width=14)
+        self.tr_name.insert(0, _prof.get("name", "")); self.tr_name.pack(side="left", padx=(0, 10))
+        self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
+        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
+        self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
+        self.b_tr.pack(side="left")
+        ttk.Label(frm, text=self.t("tr_note"), foreground="#888", wraplength=660,
+                  justify="left").pack(anchor="w")
+
         ttk.Separator(frm).pack(fill="x", pady=8)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
-        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig]
+        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig,
+                             self.b_tr]
         self._apply_gating()
         self.log(self.t("ready"))
         self._async_load_key(self._acur().get("f1", ""))
@@ -578,6 +617,10 @@ class App:
         # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
         # 신호 대기는 현재 탭이 아니라 '설정된 모든 자산'을 무장하므로 브로커 종류와 무관.
         en(self.b_sig, auto)
+        # 공개 트랙레코드 푸시 = Autopilot 등급 자격(서버 entitled와 동일 기준: 마스터 스위치 무관,
+        # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
+        if hasattr(self, "b_tr"):
+            en(self.b_tr, bool(g.get("ok")) and g.get("tier") in ("royal", "admin"))
         for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
             try:
                 if not live_ok:
@@ -733,7 +776,7 @@ class App:
                 pass
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
             _kc_save(c["f1"], self.key.get())
-        _save_full(self.lang, self._token, self._acfg)
+        _save_full(self.lang, self._token, self._acfg, self._profile)
 
     def _persist(self):
         self._save_current_asset()
@@ -1073,6 +1116,129 @@ class App:
         _sumry = " · ".join(f"{a}:{c['broker']}(1R${c['one_r']:g})" for a, c in cfgmap.items())
         self.log(f"\n▶ signal watch ON — {_sumry} · {'LIVE' if live else 'dry-run'}. polling feed")
         threading.Thread(target=self._sig_loop, args=(url, cfgmap, live), daemon=True).start()
+
+    # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
+    @staticmethod
+    def _fill_asset(symbol: str):
+        """체결 심볼 → 자산. BTCUSDT→BTC · MNQ 계약→NQ · MGC 계약→GC. 모르면 None(제외)."""
+        s = str(symbol or "").upper()
+        if "BTCUSDT" in s:
+            return "BTC"
+        if ".MNQ." in s or s.startswith("MNQ"):
+            return "NQ"
+        if ".MGC." in s or s.startswith("MGC"):
+            return "GC"
+        return None
+
+    def push_profile(self):
+        """브로커 체결(closed PnL)을 로컬에서 R로 변환·일별 합산해 요약만 서버로 푸시.
+        키·잔고 무전송. 서버는 tid로 멱등 병합 → 페이지(?u=핸들) 즉시 갱신."""
+        if not self._consent_ok():
+            return
+        handle = self.tr_handle.get().strip().lower()
+        name = self.tr_name.get().strip()
+        public = bool(self.tr_public.get())
+        if not handle:
+            messagebox.showwarning(self.t("input_needed"),
+                                   "핸들을 입력하세요 (a-z, 0-9, -, _ / 3~20자)." if self.lang == "ko"
+                                   else "Enter a handle (a-z, 0-9, -, _ / 3-20 chars)."); return
+        self._profile = {"handle": handle, "name": name, "public": public}
+        self._save_current_asset()                          # 프로필 포함 영속화
+        # creds 스냅샷(메인 스레드) — 설정된 자산만
+        creds = {}
+        for a, c in self._acfg.items():
+            f1 = (c.get("f1") or "").strip()
+            if not f1:
+                continue
+            _sp = _BROKER_SPEC.get(c["broker"], {})
+            acct = (c.get("acct") or "").strip()
+            if _sp.get("acct") and not acct:
+                continue
+            try:
+                one_r = float(c.get("one_r", 0))
+            except (TypeError, ValueError):
+                one_r = 0.0
+            creds[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                        "f3": c.get("f3", ""), "acct": acct, "one_r": one_r or 600.0}
+        if not creds:
+            messagebox.showwarning(self.t("input_needed"),
+                                   "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
+                                   else "No asset has broker credentials configured."); return
+        tok = self._token
+        self.log(f"\n📤 트랙레코드 동기화 — 핸들 [{handle}] · {'공개' if public else '비공개'} · "
+                 f"최근 {TR_LOOKBACK_DAYS}일 체결 수집…")
+
+        def w():
+            import time as _t
+            import requests
+            import autopilot_crypto
+            start_ms = int((_t.time() - TR_LOOKBACK_DAYS * 86400) * 1000)
+            fills = []
+            seen_brokers = set()                            # NQ/GC 같은 브로커·계좌 중복 조회 방지
+            for a, c in creds.items():
+                bk = (c["broker"], c["f1"], c["acct"])
+                if bk in seen_brokers:
+                    continue
+                seen_brokers.add(bk)
+                try:
+                    b = _build_broker(c["broker"], c["f1"], c["f2"], c["f3"],
+                                      [c["acct"]] if c["acct"] else [])
+                    got = b.closed_fills(start_ms)
+                    fills.extend(got)
+                    self.log(f"   {c['broker']}: 체결 {len(got)}건")
+                except AttributeError:
+                    self.log(f"   {c['broker']}: 체결 이력 미지원(지원 예정) — 건너뜀")
+                except Exception as e:
+                    self.log(f"   ⚠ {c['broker']} 체결 조회 실패: {e}")
+            # (date, asset)별 합산 → trade 1건 (시스템 = 자산당 하루 1거래) · R = 실현손익/그 자산 1R
+            import datetime as _dtd
+            agg = {}
+            for f in fills:
+                a = self._fill_asset(f.get("symbol"))
+                if not a or a not in creds:
+                    continue
+                d = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000,
+                                                _dtd.timezone.utc).date().isoformat()
+                k = (d, a)
+                e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG")})
+                e["pnl"] += float(f.get("pnl") or 0)
+            trades = [{"tid": f"agg-{d}-{a}", "date": d, "instrument": a,
+                       "direction": v["direction"],
+                       "r": round(v["pnl"] / creds[a]["one_r"], 3)}
+                      for (d, a), v in sorted(agg.items())]
+            if not trades:
+                self.log("   체결 없음 — 푸시할 내용이 없습니다.")
+                return
+            self.log(f"   일별 합산 {len(trades)}건 → 푸시 (키·잔고 무전송)")
+            pid = autopilot_crypto.path_id(tok)
+            ok_total = None
+            for i in range(0, len(trades), TR_CHUNK):
+                payload = {"handle": handle, "name": name, "public": public,
+                           "trades": trades[i:i + TR_CHUNK]}
+                blob = autopilot_crypto.encrypt(tok, payload)
+                try:
+                    r = requests.get(PUSH_BASE + "eqpush",
+                                     params={"profile_push": blob, "pid": pid}, timeout=30)
+                    txt = r.text or ""
+                    if "pp:ok" in txt:
+                        import re as _re
+                        m = _re.search(r"pp:ok:(\d+)", txt)
+                        ok_total = m.group(1) if m else "?"
+                    else:
+                        m = None
+                        import re as _re
+                        m = _re.search(r"pp:err:[^<\"]+", txt)
+                        self.log(f"   ❌ 서버 거절: {m.group(0) if m else txt[:120]}")
+                        return
+                except Exception as e:
+                    self.log(f"   ❌ 푸시 실패: {e}")
+                    return
+            self.log(f"   ✅ 동기화 완료 — 서버 누적 {ok_total}건.")
+            if public:
+                self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={handle}")
+            else:
+                self.log("   (비공개 상태 — '공개 동의' 체크 후 다시 푸시하면 페이지가 열립니다)")
+        threading.Thread(target=w, daemon=True).start()
 
     def _resolve_contract(self, b, symbol):
         """현재(활성) 계약ID를 종목으로 자동 조회. 활성 우선, 없으면 첫 결과."""

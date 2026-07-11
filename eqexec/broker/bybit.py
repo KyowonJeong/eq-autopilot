@@ -143,6 +143,33 @@ class BybitBroker(BrokerAdapter):
         return {"entry": res, "stop": bool(stop_loss_price),
                 "stop_error": None if stop_loss_price else "no stop provided"}
 
+    def closed_fills(self, start_ms: int) -> list[dict]:
+        """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
+        GET /v5/position/closed-pnl → [{tid, ts_ms, symbol, pnl, direction}].
+        direction = 포지션 방향(청산 주문 side의 반대: Sell로 닫음 = LONG이었음).
+        ⚠ UNTESTED(실키 검증 전). 실패 시 예외 — 호출측이 로그."""
+        out, cursor = [], ""
+        for _ in range(10):                                 # 최대 10페이지(안전 상한)
+            params = {"category": self.category, "startTime": int(start_ms), "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            d = self._req("GET", "/v5/position/closed-pnl", params)
+            for r in d.get("list", []):
+                try:
+                    out.append({
+                        "tid": str(r.get("orderId") or r.get("execId") or ""),
+                        "ts_ms": int(r.get("updatedTime") or r.get("createdTime") or 0),
+                        "symbol": str(r.get("symbol") or ""),
+                        "pnl": float(r.get("closedPnl") or 0),
+                        "direction": "LONG" if str(r.get("side")).lower() == "sell" else "SHORT",
+                    })
+                except (TypeError, ValueError):
+                    continue
+            cursor = d.get("nextPageCursor") or ""
+            if not cursor:
+                break
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True

@@ -130,6 +130,27 @@ class BitgetBroker(BrokerAdapter):
         return {"entry": res, "stop": bool(stop_loss_price),
                 "stop_error": None if stop_loss_price else "no stop provided"}
 
+    def closed_fills(self, start_ms: int) -> list[dict]:
+        """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
+        GET /api/v2/mix/position/history-position → [{tid, ts_ms, symbol, pnl, direction}].
+        pnl = netProfit 우선(수수료 반영), 없으면 pnl. ⚠ UNTESTED(실키 검증 전)."""
+        d = self._req("GET", "/api/v2/mix/position/history-position",
+                      {"productType": self.product, "startTime": int(start_ms), "limit": 100})
+        rows = d.get("list", d) if isinstance(d, dict) else d
+        out = []
+        for r in (rows or []):
+            try:
+                out.append({
+                    "tid": str(r.get("positionId") or r.get("orderId") or ""),
+                    "ts_ms": int(r.get("utime") or r.get("ctime") or 0),
+                    "symbol": str(r.get("symbol") or ""),
+                    "pnl": float(r.get("netProfit") if r.get("netProfit") is not None else (r.get("pnl") or 0)),
+                    "direction": "LONG" if str(r.get("holdSide")).lower() == "long" else "SHORT",
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True

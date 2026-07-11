@@ -160,6 +160,39 @@ class ProjectXBroker(BrokerAdapter):
             res.errors.append(f"post-flatten position re-check failed: {e}")
         return res
 
+    def closed_fills(self, start_ms: int) -> list[dict]:
+        """실현손익 체결 목록(트랙레코드 푸시용). POST /api/Trade/search {accountId,
+        startTimestamp} → trades[{id, contractId, creationTimestamp, profitAndLoss, side, ...}].
+        profitAndLoss=null은 진입 반턴(half-turn) → 제외, 청산 반턴만 수집.
+        direction = 포지션 방향(청산 체결 side의 반대: 1(sell)로 닫음 = LONG이었음).
+        ⚠ UNTESTED(실키 검증 전). 실패 시 예외 — 호출측이 로그."""
+        from datetime import datetime, timezone
+        start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
+        out = []
+        for a in self._accounts():
+            try:
+                d = self._post("/api/Trade/search",
+                               {"accountId": a["id"], "startTimestamp": start_iso})
+            except Exception:
+                continue
+            for t in d.get("trades", []) or []:
+                pnl = t.get("profitAndLoss")
+                if pnl is None or t.get("voided"):
+                    continue
+                try:
+                    ts = t.get("creationTimestamp") or ""
+                    ts_ms = int(datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp() * 1000)
+                    out.append({
+                        "tid": str(t.get("id") or ""),
+                        "ts_ms": ts_ms,
+                        "symbol": str(t.get("contractId") or ""),     # 예: CON.F.US.MNQ.U25
+                        "pnl": float(pnl) - float(t.get("fees") or 0),
+                        "direction": "LONG" if int(t.get("side") or 0) == 1 else "SHORT",
+                    })
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         self._accounts()
