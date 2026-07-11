@@ -422,20 +422,25 @@ class App:
     def t(self, k):
         return T[k][self.lang]
 
-    def _set_auto_ind(self, on):
-        """Green lit pill while autopilot runs; gray when off."""
+    def _set_auto_ind(self, on, assets=None):
+        """Green lit pill while autopilot runs; gray when off. assets=무장된 자산 목록 병기
+        (전 자산 커버가 아니라 '연결 테스트 통과 자산만'임을 어느 탭에서든 보이게 — 대표 2026-07-11)."""
         try:
-            self.auto_ind.config(text=self.t("auto_on_ind") if on else self.t("auto_off_ind"),
-                                 fg="white" if on else "#666",
+            txt = self.t("auto_on_ind") if on else self.t("auto_off_ind")
+            if on and assets:
+                txt = txt.rstrip() + f" [{'·'.join(assets)}]  "
+            self.auto_ind.config(text=txt, fg="white" if on else "#666",
                                  bg="#22a722" if on else "#dddddd")
         except Exception:
             pass
 
-    def _set_sig_ind(self, on):
-        """Green lit pill while the signal-watch loop runs; gray when off."""
+    def _set_sig_ind(self, on, assets=None):
+        """Green lit pill while the signal-watch loop runs; gray when off. assets=무장 자산 병기."""
         try:
-            self.sig_ind.config(text=self.t("sig_on_ind") if on else self.t("sig_off_ind"),
-                                fg="white" if on else "#666",
+            txt = self.t("sig_on_ind") if on else self.t("sig_off_ind")
+            if on and assets:
+                txt = txt.rstrip() + f" [{'·'.join(assets)}]  "
+            self.sig_ind.config(text=txt, fg="white" if on else "#666",
                                 bg="#22a722" if on else "#dddddd")
         except Exception:
             pass
@@ -642,7 +647,7 @@ class App:
         en(self.b_acc, conn and topstep)
         en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
         # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
-        # 신호 대기는 현재 탭이 아니라 '설정된 모든 자산'을 무장하므로 브로커 종류와 무관.
+        # 신호 대기 무장 = '연결 테스트 통과 자산만'(2026-07-11) — 현재 탭 브로커 종류와는 무관.
         en(self.b_sig, auto)
         # 공개 트랙레코드 푸시 = Autopilot 등급 자격(서버 entitled와 동일 기준: 마스터 스위치 무관,
         # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
@@ -997,13 +1002,18 @@ class App:
             return
         if not self._consent_ok():
             return
-        # 설정된 모든 자산의 (세션 마감시각 × 브로커 creds) 잡을 만든다 — 신호 대기(toggle_sig)와
-        # 동일하게 현재 탭이 아니라 전 자산을 커버. 청산엔 1R 불필요(키만 있으면 됨).
+        # (세션 마감시각 × 브로커 creds) 잡 — '연결 테스트 통과 자산만' 무장(2026-07-11).
+        # 청산엔 1R 불필요(키만 있으면 됨).
         self._save_current_asset()
         jobs = []
         for a, c in self._acfg.items():
             f1 = (c.get("f1") or "").strip()
             if not f1:
+                continue
+            # 자산별 연결 테스트 통과한 것만 무장(대표 2026-07-11 — 신호 대기와 동일 원칙).
+            if not self._conn_by_asset.get(a):
+                self.log(f"➖ {a}: 연결 테스트 미통과 — 자동청산 제외 "
+                         f"({a} 탭에서 '연결 테스트' 통과 후 다시 시작하세요).")
                 continue
             if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
                 self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동청산 제외.")
@@ -1023,7 +1033,7 @@ class App:
         live = bool(self.auto_live.get()) and not self._gate.get("force_dry_run", True)  # 강제 모의 존중
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
-        self._set_auto_ind(True)
+        self._set_auto_ind(True, sorted({j["asset"] for j in jobs}))
         _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                             for j in jobs)
         self.log(f"\n▶ autopilot ON — 세션 마감 자동청산 [{_sumry}] · "
@@ -1145,6 +1155,12 @@ class App:
                 one_r = 0.0
             if not f1 or one_r <= 0:              # 미설정 자산(키 or 1R 없음) 제외
                 continue
+            # 자산별 연결 테스트 통과한 것만 무장(대표 2026-07-11 — NQ만 테스트했는데 GC까지
+            # 자동으로 붙던 버그). 각 자산 탭에서 '연결 테스트'를 통과해야 신호 대기에 포함.
+            if not self._conn_by_asset.get(a):
+                self.log(f"➖ {a}: 연결 테스트 미통과 — 신호 대기 제외 "
+                         f"({a} 탭에서 '연결 테스트' 통과 후 다시 시작하세요).")
+                continue
             if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
                 self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동진입 제외.")
                 continue
@@ -1162,7 +1178,7 @@ class App:
         url = _feed_url(self._token)             # 멤버별 신호 피드
         self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
-        self._set_sig_ind(True)
+        self._set_sig_ind(True, sorted(cfgmap))
         _sumry = " · ".join(f"{a}:{c['broker']}(1R${c['one_r']:g})" for a, c in cfgmap.items())
         self.log(f"\n▶ signal watch ON — {_sumry} · {'LIVE' if live else 'dry-run'}. polling feed")
         threading.Thread(target=self._sig_loop, args=(url, cfgmap, live), daemon=True).start()
