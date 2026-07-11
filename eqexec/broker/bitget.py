@@ -95,6 +95,41 @@ class BitgetBroker(BrokerAdapter):
             res.errors.append(f"post-flatten re-check failed: {e}")
         return res
 
+    @staticmethod
+    def _symbol(sym: str) -> str:
+        """신호 심볼('BTCUSDT.P') → Bitget perp 심볼('BTCUSDT')."""
+        s = str(sym or "").upper().replace(".P", "").replace("-", "").replace("/", "")
+        return s or "BTCUSDT"
+
+    @staticmethod
+    def _fmt_qty(size) -> str:
+        q = round(float(size), 3)
+        return f"{q:.3f}".rstrip("0").rstrip(".") or "0"
+
+    def place_entry(self, *, symbol, side, size, stop_loss_price=None,
+                    dry_run: bool = True, **_ignored) -> dict:
+        """USDT-FUTURES 마켓 진입 (+ presetStopLossPrice 손절 첨부). 크립토엔 account/contract 없음 —
+        symbol·size(BTC 수량)만. ProjectX place_entry와 반환 형태 맞춤(루프 재사용)."""
+        sym = self._symbol(symbol)
+        bside = "buy" if str(side).upper() == "LONG" else "sell"
+        qty = self._fmt_qty(size)
+        if float(qty) <= 0:
+            return {"error": "qty<=0"}
+        margin_mode = getattr(self.cfg, "margin_mode", "crossed")
+        body = {"symbol": sym, "productType": self.product, "marginMode": margin_mode,
+                "marginCoin": "USDT", "side": bside, "orderType": "market", "size": qty}
+        if stop_loss_price:
+            body["presetStopLossPrice"] = str(stop_loss_price)
+        if dry_run:
+            return {"would_place": body,
+                    "would_place_stop": (str(stop_loss_price) if stop_loss_price else None)}
+        try:
+            res = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+        except Exception as e:
+            return {"error": str(e)}
+        return {"entry": res, "stop": bool(stop_loss_price),
+                "stop_error": None if stop_loss_price else "no stop provided"}
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True

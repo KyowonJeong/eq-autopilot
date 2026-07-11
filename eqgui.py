@@ -65,6 +65,18 @@ def _feed_url(token):
 
 # 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
 _BROKERS = ["projectx", "ibkr", "bybit", "bitget", "ninjatrader"]
+
+# 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
+#   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
+#   ⚠️ BTC를 CME MBTC 선물로 안 함 — MBTC는 주말 휴장인데 BTC 엣지가 주말(일요일)에 몰려 있어
+#      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
+_ASSETS = ["NQ", "GC", "BTC"]
+_ASSET_BROKERS = {"NQ": ["projectx", "ibkr"],
+                  "GC": ["projectx", "ibkr"],
+                  "BTC": ["bybit", "bitget"]}
+_ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
+                "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
+                "BTC": {"ko": "비트코인 (BTC)", "en": "Bitcoin (BTC)"}}
 _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
@@ -189,17 +201,20 @@ T = {
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
     "auto_on_ind": {"ko": "  ● 자동 청산 ON  ", "en": "  ● Auto-close ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sec_sig": {"ko": "자동 진입 (실시간 신호 · MNQ)", "en": "Auto-entry (live signal · MNQ)"},
+    "sec_sig": {"ko": "자동 진입 (실시간 신호)", "en": "Auto-entry (live signal)"},
+    "sig_1r": {"ko": "1R ($)", "en": "1R ($)"},
     "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
     "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sig_note": {"ko": "※ 신호의 방향·손절가·수량(MNQ)으로 자동 진입합니다. '사용 계좌'만 고르면 됩니다. "
-                       "이미 포지션이 있으면 중복 진입하지 않습니다(두 군데서 켜도 2배 진입 방지).",
-                 "en": "※ Enters automatically using the signal's direction, stop, and size (MNQ); just pick the "
-                       "account. It won't enter if a position is already open (no doubling even if run in two "
-                       "places)."},
+    "sig_note": {"ko": "※ 신호의 방향·손절가로 자동 진입하고, 계약 수는 위 1R($ 리스크)로 앱이 자동 계산합니다 "
+                       "(신호에 계약 수 없음). 자산은 신호의 종목으로 자동 판별(NQ→MNQ·GC→MGC·BTC→MBTC). "
+                       "'사용 계좌'만 고르면 됩니다. 이미 포지션이 있으면 중복 진입하지 않습니다.",
+                 "en": "※ Enters automatically using the signal's direction and stop; the contract count is computed "
+                       "by the app from your 1R above (the signal carries no contract count). The instrument is "
+                       "detected from the signal (NQ→MNQ · GC→MGC · BTC→MBTC). Just pick the account. It won't "
+                       "enter if a position is already open."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
 }
@@ -257,43 +272,53 @@ def _pin_ok(pin):
 
 
 def _load():
+    """단일 설정 + 자산별 설정(assets={NQ,GC,BTC}) 로드. 하위호환: 옛 flat 키(broker/f1/f3/one_r)는
+    그 브로커를 쓰는 첫 자산 슬롯으로 1회 마이그레이션. 키(f2)는 Keychain에서 async 로드."""
     try:
         import yaml
         with open(CFG_PATH) as f:
             d = yaml.safe_load(f) or {}
-        px = d.get("projectx", {}); a = px.get("accounts") or []
-        user = px.get("user_name", "")
-        # Key is loaded from Keychain ASYNC (after the window is up) so the GUI never blocks on
-        # the `security` subprocess at startup. _load() stays fast (yaml only).
-        return {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
-                "lang": d.get("lang", "ko"), "token": d.get("token", ""),
-                "broker": d.get("broker", "projectx"), "f1": d.get("f1", user),
-                "f3": d.get("f3", "")}
     except Exception:
-        return {"user": "", "key": "", "acct": "", "lang": "ko", "token": "",
-                "broker": "projectx", "f1": "", "f3": ""}
+        d = {}
+    px = d.get("projectx", {}); a = px.get("accounts") or []
+    user = px.get("user_name", "")
+    out = {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
+           "lang": d.get("lang", "ko"), "token": d.get("token", ""),
+           "broker": d.get("broker", "projectx"), "f1": d.get("f1", user),
+           "f3": d.get("f3", ""), "one_r": d.get("one_r", 600)}
+    assets = d.get("assets") or {}
+    acfg = {}
+    for _a in _ASSETS:
+        s = assets.get(_a) or {}
+        brs = _ASSET_BROKERS[_a]
+        acfg[_a] = {"broker": (s.get("broker") if s.get("broker") in brs else brs[0]),
+                    "f1": s.get("f1", ""), "f3": s.get("f3", ""),
+                    "acct": s.get("acct", ""), "one_r": s.get("one_r", 600)}
+    if not assets and out["f1"]:            # 마이그레이션: 옛 flat → 브로커 맞는 첫 자산
+        for _a in _ASSETS:
+            if out["broker"] in _ASSET_BROKERS[_a]:
+                acfg[_a].update({"broker": out["broker"], "f1": out["f1"], "f3": out["f3"],
+                                 "acct": out["acct"], "one_r": out["one_r"]}); break
+    out["assets"] = acfg
+    return out
 
 
-def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None):
-    _kc_save(user, key)                                  # secret(f2) → Keychain only
-    cur = _load()
-    if token is None:
-        token = cur.get("token", "")
-    if broker is None:
-        broker = cur.get("broker", "projectx")
-    if f1 is None:
-        f1 = cur.get("f1", user)
-    if f3 is None:
-        f3 = cur.get("f3", "")
+def _save_full(lang, token, acfg):
+    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token을 yaml에 저장.
+    비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
     try:
         import yaml
+        payload = {"live": False, "lang": lang, "token": token,
+                   "assets": {a: dict(c) for a, c in (acfg or {}).items()}}
         with open(CFG_PATH, "w") as f:
-            yaml.safe_dump({"live": False, "broker": broker, "lang": lang, "token": token,
-                            "f1": f1, "f3": f3,
-                            "projectx": {"base_url": "https://api.topstepx.com", "user_name": user,
-                                         "api_key": "", "accounts": ([acct] if acct else [])}}, f)
+            yaml.safe_dump(payload, f)
     except Exception:
         pass
+
+
+def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None, one_r=None):
+    """(레거시 단일 저장 — 호환용) 비밀만 Keychain에, 나머지는 무시(자산별은 _save_full 사용)."""
+    _kc_save(user or f1 or "", key)
 
 
 class App:
@@ -308,8 +333,11 @@ class App:
         self._sig_on = False
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성
-        self._broker_name = _load().get("broker", "projectx")
-        self._token = _load().get("token", "")
+        _d0 = _load()
+        self._acfg = _d0["assets"]       # 자산별 설정 {NQ,GC,BTC:{broker,f1,f3,acct,one_r}}
+        self._asset = "NQ"               # 현재 편집 중인 자산 탭
+        self._broker_name = self._acfg[self._asset]["broker"]
+        self._token = _d0.get("token", "")
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
                       "caps": {"use": False, "manualentry": False, "autoentry": False},
@@ -398,11 +426,22 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
+        c = self._acur()
+        # ── 자산 탭 (NQ/GC/BTC) — 클릭 시 그 자산의 브로커·키·1R로 스왑 ──
+        atab = ttk.Frame(frm); atab.pack(fill="x", pady=(2, 6))
+        for _a in _ASSETS:
+            _lbl = _ASSET_LABEL[_a]["ko" if self.lang == "ko" else "en"]
+            tk.Button(atab, text=_lbl, command=lambda a=_a: self._on_asset(a),
+                      relief=("sunken" if _a == self._asset else "raised"),
+                      font=("Helvetica", 11, "bold" if _a == self._asset else "normal"),
+                      bg=("#2b6cb0" if _a == self._asset else "#e2e8f0"),
+                      fg=("white" if _a == self._asset else "#333"),
+                      padx=14, pady=4).pack(side="left", padx=(0, 4))
         spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
-        # 브로커 선택
+        # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
         rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
         ttk.Label(rb, text=self.t("broker"), width=18).pack(side="left")
-        self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _BROKERS],
+        self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _ASSET_BROKERS[self._asset]],
                                       state="readonly", width=22)
         self.brokerbox.set(_broker_label(self._broker_name)); self.brokerbox.pack(side="left")
         self.brokerbox.bind("<<ComboboxSelected>>", self._on_broker)
@@ -412,13 +451,13 @@ class App:
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
         self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True)
-        self.user.insert(0, d.get("f1") or d.get("user") or "")
+        self.user.insert(0, c.get("f1", ""))
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
             ttk.Label(r2, text=spec["f2"], width=18).pack(side="left")
             self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True)
-            self.key.insert(0, d["key"]); self.key.config(state="readonly")
+            self.key.config(state="readonly")   # 값은 _async_load_key(c["f1"])가 Keychain서 채움
             self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
             self.b_lock.pack(side="left", padx=(4, 0))
             ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
@@ -430,13 +469,13 @@ class App:
             ttk.Label(r3e, text=spec["f3"], width=18).pack(side="left")
             _mask = "•" if ("Secret" in spec["f3"] or "Passphrase" in spec["f3"]) else ""
             self.f3 = ttk.Entry(r3e, show=_mask); self.f3.pack(side="left", fill="x", expand=True)
-            self.f3.insert(0, d.get("f3", ""))
+            self.f3.insert(0, c.get("f3", ""))
         # 계좌 스코프 — 계좌 개념 있는 브로커만(Topstep/IBKR)
         if spec.get("acct"):
             r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
             ttk.Label(r3, text=self.t("scope"), width=18).pack(side="left")
             self.scope = ttk.Combobox(r3, values=[self.t("all")], state="normal")
-            self.scope.set(d["acct"] or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
+            self.scope.set(c.get("acct") or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
 
         row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
@@ -473,6 +512,10 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_sig"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         sg = ttk.Frame(frm); sg.pack(fill="x", pady=3)
+        ttk.Label(sg, text=self.t("sig_1r")).pack(side="left", padx=(0, 4))
+        self.one_r = ttk.Entry(sg, width=8)
+        self.one_r.insert(0, str(self._acur().get("one_r", 600)))
+        self.one_r.pack(side="left", padx=(0, 14))
         self.sig_live = tk.IntVar()
         self.cb_sig_live = ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live)
         self.cb_sig_live.pack(side="left", padx=(0, 12))
@@ -492,7 +535,7 @@ class App:
         self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig]
         self._apply_gating()
         self.log(self.t("ready"))
-        self._async_load_key(d.get("user", ""))
+        self._async_load_key(self._acur().get("f1", ""))
 
     def _set_actions_enabled(self, on):
         """_busy()용. 작업 중(on=False)엔 전부 잠그고, 끝나면 게이팅 상태로 복원."""
@@ -653,13 +696,44 @@ class App:
     def _f3(self):
         return self.f3.get().strip() if hasattr(self, "f3") else ""
 
+    def _acur(self):
+        """현재 자산 탭의 설정 dict {broker,f1,f3,acct,one_r}."""
+        return self._acfg[self._asset]
+
+    def _save_current_asset(self):
+        """현재 탭의 위젯 값을 self._acfg[현재자산] 슬롯에 저장 + 비밀은 Keychain + yaml 영속화."""
+        c = self._acfg[self._asset]
+        c["broker"] = self._broker_name
+        if hasattr(self, "user"):
+            c["f1"] = self.user.get().strip()
+        c["f3"] = self._f3()
+        c["acct"] = self._scope()
+        if hasattr(self, "one_r"):
+            try:
+                c["one_r"] = float(str(self.one_r.get()).replace(",", "").strip())
+            except (TypeError, ValueError):
+                pass
+        if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
+            _kc_save(c["f1"], self.key.get())
+        _save_full(self.lang, self._token, self._acfg)
+
     def _persist(self):
-        _save(self.user.get().strip(), self._secret(), self._scope(), self.lang,
-              token=self._token, broker=self._broker_name, f1=self.user.get().strip(), f3=self._f3())
+        self._save_current_asset()
+
+    def _on_asset(self, asset):
+        """자산 탭 전환 — 현재 탭 저장 → 자산 바꿈 → 그 자산 브로커로 → 재빌드."""
+        if asset == self._asset or asset not in self._acfg:
+            return
+        self._save_current_asset()
+        self._asset = asset
+        self._broker_name = self._acfg[asset]["broker"]
+        self._connected = False
+        self._unlocked = False
+        self._build()
 
     def _on_broker(self, *_):
         sel = self.brokerbox.get()
-        for b in _BROKERS:
+        for b in _ASSET_BROKERS[self._asset]:    # 이 자산의 브로커 중에서
             if _broker_label(b) == sel:
                 self._broker_name = b
                 break
@@ -918,28 +992,40 @@ class App:
             self._set_sig_ind(False)
             self.log("⏹ signal watch stopped.")
             return
-        if not _BROKER_SPEC.get(self._broker_name, {}).get("futures"):
-            messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
-        if not self._creds_ok() or not self._consent_ok():
+        if not self._consent_ok():
             return
-        sc = self._scope()
-        if not sc:
-            messagebox.showwarning(self.t("scope"), self.t("pick_acct")); return
         if not self._token:
             messagebox.showwarning(self.t("token"), self.t("gate_none")); return
-        # 자동 진입은 '진입(수동)' 섹션과 완전 무관 — 계약(MNQ)·수량·손절가 모두 신호에서 받는다.
-        symbol = "MNQ"                           # auto-trading is MNQ only (not NQ)
-        user, key = self.user.get().strip(), self.key.get().strip()
+        self._save_current_asset()               # 현재 탭 값 반영
+        # 설정된 모든 자산의 creds 스냅샷 (메인 스레드서 Keychain 읽기 — 스레드선 위험).
+        # 루프는 신호의 instrument로 이 맵에서 해당 자산 설정을 찾아 진입한다.
+        cfgmap = {}
+        for a, c in self._acfg.items():
+            f1 = (c.get("f1") or "").strip()
+            try:
+                one_r = float(c.get("one_r", 0))
+            except (TypeError, ValueError):
+                one_r = 0.0
+            if not f1 or one_r <= 0:              # 미설정 자산(키 or 1R 없음) 제외
+                continue
+            _sp = _BROKER_SPEC.get(c["broker"], {})
+            acct = (c.get("acct") or "").strip()
+            if _sp.get("acct") and not acct:      # 선물인데 계좌 없으면 이 자산 제외
+                continue
+            cfgmap[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                         "f3": c.get("f3", ""), "acct": acct, "one_r": one_r}
+        if not cfgmap:
+            messagebox.showwarning(self.t("sig_1r"),
+                                   "자동진입할 자산을 최소 하나 설정하세요 (브로커·키·1R)." if self.lang == "ko"
+                                   else "Configure at least one asset (broker, key, 1R)."); return
         live = bool(self.sig_live.get()) and not self._gate.get("force_dry_run")  # 강제 모의 존중
         url = _feed_url(self._token)             # 멤버별 신호 피드
         self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
         self._set_sig_ind(True)
-        self.log(f"\n▶ signal watch ON — {symbol} · account [{sc}] · "
-                 f"size from signal · {'LIVE' if live else 'dry-run'}. polling member feed")
-        threading.Thread(target=self._sig_loop,
-                         args=(url, user, key, sc, symbol, live),
-                         daemon=True).start()
+        _sumry = " · ".join(f"{a}:{c['broker']}(1R${c['one_r']:g})" for a, c in cfgmap.items())
+        self.log(f"\n▶ signal watch ON — {_sumry} · {'LIVE' if live else 'dry-run'}. polling feed")
+        threading.Thread(target=self._sig_loop, args=(url, cfgmap, live), daemon=True).start()
 
     def _resolve_contract(self, b, symbol):
         """현재(활성) 계약ID를 종목으로 자동 조회. 활성 우선, 없으면 첫 결과."""
@@ -949,12 +1035,14 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    def _sig_loop(self, url, user, key, sc, symbol, live):
+    def _sig_loop(self, url, cfgmap, live):
+        # cfgmap = {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
         import time as _t
         import requests
         import autopilot_crypto
+        from eqexec import sizing
         last_id = None
-        entered_day = None     # 마지막 진입한 '신호 발행 날짜'. 같은 날 재진입 금지, 새 날이면 자동 리셋(내일 새 신호엔 진입)
+        entered_day = {}       # 자산별 {asset: 발행날짜}. 같은 자산 같은 날 재진입 금지, 새 날이면 자동 리셋
         while self._sig_on:
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
@@ -977,6 +1065,16 @@ class App:
                          f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
             if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
                 last_id = sid    # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지)
+                _asset = str(sig.get("instrument") or "").upper()   # NQ/GC/BTC
+                _sess = sig.get("session")                          # BTC 2세션(22/2), 나머지 None
+                _dedup_key = f"{_asset}:{_sess}" if _sess is not None else _asset  # 세션별 재진입 판정
+                cfg = cfgmap.get(_asset)
+                # 이 자산 미설정(탭에 브로커·키·1R 없음) → 진입 안 함. 다른 자산 신호만 처리.
+                if not cfg:
+                    self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산은 자동진입 미설정, 건너뜀.")
+                    _t.sleep(SIG_POLL_SECS); continue
+                _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
+                f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
                 # 신호 발행 시각 → 나이(신선도) + 발행 '날짜'(하루 1회 재진입 판정)
                 import datetime as _dtd
                 _pub_ts = sig.get("published_at")
@@ -986,10 +1084,10 @@ class App:
                                 if _pub_ts is not None else None)
                 except (TypeError, ValueError):
                     _age, _sig_day = None, None
-                # 🚫 재진입 금지(하루 1회): 이 신호의 '발행 날짜'에 이미 진입했으면 새 신호가 와도 스킵
-                # (놓쳤든 청산됐든 같은 날 재진입 X). 앱을 계속 켜놔도 '다음 날 새 신호'엔 자동으로 다시 진입.
-                if _sig_day is not None and entered_day == _sig_day:
-                    self.log(f"\n⏹ 신호 [{sid}] 무시 — 오늘({_sig_day}) 이미 진입함(재진입 금지). "
+                # 🚫 재진입 금지(자산별 하루 1회): 이 자산이 이 '발행 날짜'에 이미 진입했으면 스킵
+                # (놓쳤든 청산됐든 같은 날 같은 자산 재진입 X). 다른 자산·다음 날 새 신호엔 자동 재진입.
+                if _sig_day is not None and entered_day.get(_dedup_key) == _sig_day:
+                    self.log(f"\n⏹ 신호 [{sid}] {_asset} 무시 — 오늘({_sig_day}) 이미 진입함(재진입 금지). "
                              f"다음 날 새 신호에 다시 진입합니다.")
                     _t.sleep(SIG_POLL_SECS)
                     continue
@@ -1002,16 +1100,19 @@ class App:
                         _why = f"발행 {_age:.0f}초 전(1분 초과, 오래됨)"
                     else:
                         _why = f"발행 {_age / 60:.0f}분 전(오래됨)"
-                    self.log(f"\n⏸ 신호 [{sid}] 진입 안 함 — {_why}. 새 신호를 기다립니다.")
+                    self.log(f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 새 신호를 기다립니다.")
                     _t.sleep(SIG_POLL_SECS)
                     continue
-                entered_day = _sig_day   # 이 날 진입 처리 완료 → 같은 날 재진입 금지(성공/실패 무관)
+                entered_day[_dedup_key] = _sig_day   # 이 자산·세션 이 날 진입 처리 완료 → 같은 날 재진입 금지(성공/실패 무관)
                 direction, stop = sig.get("direction"), sig.get("stop_price")
-                try:
-                    size = int(sig.get("contracts") or 0)    # 수량도 신호에서 받는다(MNQ)
-                except (TypeError, ValueError):
-                    size = 0
-                sym = symbol or (sig.get("instrument") or "")
+                # 계약 수 = 사용자 1R($)로 앱이 계산(신호는 contracts 안 줌). 자산+브로커→심볼·포인트값.
+                _sz = sizing.compute_size(_asset, _broker, one_r,
+                                          sig.get("entry_ref"), stop, direction)
+                if not _sz:
+                    self.log(f"\n⏭ 신호 [{sid}] — 사이징 불가(자산 {_asset}·브로커 {_broker}·"
+                             f"진입/손절 확인). 건너뜀."); continue
+                size = _sz["size"]            # 선물=정수 계약 · 크립토=분수 BTC (int() 하면 0.3→0 됨!)
+                sym = _sz["symbol"]
                 # 캡처 순간 로그 — 보낸 시각(피드 published_at) · 받은 시각(now) · 지연 · 포지션 정보.
                 import datetime as _dtl
                 _recv = _dtl.datetime.now()
@@ -1021,40 +1122,48 @@ class App:
                     _lat = f"{_recv.timestamp() - float(_pub):.1f}s"
                 except (TypeError, ValueError):
                     _sent, _lat = None, "?"
-                self.log(f"\n📶 신호 캡처 [{sid}] — {sig.get('instrument') or sym} {direction} x{size}")
-                self.log(f"   포지션: {direction} · 수량 {size} (MNQ) · 손절 {stop} · 진입참조 {sig.get('entry_ref')}")
+                self.log(f"\n📶 신호 캡처 [{sid}] — {_asset or sym} {direction} x{size} {sym}")
+                self.log(f"   포지션: {direction} · 수량 {size} ({sym}) · 손절 {stop} · 진입참조 "
+                         f"{sig.get('entry_ref')} · 1R=${one_r:g}(손절거리 {_sz['risk_pts']})")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
                          f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
-                self.log(f"   → {sym} 계약 조회 → {'LIVE' if live else 'dry-run'} 진입 [{sc}]")
+                _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))
+                self.log(f"   → {sym} @ {_broker} → {'LIVE' if live else 'dry-run'} 진입"
+                         f"{(' [' + sc + ']') if sc else ''}")
                 if size <= 0:
-                    self.log("   ⏭ signal has no contract count (no entry_ref?) — skipping."); continue
+                    self.log(f"   ⏭ 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀."); continue
                 try:
-                    b = ProjectXBroker(ProjectXCfg(base_url="https://api.topstepx.com", user_name=user,
-                                                   api_key=key, accounts=[sc]))
-                    contract = self._resolve_contract(b, sym)
-                    if not contract:
-                        self.log(f"   ❌ no active contract found for '{sym}'."); continue
-                    self.log(f"   contract: {contract}")
-                    match = [a for a in b._accounts()
-                             if str(a.get("name")) == sc or str(a.get("id")) == sc]
-                    if not match:
-                        self.log(f"   ❌ account '{sc}' not found."); continue
-                    aid = match[0]["id"]
-                    # 중복 진입 방지: 그 계좌에 이미 포지션이 있으면 건너뛴다(다른 인스턴스/다른 기기가
-                    # 먼저 진입했거나 미청산). 두 군데서 켜놔도 2배로 안 들어가게.
+                    b = _build_broker(_broker, user, key, f3, [sc] if sc else [])
+                    _aid, _contract = None, None
+                    if _is_fut:
+                        # ── 선물(Topstep/IBKR): 계약 조회 + 계좌 id + place_entry(account_id, contract_id) ──
+                        _contract = self._resolve_contract(b, sym)
+                        if not _contract:
+                            self.log(f"   ❌ '{sym}' 활성 계약 없음."); continue
+                        self.log(f"   contract: {_contract}")
+                        match = [a for a in b._accounts()
+                                 if str(a.get("name")) == sc or str(a.get("id")) == sc]
+                        if not match:
+                            self.log(f"   ❌ 계좌 '{sc}' 없음."); continue
+                        _aid = match[0]["id"]
+                    # 중복 진입 방지: 이미 포지션 있으면 스킵(다른 인스턴스/기기 선진입·미청산). 2배 방지.
                     existing = b.list_open_positions()
                     if existing:
                         if live:
-                            self.log(f"   ⏭ already in a position ({len(existing)}) — "
-                                     f"skipping to avoid doubling.")
-                            continue
-                        self.log(f"   (note) already in a position ({len(existing)}) — LIVE would skip.")
-                    # customTag은 ProjectX에서 '계좌당 유일'해야 함 → 고정값 쓰면 두 번째 진입부터
-                    # errorCode=2("custom tag already in use"). 매 진입마다 ms 타임스탬프로 유니크하게.
-                    res = b.place_entry(account_id=aid, contract_id=contract, side=direction,
-                                        size=size, order_type=2, stop_loss_price=stop,
-                                        custom_tag=f"EQ-AP-{int(_recv.timestamp() * 1000)}",
-                                        dry_run=not live)
+                            self.log(f"   ⏭ 이미 포지션 {len(existing)}개 — 중복 진입 방지 스킵."); continue
+                        self.log(f"   (note) 이미 포지션 {len(existing)}개 — LIVE였으면 스킵.")
+                    if _is_fut:
+                        # customTag은 ProjectX '계좌당 유일' 필요 → ms 타임스탬프로 유니크.
+                        res = b.place_entry(account_id=_aid, contract_id=_contract, side=direction,
+                                            size=size, order_type=2, stop_loss_price=stop,
+                                            custom_tag=f"EQ-AP-{int(_recv.timestamp() * 1000)}",
+                                            dry_run=not live)
+                    else:
+                        # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
+                        res = b.place_entry(symbol=sym, side=direction, size=size,
+                                            stop_loss_price=stop, dry_run=not live)
+                    if res.get("error"):
+                        self.log(f"   ❌ 진입 실패: {res.get('error')}"); continue
                     if not live:
                         self.log(f"   DRY-RUN entry: {res.get('would_place')}")
                         if res.get("would_place_stop"):
@@ -1063,9 +1172,8 @@ class App:
                         self.log(f"   ✅ 진입 완료: {res.get('entry', res)}")
                         if res.get("stop"):
                             self.log("   🛡 보호 손절 거치 완료.")
-                        elif res.get("stop_error"):
-                            self._handle_stop_failure(b, aid, contract, direction, size,
-                                                      stop, res)
+                        elif res.get("stop_error") and _is_fut:  # 선물만 별도 손절 재시도(크립토는 첨부라 불필요)
+                            self._handle_stop_failure(b, _aid, _contract, direction, size, stop, res)
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")
             _t.sleep(SIG_POLL_SECS)

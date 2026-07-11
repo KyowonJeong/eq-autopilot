@@ -105,6 +105,44 @@ class BybitBroker(BrokerAdapter):
             res.errors.append(f"post-flatten re-check failed: {e}")
         return res
 
+    @staticmethod
+    def _symbol(sym: str) -> str:
+        """신호 심볼('BTCUSDT.P')/기타 → Bybit perp 심볼('BTCUSDT')."""
+        s = str(sym or "").upper().replace(".P", "").replace("-", "").replace("/", "")
+        return s or "BTCUSDT"
+
+    @staticmethod
+    def _fmt_qty(size) -> str:
+        """BTC 수량 → 문자열(랏 0.001, 소수 3자리). float '2.0' 재포맷 회피용 rstrip."""
+        q = round(float(size), 3)
+        return f"{q:.3f}".rstrip("0").rstrip(".") or "0"
+
+    def place_entry(self, *, symbol, side, size, stop_loss_price=None,
+                    dry_run: bool = True, **_ignored) -> dict:
+        """USDT perp 마켓 진입 (+ 손절 첨부). 크립토엔 account_id/contract 개념 없음 —
+        symbol·qty(BTC 수량)만. stopLoss는 주문에 붙여 포지션 손절로 건다(별도 주문 불필요).
+        ProjectX place_entry와 반환 형태 맞춤(루프 재사용): would_place/entry/stop/stop_error."""
+        sym = self._symbol(symbol)
+        bside = "Buy" if str(side).upper() == "LONG" else "Sell"
+        qty = self._fmt_qty(size)
+        if float(qty) <= 0:
+            return {"error": "qty<=0"}
+        body = {"category": self.category, "symbol": sym, "side": bside,
+                "orderType": "Market", "qty": qty, "reduceOnly": False}
+        if stop_loss_price:
+            body["stopLoss"] = str(stop_loss_price)
+            body["slTriggerBy"] = "LastPrice"
+        if dry_run:
+            return {"would_place": body,
+                    "would_place_stop": (str(stop_loss_price) if stop_loss_price else None)}
+        try:
+            res = self._req("POST", "/v5/order/create", body=body)
+        except Exception as e:
+            return {"error": str(e)}
+        # stopLoss는 진입 주문에 첨부돼 함께 체결 → 진입 성공 = 손절도 설정됨.
+        return {"entry": res, "stop": bool(stop_loss_price),
+                "stop_error": None if stop_loss_price else "no stop provided"}
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True
