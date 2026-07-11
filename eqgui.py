@@ -384,6 +384,10 @@ class App:
         self.frm = None
         self._auto_on = False
         self._sig_on = False
+        # 자산별 무장 상태(대표 2026-07-11): 자동청산/자동진입은 자산마다 독립 토글,
+        # 탭 전환은 보기 전환일 뿐 무장 상태를 절대 안 바꾼다. _*_on은 '루프 살아있음' 플래그.
+        self._auto_jobs = {}    # {asset: [job,...]}
+        self._sig_assets = {}   # {asset: cfg}
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성 (현재 탭 기준)
         self._conn_by_asset = {}         # 자산별 연결테스트 통과 기억 — 탭 전환이 리셋 안 시킴
@@ -495,8 +499,8 @@ class App:
             tk.Button(atab, text=_lbl, command=lambda a=_a: self._on_asset(a),
                       relief=("sunken" if _a == self._asset else "raised"),
                       font=("Helvetica", 11, "bold" if _a == self._asset else "normal"),
-                      bg=("#2b6cb0" if _a == self._asset else "#e2e8f0"),
-                      fg=("white" if _a == self._asset else "#333"),
+                      bg=("#eaf7ee" if _a == self._asset else "#e2e8f0"),
+                      fg=("#178a3a" if _a == self._asset else "#333"),   # 선택=초록(흰색 안 보임, 대표 2026-07-11)
                       padx=14, pady=4).pack(side="left", padx=(0, 4))
         spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
         # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
@@ -565,11 +569,11 @@ class App:
             self.auto_live = tk.IntVar()             # 탭 전환에도 LIVE 선택 유지
         self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
         self.cb_auto_live.pack(side="left", padx=(0, 10))
-        self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._auto_on else self.t("auto_start"),
+        self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._asset in self._auto_jobs else self.t("auto_start"),
                                  command=self.toggle_auto); self.b_auto.pack(side="left")
         self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
         self.auto_ind.pack(side="left", padx=(10, 0))
-        self._set_auto_ind(self._auto_on)
+        self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
         ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -583,11 +587,11 @@ class App:
             self.sig_live = tk.IntVar()              # 탭 전환에도 LIVE 선택 유지
         self.cb_sig_live = ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live)
         self.cb_sig_live.pack(side="left", padx=(0, 12))
-        self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._sig_on else self.t("sig_start"),
+        self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._asset in self._sig_assets else self.t("sig_start"),
                                 command=self.toggle_sig); self.b_sig.pack(side="left")
         self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
         self.sig_ind.pack(side="left", padx=(10, 0))
-        self._set_sig_ind(self._sig_on)
+        self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
         ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
 
@@ -669,10 +673,12 @@ class App:
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
         if getattr(self, "_sig_on", False) and not perm_auto:
             self._sig_on = False
+            self._sig_assets.clear()
             self.b_sig.config(text=self.t("sig_start")); self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
+            self._auto_jobs.clear()
             self.b_auto.config(text=self.t("auto_start")); self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
         self._update_gate_label()
@@ -994,52 +1000,59 @@ class App:
         self._run(w)
 
     def toggle_auto(self):
-        if self._auto_on:
-            self._auto_on = False
+        """자동청산 토글 — **현재 자산만** 무장/해제(대표 2026-07-11). 탭 전환은 무장에 무영향.
+        루프는 무장 자산이 하나라도 있으면 돌고, self._auto_jobs를 매 사이클 동적으로 읽는다."""
+        a = self._asset
+        if a in self._auto_jobs:
+            del self._auto_jobs[a]
+            if not self._auto_jobs:
+                self._auto_on = False
             self.b_auto.config(text=self.t("auto_start"))
-            self._set_auto_ind(False)
-            self.log("⏹ autopilot stopped.")
+            self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
+            self.log(f"⏹ {a} 자동청산 해제." + ("" if self._auto_jobs else " (무장 자산 없음 — 루프 종료)"))
             return
         if not self._consent_ok():
             return
-        # (세션 마감시각 × 브로커 creds) 잡 — '연결 테스트 통과 자산만' 무장(2026-07-11).
-        # 청산엔 1R 불필요(키만 있으면 됨).
         self._save_current_asset()
-        jobs = []
-        for a, c in self._acfg.items():
-            f1 = (c.get("f1") or "").strip()
-            if not f1:
-                continue
-            # 자산별 연결 테스트 통과한 것만 무장(대표 2026-07-11 — 신호 대기와 동일 원칙).
-            if not self._conn_by_asset.get(a):
-                self.log(f"➖ {a}: 연결 테스트 미통과 — 자동청산 제외 "
-                         f"({a} 탭에서 '연결 테스트' 통과 후 다시 시작하세요).")
-                continue
-            if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
-                self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동청산 제외.")
-                continue
-            _sp = _BROKER_SPEC.get(c["broker"], {})
-            acct = (c.get("acct") or "").strip()
-            if _sp.get("acct") and not acct:
-                continue
-            cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                    "f3": c.get("f3", ""), "acct": acct}
-            for tzname, hour in _ASSET_EXITS.get(a, []):
-                jobs.append({"asset": a, "tz": tzname, "hour": hour, **cred})
-        if not jobs:
+        c = self._acfg[a]
+        f1 = (c.get("f1") or "").strip()
+        if not f1:
             messagebox.showwarning(self.t("input_needed"),
-                                   "자동청산할 자산을 최소 하나 설정하세요 (브로커·키)." if self.lang == "ko"
-                                   else "Configure at least one asset (broker & key)."); return
+                                   f"{a}: 브로커 키를 입력하세요." if self.lang == "ko"
+                                   else f"{a}: enter the broker key."); return
+        # 자산별 연결 테스트 통과 필수(대표 2026-07-11)
+        if not self._conn_by_asset.get(a):
+            messagebox.showwarning(self.t("btn_conn"),
+                                   f"{a}: 먼저 '연결 테스트'를 통과하세요." if self.lang == "ko"
+                                   else f"{a}: pass 'Test connection' first."); return
+        if not self._broker_allowed(c["broker"]):
+            self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동청산 불가.")
+            return
+        _sp = _BROKER_SPEC.get(c["broker"], {})
+        acct = (c.get("acct") or "").strip()
+        if _sp.get("acct") and not acct:
+            messagebox.showwarning(self.t("input_needed"),
+                                   f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
+                                   else f"{a}: pick an account."); return
+        cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                "f3": c.get("f3", ""), "acct": acct}
+        jobs = [{"asset": a, "tz": tzname, "hour": hour, **cred}
+                for tzname, hour in _ASSET_EXITS.get(a, [])]
+        if not jobs:
+            self.log(f"➖ {a}: 세션 마감 스케줄 없음 — 자동청산 미지원.")
+            return
+        self._auto_jobs[a] = jobs
         live = bool(self.auto_live.get()) and not self._gate.get("force_dry_run", True)  # 강제 모의 존중
-        self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
-        self._set_auto_ind(True, sorted({j["asset"] for j in jobs}))
+        self._set_auto_ind(True, sorted(self._auto_jobs))
         _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                             for j in jobs)
-        self.log(f"\n▶ autopilot ON — 세션 마감 자동청산 [{_sumry}] · "
+        self.log(f"\n▶ {a} 자동청산 무장 [{_sumry}] · 현재 무장: {'·'.join(sorted(self._auto_jobs))} · "
                  f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
         self.log(f"   {self.t('warn_mix')}")
-        threading.Thread(target=self._auto_loop, args=(jobs, live), daemon=True).start()
+        if not self._auto_on:
+            self._auto_on = True
+            threading.Thread(target=self._auto_loop, args=(live,), daemon=True).start()
 
     def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
         """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
@@ -1075,8 +1088,9 @@ class App:
         except Exception as ce:
             self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
 
-    def _auto_loop(self, jobs, live_flag):
-        """자산별 세션 마감 자동청산. jobs=[{asset,tz,hour,broker,f1,f2,f3,acct}] — 각 잡은
+    def _auto_loop(self, live_flag):
+        """자산별 세션 마감 자동청산. 잡은 self._auto_jobs에서 매 사이클 동적으로 읽는다
+        (자산별 무장/해제 즉시 반영 — 대표 2026-07-11). 각 잡은
         자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten.
         같은 선물계좌의 NQ(14 ET)·GC(06 ET)는 세션이 안 겹쳐 flatten_all이 서로를 안 건드리고,
         BTC 02:00 UTC flatten은 다음(02-06) 세션 신호 발행(예측 계산 수 분)보다 항상 먼저 끝난다.
@@ -1084,16 +1098,21 @@ class App:
         import time as _t
         fired = {}                                     # {(asset,hour): 그 tz의 날짜}
         _tzs = {}
-        for j in jobs:
-            try:
-                _tzs[j["tz"]] = ZoneInfo(j["tz"]) if ZoneInfo else None
-            except Exception as e:
-                # Windows 등 tzdata 미동봉이면 청산이 조용히 죽는다 → 드러내고 로컬시각 폴백. (2026-06-30)
-                _tzs[j["tz"]] = None
-                self.log(f"⚠ 타임존 로드 실패({j['tz']}: {e!r}) — tzdata 누락 의심. 로컬 시각 폴백, 청산 시각 확인!")
+
+        def _tz(name):
+            if name not in _tzs:
+                try:
+                    _tzs[name] = ZoneInfo(name) if ZoneInfo else None
+                except Exception as e:
+                    # Windows 등 tzdata 미동봉이면 청산이 조용히 죽는다 → 드러내고 로컬시각 폴백. (2026-06-30)
+                    _tzs[name] = None
+                    self.log(f"⚠ 타임존 로드 실패({name}: {e!r}) — tzdata 누락 의심. 로컬 시각 폴백, 청산 시각 확인!")
+            return _tzs[name]
+
         while self._auto_on:
+            jobs = [j for jl in list(self._auto_jobs.values()) for j in jl]   # 무장 자산 동적 스냅샷
             for j in jobs:
-                now = _dt.datetime.now(_tzs.get(j["tz"]))
+                now = _dt.datetime.now(_tz(j["tz"]))
                 today = now.strftime("%Y-%m-%d")
                 key = (j["asset"], j["hour"])
                 cur = now.hour * 60 + now.minute
@@ -1133,55 +1152,58 @@ class App:
 
     # ── auto-ENTRY on EdgeQuant signal ──────────────────────────────────────
     def toggle_sig(self):
-        if self._sig_on:
-            self._sig_on = False
+        """신호 대기(자동진입) 토글 — **현재 자산만** 무장/해제(대표 2026-07-11). 탭 전환 무영향.
+        루프는 무장 자산이 하나라도 있으면 돌고, self._sig_assets를 신호 처리 시 동적으로 읽는다."""
+        a = self._asset
+        if a in self._sig_assets:
+            del self._sig_assets[a]
+            if not self._sig_assets:
+                self._sig_on = False
             self.b_sig.config(text=self.t("sig_start"))
-            self._set_sig_ind(False)
-            self.log("⏹ signal watch stopped.")
+            self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+            self.log(f"⏹ {a} 신호 대기 해제." + ("" if self._sig_assets else " (무장 자산 없음 — 루프 종료)"))
             return
         if not self._consent_ok():
             return
         if not self._token:
             messagebox.showwarning(self.t("token"), self.t("gate_none")); return
         self._save_current_asset()               # 현재 탭 값 반영
-        # 설정된 모든 자산의 creds 스냅샷 (메인 스레드서 Keychain 읽기 — 스레드선 위험).
-        # 루프는 신호의 instrument로 이 맵에서 해당 자산 설정을 찾아 진입한다.
-        cfgmap = {}
-        for a, c in self._acfg.items():
-            f1 = (c.get("f1") or "").strip()
-            try:
-                one_r = float(c.get("one_r", 0))
-            except (TypeError, ValueError):
-                one_r = 0.0
-            if not f1 or one_r <= 0:              # 미설정 자산(키 or 1R 없음) 제외
-                continue
-            # 자산별 연결 테스트 통과한 것만 무장(대표 2026-07-11 — NQ만 테스트했는데 GC까지
-            # 자동으로 붙던 버그). 각 자산 탭에서 '연결 테스트'를 통과해야 신호 대기에 포함.
-            if not self._conn_by_asset.get(a):
-                self.log(f"➖ {a}: 연결 테스트 미통과 — 신호 대기 제외 "
-                         f"({a} 탭에서 '연결 테스트' 통과 후 다시 시작하세요).")
-                continue
-            if not self._broker_allowed(c["broker"]):   # 서버가 끈 브로커(admin 토글) 제외
-                self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동진입 제외.")
-                continue
-            _sp = _BROKER_SPEC.get(c["broker"], {})
-            acct = (c.get("acct") or "").strip()
-            if _sp.get("acct") and not acct:      # 선물인데 계좌 없으면 이 자산 제외
-                continue
-            cfgmap[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                         "f3": c.get("f3", ""), "acct": acct, "one_r": one_r}
-        if not cfgmap:
+        c = self._acfg[a]
+        f1 = (c.get("f1") or "").strip()
+        try:
+            one_r = float(c.get("one_r", 0))
+        except (TypeError, ValueError):
+            one_r = 0.0
+        if not f1 or one_r <= 0:
             messagebox.showwarning(self.t("sig_1r"),
-                                   "자동진입할 자산을 최소 하나 설정하세요 (브로커·키·1R)." if self.lang == "ko"
-                                   else "Configure at least one asset (broker, key, 1R)."); return
+                                   f"{a}: 브로커 키와 1R 금액을 설정하세요." if self.lang == "ko"
+                                   else f"{a}: set the broker key and 1R amount."); return
+        # 자산별 연결 테스트 통과 필수(대표 2026-07-11 — NQ만 테스트했는데 GC까지 붙던 버그)
+        if not self._conn_by_asset.get(a):
+            messagebox.showwarning(self.t("btn_conn"),
+                                   f"{a}: 먼저 '연결 테스트'를 통과하세요." if self.lang == "ko"
+                                   else f"{a}: pass 'Test connection' first."); return
+        if not self._broker_allowed(c["broker"]):
+            self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동진입 불가.")
+            return
+        _sp = _BROKER_SPEC.get(c["broker"], {})
+        acct = (c.get("acct") or "").strip()
+        if _sp.get("acct") and not acct:
+            messagebox.showwarning(self.t("input_needed"),
+                                   f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
+                                   else f"{a}: pick an account."); return
+        self._sig_assets[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                               "f3": c.get("f3", ""), "acct": acct, "one_r": one_r}
         live = bool(self.sig_live.get()) and not self._gate.get("force_dry_run")  # 강제 모의 존중
-        url = _feed_url(self._token)             # 멤버별 신호 피드
-        self._sig_on = True
         self.b_sig.config(text=self.t("sig_stop"))
-        self._set_sig_ind(True, sorted(cfgmap))
-        _sumry = " · ".join(f"{a}:{c['broker']}(1R${c['one_r']:g})" for a, c in cfgmap.items())
-        self.log(f"\n▶ signal watch ON — {_sumry} · {'LIVE' if live else 'dry-run'}. polling feed")
-        threading.Thread(target=self._sig_loop, args=(url, cfgmap, live), daemon=True).start()
+        self._set_sig_ind(True, sorted(self._sig_assets))
+        _sumry = " · ".join(f"{k}:{v['broker']}(1R${v['one_r']:g})" for k, v in sorted(self._sig_assets.items()))
+        self.log(f"\n▶ {a} 신호 대기 무장 — 현재 무장 [{_sumry}] · {'LIVE' if live else 'dry-run'}.")
+        if not self._sig_on:
+            self._sig_on = True
+            url = _feed_url(self._token)             # 멤버별 신호 피드
+            self.log("   polling feed")
+            threading.Thread(target=self._sig_loop, args=(url, live), daemon=True).start()
 
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod
@@ -1327,8 +1349,9 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
-    def _sig_loop(self, url, cfgmap, live_flag):
-        # cfgmap = {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
+    def _sig_loop(self, url, live_flag):
+        # 무장 자산 설정은 self._sig_assets에서 동적으로 읽는다(자산별 무장/해제 즉시 반영).
+        # {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
         import time as _t
         import requests
         import autopilot_crypto
@@ -1360,7 +1383,7 @@ class App:
                 _asset = str(sig.get("instrument") or "").upper()   # NQ/GC/BTC
                 _sess = sig.get("session")                          # BTC 2세션(22/2), 나머지 None
                 _dedup_key = f"{_asset}:{_sess}" if _sess is not None else _asset  # 세션별 재진입 판정
-                cfg = cfgmap.get(_asset)
+                cfg = self._sig_assets.get(_asset)   # 동적 — 미무장 자산 신호는 스킵
                 # 이 자산 미설정(탭에 브로커·키·1R 없음) → 진입 안 함. 다른 자산 신호만 처리.
                 if not cfg:
                     self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산은 자동진입 미설정, 건너뜀.")
