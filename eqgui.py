@@ -204,16 +204,16 @@ T = {
     "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
                   "en": "Entry requires a single account in 'Account' (not all)."},
     "sec_tr": {"ko": "공개 트랙레코드 (Autopilot)", "en": "Public track record (Autopilot)"},
-    "tr_handle": {"ko": "핸들", "en": "Handle"},
-    "tr_name": {"ko": "표시 이름", "en": "Display name"},
     "tr_public": {"ko": "공개 동의", "en": "Make public"},
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
     "tr_note": {"ko": "※ 앱이 브로커 체결 기록을 이 컴퓨터에서 R로 변환해 요약만 서버로 보냅니다 — "
-                      "API 키·잔고·계좌금액은 절대 전송 안 됨. 공개 페이지: app.edgequant.app/?u=핸들 "
+                      "API 키·잔고·계좌금액은 절대 전송 안 됨. 핸들·표시 이름은 회원 계정"
+                      "(텔레그램/디스코드)에서 자동 설정되며, 공개 페이지 주소는 동기화 후 아래에 표시됩니다 "
                       "(공개 동의 체크 시에만 노출, 언제든 해제 가능).",
                 "en": "※ The app converts your broker fills to R locally and pushes only the summary — "
-                      "API keys, balances and account size are never sent. Public page: "
-                      "app.edgequant.app/?u=<handle> (visible only while 'Make public' is on)."},
+                      "API keys, balances and account size are never sent. Your handle & display name are "
+                      "set automatically from your member account (Telegram/Discord); the public page URL "
+                      "appears below after syncing (visible only while 'Make public' is on)."},
     "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
@@ -322,8 +322,7 @@ def _load():
                                  "acct": out["acct"], "one_r": out["one_r"]}); break
     out["assets"] = acfg
     _p = d.get("profile") or {}
-    out["profile"] = {"handle": _p.get("handle", ""), "name": _p.get("name", ""),
-                      "public": bool(_p.get("public"))}
+    out["profile"] = {"public": bool(_p.get("public"))}   # 핸들·이름은 서버 자동(2026-07-11) — 저장 안 함
     return out
 
 
@@ -590,14 +589,9 @@ class App:
         # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        # 핸들·이름 입력 제거(대표 2026-07-11) — 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정.
         tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
         _prof = self._profile
-        ttk.Label(tr, text=self.t("tr_handle")).pack(side="left", padx=(0, 4))
-        self.tr_handle = ttk.Entry(tr, width=14)
-        self.tr_handle.insert(0, _prof.get("handle", "")); self.tr_handle.pack(side="left", padx=(0, 10))
-        ttk.Label(tr, text=self.t("tr_name")).pack(side="left", padx=(0, 4))
-        self.tr_name = ttk.Entry(tr, width=14)
-        self.tr_name.insert(0, _prof.get("name", "")); self.tr_name.pack(side="left", padx=(0, 10))
         self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
         ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
         self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
@@ -1191,14 +1185,9 @@ class App:
         키·잔고 무전송. 서버는 tid로 멱등 병합 → 페이지(?u=핸들) 즉시 갱신."""
         if not self._consent_ok():
             return
-        handle = self.tr_handle.get().strip().lower()
-        name = self.tr_name.get().strip()
+        # 핸들·이름은 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정(대표 2026-07-11) — 앱은 안 보냄.
         public = bool(self.tr_public.get())
-        if not handle:
-            messagebox.showwarning(self.t("input_needed"),
-                                   "핸들을 입력하세요 (a-z, 0-9, -, _ / 3~20자)." if self.lang == "ko"
-                                   else "Enter a handle (a-z, 0-9, -, _ / 3-20 chars)."); return
-        self._profile = {"handle": handle, "name": name, "public": public}
+        self._profile = {"public": public}
         self._save_current_asset()                          # 프로필 포함 영속화
         # creds 스냅샷(메인 스레드) — 설정된 자산만
         creds = {}
@@ -1221,8 +1210,8 @@ class App:
                                    "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
                                    else "No asset has broker credentials configured."); return
         tok = self._token
-        self.log(f"\n📤 트랙레코드 동기화 — 핸들 [{handle}] · {'공개' if public else '비공개'} · "
-                 f"최근 {TR_LOOKBACK_DAYS}일 체결 수집…")
+        self.log(f"\n📤 트랙레코드 동기화 — {'공개' if public else '비공개'} · "
+                 f"최근 {TR_LOOKBACK_DAYS}일 체결 수집… (핸들·이름은 계정에서 자동)")
 
         def w():
             import time as _t
@@ -1267,10 +1256,9 @@ class App:
                 return
             self.log(f"   일별 합산 {len(trades)}건 → 푸시 (키·잔고 무전송)")
             pid = autopilot_crypto.path_id(tok)
-            ok_total = None
+            ok_total, srv_handle = None, None
             for i in range(0, len(trades), TR_CHUNK):
-                payload = {"handle": handle, "name": name, "public": public,
-                           "trades": trades[i:i + TR_CHUNK]}
+                payload = {"public": public, "trades": trades[i:i + TR_CHUNK]}
                 blob = autopilot_crypto.encrypt(tok, payload)
                 try:
                     r = requests.get(PUSH_BASE + "eqpush",
@@ -1278,10 +1266,11 @@ class App:
                     txt = r.text or ""
                     if "pp:ok" in txt:
                         import re as _re
-                        m = _re.search(r"pp:ok:(\d+)", txt)
-                        ok_total = m.group(1) if m else "?"
+                        m = _re.search(r"pp:ok:(\d+)(?::([a-z0-9_-]+))?", txt)
+                        if m:
+                            ok_total = m.group(1)
+                            srv_handle = m.group(2) or srv_handle
                     else:
-                        m = None
                         import re as _re
                         m = _re.search(r"pp:err:[^<\"]+", txt)
                         self.log(f"   ❌ 서버 거절: {m.group(0) if m else txt[:120]}")
@@ -1290,8 +1279,10 @@ class App:
                     self.log(f"   ❌ 푸시 실패: {e}")
                     return
             self.log(f"   ✅ 동기화 완료 — 서버 누적 {ok_total}건.")
-            if public:
-                self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={handle}")
+            if public and srv_handle:
+                self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={srv_handle}")
+            elif public:
+                self.log("   🔗 공개 페이지 주소는 서버가 핸들 배정 후 다음 동기화에 표시됩니다.")
             else:
                 self.log("   (비공개 상태 — '공개 동의' 체크 후 다시 푸시하면 페이지가 열립니다)")
         threading.Thread(target=w, daemon=True).start()
