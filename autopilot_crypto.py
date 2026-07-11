@@ -6,7 +6,7 @@
 #   암호화    = SHA256-CTR 스트림 + HMAC-SHA256 (encrypt-then-MAC)
 #   키        = 토큰에서 파생(enc/mac 분리). 토큰 없으면 경로도 못 찾고 내용도 못 푼다.
 # 토큰을 가진 본인(멤버 앱)과 서버만 복호화 가능. 파일/URL이 새도 평문 노출 X.
-# ⚠ 서버(autopilot_feed/hb)와 앱(eqgui/eqgui_close)이 같은 파일을 써야 한다(동일 복사본 유지).
+# ⚠ 서버(autopilot_feed/hb)와 앱(eqgui)이 같은 파일을 써야 한다(동일 복사본 유지).
 # =========================
 import base64
 import hashlib

@@ -48,6 +48,12 @@ URL_FREE_TG = "https://t.me/EdgeQuantSignalBot?start=token"  # 봇이 토큰 DM
 APP_BASE = "https://app.edgequant.app/app/static"
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
+# 자산별 세션 청산 시각(거래봉 마감, 서버 archive_resolver._WINDOW와 동일 상수) — 자동청산은
+# 사용자가 시각을 고르는 게 아니라 시스템 세션 마감에 자동으로 맞춘다(3자산·BTC 2세션).
+#   NQ 10-14 ET → 14:00 ET · GC 02-06 ET → 06:00 ET · BTC 22-02/02-06 UTC → 02:00·06:00 UTC
+_ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)],
+                "BTC": [("UTC", 2), ("UTC", 6)]}
+AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
@@ -194,8 +200,9 @@ T = {
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
     "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
                   "en": "Entry requires a single account in 'Account' (not all)."},
-    "sec_auto": {"ko": "자동 청산 (매일 지정 시각)", "en": "Auto-close (daily at the set time)"},
-    "cutoff": {"ko": "청산 시각(ET)", "en": "Close time (ET)"},
+    "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
+    "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
+                   "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 청산 시작", "en": "Start auto-close"},
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
@@ -215,8 +222,8 @@ T = {
                        "by the app from your 1R above (the signal carries no contract count). The instrument is "
                        "detected from the signal (NQ→MNQ · GC→MGC · BTC→MBTC). Just pick the account. It won't "
                        "enter if a position is already open."},
-    "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 매일 그 시각에 '사용 계좌'를 청산합니다.",
-                  "en": "※ App must stay open and the computer awake. Closes the chosen account daily at that time."},
+    "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 설정된 각 자산의 세션 마감 시각에 그 자산 브로커를 청산합니다.",
+                  "en": "※ App must stay open and the computer awake. Each configured asset's broker is flattened at its session close."},
 }
 
 
@@ -497,8 +504,8 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
-        ttk.Label(af, text=self.t("cutoff")).pack(side="left")
-        self.cutoff = ttk.Entry(af, width=7); self.cutoff.insert(0, "14:00"); self.cutoff.pack(side="left", padx=(2, 10))
+        # 청산 시각 = 시스템 세션 마감(자산별 자동, _ASSET_EXITS) — 사용자 입력 제거(2026-07-11).
+        ttk.Label(af, text=self.t("auto_sched"), foreground="#888").pack(side="left", padx=(0, 10))
         self.auto_live = tk.IntVar()
         self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
         self.cb_auto_live.pack(side="left", padx=(0, 10))
@@ -559,7 +566,6 @@ class App:
         auto = bool(master and caps.get("autoentry"))
         live_ok = not g.get("force_dry_run", True)
 
-        fut = bool(_BROKER_SPEC.get(self._broker_name, {}).get("futures"))  # 자동 진입=선물(Topstep)만
         topstep = self._broker_name == "projectx"
 
         def en(b, ok):
@@ -569,7 +575,9 @@ class App:
                 pass
         en(self.b_acc, conn and topstep)
         en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
-        en(self.b_sig, auto and fut)
+        # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
+        # 신호 대기는 현재 탭이 아니라 '설정된 모든 자산'을 무장하므로 브로커 종류와 무관.
+        en(self.b_sig, auto)
         for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
             try:
                 if not live_ok:
@@ -580,7 +588,7 @@ class App:
                 pass
         # fail-closed: 돌던 루프가 권한을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
         # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
-        if getattr(self, "_sig_on", False) and not (auto and fut):
+        if getattr(self, "_sig_on", False) and not auto:
             self._sig_on = False
             self.b_sig.config(text=self.t("sig_start")); self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
@@ -629,8 +637,12 @@ class App:
             pass
 
     def _heartbeat(self, periodic=False):
-        """멤버십 토큰으로 hb-<token>.json을 읽어 권한(_gate) 갱신. 실패/만료/철회 = fail-closed."""
+        """멤버십 토큰으로 hb-<token>.json을 읽어 권한(_gate) 갱신. 실패/만료/철회 = fail-closed.
+        하드닝(2026-07-11): timeout 8→15 + 네트워크 일시 오류 1회 재시도 — 경로 순단으로
+        회원이 억울하게 잠기는(깜빡 잠김) 오발 감소. 서버가 명시적으로 거부(locked/expired)한
+        경우는 재시도 없이 즉시 잠금(진짜 철회는 그대로 fail-closed)."""
         tok = (self.token_e.get().strip() if hasattr(self, "token_e") else self._token)
+        tok = (tok or "").strip()
         self._token = tok
 
         def w():
@@ -638,28 +650,34 @@ class App:
                     "caps": {"use": False, "manualentry": False, "autoentry": False},
                     "brokers": {}, "reason": "no token"}
             if tok:
-                try:
-                    import requests
-                    import time as _t
-                    import autopilot_crypto
-                    r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=8)
+                import requests
+                import time as _t
+                import autopilot_crypto
+                for attempt in (1, 2):                      # 1회 재시도(총 2회)
                     try:
-                        hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
-                    except Exception:
-                        hb = {"ok": False, "reason": "decrypt failed"}
-                    if not hb.get("ok"):
-                        gate["reason"] = hb.get("reason") or "locked"
-                    elif hb.get("exp") and _t.time() > hb["exp"]:
-                        gate["reason"] = "expired"
-                    else:
-                        ap = hb.get("autopilot", {})
-                        gate = {"ok": True, "tier": hb.get("tier", "—"),
-                                "enabled": bool(ap.get("enabled")),
-                                "force_dry_run": bool(ap.get("force_dry_run", True)),
-                                "caps": ap.get("caps", {}) or {}, "brokers": ap.get("brokers", {}) or {},
-                                "reason": ""}
-                except Exception as e:
-                    gate["reason"] = f"heartbeat error: {e}"
+                        r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=15)
+                        try:
+                            hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
+                        except Exception:
+                            hb = {"ok": False, "reason": "decrypt failed"}
+                        if not r.ok and attempt == 1:       # 5xx/일시 응답불량 → 재시도
+                            _t.sleep(2); continue
+                        if not hb.get("ok"):
+                            gate["reason"] = hb.get("reason") or "locked"
+                        elif hb.get("exp") and _t.time() > hb["exp"]:
+                            gate["reason"] = "expired"
+                        else:
+                            ap = hb.get("autopilot", {})
+                            gate = {"ok": True, "tier": hb.get("tier", "—"),
+                                    "enabled": bool(ap.get("enabled")),
+                                    "force_dry_run": bool(ap.get("force_dry_run", True)),
+                                    "caps": ap.get("caps", {}) or {}, "brokers": ap.get("brokers", {}) or {},
+                                    "reason": ""}
+                        break
+                    except Exception as e:                  # 네트워크 예외(순단) → 1회 재시도
+                        gate["reason"] = f"heartbeat error: {e}"
+                        if attempt == 1:
+                            _t.sleep(2)
             self._gate = gate
             self.root.after(0, self._apply_gating)
         threading.Thread(target=w, daemon=True).start()
@@ -900,28 +918,44 @@ class App:
             self._set_auto_ind(False)
             self.log("⏹ autopilot stopped.")
             return
-        if not self._creds_ok() or not self._consent_ok():
+        if not self._consent_ok():
             return
-        cutoff = self.cutoff.get().strip()
-        if len(cutoff) != 5 or cutoff[2] != ":" or not (cutoff[:2] + cutoff[3:]).isdigit():
-            messagebox.showwarning(self.t("input_needed"), "HH:MM"); return
-        broker, f1, f2, f3, sc = (self._broker_name, self.user.get().strip(), self._secret(),
-                                  self._f3(), self._scope())
+        # 설정된 모든 자산의 (세션 마감시각 × 브로커 creds) 잡을 만든다 — 신호 대기(toggle_sig)와
+        # 동일하게 현재 탭이 아니라 전 자산을 커버. 청산엔 1R 불필요(키만 있으면 됨).
+        self._save_current_asset()
+        jobs = []
+        for a, c in self._acfg.items():
+            f1 = (c.get("f1") or "").strip()
+            if not f1:
+                continue
+            _sp = _BROKER_SPEC.get(c["broker"], {})
+            acct = (c.get("acct") or "").strip()
+            if _sp.get("acct") and not acct:
+                continue
+            cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                    "f3": c.get("f3", ""), "acct": acct}
+            for tzname, hour in _ASSET_EXITS.get(a, []):
+                jobs.append({"asset": a, "tz": tzname, "hour": hour, **cred})
+        if not jobs:
+            messagebox.showwarning(self.t("input_needed"),
+                                   "자동청산할 자산을 최소 하나 설정하세요 (브로커·키)." if self.lang == "ko"
+                                   else "Configure at least one asset (broker & key)."); return
         live = bool(self.auto_live.get())
         self._auto_on = True
         self.b_auto.config(text=self.t("auto_stop"))
         self._set_auto_ind(True)
-        self.log(f"\n▶ autopilot ON — daily {cutoff} ET · {_broker_label(broker)} [{sc or 'all'}] · "
+        _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
+                            for j in jobs)
+        self.log(f"\n▶ autopilot ON — 세션 마감 자동청산 [{_sumry}] · "
                  f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
         self.log(f"   {self.t('warn_mix')}")
-        threading.Thread(target=self._auto_loop, args=(cutoff, broker, f1, f2, f3, sc, live),
-                         daemon=True).start()
+        threading.Thread(target=self._auto_loop, args=(jobs, live), daemon=True).start()
 
     def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
         """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
         already through the stop) → flatten the position now so we're never unprotected. Transient
         (network) → retry the stop a few times; if it still won't land, KEEP the position and warn
-        loudly (the 14:00 daily flatten is the backstop)."""
+        loudly (the session-close auto-flatten is the backstop)."""
         import time as _t
         if res.get("stop_rejected"):
             self._flatten_unprotected(b, aid, contract, res.get("stop_error"))
@@ -939,7 +973,7 @@ class App:
                 self._flatten_unprotected(b, aid, contract, sr.get("stop_error"))
                 return
             self.log(f"   … 재시도 {i + 1} 실패: {sr.get('stop_error')}")
-        self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 14:00 일일청산이 백스톱이나, "
+        self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 세션 마감 자동청산이 백스톱이나, "
                  "지금 수동으로 손절/확인 권장!")
 
     def _flatten_unprotected(self, b, aid, contract, why):
@@ -951,24 +985,37 @@ class App:
         except Exception as ce:
             self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
 
-    def _auto_loop(self, cutoff, broker, f1, f2, f3, sc, live):
+    def _auto_loop(self, jobs, live):
+        """자산별 세션 마감 자동청산. jobs=[{asset,tz,hour,broker,f1,f2,f3,acct}] — 각 잡은
+        자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten.
+        같은 선물계좌의 NQ(14 ET)·GC(06 ET)는 세션이 안 겹쳐 flatten_all이 서로를 안 건드리고,
+        BTC 02:00 UTC flatten은 다음(02-06) 세션 신호 발행(예측 계산 수 분)보다 항상 먼저 끝난다."""
         import time as _t
-        try:
-            tz = ZoneInfo("America/New_York") if ZoneInfo else None
-        except Exception as e:
-            # Windows 등 시스템 tz DB 없고 tzdata 미동봉이면 여기서 죽어 스레드가 조용히 사라진다 →
-            # 청산이 영영 안 됨. 로그로 드러내고 로컬 시각으로라도 동작(시각 확인 필요). (대표 2026-06-30)
-            tz = None
-            self.log(f"⚠ ET 타임존 로드 실패({e!r}) — tzdata 누락 의심. 로컬 시각 기준으로 동작하니 청산 시각 확인!")
-        fired = None
+        fired = {}                                     # {(asset,hour): 그 tz의 날짜}
+        _tzs = {}
+        for j in jobs:
+            try:
+                _tzs[j["tz"]] = ZoneInfo(j["tz"]) if ZoneInfo else None
+            except Exception as e:
+                # Windows 등 tzdata 미동봉이면 청산이 조용히 죽는다 → 드러내고 로컬시각 폴백. (2026-06-30)
+                _tzs[j["tz"]] = None
+                self.log(f"⚠ 타임존 로드 실패({j['tz']}: {e!r}) — tzdata 누락 의심. 로컬 시각 폴백, 청산 시각 확인!")
         while self._auto_on:
-            now = _dt.datetime.now(tz)
-            today = now.strftime("%Y-%m-%d")
-            if now.strftime("%H:%M") >= cutoff and fired != today:
-                fired = today
-                self.log(f"\n⏰ {cutoff} ET → auto-close ([{sc or 'all'}], {'LIVE' if live else 'dry-run'})")
+            for j in jobs:
+                now = _dt.datetime.now(_tzs.get(j["tz"]))
+                today = now.strftime("%Y-%m-%d")
+                key = (j["asset"], j["hour"])
+                cur = now.hour * 60 + now.minute
+                due = j["hour"] * 60
+                if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
+                    continue
+                fired[key] = today
+                _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
+                self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
+                         f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
                 try:
-                    b = _build_broker(broker, f1, f2, f3, [sc] if sc else [])
+                    b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
+                                      [j["acct"]] if j["acct"] else [])
                     res = b.flatten_all(dry_run=not live)
                     if not res.planned:
                         self.log("   no open positions (flat).")
