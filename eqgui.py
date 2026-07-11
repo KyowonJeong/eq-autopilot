@@ -327,6 +327,34 @@ def _load():
     return out
 
 
+_ENTERED_PATH = os.path.join(APP_DIR, ".entered.json")
+
+
+def _load_entered() -> dict:
+    """자산별 마지막 LIVE 진입 시각 {asset: epoch}. 앱 재시작을 넘겨 영속 — 자동청산 잡이
+    '방금 새 세션 진입'을 알아보고 새 포지션을 오살하지 않게 한다(연속 세션 순서 보장)."""
+    try:
+        import json as _json
+        with open(_ENTERED_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mark_entered(asset: str) -> dict:
+    d = _load_entered()
+    import time as _t
+    import json as _json
+    d[asset] = _t.time()
+    try:
+        with open(_ENTERED_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f)
+    except Exception:
+        pass
+    return d
+
+
 def _save_full(lang, token, acfg, profile=None):
     """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token + 공개프로필 설정을
     yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
@@ -364,6 +392,7 @@ class App:
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
         self._broker_name = self._acfg[self._asset]["broker"]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
+        self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         self._token = _d0.get("token", "")
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
@@ -1053,6 +1082,14 @@ class App:
                 if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
                     continue
                 fired[key] = today
+                # 🛡 오살 방지(연속 세션): 이 자산에 '방금'(발화창 이내) LIVE 새 진입이 있었으면
+                # 이번 마감 청산 스킵 — 신호 루프가 이미 "잔여 청산→확인→진입"을 끝냈다는 뜻이고,
+                # 여기서 flatten하면 방금 들어간 새 세션 포지션을 죽인다. (대표 2026-07-11)
+                _ea = (self._entered_at or {}).get(j["asset"], 0)
+                if _t.time() - _ea < AUTO_FIRE_WINDOW_MIN * 60:
+                    self.log(f"\n⏭ {j['asset']} 마감 청산 스킵 — {int((_t.time() - _ea) / 60)}분 전 "
+                             f"새 세션 진입(신호 루프가 이전 세션 이미 정리).")
+                    continue
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                 self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
                          f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
@@ -1359,12 +1396,42 @@ class App:
                         if not match:
                             self.log(f"   ❌ 계좌 '{sc}' 없음."); continue
                         _aid = match[0]["id"]
-                    # 중복 진입 방지: 이미 포지션 있으면 스킵(다른 인스턴스/기기 선진입·미청산). 2배 방지.
+                    # ── 잔여 포지션 정리: "청산 → 죽은 것 확인 → 진입" (대표 2026-07-11) ──
+                    # BTC 연속 세션(22-02 청산 = 02-06 진입 시각)에서 순서가 뒤집히면:
+                    # 스킵하면 새 세션을 영영 놓치고, 확인 없이 들어가면 2배 포지션. 그래서
+                    # '이 자산 심볼' 잔여만 청산·확인 후 진입한다(다른 심볼=수동거래 무접촉).
                     existing = b.list_open_positions()
-                    if existing:
-                        if live:
-                            self.log(f"   ⏭ 이미 포지션 {len(existing)}개 — 중복 진입 방지 스킵."); continue
-                        self.log(f"   (note) 이미 포지션 {len(existing)}개 — LIVE였으면 스킵.")
+                    _mysym = _contract if _is_fut else b._symbol(sym)
+                    mine = [p for p in existing if p.symbol == _mysym]
+                    others = [p for p in existing if p.symbol != _mysym]
+                    if others:
+                        self.log(f"   ⚠ 다른 심볼 포지션 {len(others)}개 감지 — 건드리지 않음: "
+                                 + ", ".join(f"{p.symbol}" for p in others[:3]))
+                    if mine:
+                        if not live:
+                            self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(mine)}개 — LIVE면 청산 확인 후 진입.")
+                        else:
+                            self.log(f"   ♻ 이전 세션 잔여 포지션 {len(mine)}개 → 청산 후 진입 (연속 세션)")
+                            _dead = False
+                            if _is_fut:
+                                try:
+                                    for p in mine:
+                                        b.close_contract(p.raw.get("_accountId") or _aid, _mysym)
+                                    for _chk in range(6):    # 죽은 것 '확인' 후에만 진입
+                                        _t.sleep(1)
+                                        if not any(q.symbol == _mysym for q in b.list_open_positions()):
+                                            _dead = True; break
+                                except Exception as _ce:
+                                    self.log(f"   ❌ 잔여 청산 실패: {_ce}")
+                            else:
+                                _r = b.close_symbol(sym, dry_run=False)
+                                _dead = bool(_r.get("closed"))
+                                if not _dead:
+                                    self.log(f"   ❌ 잔여 청산 미확인: {_r.get('error')}")
+                            if not _dead:
+                                self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!")
+                                continue
+                            self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
                     if _is_fut:
                         # customTag은 ProjectX '계좌당 유일' 필요 → ms 타임스탬프로 유니크.
                         res = b.place_entry(account_id=_aid, contract_id=_contract, side=direction,
@@ -1383,6 +1450,9 @@ class App:
                             self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
                     else:
                         self.log(f"   ✅ 진입 완료: {res.get('entry', res)}")
+                        # LIVE 진입 시각 기록(영속) — 자동청산 잡이 발화창 내 '방금 진입'을
+                        # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
+                        self._entered_at = _mark_entered(_asset)
                         if res.get("stop"):
                             self.log("   🛡 보호 손절 거치 완료.")
                         elif res.get("stop_error") and _is_fut:  # 선물만 별도 손절 재시도(크립토는 첨부라 불필요)

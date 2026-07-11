@@ -95,6 +95,29 @@ class BitgetBroker(BrokerAdapter):
             res.errors.append(f"post-flatten re-check failed: {e}")
         return res
 
+    def close_symbol(self, symbol, dry_run: bool = True) -> dict:
+        """이 심볼 포지션만 청산(다른 심볼 무접촉) — 연속 세션 '청산 확인 후 진입'용.
+        flash close(symbol 지정) + 최대 ~6초 재확인 폴링. 반환 {closed: bool, had: n, error}."""
+        sym = self._symbol(symbol)
+        mine = [p for p in self.list_open_positions() if p.symbol == sym]
+        if not mine:
+            return {"closed": True, "had": 0}
+        if dry_run:
+            return {"closed": False, "had": len(mine), "dry_run": True}
+        try:
+            self._req("POST", "/api/v2/mix/order/close-positions",
+                      body={"symbol": sym, "productType": self.product})
+        except Exception as e:
+            return {"closed": False, "had": len(mine), "error": str(e)}
+        for _ in range(6):                                   # 죽은 것 '확인' 후에만 True
+            time.sleep(1)
+            try:
+                if not any(p.symbol == sym for p in self.list_open_positions()):
+                    return {"closed": True, "had": len(mine)}
+            except Exception:
+                pass
+        return {"closed": False, "had": len(mine), "error": "still open after close"}
+
     @staticmethod
     def _symbol(sym: str) -> str:
         """신호 심볼('BTCUSDT.P') → Bitget perp 심볼('BTCUSDT')."""

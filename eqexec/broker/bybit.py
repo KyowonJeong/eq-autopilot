@@ -105,6 +105,37 @@ class BybitBroker(BrokerAdapter):
             res.errors.append(f"post-flatten re-check failed: {e}")
         return res
 
+    def close_symbol(self, symbol, dry_run: bool = True) -> dict:
+        """이 심볼 포지션만 청산(다른 심볼 무접촉) — 연속 세션(BTC 02↔22) '청산 확인 후 진입'용.
+        reduceOnly 반대 마켓 + 최대 ~6초 재확인 폴링. 반환 {closed: bool, had: n, error}."""
+        sym = self._symbol(symbol)
+        mine = [p for p in self.list_open_positions() if p.symbol == sym]
+        if not mine:
+            return {"closed": True, "had": 0}
+        if dry_run:
+            return {"closed": False, "had": len(mine), "dry_run": True}
+        for pos in mine:
+            try:
+                body = {"category": self.category, "symbol": pos.symbol,
+                        "side": "Sell" if pos.net_qty > 0 else "Buy",
+                        "orderType": "Market",
+                        "qty": str(pos.raw.get("size") or abs(pos.net_qty)),
+                        "reduceOnly": True}
+                _pi = pos.raw.get("positionIdx")
+                if _pi is not None:
+                    body["positionIdx"] = _pi
+                self._req("POST", "/v5/order/create", body=body)
+            except Exception as e:
+                return {"closed": False, "had": len(mine), "error": f"{pos.symbol}: {e}"}
+        for _ in range(6):                                   # 죽은 것 '확인' 후에만 True
+            time.sleep(1)
+            try:
+                if not any(p.symbol == sym for p in self.list_open_positions()):
+                    return {"closed": True, "had": len(mine)}
+            except Exception:
+                pass
+        return {"closed": False, "had": len(mine), "error": "still open after close"}
+
     @staticmethod
     def _symbol(sym: str) -> str:
         """신호 심볼('BTCUSDT.P')/기타 → Bybit perp 심볼('BTCUSDT')."""
