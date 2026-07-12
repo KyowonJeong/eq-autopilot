@@ -1273,22 +1273,31 @@ class App:
                     self.log(f"   {c['broker']}: 체결 이력 미지원(지원 예정) — 건너뜀")
                 except Exception as e:
                     self.log(f"   ⚠ {c['broker']} 체결 조회 실패: {e}")
-            # (date, asset)별 합산 → trade 1건 (시스템 = 자산당 하루 1거래) · R = 실현손익/그 자산 1R
+            # (date, asset[, BTC세션])별 합산 → trade 1건 · R = 실현손익/그 자산 1R.
+            # NQ/GC = 하루 1거래. BTC = 하루 2세션(22·02 UTC 진입)이라 세션별로 쪼갠다 —
+            # 날짜로만 합치면 두 거래가 1건으로 뭉개지고 방향도 첫 체결 것만 남는다(대표 2026-07-11).
             import datetime as _dtd
+
+            def _btc_sess(dt):
+                # 청산시각(UTC)으로 세션 판정: 22세션은 익일 02:00 예정청산(=02:05 전) 또는
+                # 진입 직후 조기청산(14:00 이후), 그 사이는 02세션(02:00 진입, 06:00 예정청산·손절 포함).
+                m = dt.hour * 60 + dt.minute
+                return "22" if (m < 125 or m >= 840) else "02"
+
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))
                 if not a or a not in creds:
                     continue
-                d = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000,
-                                                _dtd.timezone.utc).date().isoformat()
-                k = (d, a)
+                dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
+                d = dt.date().isoformat()
+                k = (d, a, _btc_sess(dt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG")})
                 e["pnl"] += float(f.get("pnl") or 0)
-            trades = [{"tid": f"agg-{d}-{a}", "date": d, "instrument": a,
+            trades = [{"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d, "instrument": a,
                        "direction": v["direction"],
                        "r": round(v["pnl"] / creds[a]["one_r"], 3)}
-                      for (d, a), v in sorted(agg.items())]
+                      for (d, a, s), v in sorted(agg.items())]
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
