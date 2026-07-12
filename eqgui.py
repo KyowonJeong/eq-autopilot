@@ -436,7 +436,14 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("EQ Autopilot")
-        root.geometry("720x860")
+        # 기본 창 크기 — 섹션이 늘어(트랙레코드·자산탭·진입정보) 잘리지 않게 확대(대표 2026-07-12).
+        # 화면이 그보다 작으면 화면 높이에 맞춤.
+        try:
+            _h = min(1010, root.winfo_screenheight() - 60)
+        except Exception:
+            _h = 1010
+        root.geometry(f"780x{_h}")
+        root.minsize(700, 700)
         self.q = queue.Queue()
         self.lang = _load()["lang"]
         self.frm = None
