@@ -205,6 +205,9 @@ T = {
                   "en": "Entry requires a single account in 'Account' (not all)."},
     "sec_tr": {"ko": "공개 트랙레코드 (Autopilot)", "en": "Public track record (Autopilot)"},
     "tr_public": {"ko": "공개 동의", "en": "Make public"},
+    "tr_on_ind": {"ko": "  ● 자동 동기화 ON  ", "en": "  ● Auto-sync ON  "},
+    "tr_off_ind": {"ko": "  ○ 자동 동기화 꺼짐  ", "en": "  ○ Auto-sync off  "},
+    "tr_page": {"ko": "공개 페이지", "en": "My page"},
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
     "tr_note": {"ko": "※ 앱이 브로커 체결 기록을 이 컴퓨터에서 R로 변환해 요약만 서버로 보냅니다 — "
                       "API 키·잔고·계좌금액은 절대 전송 안 됨. 핸들·표시 이름은 회원 계정"
@@ -322,7 +325,9 @@ def _load():
                                  "acct": out["acct"], "one_r": out["one_r"]}); break
     out["assets"] = acfg
     _p = d.get("profile") or {}
-    out["profile"] = {"public": bool(_p.get("public"))}   # 핸들·이름은 서버 자동(2026-07-11) — 저장 안 함
+    # 핸들·이름은 서버 자동(2026-07-11) — 입력은 없지만, 서버가 배정한 핸들은 '공개 페이지'
+    # 버튼용으로 로컬 캐시(푸시 응답 pp:ok:N:handle에서 회신받아 저장, 대표 2026-07-12).
+    out["profile"] = {"public": bool(_p.get("public")), "handle": _p.get("handle", "")}
     return out
 
 
@@ -570,7 +575,8 @@ class App:
         # 동의 — 연결 테스트 '바로 밑'(실행 동작 전 필요)
         if not hasattr(self, "consent"):
             self.consent = tk.IntVar()               # 탭 전환(재빌드)에도 동의 상태 유지
-        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent")).pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
+                        command=self._update_tr_status).pack(anchor="w", pady=(6, 0))
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -625,6 +631,10 @@ class App:
         ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
         self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
         self.b_tr.pack(side="left")
+        self.tr_ind = tk.Label(tr, font=("Helvetica", 11, "bold"))   # 신호대기와 같은 ● 표시등
+        self.tr_ind.pack(side="left", padx=(10, 0))
+        self.b_tr_page = ttk.Button(tr, text=self.t("tr_page"), command=self._open_my_page)
+        self.b_tr_page.pack(side="left", padx=(10, 0))
         self.tr_status = tk.Label(tr, font=("Helvetica", 11))
         self.tr_status.pack(side="left", padx=(12, 0))
         self._update_tr_status()
@@ -680,6 +690,8 @@ class App:
         # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
         if hasattr(self, "b_tr"):
             en(self.b_tr, bool(g.get("ok")) and g.get("tier") in ("royal", "admin"))
+        if hasattr(self, "tr_ind"):
+            self._update_tr_status()
         for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
             try:
                 if not live_ok:
@@ -1271,8 +1283,21 @@ class App:
                            else f"last sync {_ago} · sync within {d}d for a gapless record")
                     col = "#b00020" if d <= 3 else ("#b8860b" if d <= 14 else "#1a7f37")
             self.tr_status.config(text=txt, foreground=col)
+            # ● 자동 동기화 표시등 — 조건(동의+Autopilot 등급) 충족 = ON (신호대기와 동일 패턴)
+            g = self._gate or {}
+            _armed = bool(self.consent.get() and g.get("ok") and g.get("tier") in ("royal", "admin"))
+            self.tr_ind.config(text=self.t("tr_on_ind") if _armed else self.t("tr_off_ind"),
+                               fg="white" if _armed else "#666",
+                               bg="#1a7f37" if _armed else self.root.cget("bg"))
+            # 공개 페이지 버튼 — 서버가 핸들 배정한 뒤부터 활성
+            self.b_tr_page.config(state="normal" if (self._profile or {}).get("handle") else "disabled")
         except Exception:
             pass
+
+    def _open_my_page(self):
+        h = (self._profile or {}).get("handle")
+        if h:
+            webbrowser.open(f"{PUSH_BASE}?u={h}")
 
     AUTOPUSH_EVERY_S = 24 * 3600      # 일일 자동 동기화 주기
 
@@ -1305,7 +1330,7 @@ class App:
             return
         # 핸들·이름은 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정(대표 2026-07-11) — 앱은 안 보냄.
         public = bool(self.tr_public.get())
-        self._profile = {"public": public}
+        self._profile = {**(self._profile or {}), "public": public}   # handle 캐시 보존
         self._save_current_asset()                          # 프로필 포함 영속화
         # creds 스냅샷(메인 스레드) — 설정된 자산만
         creds = {}
@@ -1413,6 +1438,12 @@ class App:
                 self.root.after(0, self._update_tr_status)
             except Exception:
                 pass
+            if srv_handle:                              # 핸들 영속화 → '공개 페이지' 버튼 활성
+                self._profile["handle"] = srv_handle
+                try:
+                    self.root.after(0, self._save_current_asset)
+                except Exception:
+                    pass
             if public and srv_handle:
                 self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={srv_handle}")
             elif public:
