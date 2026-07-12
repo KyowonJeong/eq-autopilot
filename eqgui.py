@@ -176,7 +176,7 @@ T = {
                        "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
                  "en": "⚠ Closing flattens EVERY position on the chosen account. "
                        "Don't mix other trades on it — use a dedicated account."},
-    "lang": {"ko": "언어", "en": "Language"},
+    "lang": {"ko": "Language", "en": "Language"},   # 언어 선택 라벨은 언어 무관 고정(대표 2026-07-12)
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
