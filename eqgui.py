@@ -565,15 +565,15 @@ class App:
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
         # 청산 시각 = 시스템 세션 마감(자산별 자동, _ASSET_EXITS) — 사용자 입력 제거(2026-07-11).
         ttk.Label(af, text=self.t("auto_sched"), foreground="#888").pack(side="left", padx=(0, 10))
-        if not hasattr(self, "auto_live"):
-            self.auto_live = tk.IntVar()             # 탭 전환에도 LIVE 선택 유지
+        # LIVE 체크 = 자산별 저장값(대표 2026-07-12: 자산 상태 완전 분리)
+        self.auto_live = tk.IntVar(value=1 if self._acur().get("auto_live") else 0)
         self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
         self.cb_auto_live.pack(side="left", padx=(0, 10))
         self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._asset in self._auto_jobs else self.t("auto_start"),
                                  command=self.toggle_auto); self.b_auto.pack(side="left")
         self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
         self.auto_ind.pack(side="left", padx=(10, 0))
-        self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
+        self._set_auto_ind(self._asset in self._auto_jobs, [self._asset])
         ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -583,15 +583,14 @@ class App:
         self.one_r = ttk.Entry(sg, width=8)
         self.one_r.insert(0, str(self._acur().get("one_r", 600)))
         self.one_r.pack(side="left", padx=(0, 14))
-        if not hasattr(self, "sig_live"):
-            self.sig_live = tk.IntVar()              # 탭 전환에도 LIVE 선택 유지
+        self.sig_live = tk.IntVar(value=1 if self._acur().get("sig_live") else 0)
         self.cb_sig_live = ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live)
         self.cb_sig_live.pack(side="left", padx=(0, 12))
         self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._asset in self._sig_assets else self.t("sig_start"),
                                 command=self.toggle_sig); self.b_sig.pack(side="left")
         self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
         self.sig_ind.pack(side="left", padx=(10, 0))
-        self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+        self._set_sig_ind(self._asset in self._sig_assets, [self._asset])
         ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
 
@@ -818,6 +817,11 @@ class App:
                 pass
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
             _kc_save(c["f1"], self.key.get())
+        # LIVE 선택도 자산별(대표 2026-07-12 — 전역이라 탭 넘어가면 '셋된 것처럼' 보이던 혼동 제거)
+        if hasattr(self, "auto_live"):
+            c["auto_live"] = bool(self.auto_live.get())
+        if hasattr(self, "sig_live"):
+            c["sig_live"] = bool(self.sig_live.get())
         _save_full(self.lang, self._token, self._acfg, self._profile)
 
     def _persist(self):
@@ -1008,7 +1012,7 @@ class App:
             if not self._auto_jobs:
                 self._auto_on = False
             self.b_auto.config(text=self.t("auto_start"))
-            self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
+            self._set_auto_ind(False, [a])
             self.log(f"⏹ {a} 자동청산 해제." + ("" if self._auto_jobs else " (무장 자산 없음 — 루프 종료)"))
             return
         if not self._consent_ok():
@@ -1036,15 +1040,15 @@ class App:
                                    else f"{a}: pick an account."); return
         cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
                 "f3": c.get("f3", ""), "acct": acct}
-        jobs = [{"asset": a, "tz": tzname, "hour": hour, **cred}
+        live = bool(self.auto_live.get())             # 이 자산의 LIVE 선택(발화 순간 게이트 재판정)
+        jobs = [{"asset": a, "tz": tzname, "hour": hour, "live": live, **cred}
                 for tzname, hour in _ASSET_EXITS.get(a, [])]
         if not jobs:
             self.log(f"➖ {a}: 세션 마감 스케줄 없음 — 자동청산 미지원.")
             return
         self._auto_jobs[a] = jobs
-        live = bool(self.auto_live.get()) and not self._gate.get("force_dry_run", True)  # 강제 모의 존중
         self.b_auto.config(text=self.t("auto_stop"))
-        self._set_auto_ind(True, sorted(self._auto_jobs))
+        self._set_auto_ind(True, [a])
         _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                             for j in jobs)
         self.log(f"\n▶ {a} 자동청산 무장 [{_sumry}] · 현재 무장: {'·'.join(sorted(self._auto_jobs))} · "
@@ -1052,7 +1056,7 @@ class App:
         self.log(f"   {self.t('warn_mix')}")
         if not self._auto_on:
             self._auto_on = True
-            threading.Thread(target=self._auto_loop, args=(live,), daemon=True).start()
+            threading.Thread(target=self._auto_loop, daemon=True).start()
 
     def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
         """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
@@ -1088,7 +1092,7 @@ class App:
         except Exception as ce:
             self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
 
-    def _auto_loop(self, live_flag):
+    def _auto_loop(self):
         """자산별 세션 마감 자동청산. 잡은 self._auto_jobs에서 매 사이클 동적으로 읽는다
         (자산별 무장/해제 즉시 반영 — 대표 2026-07-11). 각 잡은
         자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten.
@@ -1128,7 +1132,7 @@ class App:
                     self.log(f"\n⏭ {j['asset']} 마감 청산 스킵 — {int((_t.time() - _ea) / 60)}분 전 "
                              f"새 세션 진입(신호 루프가 이전 세션 이미 정리).")
                     continue
-                live = self._live_now(live_flag)   # 발화 순간 재판정(강제 dry run 즉시 반영)
+                live = self._live_now(j.get("live"))   # 이 자산 LIVE 선택 × 발화 순간 게이트 재판정
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                 self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
                          f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
@@ -1160,7 +1164,7 @@ class App:
             if not self._sig_assets:
                 self._sig_on = False
             self.b_sig.config(text=self.t("sig_start"))
-            self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+            self._set_sig_ind(False, [a])
             self.log(f"⏹ {a} 신호 대기 해제." + ("" if self._sig_assets else " (무장 자산 없음 — 루프 종료)"))
             return
         if not self._consent_ok():
@@ -1192,18 +1196,18 @@ class App:
             messagebox.showwarning(self.t("input_needed"),
                                    f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
                                    else f"{a}: pick an account."); return
+        live = bool(self.sig_live.get())              # 이 자산의 LIVE 선택(발주 순간 게이트 재판정)
         self._sig_assets[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                               "f3": c.get("f3", ""), "acct": acct, "one_r": one_r}
-        live = bool(self.sig_live.get()) and not self._gate.get("force_dry_run")  # 강제 모의 존중
+                               "f3": c.get("f3", ""), "acct": acct, "one_r": one_r, "live": live}
         self.b_sig.config(text=self.t("sig_stop"))
-        self._set_sig_ind(True, sorted(self._sig_assets))
+        self._set_sig_ind(True, [a])
         _sumry = " · ".join(f"{k}:{v['broker']}(1R${v['one_r']:g})" for k, v in sorted(self._sig_assets.items()))
         self.log(f"\n▶ {a} 신호 대기 무장 — 현재 무장 [{_sumry}] · {'LIVE' if live else 'dry-run'}.")
         if not self._sig_on:
             self._sig_on = True
             url = _feed_url(self._token)             # 멤버별 신호 피드
             self.log("   polling feed")
-            threading.Thread(target=self._sig_loop, args=(url, live), daemon=True).start()
+            threading.Thread(target=self._sig_loop, args=(url,), daemon=True).start()
 
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod
@@ -1358,7 +1362,7 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
-    def _sig_loop(self, url, live_flag):
+    def _sig_loop(self, url):
         # 무장 자산 설정은 self._sig_assets에서 동적으로 읽는다(자산별 무장/해제 즉시 반영).
         # {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
         import time as _t
@@ -1399,7 +1403,7 @@ class App:
                     _t.sleep(SIG_POLL_SECS); continue
                 _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
                 f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
-                live = self._live_now(live_flag)   # 발주 순간 재판정(강제 dry run 즉시 반영)
+                live = self._live_now(cfg.get("live"))   # 이 자산 LIVE 선택 × 발주 순간 게이트 재판정
                 # 신호 발행 시각 → 나이(신선도) + 발행 '날짜'(하루 1회 재진입 판정)
                 import datetime as _dtd
                 _pub_ts = sig.get("published_at")
