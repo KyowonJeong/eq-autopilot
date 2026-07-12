@@ -1788,7 +1788,16 @@ class App:
                         res = b.place_entry(symbol=sym, side=direction, size=size,
                                             stop_loss_price=stop, dry_run=not live)
                     if res.get("error"):
-                        self.log(f"   ❌ 진입 실패: {res.get('error')}"); continue
+                        self.log(f"   ❌ 진입 실패: {res.get('error')}")
+                        # 눈에 띄는 알림(대표 2026-07-12) — 마진 부족·API 거절 등을 놓치지 않게.
+                        _em = str(res.get("error"))[:300]
+                        self.root.after(0, lambda m=_em, a=_asset: messagebox.showerror(
+                            "진입 실패" if self.lang == "ko" else "Entry failed",
+                            (f"{a} 진입 주문이 거절되었습니다:\n\n{m}\n\n잔고(마진)·레버리지 설정을 "
+                             f"확인하세요." if self.lang == "ko" else
+                             f"{a} entry order was rejected:\n\n{m}\n\nCheck margin balance and "
+                             f"leverage settings.")))
+                        continue
                     if not live:
                         self.log(f"   DRY-RUN entry: {res.get('would_place')}")
                         if res.get("would_place_stop"):
@@ -1804,6 +1813,11 @@ class App:
                             self._handle_stop_failure(b, _aid, _contract, direction, size, stop, res)
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")
+                    _em = str(e)[:300]
+                    self.root.after(0, lambda m=_em, a=_asset: messagebox.showerror(
+                        "진입 실패" if self.lang == "ko" else "Entry failed",
+                        (f"{a} 진입 중 오류:\n\n{m}" if self.lang == "ko"
+                         else f"{a} entry error:\n\n{m}")))
             _t.sleep(SIG_POLL_SECS)
 
 
