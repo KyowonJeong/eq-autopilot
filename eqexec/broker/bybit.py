@@ -169,6 +169,16 @@ class BybitBroker(BrokerAdapter):
         try:
             res = self._req("POST", "/v5/order/create", body=body)
         except Exception as e:
+            # 헤지(양방향) 모드 계정: positionIdx 필수(10001 position idx not match) —
+            # 주문이 안 나간 거절이므로 사이드 지정 후 1회 재시도(원웨이/헤지 자동 호환, 2026-07-12).
+            if "10001" in str(e) or "position idx" in str(e).lower():
+                body["positionIdx"] = 1 if bside == "Buy" else 2
+                try:
+                    res = self._req("POST", "/v5/order/create", body=body)
+                    return {"entry": res, "stop": bool(stop_loss_price), "hedge_mode": True,
+                            "stop_error": None if stop_loss_price else "no stop provided"}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
             return {"error": str(e)}
         # stopLoss는 진입 주문에 첨부돼 함께 체결 → 진입 성공 = 손절도 설정됨.
         return {"entry": res, "stop": bool(stop_loss_price),

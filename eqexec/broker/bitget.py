@@ -149,6 +149,16 @@ class BitgetBroker(BrokerAdapter):
         try:
             res = self._req("POST", "/api/v2/mix/order/place-order", body=body)
         except Exception as e:
+            # 헤지(양방향) 모드 계정: tradeSide(open/close) 필수 — 거절 시 open 지정 후 1회 재시도
+            # (원웨이/헤지 자동 호환, 2026-07-12). 주문 미체결 거절이라 이중 진입 위험 없음.
+            if "side" in str(e).lower() or "40774" in str(e):
+                body["tradeSide"] = "open"
+                try:
+                    res = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+                    return {"entry": res, "stop": bool(stop_loss_price), "hedge_mode": True,
+                            "stop_error": None if stop_loss_price else "no stop provided"}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
             return {"error": str(e)}
         return {"entry": res, "stop": bool(stop_loss_price),
                 "stop_error": None if stop_loss_price else "no stop provided"}
