@@ -715,10 +715,13 @@ class App:
             except Exception:
                 pass
         en(self.b_acc, conn and topstep)
-        en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok); en(self.b_auto, use)
+        # 루프 '정지'는 어느 탭에서든 항상 가능해야 함(미연결 탭에서 버튼이 죽으면 돌던 루프를
+        # 못 세움 — 대표 2026-07-12). 시작 조건은 기존대로(연결+권한), 도는 중엔 무조건 활성.
+        en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok)
+        en(self.b_auto, use or getattr(self, "_auto_on", False))
         # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
         # 신호 대기 무장 = '연결 테스트 통과 자산만'(2026-07-11) — 현재 탭 브로커 종류와는 무관.
-        en(self.b_sig, auto)
+        en(self.b_sig, auto or getattr(self, "_sig_on", False))
         # 공개 트랙레코드 푸시 = Autopilot 등급 자격(서버 entitled와 동일 기준: 마스터 스위치 무관,
         # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
         if hasattr(self, "b_tr"):
