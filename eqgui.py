@@ -1266,6 +1266,9 @@ class App:
             import time as _t
             last = _last_pushed()
             ko = self.lang == "ko"
+            # ● 자동 동기화 무장 여부(동의+Autopilot 등급) — 먼저 판정해 문구 분기에 사용
+            g = self._gate or {}
+            _armed = bool(self.consent.get() and g.get("ok") and g.get("tier") in ("royal", "admin"))
             if not last:
                 txt = ("아직 동기화 전 — 첫 동기화로 기록 추적 시작" if ko
                        else "not synced yet — run the first sync")
@@ -1274,7 +1277,11 @@ class App:
                 n = int((_t.time() - last) // 86400)
                 d = max(0, TR_LOOKBACK_DAYS - n)
                 _ago = ("오늘" if ko else "today") if n == 0 else (f"{n}일 전" if ko else f"{n}d ago")
-                if d == 0:
+                if _armed:
+                    # 자동 동기화 ON — 매일 알아서 도니 마감 경고는 소음(대표 2026-07-12). 시각만.
+                    txt = (f"마지막 동기화 {_ago}" if ko else f"last sync {_ago}")
+                    col = "#1a7f37"
+                elif d == 0:
                     txt = (f"마지막 동기화 {_ago} — 지금 동기화해야 기록이 이어집니다!" if ko
                            else f"last sync {_ago} — sync NOW to keep the record intact!")
                     col = "#b00020"
@@ -1283,9 +1290,6 @@ class App:
                            else f"last sync {_ago} · sync within {d}d for a gapless record")
                     col = "#b00020" if d <= 3 else ("#b8860b" if d <= 14 else "#1a7f37")
             self.tr_status.config(text=txt, foreground=col)
-            # ● 자동 동기화 표시등 — 조건(동의+Autopilot 등급) 충족 = ON (신호대기와 동일 패턴)
-            g = self._gate or {}
-            _armed = bool(self.consent.get() and g.get("ok") and g.get("tier") in ("royal", "admin"))
             self.tr_ind.config(text=self.t("tr_on_ind") if _armed else self.t("tr_off_ind"),
                                fg="white" if _armed else "#666",
                                bg="#1a7f37" if _armed else self.root.cget("bg"))
