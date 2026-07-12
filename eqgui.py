@@ -554,7 +554,9 @@ class App:
         tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
         _prof = self._profile
         self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
-        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
+        # 토글 즉시 _profile 반영+영속 — 저장 없이 탭 바꾸면 옛 값으로 되살아나던 버그(대표 2026-07-12)
+        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public,
+                        command=self._on_tr_public).pack(side="left", padx=(0, 10))
         self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
         self.b_tr.pack(side="left")
         self.tr_ind = tk.Label(tr, font=("Helvetica", 11, "bold"))   # 신호대기와 같은 ● 표시등
@@ -1406,6 +1408,14 @@ class App:
             self.b_tr_page.config(state="normal" if (self._profile or {}).get("handle") else "disabled")
         except Exception:
             pass
+
+    def _on_tr_public(self):
+        """공개 동의 토글 = 즉시 영속(전역·회원 단위 — 탭 전환과 무관). 다음 동기화(수동/자동)가
+        새 공개 상태를 서버에 반영한다."""
+        self._profile = {**(self._profile or {}), "public": bool(self.tr_public.get())}
+        _save_full(self.lang, self._token, self._acfg, self._profile)
+        self.log("🔓 공개 트랙레코드: 공개 동의 " + ("ON — 다음 동기화 때 페이지 공개"
+                 if self.tr_public.get() else "OFF — 다음 동기화 때 페이지 비공개"))
 
     def _open_my_page(self):
         h = (self._profile or {}).get("handle")
