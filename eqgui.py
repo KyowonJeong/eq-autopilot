@@ -625,6 +625,9 @@ class App:
         ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
         self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
         self.b_tr.pack(side="left")
+        self.tr_status = tk.Label(tr, font=("Helvetica", 11))
+        self.tr_status.pack(side="left", padx=(12, 0))
+        self._update_tr_status()
         ttk.Label(frm, text=self.t("tr_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
 
@@ -1243,6 +1246,34 @@ class App:
             return "GC"
         return None
 
+    def _update_tr_status(self):
+        """트랙레코드 동기화 상태 라벨 — 마지막 동기화 며칠 전 + 며칠 내 하면 기록이 안 끊기는지.
+        브로커 체결 이력 조회창(TR_LOOKBACK_DAYS=90일)이 한계라, 마지막 동기화 + 90일 안에
+        다시 동기화해야 공백 없이 이어진다(대표 2026-07-12). 앱 실행 중엔 매일 자동이라 여유 만땅."""
+        try:
+            import time as _t
+            last = _last_pushed()
+            ko = self.lang == "ko"
+            if not last:
+                txt = ("아직 동기화 전 — 첫 동기화로 기록 추적 시작" if ko
+                       else "not synced yet — run the first sync")
+                col = "#888888"
+            else:
+                n = int((_t.time() - last) // 86400)
+                d = max(0, TR_LOOKBACK_DAYS - n)
+                _ago = ("오늘" if ko else "today") if n == 0 else (f"{n}일 전" if ko else f"{n}d ago")
+                if d == 0:
+                    txt = (f"마지막 동기화 {_ago} — 지금 동기화해야 기록이 이어집니다!" if ko
+                           else f"last sync {_ago} — sync NOW to keep the record intact!")
+                    col = "#b00020"
+                else:
+                    txt = (f"마지막 동기화 {_ago} · {d}일 내 동기화하면 기록이 끊김 없이 이어짐" if ko
+                           else f"last sync {_ago} · sync within {d}d for a gapless record")
+                    col = "#b00020" if d <= 3 else ("#b8860b" if d <= 14 else "#1a7f37")
+            self.tr_status.config(text=txt, foreground=col)
+        except Exception:
+            pass
+
     AUTOPUSH_EVERY_S = 24 * 3600      # 일일 자동 동기화 주기
 
     def _autopush_tick(self):
@@ -1256,6 +1287,7 @@ class App:
                 self.push_profile(auto=True)
         except Exception:
             pass
+        self._update_tr_status()                       # 상태 라벨 시간 경과 반영
         try:
             self.root.after(60 * 60 * 1000, self._autopush_tick)   # 다음 체크 1시간 뒤
         except Exception:
@@ -1377,6 +1409,10 @@ class App:
                     return
             self.log(f"   ✅ 동기화 완료 — 서버 누적 {ok_total}건.")
             _mark_pushed()                              # 일일 자동 동기화 기준점
+            try:
+                self.root.after(0, self._update_tr_status)
+            except Exception:
+                pass
             if public and srv_handle:
                 self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={srv_handle}")
             elif public:
