@@ -1685,8 +1685,16 @@ class App:
                     continue
                 entered_day[_dedup_key] = _sig_day   # 이 자산·세션 이 날 진입 처리 완료 → 같은 날 재진입 금지(성공/실패 무관)
                 direction, stop = sig.get("direction"), sig.get("stop_price")
-                # 계약 수 = 사용자 1R($)로 앱이 계산(신호는 contracts 안 줌). 자산+브로커→심볼·포인트값.
-                _sz = sizing.compute_size(_asset, _broker, one_r,
+                # 계약 수 = 사용자 1R($) × 신호 size 배수(신뢰도 사이징, 시스템 공식과 동일 —
+                # 백테스트/트랙레코드 R 계산이 이 배수를 전제. 대표 2026-07-12 감사에서 누락 발견).
+                # 배수는 0~3으로 클램프(랜딩 '거래당 최대 3R' 캡과 일치).
+                try:
+                    _mult = float(sig.get("size_mult") or 1.0)
+                except (TypeError, ValueError):
+                    _mult = 1.0
+                _mult = max(0.0, min(_mult, 3.0))
+                _eff_r = one_r * _mult
+                _sz = sizing.compute_size(_asset, _broker, _eff_r,
                                           sig.get("entry_ref"), stop, direction)
                 if not _sz:
                     self.log(f"\n⏭ 신호 [{sid}] — 사이징 불가(자산 {_asset}·브로커 {_broker}·"
@@ -1704,7 +1712,8 @@ class App:
                     _sent, _lat = None, "?"
                 self.log(f"\n📶 신호 캡처 [{sid}] — {_asset or sym} {direction} x{size} {sym}")
                 self.log(f"   포지션: {direction} · 수량 {size} ({sym}) · 손절 {stop} · 진입참조 "
-                         f"{sig.get('entry_ref')} · 1R=${one_r:g}(손절거리 {_sz['risk_pts']})")
+                         f"{sig.get('entry_ref')} · 1R=${one_r:g}×{_mult:.2f}x=${_eff_r:g}"
+                         f"(손절거리 {_sz['risk_pts']})")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
                          f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
                 _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))
