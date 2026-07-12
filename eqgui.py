@@ -256,15 +256,17 @@ T = {
                        "(신호에 계약 수 없음). ⚠️ EdgeQuant는 신호 확신도에 따라 포지션을 키워 "
                        "거래당 최대 3R까지 리스크합니다 — 계좌 여유는 1R의 3배 기준으로 잡으세요. "
                        "자산은 신호의 종목으로 자동 판별(NQ→MNQ·GC→MGC·BTC→BTCUSDT.P). "
-                       "'사용 계좌'만 고르면 됩니다. 포지션 관리는 종목별 — 같은 종목 잔여는 청산 확인 후 "
-                       "진입(2배 방지), 다른 종목은 안 건드려 NQ·GC 같은 계좌도 독립 진입됩니다.",
+                       "'사용 계좌'만 고르면 됩니다. 포지션은 종목별로 독립 관리됩니다 — 같은 종목은 기존 "
+                       "포지션이 완전히 청산된 것이 확인된 후에만 새로 진입하여 중복 포지션을 방지하고, 다른 "
+                       "종목은 서로 영향을 주지 않으므로 NQ와 GC도 같은 계좌에서 동시에 독립 운용할 수 있습니다.",
                  "en": "※ Enters automatically using the signal's direction and stop; the contract count is computed "
                        "by the app from your 1R above (the signal carries no contract count). ⚠️ EdgeQuant scales "
                        "position size with signal confidence — up to 3R risk per trade; budget your account for "
                        "3× your 1R. The instrument is detected from the signal (NQ→MNQ · GC→MGC · BTC→BTCUSDT.P). "
-                       "Just pick the account. Position handling is per-symbol — a same-symbol residual is "
-                       "closed-and-confirmed before entry (no doubling); other symbols are untouched, so NQ and "
-                       "GC enter independently on one account."},
+                       "Just pick the account. Positions are managed independently per symbol — the same "
+                       "symbol re-enters only after the previous position is confirmed fully closed (no doubling), "
+                       "and different symbols never affect each other, so NQ and GC can run side by side on one "
+                       "account."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 설정된 각 자산의 세션 마감 시각에 그 자산 브로커를 청산합니다.",
                   "en": "※ App must stay open and the computer awake. Each configured asset's broker is flattened at its session close."},
 }
