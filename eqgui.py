@@ -354,6 +354,26 @@ def _mark_entered(asset: str) -> dict:
     return d
 
 
+_PUSHED_PATH = os.path.join(APP_DIR, ".lastpush")
+
+
+def _last_pushed() -> float:
+    try:
+        with open(_PUSHED_PATH, encoding="utf-8") as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _mark_pushed() -> None:
+    try:
+        import time as _t
+        with open(_PUSHED_PATH, "w", encoding="utf-8") as f:
+            f.write(str(_t.time()))
+    except Exception:
+        pass
+
+
 def _save_full(lang, token, acfg, profile=None):
     """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token + 공개프로필 설정을
     yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
@@ -405,6 +425,7 @@ class App:
         self._build()
         root.after(120, self._drain)
         root.after(800, lambda: self._heartbeat(periodic=True))   # 시작 직후 + 주기 권한 갱신
+        root.after(5 * 60 * 1000, self._autopush_tick)             # 일일 자동 트랙레코드 동기화
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -1222,10 +1243,33 @@ class App:
             return "GC"
         return None
 
-    def push_profile(self):
+    AUTOPUSH_EVERY_S = 24 * 3600      # 일일 자동 동기화 주기
+
+    def _autopush_tick(self):
+        """1시간마다 깨어나 24h 경과 시 트랙레코드 자동 동기화(무소음). 조건: 동의 체크 +
+        Autopilot 등급(royal/admin) 토큰. 주기 푸시 = 기록이 끊김 없이 쌓임(90일 조회창 공백 방지)."""
+        try:
+            import time as _t
+            g = self._gate or {}
+            if (self.consent.get() and g.get("ok") and g.get("tier") in ("royal", "admin")
+                    and _t.time() - _last_pushed() > self.AUTOPUSH_EVERY_S):
+                self.push_profile(auto=True)
+        except Exception:
+            pass
+        try:
+            self.root.after(60 * 60 * 1000, self._autopush_tick)   # 다음 체크 1시간 뒤
+        except Exception:
+            pass
+
+    def push_profile(self, auto: bool = False):
         """브로커 체결(closed PnL)을 로컬에서 R로 변환·일별 합산해 요약만 서버로 푸시.
-        키·잔고 무전송. 서버는 tid로 멱등 병합 → 페이지(?u=핸들) 즉시 갱신."""
-        if not self._consent_ok():
+        키·잔고 무전송. 서버는 tid로 멱등 병합 → 페이지(?u=핸들) 즉시 갱신.
+        auto=True: 일일 자동 동기화(경고창 없이 조용히 스킵) — 주기 푸시로 기록이 계속 쌓여
+        90일 조회창(브로커 이력 한계)에 공백이 안 생긴다(대표 2026-07-12)."""
+        if auto:
+            if not self.consent.get():
+                return                                   # 동의 전엔 자동 동기화도 안 함(무소음)
+        elif not self._consent_ok():
             return
         # 핸들·이름은 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정(대표 2026-07-11) — 앱은 안 보냄.
         public = bool(self.tr_public.get())
@@ -1248,11 +1292,13 @@ class App:
             creds[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
                         "f3": c.get("f3", ""), "acct": acct, "one_r": one_r or 600.0}
         if not creds:
-            messagebox.showwarning(self.t("input_needed"),
-                                   "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
-                                   else "No asset has broker credentials configured."); return
+            if not auto:
+                messagebox.showwarning(self.t("input_needed"),
+                                       "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
+                                       else "No asset has broker credentials configured.")
+            return
         tok = self._token
-        self.log(f"\n📤 트랙레코드 동기화 — {'공개' if public else '비공개'} · "
+        self.log(f"\n📤 트랙레코드 동기화{'(일일 자동)' if auto else ''} — {'공개' if public else '비공개'} · "
                  f"최근 {TR_LOOKBACK_DAYS}일 체결 수집… (핸들·이름은 계정에서 자동)")
 
         def w():
@@ -1330,6 +1376,7 @@ class App:
                     self.log(f"   ❌ 푸시 실패: {e}")
                     return
             self.log(f"   ✅ 동기화 완료 — 서버 누적 {ok_total}건.")
+            _mark_pushed()                              # 일일 자동 동기화 기준점
             if public and srv_handle:
                 self.log(f"   🔗 공개 페이지: {PUSH_BASE}?u={srv_handle}")
             elif public:
