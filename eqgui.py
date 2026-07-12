@@ -196,8 +196,10 @@ T = {
     "lock": {"ko": "🔒 잠금", "en": "🔒 Lock"},
     "pin_new": {"ko": "키 변경용 PIN을 새로 설정하세요 (숫자/문자):",
                 "en": "Set a PIN (needed to change the key):"},
-    "pin_enter": {"ko": "PIN 입력:", "en": "Enter PIN:"},
-    "pin_wrong": {"ko": "PIN이 틀립니다.", "en": "Wrong PIN."},
+    "pin_enter": {"ko": "PIN 입력 (이 앱에서 키 보호용으로 설정한 PIN — 거래소 비밀번호 아님):",
+                  "en": "Enter PIN (the key-protection PIN you set in this app — not your exchange password):"},
+    "pin_wrong": {"ko": "PIN이 틀립니다 — 이 앱에서 키 보호용으로 설정했던 PIN입니다 (거래소 비밀번호 아님).",
+                  "en": "Wrong PIN — this is the key-protection PIN you set in this app (not your exchange password)."},
     "locked_msg": {"ko": "키를 보거나 바꾸려면 먼저 '잠금해제'(PIN)를 하세요.",
                    "en": "Unlock (PIN) first to view or change the key."},
     "scope": {"ko": "사용 계좌", "en": "Account"},
@@ -523,13 +525,35 @@ class App:
 
     def _build(self):
         d = _load()
-        if self.frm is not None:
+        if getattr(self, "_scroll_host", None) is not None:
+            self._scroll_host.destroy()
+        elif self.frm is not None:
             self.frm.destroy()
         # 브로커별로 만들어지는 위젯 속성 정리(파괴된 위젯의 stale 참조 방지).
         for _a in ("key", "f3", "scope", "b_lock"):
             if hasattr(self, _a):
                 delattr(self, _a)
-        frm = ttk.Frame(self.root, padding=14); frm.pack(fill="both", expand=True); self.frm = frm
+        # 본문을 세로 스크롤 캔버스로 감싼다 — 노트북/저해상도에서 아래 섹션이 짤리던 문제
+        # (테스터 리포트 2026-07-12). 창을 줄여도 스크롤로 전부 접근 가능.
+        host = ttk.Frame(self.root); host.pack(fill="both", expand=True)
+        self._scroll_host = host
+        _cv = tk.Canvas(host, highlightthickness=0, borderwidth=0)
+        _sb = ttk.Scrollbar(host, orient="vertical", command=_cv.yview)
+        _cv.configure(yscrollcommand=_sb.set)
+        _sb.pack(side="right", fill="y")
+        _cv.pack(side="left", fill="both", expand=True)
+        frm = ttk.Frame(_cv, padding=14)
+        _win = _cv.create_window((0, 0), window=frm, anchor="nw")
+        frm.bind("<Configure>", lambda e: _cv.configure(scrollregion=_cv.bbox("all")))
+        _cv.bind("<Configure>", lambda e: _cv.itemconfigure(_win, width=e.width))
+
+        def _wheel(e):
+            _cv.yview_scroll(-1 * (e.delta if sys.platform == "darwin"
+                                   else int(e.delta / 120)), "units")
+        _cv.bind_all("<MouseWheel>", _wheel)
+        _cv.bind_all("<Button-4>", lambda e: _cv.yview_scroll(-1, "units"))   # 리눅스
+        _cv.bind_all("<Button-5>", lambda e: _cv.yview_scroll(1, "units"))
+        self.frm = frm
 
         top = ttk.Frame(frm); top.pack(fill="x")
         try:
@@ -1092,9 +1116,23 @@ class App:
         self._set_actions_enabled(False if on else self._connected)
 
     def _creds_ok(self):
+        # 빠진 필드를 브로커 실제 라벨로 안내 — 옛 고정문구 "이메일과 API Key"는 Bybit 등
+        # 크립토(이메일 칸 없음)에서 대혼란(테스터 리포트 2026-07-12).
         spec = _BROKER_SPEC.get(self._broker_name, {})
-        if not self.user.get().strip() or (spec.get("f2") and not self._secret()):
-            messagebox.showwarning(self.t("input_needed"), self.t("need_creds")); return False
+        _missing = []
+        if not self.user.get().strip():
+            _missing.append(spec.get("f1", "ID"))
+        if spec.get("f2") and not self._secret():
+            _missing.append(spec.get("f2"))
+        if _missing:
+            _f = " · ".join(_missing)
+            messagebox.showwarning(
+                self.t("input_needed"),
+                (f"다음 항목을 입력하세요: {_f}\n"
+                 "(비밀 필드는 '잠금해제' 후 '붙여넣기'로 입력합니다)") if self.lang == "ko" else
+                (f"Please fill in: {_f}\n"
+                 "(secret fields: press 'Unlock' first, then 'Paste')"))
+            return False
         self._persist(); return True
 
     def _consent_ok(self):
@@ -1125,7 +1163,19 @@ class App:
         if not self._creds_ok(): return
         self.log("\n── connection test ──")
         def w():
-            b = self._broker(); b.healthcheck()
+            b = self._broker()
+            try:
+                b.healthcheck()
+            except Exception as _e:
+                self.log(f"❌ {_e}")
+                if self._broker_name in ("bybit", "bitget"):
+                    self.log(("   힌트: ① Testnet 칸 확인 — 실계좌 키면 빈칸/0, 테스트넷 키면 1"
+                              "  ② 키에 IP 제한이 있으면 이 기기 IP를 허용"
+                              "  ③ 키 권한(읽기·주문) 확인") if self.lang == "ko" else
+                             ("   Hints: ① Check the Testnet field — live key: empty/0, testnet key: 1"
+                              "  ② If the key has an IP whitelist, allow this machine's IP"
+                              "  ③ Check key permissions (read/trade)"))
+                return
             if self._broker_name == "projectx":      # Topstep만 계좌목록 채움
                 try:
                     names = [str(a.get("name")) for a in b._accounts()]
