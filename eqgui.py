@@ -697,7 +697,17 @@ class App:
         self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig,
                              self.b_tr]
         self._apply_gating()
-        self.log(self.t("ready"))
+        # 안내 로그: 첫 실행만 '준비됨…', 이후(탭·브로커 전환 재빌드)는 그 자산의 실제 연결
+        # 상태를 찍는다 — '준비됨'이 매번 떠서 리셋된 걸로 오해되던 것 수정(대표 2026-07-12).
+        if not getattr(self, "_built_once", False):
+            self._built_once = True
+            self.log(self.t("ready"))
+        else:
+            _ok = self._conn_by_asset.get(self._asset)
+            self.log(f"▸ {self._asset} · {_broker_label(self._broker_name)} — "
+                     + (("연결됨 ✓ (테스트 통과, 재연결 불필요)" if self.lang == "ko"
+                         else "connected ✓ (test passed, no retest needed)") if _ok else
+                        ("연결 테스트 필요" if self.lang == "ko" else "connection test required")))
         self._async_load_key(self._acur().get("f1", ""))
 
     def _set_actions_enabled(self, on):
