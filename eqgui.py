@@ -229,14 +229,15 @@ T = {
     "tr_off_ind": {"ko": "  ○ 자동 동기화 꺼짐  ", "en": "  ○ Auto-sync off  "},
     "tr_page": {"ko": "공개 페이지", "en": "My page"},
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
-    "tr_note": {"ko": "※ 앱이 브로커 체결 기록을 이 컴퓨터에서 R로 변환해 요약만 서버로 보냅니다 — "
-                      "API 키·잔고·계좌금액은 절대 전송 안 됨. 핸들·표시 이름은 회원 계정"
-                      "(텔레그램/디스코드)에서 자동 설정되며, 공개 페이지 주소는 동기화 후 아래에 표시됩니다 "
-                      "(공개 동의 체크 시에만 노출, 언제든 해제 가능).",
-                "en": "※ The app converts your broker fills to R locally and pushes only the summary — "
-                      "API keys, balances and account size are never sent. Your handle & display name are "
-                      "set automatically from your member account (Telegram/Discord); the public page URL "
-                      "appears below after syncing (visible only while 'Make public' is on)."},
+    "tr_note": {"ko": "※ 실거래 트랙레코드를 자동 생성합니다. 앱은 브로커 체결 기록을 로컬에서 "
+                      "R 단위로 변환한 후, 공개용 요약 데이터만 서버에 전송합니다. API 키, 계좌번호, "
+                      "잔고 등 민감 정보는 전송되지 않습니다. 생성된 트랙레코드는 자동 업데이트되며, "
+                      "공개 페이지 링크를 통해 손쉽게 공개할 수 있습니다.",
+                "en": "※ Builds your real-trading track record automatically. The app converts your "
+                      "broker fills to R units locally and sends only the public summary to the server — "
+                      "sensitive data such as API keys, account numbers and balances are never "
+                      "transmitted. The track record updates automatically and can be shared easily "
+                      "via its public page link."},
     "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
