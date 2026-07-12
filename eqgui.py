@@ -315,14 +315,24 @@ def _load():
     for _a in _ASSETS:
         s = assets.get(_a) or {}
         brs = _ASSET_BROKERS[_a]
-        acfg[_a] = {"broker": (s.get("broker") if s.get("broker") in brs else brs[0]),
-                    "f1": s.get("f1", ""), "f3": s.get("f3", ""),
-                    "acct": s.get("acct", ""), "one_r": s.get("one_r", 600)}
+        _bk = s.get("broker") if s.get("broker") in brs else brs[0]
+        # 브로커별 자격증명 분리(대표 2026-07-12: 바이빗 키가 빗겟에 공유되던 것 차단) —
+        # creds[broker] = {f1,f3,acct}. 옛 스키마(자산 상위 f1/f3/acct)는 당시 브로커 창고로 이관.
+        creds = {b: dict(v) for b, v in (s.get("creds") or {}).items() if b in brs}
+        if s.get("f1") and _bk not in creds:
+            creds[_bk] = {"f1": s.get("f1", ""), "f3": s.get("f3", ""), "acct": s.get("acct", "")}
+        cur = creds.get(_bk) or {"f1": "", "f3": "", "acct": ""}
+        acfg[_a] = {"broker": _bk, "one_r": s.get("one_r", 600), "creds": creds,
+                    # 상위 f1/f3/acct = '현재 브로커' 미러(다운스트림 호환) — 저장·전환 때 갱신
+                    "f1": cur.get("f1", ""), "f3": cur.get("f3", ""), "acct": cur.get("acct", "")}
     if not assets and out["f1"]:            # 마이그레이션: 옛 flat → 브로커 맞는 첫 자산
         for _a in _ASSETS:
             if out["broker"] in _ASSET_BROKERS[_a]:
                 acfg[_a].update({"broker": out["broker"], "f1": out["f1"], "f3": out["f3"],
-                                 "acct": out["acct"], "one_r": out["one_r"]}); break
+                                 "acct": out["acct"], "one_r": out["one_r"]})
+                acfg[_a]["creds"][out["broker"]] = {"f1": out["f1"], "f3": out["f3"],
+                                                    "acct": out["acct"]}
+                break
     out["assets"] = acfg
     _p = d.get("profile") or {}
     # 핸들·이름은 서버 자동(2026-07-11) — 입력은 없지만, 서버가 배정한 핸들은 '공개 페이지'
@@ -847,10 +857,13 @@ class App:
         """현재 탭의 위젯 값을 self._acfg[현재자산] 슬롯에 저장 + 비밀은 Keychain + yaml 영속화."""
         c = self._acfg[self._asset]
         c["broker"] = self._broker_name
+        cr = c.setdefault("creds", {}).setdefault(self._broker_name, {})
         if hasattr(self, "user"):
-            c["f1"] = self.user.get().strip()
-        c["f3"] = self._f3()
-        c["acct"] = self._scope()
+            cr["f1"] = self.user.get().strip()
+        cr["f3"] = self._f3()
+        cr["acct"] = self._scope()
+        # 상위 미러 = 현재 브로커 창고 (다운스트림 c.get("f1") 호환)
+        c["f1"], c["f3"], c["acct"] = cr.get("f1", ""), cr.get("f3", ""), cr.get("acct", "")
         if hasattr(self, "one_r"):
             try:
                 c["one_r"] = float(str(self.one_r.get()).replace(",", "").strip())
@@ -881,15 +894,24 @@ class App:
         self._build()
 
     def _on_broker(self, *_):
+        # 전환 전, 지금 화면 값을 '이전 브로커' 창고에 먼저 저장(안 하면 유실)
+        self._save_current_asset()
         sel = self.brokerbox.get()
         for b in _ASSET_BROKERS[self._asset]:    # 이 자산의 브로커 중에서
             if _broker_label(b) == sel:
                 self._broker_name = b
                 break
+        # 미러를 새 브로커 창고로 스위치 — 바이빗↔빗겟 자격증명 완전 분리(대표 2026-07-12)
+        c = self._acfg[self._asset]
+        c["broker"] = self._broker_name
+        cr = c.setdefault("creds", {}).setdefault(self._broker_name, {"f1": "", "f3": "", "acct": ""})
+        c["f1"], c["f3"], c["acct"] = cr.get("f1", ""), cr.get("f3", ""), cr.get("acct", "")
         self._connected = False
         self._conn_by_asset.pop(self._asset, None)   # 브로커가 바뀌면 연결테스트 다시
         self._unlocked = False
-        self._persist()
+        # ⚠️ _persist() 금지 — 위젯엔 아직 '이전 브로커' 값이 있어 새 창고를 오염시킨다.
+        # 위에서 창고 저장·미러 스위치를 끝냈으니 yaml만 직접 영속화하고 재빌드.
+        _save_full(self.lang, self._token, self._acfg, self._profile)
         self._build()
 
     def _set_lang(self, *_):
