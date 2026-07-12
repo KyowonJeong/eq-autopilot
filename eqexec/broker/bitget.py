@@ -184,6 +184,24 @@ class BitgetBroker(BrokerAdapter):
                 continue
         return out
 
+    def entry_info(self) -> list:
+        """진입 관련 계정 정보(연결 테스트 로그용, 읽기전용). 주문은 교차(cross) 자동 지정."""
+        out = []
+        try:
+            d = self._req("GET", "/api/v2/mix/account/account",
+                          {"symbol": "BTCUSDT", "productType": self.product, "marginCoin": "USDT"})
+            row = d[0] if isinstance(d, list) else d
+            lev = row.get("crossedMarginLeverage") or row.get("leverage")
+            avail = row.get("available") or row.get("crossedMaxAvailable")
+            if lev:
+                out.append(f"BTCUSDT 레버리지(교차) {float(lev):g}x")
+            if avail:
+                out.append(f"가용 잔고(마진) ≈ {float(avail):,.0f} USDT")
+        except Exception:
+            pass
+        out.append("주문 마진모드 = 교차(cross) 자동 지정")
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True

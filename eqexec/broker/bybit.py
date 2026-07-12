@@ -211,6 +211,30 @@ class BybitBroker(BrokerAdapter):
                 break
         return out
 
+    def entry_info(self) -> list:
+        """진입 관련 계정 정보(연결 테스트 로그용, 읽기전용): BTCUSDT 레버리지·마진모드·가용잔고.
+        변경은 안 함 — 정보 제공만(대표 2026-07-12). 실패 필드는 조용히 생략."""
+        out = []
+        try:
+            d = self._req("GET", "/v5/position/list", {"category": self.category, "symbol": "BTCUSDT"})
+            row = (d.get("list") or [{}])[0]
+            lev = row.get("leverage")
+            tm = row.get("tradeMode")
+            mode = {0: "교차(cross)", 1: "격리(isolated)"}.get(int(tm) if tm is not None else -1, "")
+            if lev:
+                out.append(f"BTCUSDT 레버리지 {float(lev):g}x" + (f" · {mode}" if mode else ""))
+        except Exception:
+            pass
+        try:
+            w = self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+            acct = (w.get("list") or [{}])[0]
+            avail = acct.get("totalAvailableBalance") or acct.get("totalEquity")
+            if avail:
+                out.append(f"가용 잔고(마진) ≈ {float(avail):,.0f} USDT")
+        except Exception:
+            pass
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True

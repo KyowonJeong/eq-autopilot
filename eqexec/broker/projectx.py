@@ -160,6 +160,18 @@ class ProjectXBroker(BrokerAdapter):
             res.errors.append(f"post-flatten position re-check failed: {e}")
         return res
 
+    def entry_info(self) -> list:
+        """진입 관련 계정 정보(연결 테스트 로그용): 계좌별 잔고(마이크로 선물 마진 여력 가늠)."""
+        out = []
+        try:
+            for a in self._accounts():
+                bal = a.get("balance")
+                if bal is not None:
+                    out.append(f"{a.get('name')}: 잔고 ${float(bal):,.0f}")
+        except Exception:
+            pass
+        return out
+
     def closed_fills(self, start_ms: int) -> list[dict]:
         """실현손익 체결 목록(트랙레코드 푸시용). POST /api/Trade/search {accountId,
         startTimestamp} → trades[{id, contractId, creationTimestamp, profitAndLoss, side, ...}].

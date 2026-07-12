@@ -1122,6 +1122,15 @@ class App:
             if not pos: self.log("   (flat)")
             self._connected = True                # 통과 → 나머지 기능 활성화(_busy 복원이 반영)
             self._conn_by_asset[self._asset] = True   # 탭 전환 후 복귀해도 재연결 불필요
+            # 진입 관련 계정 정보(읽기전용): 레버리지·마진모드·가용잔고 — 진입 전에 설정 상태를
+            # 앱 로그에서 바로 확인(대표 2026-07-12). 변경은 안 함, 실패 시 조용히 생략.
+            try:
+                for _ln in (b.entry_info() or []):
+                    self.log(f"   ℹ {_ln}")
+            except AttributeError:
+                pass
+            except Exception:
+                pass
             self.log("🔓 " + self.t("conn_ok"))
         self._run(w)
 
