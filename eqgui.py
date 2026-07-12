@@ -110,9 +110,11 @@ _BROKER_SPEC = {
     "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (예: 127.0.0.1)", "f2": None,
                     "f3": "Port (7497/7496)", "acct": True, "futures": True, "preview": True},
     "bybit":       {"label": "Bybit (USDT perp)", "f1": "API Key", "f2": "API Secret",
-                    "f3": "Testnet (1=on)", "acct": False, "futures": False, "preview": True},
+                    "f3": "Testnet (1=on)", "acct": False, "futures": False, "preview": True,
+                    "f1_secret": True},
     "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
-                    "f3": "Passphrase", "acct": False, "futures": False, "preview": True},
+                    "f3": "Passphrase", "acct": False, "futures": False, "preview": True,
+                    "f1_secret": True},
     "ninjatrader": {"label": "NinjaTrader (ATI)", "f1": "NT 계좌 (비우면 전체)", "f2": None,
                     "f3": None, "acct": False, "futures": False, "preview": True},
 }
@@ -569,11 +571,18 @@ class App:
         # f1 (브로커별 1번 필드)
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
-        self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True)
+        _f1sec = bool(spec.get("f1_secret"))          # 크립토 API Key = 비밀 취급(대표 2026-07-12)
+        self._f1_unlocked = False
+        self.user = ttk.Entry(r1, show=("•" if _f1sec else ""))
+        self.user.pack(side="left", fill="x", expand=True)
         self.user.insert(0, c.get("f1", ""))
+        if _f1sec:
+            self.user.config(state="readonly")        # 잠금해제 후에만 편집·붙여넣기
+            self.b_lock_f1 = ttk.Button(r1, text=self.t("unlock"), width=11, command=self._unlock_f1)
+            self.b_lock_f1.pack(side="left", padx=(4, 0))
         # Bybit/Bitget은 f1이 긴 API Key라 수동 타이핑이 고역 — 붙여넣기 버튼(대표 2026-07-12)
         ttk.Button(r1, text=self.t("paste"), width=8,
-                   command=lambda: self._paste_into(self.user)).pack(side="left", padx=(4, 0))
+                   command=self._paste_f1).pack(side="left", padx=(4, 0))
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
@@ -927,6 +936,19 @@ class App:
         c["broker"] = self._broker_name
         cr = c.setdefault("creds", {}).setdefault(self._broker_name, {"f1": "", "f3": "", "acct": ""})
         c["f1"], c["f3"], c["acct"] = cr.get("f1", ""), cr.get("f3", ""), cr.get("acct", "")
+        # 무장 상태도 브로커별(대표 2026-07-12): 이 자산이 '이전 브로커'로 무장돼 있었다면 해제 —
+        # 새 브로커는 연결 테스트 → 다시 시작해야 무장된다(신호대기·자동청산 동일).
+        a = self._asset
+        if a in self._sig_assets and self._sig_assets[a].get("broker") != self._broker_name:
+            del self._sig_assets[a]
+            if not self._sig_assets:
+                self._sig_on = False
+            self.log(f"⏹ {a} 신호 대기 해제 — 브로커 변경({self._broker_name}). 연결 테스트 후 다시 시작하세요.")
+        if a in self._auto_jobs and (self._auto_jobs[a] or [{}])[0].get("broker") != self._broker_name:
+            del self._auto_jobs[a]
+            if not self._auto_jobs:
+                self._auto_on = False
+            self.log(f"⏹ {a} 자동청산 해제 — 브로커 변경({self._broker_name}). 연결 테스트 후 다시 시작하세요.")
         self._connected = False
         self._conn_by_asset.pop(self._asset, None)   # 브로커가 바뀌면 연결테스트 다시
         self._unlocked = False
@@ -960,6 +982,33 @@ class App:
         self._unlocked = True
         self.key.config(state="normal")
         self.b_lock.config(text=self.t("lock"))
+
+    def _unlock_f1(self):
+        """크립토 API Key(f1) 잠금 토글 — f2와 같은 PIN 사용(대표 2026-07-12)."""
+        if self._f1_unlocked:                                # → re-lock
+            self._f1_unlocked = False
+            self.user.config(state="readonly", show="•")
+            self.b_lock_f1.config(text=self.t("unlock"))
+            return
+        if not _pin_hash():
+            pin = simpledialog.askstring("PIN", self.t("pin_new"), show="*", parent=self.root)
+            if not pin:
+                return
+            _pin_set(pin)
+        else:
+            pin = simpledialog.askstring("PIN", self.t("pin_enter"), show="*", parent=self.root)
+            if not pin or not _pin_ok(pin):
+                messagebox.showwarning("PIN", self.t("pin_wrong")); return
+        self._f1_unlocked = True
+        self.user.config(state="normal", show="")
+        self.b_lock_f1.config(text=self.t("lock"))
+
+    def _paste_f1(self):
+        """f1 붙여넣기 — 비밀 취급 브로커(크립토)는 잠금해제 후에만."""
+        _sp = _BROKER_SPEC.get(self._broker_name, {})
+        if _sp.get("f1_secret") and not self._f1_unlocked:
+            messagebox.showinfo("PIN", self.t("locked_msg")); return
+        self._paste_into(self.user)
 
     def _paste_into(self, entry):
         """클립보드 → 일반 Entry 교체 붙여넣기(strip). f1(API Key)·f3(Passphrase)용."""
@@ -1392,23 +1441,27 @@ class App:
         public = bool(self.tr_public.get())
         self._profile = {**(self._profile or {}), "public": public}   # handle 캐시 보존
         self._save_current_asset()                          # 프로필 포함 영속화
-        # creds 스냅샷(메인 스레드) — 설정된 자산만
-        creds = {}
+        # creds 스냅샷(메인 스레드) — 자산별 '모든 브로커 창고' 순회(대표 2026-07-12):
+        # 브로커를 갈아탔어도(바이빗→빗겟 등) 예전 브로커 체결까지 전부 트랙레코드에 수집.
+        credlist, one_r_by_asset = [], {}
         for a, c in self._acfg.items():
-            f1 = (c.get("f1") or "").strip()
-            if not f1:
-                continue
-            _sp = _BROKER_SPEC.get(c["broker"], {})
-            acct = (c.get("acct") or "").strip()
-            if _sp.get("acct") and not acct:
-                continue
             try:
                 one_r = float(c.get("one_r", 0))
             except (TypeError, ValueError):
                 one_r = 0.0
-            creds[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                        "f3": c.get("f3", ""), "acct": acct, "one_r": one_r or 600.0}
-        if not creds:
+            one_r_by_asset[a] = one_r or 600.0
+            for bk, cr in (c.get("creds") or {}).items():
+                f1 = (cr.get("f1") or "").strip()
+                if not f1:
+                    continue
+                _sp = _BROKER_SPEC.get(bk, {})
+                acct = (cr.get("acct") or "").strip()
+                if _sp.get("acct") and not acct:
+                    continue
+                credlist.append({"asset": a, "broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
+                                 "f3": cr.get("f3", ""), "acct": acct})
+        assets_with_creds = {e["asset"] for e in credlist}
+        if not credlist:
             if not auto:
                 messagebox.showwarning(self.t("input_needed"),
                                        "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
@@ -1424,8 +1477,8 @@ class App:
             import autopilot_crypto
             start_ms = int((_t.time() - TR_LOOKBACK_DAYS * 86400) * 1000)
             fills = []
-            seen_brokers = set()                            # NQ/GC 같은 브로커·계좌 중복 조회 방지
-            for a, c in creds.items():
+            seen_brokers = set()                            # 같은 브로커·키·계좌 중복 조회 방지
+            for c in credlist:
                 bk = (c["broker"], c["f1"], c["acct"])
                 if bk in seen_brokers:
                     continue
@@ -1454,7 +1507,7 @@ class App:
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))
-                if not a or a not in creds:
+                if not a or a not in assets_with_creds:
                     continue
                 dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
                 d = dt.date().isoformat()
@@ -1463,7 +1516,7 @@ class App:
                 e["pnl"] += float(f.get("pnl") or 0)
             trades = [{"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d, "instrument": a,
                        "direction": v["direction"],
-                       "r": round(v["pnl"] / creds[a]["one_r"], 3)}
+                       "r": round(v["pnl"] / one_r_by_asset[a], 3)}
                       for (d, a, s), v in sorted(agg.items())]
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
