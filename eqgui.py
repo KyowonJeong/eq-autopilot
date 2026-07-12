@@ -547,6 +547,29 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
+        # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        # 핸들·이름 입력 제거(대표 2026-07-11) — 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정.
+        tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
+        _prof = self._profile
+        self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
+        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
+        self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
+        self.b_tr.pack(side="left")
+        self.tr_ind = tk.Label(tr, font=("Helvetica", 11, "bold"))   # 신호대기와 같은 ● 표시등
+        self.tr_ind.pack(side="left", padx=(10, 0))
+        self.b_tr_page = ttk.Button(tr, text=self.t("tr_page"), command=self._open_my_page)
+        self.b_tr_page.pack(side="left", padx=(10, 0))
+        self.tr_status = tk.Label(tr, font=("Helvetica", 11))
+        self.tr_status.pack(side="left", padx=(12, 0))
+        if not hasattr(self, "consent"):      # 동의 var가 아직 없을 수 있음(아래서 생성) — 선생성
+            self.consent = tk.IntVar()
+        self._update_tr_status()
+        ttk.Label(frm, text=self.t("tr_note"), foreground="#888", wraplength=660,
+                  justify="left").pack(anchor="w")
+        ttk.Separator(frm).pack(fill="x", pady=8)
+
         c = self._acur()
         # ── 자산 탭 (NQ/GC/BTC) — 클릭 시 그 자산의 브로커·키·1R로 스왑 ──
         atab = ttk.Frame(frm); atab.pack(fill="x", pady=(2, 6))
@@ -663,25 +686,6 @@ class App:
         ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
 
-        # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
-        ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        # 핸들·이름 입력 제거(대표 2026-07-11) — 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정.
-        tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
-        _prof = self._profile
-        self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
-        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public).pack(side="left", padx=(0, 10))
-        self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
-        self.b_tr.pack(side="left")
-        self.tr_ind = tk.Label(tr, font=("Helvetica", 11, "bold"))   # 신호대기와 같은 ● 표시등
-        self.tr_ind.pack(side="left", padx=(10, 0))
-        self.b_tr_page = ttk.Button(tr, text=self.t("tr_page"), command=self._open_my_page)
-        self.b_tr_page.pack(side="left", padx=(10, 0))
-        self.tr_status = tk.Label(tr, font=("Helvetica", 11))
-        self.tr_status.pack(side="left", padx=(12, 0))
-        self._update_tr_status()
-        ttk.Label(frm, text=self.t("tr_note"), foreground="#888", wraplength=660,
-                  justify="left").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
