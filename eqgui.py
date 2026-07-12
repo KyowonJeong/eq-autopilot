@@ -62,6 +62,24 @@ STOP_RETRY_WAIT = 1.5                               # seconds between stop retri
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
 
 
+def _cross_basis_bitget() -> float:
+    """빗겟 캘리브레이션(대표 2026-07-12): 신호 손절은 Bybit BTCUSDT.P 좌표계 —
+    Bitget 체결용으로 순수 거래소 베이시스(빗겟가-바이빗가, 같은 순간 공개 티커)만 가산한다.
+    (진입 후 드리프트는 양쪽 공통이라 미반영 — Bybit 회원의 원본 손절/공식 채점과 일관 유지.)
+    실패 시 0.0(원본 손절 그대로) — 베이시스는 보통 리스크의 2~4%라 미조정도 치명적이지 않다."""
+    import requests
+    try:
+        by = requests.get("https://api.bybit.com/v5/market/tickers",
+                          params={"category": "linear", "symbol": "BTCUSDT"}, timeout=5).json()
+        bg = requests.get("https://api.bitget.com/api/v2/mix/market/ticker",
+                          params={"productType": "USDT-FUTURES", "symbol": "BTCUSDT"}, timeout=5).json()
+        p_by = float(by["result"]["list"][0]["lastPrice"])
+        p_bg = float(bg["data"][0]["lastPr"])
+        return p_bg - p_by
+    except Exception:
+        return 0.0
+
+
 def _hb_url(token):
     import autopilot_crypto
     return f"{APP_BASE}/hb-{autopilot_crypto.path_id(token)}.json"
@@ -1672,6 +1690,12 @@ class App:
                                             dry_run=not live)
                     else:
                         # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
+                        # Bitget = Bybit 좌표계 손절에 거래소 베이시스 가산(캘리브레이션, 대표 2026-07-12)
+                        if _broker == "bitget" and stop is not None:
+                            _basis = _cross_basis_bitget()
+                            if _basis:
+                                stop = round(stop + _basis, 2)
+                                self.log(f"   ⚖ 빗겟 캘리브레이션: 바이빗 대비 {_basis:+.2f} → 손절 {stop}")
                         res = b.place_entry(symbol=sym, side=direction, size=size,
                                             stop_loss_price=stop, dry_run=not live)
                     if res.get("error"):
