@@ -543,6 +543,9 @@ class App:
         ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
         self.user = ttk.Entry(r1); self.user.pack(side="left", fill="x", expand=True)
         self.user.insert(0, c.get("f1", ""))
+        # Bybit/Bitget은 f1이 긴 API Key라 수동 타이핑이 고역 — 붙여넣기 버튼(대표 2026-07-12)
+        ttk.Button(r1, text=self.t("paste"), width=8,
+                   command=lambda: self._paste_into(self.user)).pack(side="left", padx=(4, 0))
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
@@ -561,6 +564,8 @@ class App:
             _mask = "•" if ("Secret" in spec["f3"] or "Passphrase" in spec["f3"]) else ""
             self.f3 = ttk.Entry(r3e, show=_mask); self.f3.pack(side="left", fill="x", expand=True)
             self.f3.insert(0, c.get("f3", ""))
+            ttk.Button(r3e, text=self.t("paste"), width=8,
+                       command=lambda: self._paste_into(self.f3)).pack(side="left", padx=(4, 0))
         # 계좌 스코프 — 계좌 개념 있는 브로커만(Topstep/IBKR)
         if spec.get("acct"):
             r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
@@ -912,6 +917,14 @@ class App:
         self._unlocked = True
         self.key.config(state="normal")
         self.b_lock.config(text=self.t("lock"))
+
+    def _paste_into(self, entry):
+        """클립보드 → 일반 Entry 교체 붙여넣기(strip). f1(API Key)·f3(Passphrase)용."""
+        try:
+            entry.delete(0, "end")
+            entry.insert(0, self.root.clipboard_get().strip())
+        except Exception:
+            pass
 
     def _paste_key(self):
         if not self._unlocked:
