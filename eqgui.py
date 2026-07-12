@@ -445,8 +445,8 @@ class App:
             _h = min(1010, root.winfo_screenheight() - 60)
         except Exception:
             _h = 1010
-        root.geometry(f"780x{_h}")
-        root.minsize(700, 700)
+        root.geometry(f"860x{_h}")
+        root.minsize(760, 700)
         self.q = queue.Queue()
         self.lang = _load()["lang"]
         self.frm = None
