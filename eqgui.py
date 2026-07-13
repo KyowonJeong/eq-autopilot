@@ -57,9 +57,31 @@ HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5
 _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)],
                 "BTC": [("UTC", 2), ("UTC", 6)]}
 AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
+# 세션 진입(신호 도착) 시각 — 진입 전 API 사전 점검용(대표 2026-07-13). NQ·GC 주말 스킵.
+_ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 2)],
+                  "BTC": [("UTC", 22), ("UTC", 2)]}
+PRECHECK_WINDOW_MIN = 70                            # 진입까지 이 분 이내면 사전 점검 발동
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
+
+
+def _next_entry_dt(asset: str):
+    """이 자산의 다음 진입(신호 도착) 시각 — tz-aware datetime. NQ·GC는 주말 건너뜀."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    best = None
+    for tzname, hour in _ASSET_ENTRIES.get(asset, []):
+        tz = ZoneInfo(tzname)
+        d = datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0)
+        if d <= datetime.now(tz):
+            d += timedelta(days=1)
+        if asset in ("NQ", "GC"):
+            while d.weekday() >= 5:                  # 토(5)·일(6) 스킵
+                d += timedelta(days=1)
+        if best is None or d < best:
+            best = d
+    return best
 
 
 def _entry_fail_hint(msg: str, ko: bool) -> str:
@@ -500,6 +522,8 @@ class App:
         root.after(120, self._drain)
         root.after(800, lambda: self._heartbeat(periodic=True))   # 시작 직후 + 주기 권한 갱신
         root.after(5 * 60 * 1000, self._autopush_tick)             # 일일 자동 트랙레코드 동기화
+        self._precheck_done = {}                                    # {(asset, entry_iso): True}
+        root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -1461,6 +1485,68 @@ class App:
             url = _feed_url(self._token)             # 멤버별 신호 피드
             self.log("   polling feed")
             threading.Thread(target=self._sig_loop, args=(url,), daemon=True).start()
+
+    # ── 진입 전 API 사전 점검 (대표 2026-07-13) ──────────────────────────────
+    # 무장된 자산마다 다음 진입 70분 전~진입 사이에 1회, 그 자산 브로커 API를 실제 인증해 본다.
+    # 실패=팝업+로그(키·IP·네트워크 문제를 진입 전에 발견), Bybit는 키 만료 임박·권한도 경고.
+    def _precheck_tick(self):
+        try:
+            from datetime import datetime
+            armed = dict(self._sig_assets)
+            for a, jobs in (self._auto_jobs or {}).items():
+                if a not in armed and jobs:
+                    armed[a] = jobs[0]
+            for a, cfg in armed.items():
+                ent = _next_entry_dt(a)
+                if ent is None:
+                    continue
+                mins = (ent - datetime.now(ent.tzinfo)).total_seconds() / 60.0
+                key = (a, ent.isoformat())
+                if not (0 < mins <= PRECHECK_WINDOW_MIN) or self._precheck_done.get(key):
+                    continue
+                self._precheck_done[key] = True
+                threading.Thread(target=self._precheck_run,
+                                 args=(a, dict(cfg), ent.strftime("%H:%M %Z")),
+                                 daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            self.root.after(5 * 60 * 1000, self._precheck_tick)
+
+    def _precheck_run(self, asset, cfg, entry_label):
+        ko = self.lang == "ko"
+        try:
+            b = _build_broker(cfg.get("broker"), cfg.get("f1", ""), cfg.get("f2", ""),
+                              cfg.get("f3", ""), [cfg.get("acct")] if cfg.get("acct") else [])
+            b.healthcheck()
+            warns = []
+            if hasattr(b, "key_info"):
+                try:
+                    warns = b.key_info() or []
+                except Exception:
+                    warns = []
+            if warns:
+                _w = "\n".join(f"· {w}" for w in warns)
+                self.log(f"⚠ {asset} 사전 점검 경고 (진입 {entry_label}):")
+                for w in warns:
+                    self.log(f"   · {w}")
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "API 사전 점검" if ko else "API pre-check",
+                    (f"{asset} 진입({entry_label}) 전 점검에서 경고가 있습니다:\n\n{_w}"
+                     if ko else
+                     f"Pre-entry check for {asset} ({entry_label}) has warnings:\n\n{_w}")))
+            else:
+                self.log(f"🩺 {asset} API 사전 점검 통과 — 진입 {entry_label} 준비 완료"
+                         f" ({_broker_label(cfg.get('broker'))})")
+        except Exception as e:
+            _em = str(e)[:300]
+            _hint = _entry_fail_hint(_em, ko)
+            self.log(f"❌ {asset} API 사전 점검 실패 (진입 {entry_label}): {_em}")
+            self.root.after(0, lambda: messagebox.showerror(
+                "API 사전 점검 실패" if ko else "API pre-check failed",
+                (f"{asset} 진입({entry_label}) 1시간 전 점검에서 API가 실패했습니다:\n\n{_em}\n\n{_hint}"
+                 if ko else
+                 f"The pre-entry API check for {asset} ({entry_label}) failed:\n\n{_em}\n\n{_hint}")))
 
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod

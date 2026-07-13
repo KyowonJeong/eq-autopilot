@@ -235,6 +235,24 @@ class BybitBroker(BrokerAdapter):
             pass
         return out
 
+    def key_info(self) -> list:
+        """API 키 사전 점검 경고 목록(빈 리스트 = 이상 없음). GET /v5/user/query-api:
+        읽기전용 여부·계약 주문 권한·만료 잔여일(deadlineDay, IP 미등록 키의 3개월 만료)."""
+        out = []
+        d = self._req("GET", "/v5/user/query-api")
+        if int(d.get("readOnly") or 0) == 1:
+            out.append("키가 읽기 전용입니다 — 주문 불가")
+        ct = (d.get("permissions") or {}).get("ContractTrade") or []
+        if "Order" not in ct:
+            out.append("계약(Contract) 주문 권한이 없습니다")
+        try:
+            dd = int(d.get("deadlineDay") if d.get("deadlineDay") is not None else -1)
+        except (TypeError, ValueError):
+            dd = -1
+        if 0 <= dd <= 7:
+            out.append(f"키 만료 D-{dd} — IP 미등록 키는 3개월 만료. 재발급 또는 IP 등록 필요")
+        return out
+
     def healthcheck(self) -> bool:
         self.authenticate()
         return True
