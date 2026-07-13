@@ -287,11 +287,13 @@ T = {
     "live_dry": {"ko": "모의(Dry Run) — 체크 해제 시 실거래", "en": "Dry Run — uncheck for LIVE orders"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
-    "live_note": {"ko": "체크된 자산 전부: 연결 테스트 자동 실행 → 전부 통과 시에만 자동 청산+신호 대기 동시 가동 "
-                        "(하나라도 실패하면 아무것도 시작하지 않습니다). 개별 정지는 각 자산 섹션에서.",
-                  "en": "All checked assets: connection test runs automatically → arms auto-close + signal "
-                        "watch together only if every asset passes (one failure = nothing arms). "
-                        "Per-asset stop lives in each asset section."},
+    "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
+                        "신호의 방향·손절로 자동 진입 — 계약 수는 1R 기준 자동 계산(확신도 따라 최대 3R, "
+                        "계좌 여유는 3배 권장) — 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리.",
+                  "en": "Starts every checked asset at once after connection tests (one failure = nothing "
+                        "starts). Auto-enters with the signal's direction & stop — size auto-computed from "
+                        "your 1R (up to 3R by confidence; budget 3×) — auto-closes at session end. "
+                        "Positions are managed independently per symbol."},
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
@@ -672,6 +674,8 @@ class App:
             self._live_1r[_a] = _re
             dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
             dot.pack(side="right", padx=(6, 0))
+            ttk.Button(row, text=("정지" if self.lang == "ko" else "Stop"), width=5,
+                       command=lambda a=_a: self._panel_stop(a)).pack(side="right", padx=(4, 0))
             ttk.Button(row, text=self.t("btn_conn"), width=11,
                        command=lambda a=_a: self._panel_conn_test(a)).pack(side="right", padx=(6, 0))
             lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
@@ -787,40 +791,13 @@ class App:
             self.b_acc.pack(side="left")
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
-        # 즉시 청산 섹션 제거(대표 2026-07-13) — 자동 청산이 담당, 수동 청산은 브로커 앱에서
-        ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        af = ttk.Frame(frm); af.pack(fill="x", pady=3)
-        # 청산 시각 = 시스템 세션 마감(자산별 자동, _ASSET_EXITS) — 사용자 입력 제거(2026-07-11).
-        ttk.Label(af, text=self.t("auto_sched"), foreground="#888").pack(side="left", padx=(0, 10))
-        # LIVE/모의 선택은 전역 스위치(라이브 패널)로 통일(대표 2026-07-13 한방 라이브)
-        self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._asset in self._auto_jobs else self.t("auto_start"),
-                                 command=self.toggle_auto); self.b_auto.pack(side="left")
-        self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
-        self.auto_ind.pack(side="left", padx=(10, 0))
-        self._set_auto_ind(self._asset in self._auto_jobs, [self._asset])
-        ttk.Label(frm, text=self.t("auto_note"), foreground="#888").pack(anchor="w")
-
-        ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_sig"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        sg = ttk.Frame(frm); sg.pack(fill="x", pady=3)
-        # 1R 입력은 라이브 패널 자산 줄로 이동(대표 2026-07-13)
-        self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._asset in self._sig_assets else self.t("sig_start"),
-                                command=self.toggle_sig); self.b_sig.pack(side="left")
-        self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
-        self.sig_ind.pack(side="left", padx=(10, 0))
-        self._set_sig_ind(self._asset in self._sig_assets, [self._asset])
-        ttk.Label(frm, text=self.t("sig_note"), foreground="#888", wraplength=660,
-                  justify="left").pack(anchor="w")
-
-
+        # 자동 청산·자동 진입 섹션은 라이브 패널로 통합(대표 2026-07-13) — 개별 정지도 패널 줄에서.
         ttk.Separator(frm).pack(fill="x", pady=8)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. 계좌 버튼(연결 테스트 겸)은 항상 활성.
-        self._action_btns = [self.b_acc, self.b_auto, self.b_sig,
-                             self.b_tr]
+        self._action_btns = [self.b_acc, self.b_tr]
         self._apply_gating()
         # 안내 로그: 첫 실행만 '준비됨…', 이후(탭·브로커 전환 재빌드)는 그 자산의 실제 연결
         # 상태를 찍는다 — '준비됨'이 매번 떠서 리셋된 걸로 오해되던 것 수정(대표 2026-07-12).
@@ -868,10 +845,10 @@ class App:
         # 루프 '정지'는 어느 탭에서든 항상 가능해야 함(미연결 탭에서 버튼이 죽으면 돌던 루프를
         # 못 세움 — 대표 2026-07-12). 시작 조건은 기존대로(연결+권한), 도는 중엔 무조건 활성.
 
-        en(self.b_auto, use or getattr(self, "_auto_on", False))
+
         # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
         # 신호 대기 무장 = '연결 테스트 통과 자산만'(2026-07-11) — 현재 탭 브로커 종류와는 무관.
-        en(self.b_sig, auto or getattr(self, "_sig_on", False))
+
         # 공개 트랙레코드 푸시 = Autopilot 등급 자격(서버 entitled와 동일 기준: 마스터 스위치 무관,
         # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
         if hasattr(self, "b_tr"):
@@ -901,12 +878,12 @@ class App:
         if getattr(self, "_sig_on", False) and not perm_auto:
             self._sig_on = False
             self._sig_assets.clear()
-            self.b_sig.config(text=self.t("sig_start")); self._set_sig_ind(False)
+            self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self._auto_jobs.clear()
-            self.b_auto.config(text=self.t("auto_start")); self._set_auto_ind(False)
+            self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
         self._update_gate_label()
 
@@ -1349,7 +1326,6 @@ class App:
             del self._auto_jobs[a]
             if not self._auto_jobs:
                 self._auto_on = False
-            self.b_auto.config(text=self.t("auto_start"))
             self._set_auto_ind(False, [a])
             self.log(f"⏹ {a} 자동청산 해제." + ("" if self._auto_jobs else " (가동 자산 없음 — 루프 종료)"))
             self._refresh_live_panel()
@@ -1386,7 +1362,6 @@ class App:
             self.log(f"➖ {a}: 세션 마감 스케줄 없음 — 자동청산 미지원.")
             return
         self._auto_jobs[a] = jobs
-        self.b_auto.config(text=self.t("auto_stop"))
         self._set_auto_ind(True, [a])
         _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                             for j in jobs)
@@ -1503,7 +1478,6 @@ class App:
             del self._sig_assets[a]
             if not self._sig_assets:
                 self._sig_on = False
-            self.b_sig.config(text=self.t("sig_start"))
             self._set_sig_ind(False, [a])
             self.log(f"⏹ {a} 신호 대기 해제." + ("" if self._sig_assets else " (가동 자산 없음 — 루프 종료)"))
             self._refresh_live_panel()
@@ -1540,7 +1514,6 @@ class App:
         live = not bool(self.live_dry.get())          # 전역 모의 스위치(발주 순간 게이트 재판정)
         self._sig_assets[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
                                "f3": c.get("f3", ""), "acct": acct, "one_r": one_r, "live": live}
-        self.b_sig.config(text=self.t("sig_stop"))
         self._set_sig_ind(True, [a])
         _sumry = " · ".join(f"{k}:{v['broker']}(1R${v['one_r']:g})" for k, v in sorted(self._sig_assets.items()))
         self.log(f"\n▶ {a} 신호 대기 가동 — 현재 가동 [{_sumry}] · {'LIVE' if live else 'dry-run'}.")
@@ -1595,6 +1568,24 @@ class App:
                 dot.config(foreground=col)
             except Exception:
                 pass
+
+    def _panel_stop(self, a):
+        """패널 자산 줄 정지 — 이 자산만 가동 해제(자동 청산+신호 대기 둘 다)."""
+        ch = False
+        if a in self._auto_jobs:
+            del self._auto_jobs[a]; ch = True
+        if a in self._sig_assets:
+            del self._sig_assets[a]; ch = True
+        if not self._auto_jobs:
+            self._auto_on = False
+        if not self._sig_assets:
+            self._sig_on = False
+        if ch:
+            self.log(f"⏹ {a} 가동 해제." + ("" if (self._auto_jobs or self._sig_assets)
+                                            else " (가동 자산 없음 — 루프 종료)"))
+            self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
+            self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+        self._refresh_live_panel()
 
     def _save_panel_1r(self, a):
         """라이브 패널의 자산별 1R 입력 저장(대표 2026-07-13 '1R도 자산 옆에')."""
