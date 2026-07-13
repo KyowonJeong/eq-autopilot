@@ -283,7 +283,7 @@ T = {
                       "sensitive data such as API keys, account numbers and balances are never "
                       "transmitted. The track record updates automatically and can be shared easily "
                       "via its public page link."},
-    "sec_live": {"ko": "라이브 — 전 자산 한방 실행", "en": "Go Live — all assets at once"},
+    "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
     "live_dry": {"ko": "모의(Dry Run) — 체크 해제 시 실거래", "en": "Dry Run — uncheck for LIVE orders"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
@@ -648,6 +648,11 @@ class App:
         # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-13) ──────────────
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_live"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        # 동의(전 자산 공통, 대표 2026-07-13) — 실행 동작 전 필요, 탭 재빌드에도 상태 유지
+        if not hasattr(self, "consent"):
+            self.consent = tk.IntVar()
+        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
+                        command=self._update_tr_status).pack(anchor="w", pady=(2, 2))
         self._live_rows = {}
         self._live_include = {}
         lv = ttk.Frame(frm); lv.pack(fill="x", pady=(3, 0))
@@ -660,6 +665,8 @@ class App:
             cb.pack(side="left")
             dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
             dot.pack(side="right", padx=(6, 0))
+            ttk.Button(row, text=self.t("btn_conn"), width=11,
+                       command=lambda a=_a: self._panel_conn_test(a)).pack(side="right", padx=(6, 0))
             lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
             lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
             self._live_rows[_a] = (lbl, dot)
@@ -768,11 +775,6 @@ class App:
         row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
         self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
         self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.accounts); self.b_acc.pack(side="left", padx=6)
-        # 동의 — 연결 테스트 '바로 밑'(실행 동작 전 필요)
-        if not hasattr(self, "consent"):
-            self.consent = tk.IntVar()               # 탭 전환(재빌드)에도 동의 상태 유지
-        ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
-                        command=self._update_tr_status).pack(anchor="w", pady=(6, 0))
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -1582,6 +1584,26 @@ class App:
                 dot.config(foreground=col)
             except Exception:
                 pass
+
+    def _panel_conn_test(self, a):
+        """라이브 패널 자산 줄의 연결 테스트 버튼(대표 2026-07-13) — 저장된 설정으로 무음 점검."""
+        self._save_current_asset()
+        txt, _ = self._asset_row_state(a)
+        if txt.startswith("✗"):
+            messagebox.showwarning(self.t("btn_conn"), f"{a}: {txt}")
+            return
+        self.log(f"\n── {a} 연결 테스트 ({_broker_label(self._acfg[a].get('broker'))}) ──")
+
+        def w():
+            err = self._conn_check_asset(a)
+            def done():
+                if err:
+                    self.log(f"❌ {a}: {err}")
+                else:
+                    self.log(f"✅ {a} 연결 OK")
+                self._refresh_live_panel()
+            self.root.after(0, done)
+        threading.Thread(target=w, daemon=True).start()
 
     def _conn_check_asset(self, a):
         """자산 설정값으로 무음 연결 테스트(스레드 컨텍스트) — 성공 시 _conn_by_asset 세팅.
