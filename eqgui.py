@@ -283,6 +283,15 @@ T = {
                       "sensitive data such as API keys, account numbers and balances are never "
                       "transmitted. The track record updates automatically and can be shared easily "
                       "via its public page link."},
+    "sec_live": {"ko": "라이브 — 전 자산 한방 실행", "en": "Go Live — all assets at once"},
+    "live_dry": {"ko": "모의(Dry Run) — 체크 해제 시 실거래", "en": "Dry Run — uncheck for LIVE orders"},
+    "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
+    "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
+    "live_note": {"ko": "체크된 자산 전부: 연결 테스트 자동 실행 → 전부 통과 시에만 자동 청산+신호 대기 동시 무장 "
+                        "(하나라도 실패하면 아무것도 무장하지 않습니다). 개별 정지는 각 자산 섹션에서.",
+                  "en": "All checked assets: connection test runs automatically → arms auto-close + signal "
+                        "watch together only if every asset passes (one failure = nothing arms). "
+                        "Per-asset stop lives in each asset section."},
     "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
@@ -397,6 +406,7 @@ def _load():
             creds[_bk] = {"f1": s.get("f1", ""), "f3": s.get("f3", ""), "acct": s.get("acct", "")}
         cur = creds.get(_bk) or {"f1": "", "f3": "", "acct": ""}
         acfg[_a] = {"broker": _bk, "one_r": s.get("one_r", 600), "creds": creds,
+                    "include": bool(s.get("include", True)),
                     # 상위 f1/f3/acct = '현재 브로커' 미러(다운스트림 호환) — 저장·전환 때 갱신
                     "f1": cur.get("f1", ""), "f3": cur.get("f3", ""), "acct": cur.get("acct", "")}
     if not assets and out["f1"]:            # 마이그레이션: 옛 flat → 브로커 맞는 첫 자산
@@ -408,6 +418,7 @@ def _load():
                                                     "acct": out["acct"]}
                 break
     out["assets"] = acfg
+    out["dry_run"] = bool(d.get("dry_run", True))   # 전역 모의 스위치(대표 2026-07-13 한방 라이브)
     _p = d.get("profile") or {}
     # 핸들·이름은 서버 자동(2026-07-11) — 입력은 없지만, 서버가 배정한 핸들은 '공개 페이지'
     # 버튼용으로 로컬 캐시(푸시 응답 pp:ok:N:handle에서 회신받아 저장, 대표 2026-07-12).
@@ -463,13 +474,15 @@ def _mark_pushed() -> None:
         pass
 
 
-def _save_full(lang, token, acfg, profile=None):
-    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r}}) + lang/token + 공개프로필 설정을
-    yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 _kc_save로 Keychain에 이미 넣는다."""
+def _save_full(lang, token, acfg, profile=None, dry_run=None):
+    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r,include}}) + lang/token/전역 dry_run +
+    공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 Keychain에 이미 넣는다."""
     try:
         import yaml
         payload = {"live": False, "lang": lang, "token": token,
                    "assets": {a: dict(c) for a, c in (acfg or {}).items()}}
+        if dry_run is not None:
+            payload["dry_run"] = bool(dry_run)
         if profile is not None:
             payload["profile"] = dict(profile)
         with open(CFG_PATH, "w") as f:
@@ -632,6 +645,37 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
+        # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-13) ──────────────
+        ttk.Separator(frm).pack(fill="x", pady=8)
+        ttk.Label(frm, text=self.t("sec_live"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        self._live_rows = {}
+        self._live_include = {}
+        lv = ttk.Frame(frm); lv.pack(fill="x", pady=(3, 0))
+        for _a in _ASSETS:
+            row = ttk.Frame(lv); row.pack(fill="x", pady=1)
+            var = tk.IntVar(value=1 if self._acfg[_a].get("include", True) else 0)
+            self._live_include[_a] = var
+            cb = ttk.Checkbutton(row, text=_a, width=5, variable=var,
+                                 command=self._save_current_asset)
+            cb.pack(side="left")
+            dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
+            dot.pack(side="right", padx=(6, 0))
+            lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
+            lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
+            self._live_rows[_a] = (lbl, dot)
+        lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
+        self.live_dry = tk.IntVar(value=1 if d.get("dry_run", True) else 0)
+        self.cb_live_dry = ttk.Checkbutton(lc, text=self.t("live_dry"), variable=self.live_dry,
+                                           command=self._save_current_asset)
+        self.cb_live_dry.pack(side="left", padx=(0, 12))
+        self.b_live_start = ttk.Button(lc, text=self.t("live_start"), command=self._master_start)
+        self.b_live_start.pack(side="left")
+        self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
+        self.b_live_stop.pack(side="left", padx=(6, 0))
+        ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+        self._refresh_live_panel()
+
         # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
@@ -744,10 +788,7 @@ class App:
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
         # 청산 시각 = 시스템 세션 마감(자산별 자동, _ASSET_EXITS) — 사용자 입력 제거(2026-07-11).
         ttk.Label(af, text=self.t("auto_sched"), foreground="#888").pack(side="left", padx=(0, 10))
-        # LIVE 체크 = 자산별 저장값(대표 2026-07-12: 자산 상태 완전 분리)
-        self.auto_live = tk.IntVar(value=1 if self._acur().get("auto_live") else 0)
-        self.cb_auto_live = ttk.Checkbutton(af, text=self.t("auto_live"), variable=self.auto_live)
-        self.cb_auto_live.pack(side="left", padx=(0, 10))
+        # LIVE/모의 선택은 전역 스위치(라이브 패널)로 통일(대표 2026-07-13 한방 라이브)
         self.b_auto = ttk.Button(af, text=self.t("auto_stop") if self._asset in self._auto_jobs else self.t("auto_start"),
                                  command=self.toggle_auto); self.b_auto.pack(side="left")
         self.auto_ind = tk.Label(af, font=("Helvetica", 11, "bold"))
@@ -762,9 +803,6 @@ class App:
         self.one_r = ttk.Entry(sg, width=8)
         self.one_r.insert(0, str(self._acur().get("one_r", 600)))
         self.one_r.pack(side="left", padx=(0, 14))
-        self.sig_live = tk.IntVar(value=1 if self._acur().get("sig_live") else 0)
-        self.cb_sig_live = ttk.Checkbutton(sg, text=self.t("sig_live"), variable=self.sig_live)
-        self.cb_sig_live.pack(side="left", padx=(0, 12))
         self.b_sig = ttk.Button(sg, text=self.t("sig_stop") if self._asset in self._sig_assets else self.t("sig_start"),
                                 command=self.toggle_sig); self.b_sig.pack(side="left")
         self.sig_ind = tk.Label(sg, font=("Helvetica", 11, "bold"))
@@ -838,14 +876,20 @@ class App:
             en(self.b_tr, bool(g.get("ok")) and g.get("tier") in ("royal", "admin"))
         if hasattr(self, "tr_ind"):
             self._update_tr_status()
-        for cb, var in ((self.cb_auto_live, self.auto_live), (self.cb_sig_live, self.sig_live)):
+        # 전역 모의 스위치: 권한 없으면 모의 고정(체크 강제 + 비활성)
+        if hasattr(self, "cb_live_dry"):
             try:
                 if not live_ok:
-                    var.set(0); cb.config(state="disabled")
+                    self.live_dry.set(1); self.cb_live_dry.config(state="disabled")
                 else:
-                    cb.config(state="normal")
+                    self.cb_live_dry.config(state="normal")
             except Exception:
                 pass
+        if hasattr(self, "b_live_start"):
+            _pu = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
+            _pa = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
+            en(self.b_live_start, _pu or _pa)
+        self._refresh_live_panel()
         # fail-closed: 돌던 루프가 '권한'을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
         # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
         # ⚠️ 판정은 하트비트 권한만 — 연결(_connected)은 '현재 탭' 상태라 여기 섞으면
@@ -1002,12 +1046,15 @@ class App:
                 pass
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
             _kc_save(c["f1"], self.key.get())
-        # LIVE 선택도 자산별(대표 2026-07-12 — 전역이라 탭 넘어가면 '셋된 것처럼' 보이던 혼동 제거)
-        if hasattr(self, "auto_live"):
-            c["auto_live"] = bool(self.auto_live.get())
-        if hasattr(self, "sig_live"):
-            c["sig_live"] = bool(self.sig_live.get())
-        _save_full(self.lang, self._token, self._acfg, self._profile)
+        # 참여 체크(라이브 패널) 반영 — LIVE/모의는 전역 스위치로 이동(대표 2026-07-13)
+        for _a, _v in getattr(self, "_live_include", {}).items():
+            try:
+                self._acfg[_a]["include"] = bool(_v.get())
+            except Exception:
+                pass
+        _save_full(self.lang, self._token, self._acfg, self._profile,
+                   dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
+        self._refresh_live_panel()
 
     def _persist(self):
         self._save_current_asset()
@@ -1243,6 +1290,7 @@ class App:
             except Exception:
                 pass
             self.log("🔓 " + self.t("conn_ok"))
+            self.root.after(0, self._refresh_live_panel)
         self._run(w)
 
     def accounts(self):
@@ -1291,6 +1339,7 @@ class App:
             self.b_auto.config(text=self.t("auto_start"))
             self._set_auto_ind(False, [a])
             self.log(f"⏹ {a} 자동청산 해제." + ("" if self._auto_jobs else " (무장 자산 없음 — 루프 종료)"))
+            self._refresh_live_panel()
             return
         if not self._consent_ok():
             return
@@ -1317,7 +1366,7 @@ class App:
                                    else f"{a}: pick an account."); return
         cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
                 "f3": c.get("f3", ""), "acct": acct}
-        live = bool(self.auto_live.get())             # 이 자산의 LIVE 선택(발화 순간 게이트 재판정)
+        live = not bool(self.live_dry.get())          # 전역 모의 스위치(발화 순간 게이트 재판정)
         jobs = [{"asset": a, "tz": tzname, "hour": hour, "live": live, **cred}
                 for tzname, hour in _ASSET_EXITS.get(a, [])]
         if not jobs:
@@ -1334,6 +1383,7 @@ class App:
         if not self._auto_on:
             self._auto_on = True
             threading.Thread(target=self._auto_loop, daemon=True).start()
+        self._refresh_live_panel()
 
     def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
         """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
@@ -1443,6 +1493,7 @@ class App:
             self.b_sig.config(text=self.t("sig_start"))
             self._set_sig_ind(False, [a])
             self.log(f"⏹ {a} 신호 대기 해제." + ("" if self._sig_assets else " (무장 자산 없음 — 루프 종료)"))
+            self._refresh_live_panel()
             return
         if not self._consent_ok():
             return
@@ -1473,7 +1524,7 @@ class App:
             messagebox.showwarning(self.t("input_needed"),
                                    f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
                                    else f"{a}: pick an account."); return
-        live = bool(self.sig_live.get())              # 이 자산의 LIVE 선택(발주 순간 게이트 재판정)
+        live = not bool(self.live_dry.get())          # 전역 모의 스위치(발주 순간 게이트 재판정)
         self._sig_assets[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
                                "f3": c.get("f3", ""), "acct": acct, "one_r": one_r, "live": live}
         self.b_sig.config(text=self.t("sig_stop"))
@@ -1485,6 +1536,187 @@ class App:
             url = _feed_url(self._token)             # 멤버별 신호 피드
             self.log("   polling feed")
             threading.Thread(target=self._sig_loop, args=(url,), daemon=True).start()
+        self._refresh_live_panel()
+
+    # ── 라이브 패널 (대표 2026-07-13 "자산별 세팅 후 한방 라이브") ─────────────
+    def _asset_row_state(self, a):
+        """(요약문, 점 색) — 설정·연결·무장 상태를 한 줄로."""
+        c = self._acfg.get(a) or {}
+        f1 = (c.get("f1") or "").strip()
+        try:
+            one_r = float(c.get("one_r", 0))
+        except (TypeError, ValueError):
+            one_r = 0.0
+        _sp = _BROKER_SPEC.get(c.get("broker"), {})
+        need_acct = bool(_sp.get("acct"))
+        missing = []
+        if not f1:
+            missing.append("키" if self.lang == "ko" else "key")
+        if one_r <= 0:
+            missing.append("1R")
+        if need_acct and not (c.get("acct") or "").strip():
+            missing.append("계좌" if self.lang == "ko" else "account")
+        if missing:
+            return (("✗ 미설정: " if self.lang == "ko" else "✗ missing: ") + " · ".join(missing)
+                    + f"  ({_broker_label(c.get('broker'))})", "#9ca3af")
+        armed = a in self._sig_assets or a in self._auto_jobs
+        live = (self._sig_assets.get(a) or (self._auto_jobs.get(a) or [{}])[0]).get("live")
+        acct = (c.get("acct") or "").strip()
+        base = (f"✓ {_broker_label(c.get('broker'))}"
+                + (f" ···{acct[-4:]}" if acct else "") + f" · 1R ${one_r:g}"
+                + ("" if self._conn_by_asset.get(a) else
+                   (" · 연결 테스트 전" if self.lang == "ko" else " · not tested")))
+        if armed:
+            base += " · " + (("무장(LIVE)" if live else "무장(모의)") if self.lang == "ko"
+                             else ("ARMED LIVE" if live else "ARMED dry"))
+            return base, ("#21c55e" if live else "#eab308")
+        return base, "#9ca3af"
+
+    def _refresh_live_panel(self):
+        if not getattr(self, "_live_rows", None):
+            return
+        for a, (lbl, dot) in self._live_rows.items():
+            try:
+                txt, col = self._asset_row_state(a)
+                lbl.config(text=txt)
+                dot.config(foreground=col)
+            except Exception:
+                pass
+
+    def _conn_check_asset(self, a):
+        """자산 설정값으로 무음 연결 테스트(스레드 컨텍스트) — 성공 시 _conn_by_asset 세팅.
+        반환: None(성공) | 오류 문자열."""
+        c = self._acfg.get(a) or {}
+        f1 = (c.get("f1") or "").strip()
+        try:
+            b = _build_broker(c.get("broker"), f1, _kc_load(f1) or "", c.get("f3", ""),
+                              [c.get("acct")] if c.get("acct") else [])
+            b.healthcheck()
+            if c.get("broker") == "projectx":
+                names = [str(x.get("name")) for x in b._accounts()]
+                acct = (c.get("acct") or "").strip()
+                if acct and acct not in names:
+                    return (f"저장된 계좌 '{acct}'가 계좌 목록에 없음" if self.lang == "ko"
+                            else f"saved account '{acct}' not in account list")
+            self._conn_by_asset[a] = True
+            try:
+                for _ln in (b.entry_info() or []):
+                    self.log(f"   ℹ {a} {_ln}")
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            return str(e)[:200]
+
+    def _master_arm_asset(self, a, live, arm_sig):
+        """마스터 플로우 전용 무장(검증은 프리플라이트에서 완료) — 자동청산 + (권한 시) 신호대기."""
+        c = self._acfg[a]
+        f1 = (c.get("f1") or "").strip()
+        cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
+                "f3": c.get("f3", ""), "acct": (c.get("acct") or "").strip()}
+        jobs = [{"asset": a, "tz": tzname, "hour": hour, "live": live, **cred}
+                for tzname, hour in _ASSET_EXITS.get(a, [])]
+        if jobs:
+            self._auto_jobs[a] = jobs
+            if not self._auto_on:
+                self._auto_on = True
+                threading.Thread(target=self._auto_loop, daemon=True).start()
+        if arm_sig:
+            self._sig_assets[a] = {**cred, "one_r": float(c.get("one_r", 0)), "live": live}
+            if not self._sig_on:
+                self._sig_on = True
+                threading.Thread(target=self._sig_loop, args=(_feed_url(self._token),),
+                                 daemon=True).start()
+        self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
+        self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+
+    def _master_start(self):
+        """[▶ 라이브 시작] — 체크된 자산 전부 연결 테스트 → 전부 통과 시에만 일괄 무장.
+        하나라도 실패하면 아무것도 무장하지 않음(대표 2026-07-13 전체 중단)."""
+        if self._sig_assets or self._auto_jobs:
+            messagebox.showinfo(self.t("sec_live"),
+                                "이미 무장 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
+                                if self.lang == "ko" else
+                                "Already armed — press 'Stop all' first."); return
+        if not self._consent_ok():
+            return
+        if not self._token:
+            messagebox.showwarning(self.t("token"), self.t("gate_none")); return
+        self._save_current_asset()
+        incl = [a for a in _ASSETS if self._live_include[a].get()]
+        if not incl:
+            messagebox.showwarning(self.t("sec_live"),
+                                   "참여 자산이 없습니다 — 자산을 체크하세요."
+                                   if self.lang == "ko" else "No assets checked."); return
+        # 프리플라이트: 설정 완결성(전체 중단 원칙 — 하나라도 미비면 시작 안 함)
+        bad = []
+        for a in incl:
+            txt, _ = self._asset_row_state(a)
+            if txt.startswith("✗"):
+                bad.append(f"{a}: {txt}")
+            elif not self._broker_allowed(self._acfg[a].get("broker")):
+                bad.append(f"{a}: 브로커 지원 꺼짐(서버)" if self.lang == "ko"
+                           else f"{a}: broker disabled (server)")
+        if bad:
+            messagebox.showwarning(self.t("sec_live"), "\n".join(bad)); return
+        g = self._gate or {}
+        caps = g.get("caps", {})
+        perm_use = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
+        perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
+        if not (perm_use or perm_auto):
+            messagebox.showwarning(self.t("token"),
+                                   "멤버십 권한이 없습니다 — 토큰을 확인하세요."
+                                   if self.lang == "ko" else "No membership permission."); return
+        live = not bool(self.live_dry.get())
+        self.b_live_start.config(state="disabled")
+        self.log("\n══ 라이브 시작 — 연결 테스트 " + "·".join(incl)
+                 + f" ({'LIVE' if live else 'dry-run'}) ══")
+
+        def w():
+            fails = []
+            for a in incl:
+                self.log(f"── {a} 연결 테스트 ({_broker_label(self._acfg[a].get('broker'))}) ──")
+                err = self._conn_check_asset(a)
+                if err:
+                    fails.append(f"{a}: {err}")
+                    self.log(f"❌ {a}: {err}")
+                else:
+                    self.log(f"✅ {a} 연결 OK")
+
+            def done():
+                self.b_live_start.config(state="normal")
+                if fails:
+                    self.log("⛔ 전체 중단 — 아무 자산도 무장하지 않았습니다.")
+                    messagebox.showerror(self.t("sec_live"),
+                                         ("연결 실패 — 전체 중단:\n" if self.lang == "ko"
+                                          else "Connection failed — aborted:\n") + "\n".join(fails))
+                    self._refresh_live_panel(); return
+                for a in incl:
+                    self._master_arm_asset(a, live, arm_sig=perm_auto)
+                _what = ("자동 청산" + (" + 신호 대기" if perm_auto else " (신호 대기는 Autopilot 등급)")
+                         if self.lang == "ko" else
+                         "auto-close" + (" + signal watch" if perm_auto else ""))
+                self.log(f"🚀 라이브 무장 완료 [{ '·'.join(incl) }] — {_what} · "
+                         f"{'LIVE' if live else 'dry-run(모의)'}")
+                self.log(f"   {self.t('warn_mix')}")
+                self._refresh_live_panel()
+                self._apply_gating()
+            self.root.after(0, done)
+        self._run(w)
+
+    def _master_stop(self):
+        """[⏹ 전체 정지] — 모든 자산 무장 해제(루프는 무장 0이면 자연 종료)."""
+        n = len(set(list(self._sig_assets) + list(self._auto_jobs)))
+        self._sig_assets.clear()
+        self._auto_jobs.clear()
+        self._sig_on = False
+        self._auto_on = False
+        self._set_auto_ind(False, [])
+        self._set_sig_ind(False, [])
+        self.log(f"\n⏹ 전체 정지 — {n}개 자산 무장 해제." if self.lang == "ko"
+                 else f"\n⏹ Stopped all — {n} asset(s) disarmed.")
+        self._refresh_live_panel()
+        self._apply_gating()
 
     # ── 진입 전 API 사전 점검 (대표 2026-07-13) ──────────────────────────────
     # 무장된 자산마다 다음 진입 70분 전~진입 사이에 1회, 그 자산 브로커 API를 실제 인증해 본다.
