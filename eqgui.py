@@ -893,13 +893,16 @@ class App:
         _tr_ok = bool(g.get("ok")) and g.get("tier") in ("royal", "admin")
         if hasattr(self, "b_tr"):
             en(self.b_tr, _tr_ok)
-        # 공개 동의도 Autopilot 전용(대표 2026-07-13) — Operator 이하는 해제+비활성
+        # 공개 동의도 Autopilot 전용(대표 2026-07-13) — Operator 이하는 해제+비활성.
+        # 표시만 끄고 저장값(_profile.public)은 안 건드림 → 권한 확인·복귀 시 저장된 동의로
+        # 복원 = "한 번 동의하면 앱 켤 때마다 동의 유지"(대표).
         if hasattr(self, "cb_tr_public"):
             try:
                 if not _tr_ok:
                     self.tr_public.set(0)
                     self.cb_tr_public.config(state="disabled")
                 else:
+                    self.tr_public.set(1 if (self._profile or {}).get("public") else 0)
                     self.cb_tr_public.config(state="normal")
             except Exception:
                 pass
