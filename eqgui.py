@@ -610,8 +610,19 @@ class App:
         _cv.pack(side="left", fill="both", expand=True)
         frm = ttk.Frame(_cv, padding=14)
         _win = _cv.create_window((0, 0), window=frm, anchor="nw")
-        frm.bind("<Configure>", lambda e: _cv.configure(scrollregion=_cv.bbox("all")))
-        _cv.bind("<Configure>", lambda e: _cv.itemconfigure(_win, width=e.width))
+        # 내용이 뷰포트보다 짧으면(설정 접힘 등) 안쪽 프레임을 뷰포트 높이로 늘려
+        # 로그 창(expand=True)이 남는 공간을 전부 먹게 한다(대표 2026-07-13).
+        def _fit_canvas(_e=None):
+            try:
+                _need = max(frm.winfo_reqheight(), _cv.winfo_height())
+                if _cv.itemcget(_win, "height") != str(_need):
+                    _cv.itemconfigure(_win, height=_need)
+                _cv.configure(scrollregion=_cv.bbox("all"))
+            except Exception:
+                pass
+        frm.bind("<Configure>", _fit_canvas)
+        _cv.bind("<Configure>", lambda e: (_cv.itemconfigure(_win, width=e.width),
+                                           _fit_canvas()))
 
         def _wheel(e):
             _cv.yview_scroll(-1 * (e.delta if sys.platform == "darwin"
