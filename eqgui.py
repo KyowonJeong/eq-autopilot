@@ -423,6 +423,8 @@ def _load():
                 break
     out["assets"] = acfg
     out["dry_run"] = bool(d.get("dry_run", True))   # 전역 모의 스위치(대표 2026-07-13 한방 라이브)
+    if "cfg_open" in d:
+        out["cfg_open"] = bool(d.get("cfg_open"))   # 브로커 설정 접이식 상태
     _p = d.get("profile") or {}
     # 핸들·이름은 서버 자동(2026-07-11) — 입력은 없지만, 서버가 배정한 핸들은 '공개 페이지'
     # 버튼용으로 로컬 캐시(푸시 응답 pp:ok:N:handle에서 회신받아 저장, 대표 2026-07-12).
@@ -478,7 +480,7 @@ def _mark_pushed() -> None:
         pass
 
 
-def _save_full(lang, token, acfg, profile=None, dry_run=None):
+def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None):
     """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r,include}}) + lang/token/전역 dry_run +
     공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 Keychain에 이미 넣는다."""
     try:
@@ -487,6 +489,8 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None):
                    "assets": {a: dict(c) for a, c in (acfg or {}).items()}}
         if dry_run is not None:
             payload["dry_run"] = bool(dry_run)
+        if cfg_open is not None:
+            payload["cfg_open"] = bool(cfg_open)
         if profile is not None:
             payload["profile"] = dict(profile)
         with open(CFG_PATH, "w") as f:
@@ -724,6 +728,24 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=8)
 
         c = self._acur()
+        # ── 자산별 브로커 설정 — 접이식(대표 2026-07-13: 한 번 셋업하면 열 일이 드묾).
+        #    기본: 미설정 자산이 있으면 펼침, 전부 설정돼 있으면 접힘. 상태는 세션 유지+영속.
+        if not hasattr(self, "_cfg_open"):
+            _unset = any(self._asset_row_state(_a)[0].startswith("✗") for _a in _ASSETS)
+            self._cfg_open = bool(d.get("cfg_open", _unset))
+        self._cfg_hdr = tk.Button(
+            frm, text=("▾ " if self._cfg_open else "▸ ")
+            + ("자산별 브로커 설정 (NQ·GC·BTC)" if self.lang == "ko"
+               else "Per-asset broker setup (NQ·GC·BTC)"),
+            command=self._toggle_cfg, relief="flat", anchor="w",
+            font=("Helvetica", 12, "bold"), padx=0)
+        self._cfg_hdr.pack(fill="x", anchor="w")
+        self._cfg_body = ttk.Frame(frm)
+        if self._cfg_open:
+            self._cfg_body.pack(fill="x")
+        _outer_frm = frm
+        frm = self._cfg_body                      # 아래 설정 위젯들은 접이식 본문으로
+
         # ── 자산 탭 (NQ/GC/BTC) — 클릭 시 그 자산의 브로커·키·1R로 스왑 ──
         atab = ttk.Frame(frm); atab.pack(fill="x", pady=(2, 6))
         for _a in _ASSETS:
@@ -794,6 +816,7 @@ class App:
         if spec.get("acct"):
             self.b_acc.pack(side="left")
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
+        frm = _outer_frm                          # 접이식 본문 끝 — 이후(로그)는 바깥에
 
         # 자동 청산·자동 진입 섹션은 라이브 패널로 통합(대표 2026-07-13) — 개별 정지도 패널 줄에서.
         ttk.Separator(frm).pack(fill="x", pady=8)
@@ -1572,6 +1595,20 @@ class App:
                 dot.config(foreground=col)
             except Exception:
                 pass
+
+    def _toggle_cfg(self):
+        """자산별 브로커 설정 접기/펼치기(대표 2026-07-13)."""
+        self._cfg_open = not self._cfg_open
+        if self._cfg_open:
+            self._cfg_body.pack(fill="x", after=self._cfg_hdr)
+        else:
+            self._cfg_body.pack_forget()
+        self._cfg_hdr.config(text=("▾ " if self._cfg_open else "▸ ")
+                             + ("자산별 브로커 설정 (NQ·GC·BTC)" if self.lang == "ko"
+                                else "Per-asset broker setup (NQ·GC·BTC)"))
+        _save_full(self.lang, self._token, self._acfg, self._profile,
+                   dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
+                   cfg_open=self._cfg_open)
 
     def _panel_stop(self, a):
         """패널 자산 줄 정지 — 이 자산만 가동 해제(자동 청산+신호 대기 둘 다)."""
