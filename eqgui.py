@@ -62,6 +62,27 @@ STOP_RETRY_WAIT = 1.5                               # seconds between stop retri
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
 
 
+def _entry_fail_hint(msg: str, ko: bool) -> str:
+    """주문 거절 메시지 → 원인별 안내 문구. 10005(권한)를 잔고 문제로 오도하지 않게(대표 2026-07-12)."""
+    m = (msg or "").lower()
+    if "10005" in m or "permission" in m or "40014" in m:
+        return ("API 키에 주문 권한이 없습니다. 거래소 API 관리에서 이 키에 파생상품(계약) "
+                "주문 권한을 켜고, IP 제한이 있다면 이 컴퓨터 IP를 허용하세요."
+                if ko else
+                "The API key lacks trade permission. In the exchange's API management enable "
+                "derivatives (contract) order permission for this key, and allow this computer's "
+                "IP if the key is IP-restricted.")
+    if "10004" in m or "sign" in m or "40012" in m or "40013" in m:
+        return ("API 키/시크릿(패스프레이즈)이 올바른지 다시 확인하세요."
+                if ko else "Double-check the API key/secret (and passphrase).")
+    if "110007" in m or "insufficient" in m or "margin" in m or "balance" in m or "40754" in m:
+        return ("가용 잔고(마진)가 부족합니다 — 잔고를 늘리거나 해당 심볼의 레버리지를 높이세요."
+                if ko else
+                "Insufficient available margin — add funds or raise the symbol's leverage.")
+    return ("잔고(마진)·레버리지·API 키 권한을 확인하세요."
+            if ko else "Check margin balance, leverage and API key permissions.")
+
+
 def _cross_basis_bitget() -> float:
     """빗겟 캘리브레이션(대표 2026-07-12): 신호 손절은 Bybit BTCUSDT.P 좌표계 —
     Bitget 체결용으로 순수 거래소 베이시스(빗겟가-바이빗가, 같은 순간 공개 티커)만 가산한다.
@@ -1866,12 +1887,12 @@ class App:
                         self.log(f"   ❌ 진입 실패: {res.get('error')}")
                         # 눈에 띄는 알림(대표 2026-07-12) — 마진 부족·API 거절 등을 놓치지 않게.
                         _em = str(res.get("error"))[:300]
-                        self.root.after(0, lambda m=_em, a=_asset: messagebox.showerror(
+                        _hint = _entry_fail_hint(_em, self.lang == "ko")
+                        self.root.after(0, lambda m=_em, a=_asset, h=_hint: messagebox.showerror(
                             "진입 실패" if self.lang == "ko" else "Entry failed",
-                            (f"{a} 진입 주문이 거절되었습니다:\n\n{m}\n\n잔고(마진)·레버리지 설정을 "
-                             f"확인하세요." if self.lang == "ko" else
-                             f"{a} entry order was rejected:\n\n{m}\n\nCheck margin balance and "
-                             f"leverage settings.")))
+                            (f"{a} 진입 주문이 거절되었습니다:\n\n{m}\n\n{h}"
+                             if self.lang == "ko" else
+                             f"{a} entry order was rejected:\n\n{m}\n\n{h}")))
                         continue
                     if not live:
                         self.log(f"   DRY-RUN entry: {res.get('would_place')}")
