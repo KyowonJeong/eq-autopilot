@@ -721,8 +721,9 @@ class App:
         _prof = self._profile
         self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
         # 토글 즉시 _profile 반영+영속 — 저장 없이 탭 바꾸면 옛 값으로 되살아나던 버그(대표 2026-07-12)
-        ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public,
-                        command=self._on_tr_public).pack(side="left", padx=(0, 10))
+        self.cb_tr_public = ttk.Checkbutton(tr, text=self.t("tr_public"), variable=self.tr_public,
+                                            command=self._on_tr_public)
+        self.cb_tr_public.pack(side="left", padx=(0, 10))
         self.b_tr = ttk.Button(tr, text=self.t("tr_push"), command=self.push_profile)
         self.b_tr.pack(side="left")
         self.tr_ind = tk.Label(tr, font=("Helvetica", 11, "bold"))   # 신호대기와 같은 ● 표시등
@@ -889,8 +890,19 @@ class App:
 
         # 공개 트랙레코드 푸시 = Autopilot 등급 자격(서버 entitled와 동일 기준: 마스터 스위치 무관,
         # 주문 실행이 아니라 본인 성과 공개라서). 토큰 유효 + royal/admin이면 활성.
+        _tr_ok = bool(g.get("ok")) and g.get("tier") in ("royal", "admin")
         if hasattr(self, "b_tr"):
-            en(self.b_tr, bool(g.get("ok")) and g.get("tier") in ("royal", "admin"))
+            en(self.b_tr, _tr_ok)
+        # 공개 동의도 Autopilot 전용(대표 2026-07-13) — Operator 이하는 해제+비활성
+        if hasattr(self, "cb_tr_public"):
+            try:
+                if not _tr_ok:
+                    self.tr_public.set(0)
+                    self.cb_tr_public.config(state="disabled")
+                else:
+                    self.cb_tr_public.config(state="normal")
+            except Exception:
+                pass
         if hasattr(self, "tr_ind"):
             self._update_tr_status()
         # 전역 모의 스위치: 권한 없으면 모의 고정(체크 강제 + 비활성)
