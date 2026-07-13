@@ -288,11 +288,11 @@ T = {
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
     "live_note": {"ko": "체크된 자산 전부: 연결 테스트 자동 실행 → 전부 통과 시에만 자동 청산+신호 대기 동시 가동 "
-                        "(하나라도 실패하면 아무것도 무장하지 않습니다). 개별 정지는 각 자산 섹션에서.",
+                        "(하나라도 실패하면 아무것도 시작하지 않습니다). 개별 정지는 각 자산 섹션에서.",
                   "en": "All checked assets: connection test runs automatically → arms auto-close + signal "
                         "watch together only if every asset passes (one failure = nothing arms). "
                         "Per-asset stop lives in each asset section."},
-    "sec_auto": {"ko": "자동 청산 (세션 마감 자동)", "en": "Auto-close (at session close)"},
+    "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
@@ -300,7 +300,7 @@ T = {
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
     "auto_on_ind": {"ko": "  ● 자동 청산 ON  ", "en": "  ● Auto-close ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
-    "sec_sig": {"ko": "자동 진입 (실시간 신호)", "en": "Auto-entry (live signal)"},
+    "sec_sig": {"ko": "자산별 자동 진입 (실시간 신호)", "en": "Per-asset auto-entry (live signal)"},
     "sig_1r": {"ko": "1R ($)", "en": "1R ($)"},
     "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
@@ -780,18 +780,14 @@ class App:
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
 
         row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
-        self.b_hc = ttk.Button(row, text=self.t("btn_conn"), command=self.healthcheck); self.b_hc.pack(side="left")
-        self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.accounts); self.b_acc.pack(side="left", padx=6)
+        # 연결 테스트 버튼은 라이브 패널로 이관 — 계좌 버튼이 연결 테스트를 겸함(대표 2026-07-13).
+        # healthcheck가 연결 검증 + (선물) 계좌 목록 채움 + 진입 정보 로그까지 전부 수행.
+        self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.healthcheck)
+        if spec.get("acct"):
+            self.b_acc.pack(side="left")
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
 
-        ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_flat"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        cf = ttk.Frame(frm); cf.pack(fill="x", pady=3)
-        self.b_flat_dry = ttk.Button(cf, text=self.t("dry_close"), command=lambda: self.flatten(False))
-        self.b_flat_dry.pack(side="left")
-        self.b_flat_live = ttk.Button(cf, text=self.t("live_close"), command=lambda: self.flatten(True))
-        self.b_flat_live.pack(side="left", padx=8)
-
+        # 즉시 청산 섹션 제거(대표 2026-07-13) — 자동 청산이 담당, 수동 청산은 브로커 앱에서
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_auto"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         af = ttk.Frame(frm); af.pack(fill="x", pady=3)
@@ -822,8 +818,8 @@ class App:
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(6, 0))
 
-        # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. b_hc(연결 테스트)는 항상 활성.
-        self._action_btns = [self.b_acc, self.b_flat_dry, self.b_flat_live, self.b_auto, self.b_sig,
+        # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. 계좌 버튼(연결 테스트 겸)은 항상 활성.
+        self._action_btns = [self.b_acc, self.b_auto, self.b_sig,
                              self.b_tr]
         self._apply_gating()
         # 안내 로그: 첫 실행만 '준비됨…', 이후(탭·브로커 전환 재빌드)는 그 자산의 실제 연결
@@ -871,7 +867,7 @@ class App:
         en(self.b_acc, conn and topstep)
         # 루프 '정지'는 어느 탭에서든 항상 가능해야 함(미연결 탭에서 버튼이 죽으면 돌던 루프를
         # 못 세움 — 대표 2026-07-12). 시작 조건은 기존대로(연결+권한), 도는 중엔 무조건 활성.
-        en(self.b_flat_dry, use); en(self.b_flat_live, use and live_ok)
+
         en(self.b_auto, use or getattr(self, "_auto_on", False))
         # 자동 진입 = 전 브로커(선물 place_entry + 크립토 place_entry, 2026-07-11 크립토 제한 해제).
         # 신호 대기 무장 = '연결 테스트 통과 자산만'(2026-07-11) — 현재 탭 브로커 종류와는 무관.
@@ -1217,8 +1213,11 @@ class App:
                              self._f3(), [sc] if sc else [])
 
     def _busy(self, on):
-        # 작업 중엔 연결 테스트도 잠그고, 끝나면 연결 여부에 맞춰 실행 버튼 복원.
-        self.b_hc.config(state="disabled" if on else "normal")
+        # 작업 중엔 계좌(연결 테스트 겸) 버튼도 잠그고, 끝나면 연결 여부에 맞춰 실행 버튼 복원.
+        try:
+            self.b_acc.config(state="disabled" if on else "normal")
+        except Exception:
+            pass
         self._set_actions_enabled(False if on else self._connected)
 
     def _creds_ok(self):
