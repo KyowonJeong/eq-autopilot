@@ -223,10 +223,10 @@ T = {
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
     "btn_free": {"ko": "무료 사용", "en": "Use free"},
-    "free_msg": {"ko": "이 버튼을 누르면 ① 무료 멤버십 토큰 발급 + ② 무료 시그널 방 가입이 됩니다.\n"
+    "free_msg": {"ko": "이 버튼을 누르면 ① 무료 멤버십 토큰이 발급되고 ② 무료 시그널 방에 가입됩니다.\n"
                        "받은 토큰을 위 '멤버십 토큰' 칸에 붙여넣으면 자동 청산이 열립니다.\n"
                        "• Telegram: 봇이 토큰 + 방 초대 링크를 DM 합니다.\n"
-                       "• Discord: 로그인하면 토큰 발급 + 무료 시그널 서버에 자동 가입됩니다.",
+                       "• Discord: 로그인하면 토큰이 발급되고 무료 시그널 서버에 자동 가입됩니다.",
                  "en": "Clicking gets you ① a free membership token + ② joins the free signal room.\n"
                        "Paste the token into the 'Membership token' box above to unlock auto-close.\n"
                        "• Telegram: the bot DMs you the token + a room invite.\n"
@@ -263,10 +263,10 @@ T = {
                    "en": "※ Pass 'Test connection' first to unlock close / auto-entry."},
     "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
     "need_creds": {"ko": "이메일과 API Key를 모두 입력하세요.", "en": "Enter both email and API Key."},
-    "need_consent": {"ko": "실행 동작은 먼저 동의 체크박스를 켜야 합니다.", "en": "Tick the consent box before acting."},
+    "need_consent": {"ko": "실행하려면 먼저 동의 체크박스를 켜세요.", "en": "Tick the consent box before acting."},
     "live_confirm": {"ko": "실거래 확인", "en": "Confirm LIVE"},
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
-    "pick_acct": {"ko": "진입은 '사용 계좌'에서 단일 계좌를 지정해야 합니다 (전체 불가).",
+    "pick_acct": {"ko": "진입하려면 '사용 계좌'에서 단일 계좌를 지정하세요 (전체 불가).",
                   "en": "Entry requires a single account in 'Account' (not all)."},
     "sec_tr": {"ko": "공개 트랙레코드 (Autopilot)", "en": "Public track record (Autopilot)"},
     "tr_public": {"ko": "공개 동의", "en": "Make public"},
@@ -299,7 +299,7 @@ T = {
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (auto)"},
-    "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
+    "auto_live": {"ko": "실제 청산 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 청산 시작", "en": "Start auto-close"},
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
     "auto_on_ind": {"ko": "  ● 자동 청산 ON  ", "en": "  ● Auto-close ON  "},
@@ -313,7 +313,7 @@ T = {
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sig_note": {"ko": "※ 신호의 방향·손절가로 자동 진입하고, 계약 수는 위 1R($ 리스크)로 앱이 자동 계산합니다 "
                        "(신호에 계약 수 없음). ⚠️ EdgeQuant는 신호 확신도에 따라 포지션을 키워 "
-                       "거래당 최대 3R까지 리스크합니다 — 계좌 여유는 1R의 3배 기준으로 잡으세요. "
+                       "거래당 최대 3R까지 리스크를 감수합니다 — 계좌 여유는 1R의 3배 기준으로 잡으세요. "
                        "자산은 신호의 종목으로 자동 판별(NQ→MNQ·GC→MGC·BTC→BTCUSDT.P). "
                        "'사용 계좌'만 고르면 됩니다. 포지션은 종목별로 독립 관리됩니다 — 같은 종목은 기존 "
                        "포지션이 완전히 청산된 것이 확인된 후에만 새로 진입하여 중복 포지션을 방지하고, 다른 "
@@ -1918,7 +1918,7 @@ class App:
             self.log(f"❌ {asset} API 사전 점검 실패 (진입 {entry_label}): {_em}")
             self.root.after(0, lambda: messagebox.showerror(
                 "API 사전 점검 실패" if ko else "API pre-check failed",
-                (f"{asset} 진입({entry_label}) 1시간 전 점검에서 API가 실패했습니다:\n\n{_em}\n\n{_hint}"
+                (f"{asset} 진입({entry_label}) 1시간 전 점검에서 API 호출이 실패했습니다:\n\n{_em}\n\n{_hint}"
                  if ko else
                  f"The pre-entry API check for {asset} ({entry_label}) failed:\n\n{_em}\n\n{_hint}")))
 
