@@ -1468,8 +1468,8 @@ class App:
                 self._flatten_unprotected(b, aid, contract, sr.get("stop_error"))
                 return
             self.log(f"   … 재시도 {i + 1} 실패: {sr.get('stop_error')}")
-        self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 세션 마감 자동청산이 백스톱이나, "
-                 "지금 수동으로 손절/확인 권장!")
+        self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 세션 마감 자동청산이 백스톱이지만, "
+                 "지금 수동으로 손절/확인을 권장!")
 
     def _flatten_unprotected(self, b, aid, contract, why):
         """Market-close a just-entered position whose protective stop was rejected."""
