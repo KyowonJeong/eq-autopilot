@@ -880,7 +880,10 @@ class App:
                 b.config(state="normal" if ok else "disabled")
             except Exception:
                 pass
-        en(self.b_acc, conn and topstep)
+        # 계좌 버튼은 연결 테스트 겸용이라 항상 활성(Topstep) — 'conn and'를 걸면 연결해야
+        # 계좌 버튼이 켜지는데 연결이 곧 이 버튼이라 신규 설정이 영영 못 나감(테스터 실사고
+        # 2026-07-14 GC 데드락). 자격 미입력은 healthcheck 초입 _creds_ok()가 안내.
+        en(self.b_acc, topstep)
         # 루프 '정지'는 어느 탭에서든 항상 가능해야 함(미연결 탭에서 버튼이 죽으면 돌던 루프를
         # 못 세움 — 대표 2026-07-12). 시작 조건은 기존대로(연결+권한), 도는 중엔 무조건 활성.
 
@@ -1688,8 +1691,20 @@ class App:
         self._save_current_asset()
         txt, _ = self._asset_row_state(a)
         if txt.startswith("✗"):
-            messagebox.showwarning(self.t("btn_conn"), f"{a}: {txt}")
-            return
+            # 계좌'만' 미설정인 Topstep은 테스트를 허용 — 계좌 목록은 연결이 돼야 받아오므로
+            # 여기서 막으면 신규 자산 설정이 영영 못 나감(테스터 실사고 2026-07-14 GC 데드락).
+            # 연결 성공이 계좌 드롭다운을 채워 주고, 무장(라이브 시작)은 여전히 계좌 지정 필수.
+            c = self._acfg.get(a) or {}
+            _sp = _BROKER_SPEC.get(c.get("broker"), {})
+            try:
+                _r_ok = float(c.get("one_r", 0)) > 0
+            except (TypeError, ValueError):
+                _r_ok = False
+            _acct_only = (bool((c.get("f1") or "").strip()) and _r_ok
+                          and bool(_sp.get("acct")) and not (c.get("acct") or "").strip())
+            if not _acct_only:
+                messagebox.showwarning(self.t("btn_conn"), f"{a}: {txt}")
+                return
         self.log(f"\n── {a} 연결 테스트 ({_broker_label(self._acfg[a].get('broker'))}) ──")
 
         def w():
@@ -1699,6 +1714,11 @@ class App:
                     self.log(f"❌ {a}: {err}")
                 else:
                     self.log(f"✅ {a} 연결 OK")
+                    if (self._acfg.get(a) or {}).get("broker") == "projectx" \
+                            and not ((self._acfg.get(a) or {}).get("acct") or "").strip():
+                        self.log(("   → 자산 탭의 '사용 계좌'에서 계좌를 선택한 뒤 라이브를 시작하세요."
+                                  if self.lang == "ko" else
+                                  "   → pick an account in the asset tab, then go live."))
                 self._refresh_live_panel()
             self.root.after(0, done)
         threading.Thread(target=w, daemon=True).start()
@@ -1718,6 +1738,8 @@ class App:
                 if acct and acct not in names:
                     return (f"저장된 계좌 '{acct}'가 계좌 목록에 없음" if self.lang == "ko"
                             else f"saved account '{acct}' not in account list")
+                if a == self._asset:   # 현재 탭 자산이면 계좌 드롭다운도 채움 — 계좌 선택 유도
+                    self.root.after(0, lambda n=names: self._fill_scope(n))
             self._conn_by_asset[a] = True
             try:
                 for _ln in (b.entry_info() or []):
