@@ -988,12 +988,13 @@ class App:
         self._token = tok
 
         def w():
+            import time as _t
             gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
                     "caps": {"use": False, "manualentry": False, "autoentry": False},
                     "brokers": {}, "reason": "no token"}
+            _net_fail = False                               # 네트워크성 실패(서버 무응답/5xx/타임아웃)
             if tok:
                 import requests
-                import time as _t
                 import autopilot_crypto
                 for attempt in (1, 2):                      # 1회 재시도(총 2회)
                     try:
@@ -1002,12 +1003,15 @@ class App:
                             hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
                         except Exception:
                             hb = {"ok": False, "reason": "decrypt failed"}
-                        if not r.ok and attempt == 1:       # 5xx/일시 응답불량 → 재시도
-                            _t.sleep(2); continue
-                        if not hb.get("ok"):
-                            gate["reason"] = hb.get("reason") or "locked"
+                        if not r.ok:                        # 5xx/일시 응답불량 → 재시도 후 네트워크성
+                            if attempt == 1:
+                                _t.sleep(2); continue
+                            _net_fail = True
+                            gate["reason"] = f"server {r.status_code}"
+                        elif not hb.get("ok"):
+                            gate["reason"] = hb.get("reason") or "locked"     # 명시 거부 = 즉시 잠금
                         elif hb.get("exp") and _t.time() > hb["exp"]:
-                            gate["reason"] = "expired"
+                            gate["reason"] = "expired"                        # 명시 만료 = 즉시 잠금
                         else:
                             ap = hb.get("autopilot", {})
                             gate = {"ok": True, "tier": hb.get("tier", "—"),
@@ -1020,6 +1024,19 @@ class App:
                         gate["reason"] = f"heartbeat error: {e}"
                         if attempt == 1:
                             _t.sleep(2)
+                        else:
+                            _net_fail = True
+            # ── 네트워크 유예(대표 2026-07-14: 서버 순단·과부하로 가동이 죽던 것): 서버에
+            # '닿지 못한' 실패는 최근 15분 내 정상 권한을 유지한 채 경고만. 서버가 명시적으로
+            # 거부(locked/expired/decrypt)한 경우는 유예 없이 즉시 fail-closed(위에서 처리). ──
+            if gate.get("ok"):
+                self._gate_good, self._gate_good_ts = dict(gate), _t.time()
+            elif _net_fail and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < 15 * 60:
+                _age = int((_t.time() - self._gate_good_ts) // 60)
+                gate = {**self._gate_good,
+                        "reason": f"네트워크 순단 — 최근 권한 유지(유예 {_age}/15분)"}
+                self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {15 - _age}분 유예 중 "
+                         f"(서버가 명시 거부하면 즉시 잠금)")
             self._gate = gate
             self.root.after(0, self._apply_gating)
         threading.Thread(target=w, daemon=True).start()
@@ -2144,7 +2161,13 @@ class App:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
                 sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
             except Exception as e:
-                self.log(f"   signal feed error: {e}"); _t.sleep(SIG_POLL_SECS); continue
+                self._feed_errs = getattr(self, "_feed_errs", 0) + 1
+                if self._feed_errs == 1 or self._feed_errs % 10 == 0:
+                    self.log(f"   signal feed error ×{self._feed_errs}: {e}")
+                _t.sleep(SIG_POLL_SECS); continue
+            if getattr(self, "_feed_errs", 0):
+                self.log(f"   signal feed 복구 (오류 {self._feed_errs}회 후)")
+                self._feed_errs = 0
             sid = sig.get("id")
             # no-trade(거래 없음) 신호도 새로 오면 '받았다'만 표시(포지션은 안 잡음).
             if sid and sid != last_id and not (sig.get("tradeable") and sig.get("direction")):
