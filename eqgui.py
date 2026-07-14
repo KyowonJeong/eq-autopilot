@@ -91,7 +91,7 @@ def _entry_fail_hint(msg: str, ko: bool) -> str:
         return ("API 키에 주문 권한이 없습니다. 거래소 API 관리에서 이 키에 파생상품(계약) "
                 "주문 권한을 켜고, IP 제한이 있다면 이 컴퓨터 IP를 허용하세요."
                 if ko else
-                "The API key lacks trade permission. In the exchange's API management enable "
+                "The API key lacks trade permission. In the exchange's API settings, enable "
                 "derivatives (contract) order permission for this key, and allow this computer's "
                 "IP if the key is IP-restricted.")
     if "10004" in m or "sign" in m or "40012" in m or "40013" in m:
@@ -289,7 +289,7 @@ T = {
     "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
     "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 신호 확신도에 따라 최대 3R"
                            "(maximum risk)까지 — 계좌 여유는 1R의 3배로 잡으세요.",
-                     "en": "1R = typical risk per trade · scales up to 3R maximum risk by signal "
+                     "en": "1R = typical risk per trade · scales up to 3R (maximum risk) with signal "
                            "confidence — budget 3× your 1R."},
     "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
                         "신호의 방향·손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리.",
