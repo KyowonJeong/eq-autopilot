@@ -21,12 +21,24 @@ _LONG = 1                       # position.type: 1=long, 2=short (docs don't sta
                                 # flattens the whole position regardless, so a wrong guess is cosmetic.
 _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
 
+# 계약 메타데이터 조회 실패 시 폴백 틱사이즈(우리가 다루는 심볼만).
+_FALLBACK_TICK = {"MNQ": 0.25, "NQ": 0.25, "MGC": 0.1, "GC": 0.1}
+
 
 def _side_code(side):
     s = side.upper() if isinstance(side, str) else side
     if s not in _SIDE:
         raise ValueError(f"bad side {side!r} (use BUY/LONG/0 or SELL/SHORT/1)")
     return _SIDE[s]
+
+
+def _snap_to_tick(price: float, tick: float) -> float:
+    """가격을 틱 그리드에 스냅(최근접 틱). ProjectX는 틱 미정렬 가격을 거부한다
+    (errorCode=2 'Invalid stop price. Price is not aligned to tick size.' — 2026-07-14 GC 실사고).
+    steps*tick은 이진 부동소수 잔여 오차가 남을 수 있어 틱 소수 자릿수로 재반올림."""
+    steps = round(float(price) / tick)
+    decimals = len(str(tick).split(".")[1]) if "." in str(tick) else 0
+    return round(steps * tick, decimals)
 
 
 class ProjectXBroker(BrokerAdapter):
@@ -37,6 +49,7 @@ class ProjectXBroker(BrokerAdapter):
         self.base = cfg.base_url.rstrip("/")
         self._token: str | None = None
         self._token_at: float = 0.0
+        self._ticks: dict[str, float] = {}   # contractId → tickSize 캐시
 
     # ── auth ──────────────────────────────────────────────────────────────
     def authenticate(self) -> None:
@@ -88,6 +101,32 @@ class ProjectXBroker(BrokerAdapter):
         contractId for a symbol (e.g. 'MNQ') so the user doesn't hand-type an expired code."""
         d = self._post("/api/Contract/search", {"searchText": text, "live": bool(live)})
         return d.get("contracts", d if isinstance(d, list) else [])
+
+    def _tick_size(self, contract_id: str):
+        """contractId(예: CON.F.US.MGC.Q26)의 tickSize — Contract/search 메타데이터에서 조회(캐시),
+        실패 시 심볼 루트로 폴백 테이블. 못 찾으면 None(정렬 없이 원가격 사용)."""
+        if contract_id in self._ticks:
+            return self._ticks[contract_id]
+        parts = str(contract_id).split(".")
+        sym = parts[3] if len(parts) >= 4 else str(contract_id)
+        tick = None
+        try:
+            for c in self.search_contracts(sym):
+                if str(c.get("id")) == str(contract_id) and c.get("tickSize"):
+                    tick = float(c["tickSize"])
+                    break
+        except Exception:
+            pass
+        if not tick:
+            tick = _FALLBACK_TICK.get(sym.upper())
+        if tick:
+            self._ticks[contract_id] = tick
+        return tick
+
+    def _align(self, contract_id: str, price) -> float:
+        """주문 가격을 계약 틱 그리드에 정렬. 틱을 못 알아내면 원가격 그대로(서버 판정에 맡김)."""
+        tick = self._tick_size(contract_id)
+        return _snap_to_tick(price, tick) if tick else float(price)
 
     def _open_orders(self, account_id) -> list[dict]:
         """POST /api/Order/searchOpen {accountId} -> {orders:[{id, ...}]}. Working (resting) orders
@@ -227,9 +266,9 @@ class ProjectXBroker(BrokerAdapter):
         body = {"accountId": int(account_id), "contractId": contract_id,
                 "type": int(order_type), "side": side_code, "size": int(size)}
         if limit_price is not None:
-            body["limitPrice"] = limit_price
+            body["limitPrice"] = self._align(contract_id, limit_price)
         if stop_price is not None:
-            body["stopPrice"] = stop_price
+            body["stopPrice"] = self._align(contract_id, stop_price)
         if custom_tag:
             body["customTag"] = custom_tag
         if stop_loss_ticks is not None:                 # bracket: type 4 = Stop
@@ -242,7 +281,7 @@ class ProjectXBroker(BrokerAdapter):
         if stop_loss_price is not None:
             stop_body = {"accountId": int(account_id), "contractId": contract_id,
                          "type": 4, "side": 1 - side_code, "size": int(size),
-                         "stopPrice": float(stop_loss_price)}
+                         "stopPrice": self._align(contract_id, stop_loss_price)}
             if custom_tag:
                 stop_body["customTag"] = f"{custom_tag}-SL"
 
@@ -261,16 +300,18 @@ class ProjectXBroker(BrokerAdapter):
                               stop_price, *, custom_tag=None) -> dict:
         """(Re)place a standalone protective Stop (type 4) on the side OPPOSITE the entry, at an
         absolute price — used after a market entry, and retried by the caller on a transient miss.
-        Returns {"stop": <order>} on success, else {"stop_error": str, "stop_rejected": bool}:
+        Returns {"stop": <order>, "stop_price": <tick-aligned px>} on success,
+        else {"stop_error": str, "stop_rejected": bool}:
           stop_rejected=True  → broker said no (HTTP 200 success:false) — won't change on retry.
           stop_rejected=False → transient network/HTTP error — safe to retry."""
+        px = self._align(contract_id, stop_price)
         body = {"accountId": int(account_id), "contractId": contract_id, "type": 4,
                 "side": 1 - _side_code(entry_side), "size": int(size),
-                "stopPrice": float(stop_price)}
+                "stopPrice": px}
         if custom_tag:
             body["customTag"] = f"{custom_tag}-SL"
         try:
-            return {"stop": self._post("/api/Order/place", body)}
+            return {"stop": self._post("/api/Order/place", body), "stop_price": px}
         except requests.RequestException as e:           # timeout / connection / 5xx → transient
             return {"stop_error": str(e), "stop_rejected": False}
         except Exception as e:                            # RuntimeError(success:false) → broker reject

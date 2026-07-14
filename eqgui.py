@@ -2325,7 +2325,10 @@ class App:
                         # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
                         self._entered_at = _mark_entered(_asset)
                         if res.get("stop"):
-                            self.log("   🛡 보호 손절 거치 완료.")
+                            _sp = res.get("stop_price")
+                            _adj = (f" (틱 정렬 {stop} → {_sp:g})"
+                                    if _sp is not None and float(_sp) != float(stop) else "")
+                            self.log(f"   🛡 보호 손절 거치 완료.{_adj}")
                         elif res.get("stop_error") and _is_fut:  # 선물만 별도 손절 재시도(크립토는 첨부라 불필요)
                             self._handle_stop_failure(b, _aid, _contract, direction, size, stop, res)
                 except Exception as e:
