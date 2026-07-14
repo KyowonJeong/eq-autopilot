@@ -207,7 +207,7 @@ T = {
     "token_show": {"ko": "표시", "en": "Show"},
     "token_get": {"ko": "토큰 받기", "en": "Get token"},
     "gate_none": {"ko": "멤버십 토큰을 입력하세요 (무료 사용 → 채널에서 발급).",
-                  "en": "Enter a membership token (Use free → issued in the channel)."},
+                  "en": "Enter a membership token — press 'Use free' to get one."},
     "gate_locked": {"ko": "잠김 — 토큰이 유효하지 않거나 만료/철회됨 (fail-closed).",
                     "en": "Locked — token invalid or expired/revoked (fail-closed)."},
     "gate_master_off": {"ko": "잠김 — 관리자가 Autopilot을 꺼둠 (마스터 OFF).",
@@ -218,7 +218,7 @@ T = {
     "warn_mix": {"ko": "⚠ 청산 시 사용 계좌의 모든 포지션이 일괄 청산됩니다. "
                        "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
                  "en": "⚠ Closing flattens EVERY position on the chosen account. "
-                       "Don't mix other trades on it — use a dedicated account."},
+                       "Don't mix in other trades — use a dedicated account."},
     "lang": {"ko": "Language", "en": "Language"},   # 언어 선택 라벨은 언어 무관 고정(대표 2026-07-12)
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
@@ -227,7 +227,7 @@ T = {
                        "받은 토큰을 위 '멤버십 토큰' 칸에 붙여넣으면 자동 청산이 열립니다.\n"
                        "• Telegram: 봇이 토큰 + 방 초대 링크를 DM 합니다.\n"
                        "• Discord: 로그인하면 토큰이 발급되고 무료 시그널 서버에 자동 가입됩니다.",
-                 "en": "Clicking gets you ① a free membership token + ② joins the free signal room.\n"
+                 "en": "This button ① issues you a free membership token and ② joins you to the free signal room.\n"
                        "Paste the token into the 'Membership token' box above to unlock auto-close.\n"
                        "• Telegram: the bot DMs you the token + a room invite.\n"
                        "• Discord: log in → token issued + auto-joined to the free signal server."},
@@ -248,7 +248,7 @@ T = {
     "scope": {"ko": "사용 계좌", "en": "Account"},
     "all": {"ko": "(전체 계좌)", "en": "(all accounts)"},
     "scope_note": {"ko": "※ '사용 계좌'에 지정한 계좌에만 청산/진입이 적용됩니다. (전체 = 모든 활성 계좌)",
-                   "en": "※ Only the chosen account is flattened/entered. (all = every active account)"},
+                   "en": "※ Closes and entries apply only to the chosen account. (all = every active account)"},
     "btn_conn": {"ko": "연결 테스트", "en": "Test connection"},
     "btn_accts": {"ko": "계좌 목록 불러오기", "en": "Load accounts"},
     "sec_flat": {"ko": "즉시 청산 (지금 사용 계좌의 모든 포지션 닫기)",
@@ -258,7 +258,7 @@ T = {
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
-              "en": "Ready. Enter key → 'Test connection' → the rest unlocks once it passes."},
+              "en": "Ready. Enter your key → 'Test connection' → the rest unlocks once it passes."},
     "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·자동 진입 기능이 활성화됩니다.",
                    "en": "※ Pass 'Test connection' first to unlock close / auto-entry."},
     "conn_ok": {"ko": "기능이 활성화되었습니다.", "en": "Features unlocked."},
@@ -327,7 +327,7 @@ T = {
                        "and different symbols never affect each other, so NQ and GC can run side by side on one "
                        "account."},
     "auto_note": {"ko": "※ 앱이 떠 있고 컴퓨터가 켜져(절전 해제) 있어야 작동. 설정된 각 자산의 세션 마감 시각에 그 자산 브로커를 청산합니다.",
-                  "en": "※ App must stay open and the computer awake. Each configured asset's broker is flattened at its session close."},
+                  "en": "※ App must stay open and the computer awake. Each configured asset's positions are flattened at its session close."},
 }
 
 
@@ -1808,7 +1808,7 @@ class App:
         if not (perm_use or perm_auto):
             messagebox.showwarning(self.t("token"),
                                    "멤버십 권한이 없습니다 — 토큰을 확인하세요."
-                                   if self.lang == "ko" else "No membership permission."); return
+                                   if self.lang == "ko" else "No membership permission — check your token."); return
         live = not bool(self.live_dry.get())
         self.b_live_start.config(state="disabled")
         self.log("\n══ 라이브 시작 — 연결 테스트 " + "·".join(incl)
