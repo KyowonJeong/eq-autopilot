@@ -55,11 +55,11 @@ HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5
 # 사용자가 시각을 고르는 게 아니라 시스템 세션 마감에 자동으로 맞춘다(3자산·BTC 2세션).
 #   NQ 10-14 ET → 14:00 ET · GC 02-06 ET → 06:00 ET · BTC 22-02/02-06 UTC → 02:00·06:00 UTC
 _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)],
-                "BTC": [("UTC", 2), ("UTC", 6)]}
+                "BTC": [("UTC", 2)]}          # H22 단독 복귀(02세션 은퇴 2026-07-14) — 06:00 청산 제거
 AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
 # 세션 진입(신호 도착) 시각 — 진입 전 API 사전 점검용(대표 2026-07-13). NQ·GC 주말 스킵.
 _ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 2)],
-                  "BTC": [("UTC", 22), ("UTC", 2)]}
+                  "BTC": [("UTC", 22)]}       # H22 단독 — 02:00 진입 은퇴(2026-07-14)
 PRECHECK_WINDOW_MIN = 70                            # 진입까지 이 분 이내면 사전 점검 발동
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
@@ -297,8 +297,8 @@ T = {
                         "starts). Auto-enters with the signal's direction & stop, auto-closes at session "
                         "end. Positions are managed independently per symbol."},
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
-    "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (자동)",
-                   "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00/06:00 UTC (auto)"},
+    "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (자동)",
+                   "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (auto)"},
     "auto_live": {"ko": "실제 청산으로 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 청산 시작", "en": "Start auto-close"},
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
