@@ -189,26 +189,36 @@ class BybitBroker(BrokerAdapter):
         GET /v5/position/closed-pnl → [{tid, ts_ms, symbol, pnl, direction}].
         direction = 포지션 방향(청산 주문 side의 반대: Sell로 닫음 = LONG이었음).
         ⚠ UNTESTED(실키 검증 전). 실패 시 예외 — 호출측이 로그."""
-        out, cursor = [], ""
-        for _ in range(10):                                 # 최대 10페이지(안전 상한)
-            params = {"category": self.category, "startTime": int(start_ms), "limit": 100}
-            if cursor:
-                params["cursor"] = cursor
-            d = self._req("GET", "/v5/position/closed-pnl", params)
-            for r in d.get("list", []):
-                try:
-                    out.append({
-                        "tid": str(r.get("orderId") or r.get("execId") or ""),
-                        "ts_ms": int(r.get("updatedTime") or r.get("createdTime") or 0),
-                        "symbol": str(r.get("symbol") or ""),
-                        "pnl": float(r.get("closedPnl") or 0),
-                        "direction": "LONG" if str(r.get("side")).lower() == "sell" else "SHORT",
-                    })
-                except (TypeError, ValueError):
-                    continue
-            cursor = d.get("nextPageCursor") or ""
-            if not cursor:
-                break
+        # ⚠ Bybit 제약: closed-pnl은 조회창 7일 초과 시 startTime 주변 7일만 반환
+        # (2026-07-15 실사고: 90일 요청 → 90일 전 그 주만 오고 최근 BTCUSDT 누락).
+        # → 7일 창으로 분할해 전 구간 수집.
+        out = []
+        WEEK_MS = 7 * 86400 * 1000 - 1000
+        t0 = int(start_ms)
+        now_ms = int(time.time() * 1000)
+        while t0 < now_ms:
+            t1 = min(t0 + WEEK_MS, now_ms)
+            cursor = ""
+            for _ in range(10):                             # 창당 최대 10페이지(안전 상한)
+                params = {"category": self.category, "startTime": t0, "endTime": t1, "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                d = self._req("GET", "/v5/position/closed-pnl", params)
+                for r in d.get("list", []):
+                    try:
+                        out.append({
+                            "tid": str(r.get("orderId") or r.get("execId") or ""),
+                            "ts_ms": int(r.get("updatedTime") or r.get("createdTime") or 0),
+                            "symbol": str(r.get("symbol") or ""),
+                            "pnl": float(r.get("closedPnl") or 0),
+                            "direction": "LONG" if str(r.get("side")).lower() == "sell" else "SHORT",
+                        })
+                    except (TypeError, ValueError):
+                        continue
+                cursor = d.get("nextPageCursor") or ""
+                if not cursor:
+                    break
+            t0 = t1 + 1000
         return out
 
     def entry_info(self) -> list:

@@ -2094,9 +2094,13 @@ class App:
                 k = (d, a, _btc_sess(dt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG")})
                 e["pnl"] += float(f.get("pnl") or 0)
+            # R 정규화 = 자산 중 최대 1R 기준 통일(대표 2026-07-15) — 자산별 1R이 다르면
+            # 자산별로 나눌 때 실제 비중이 지워짐(BTC $50 승리가 NQ $600 승리와 같은 +1R로 보임).
+            # 최대 1R로 통일하면 곡선이 실제 달러 비례 = 회원이 설정한 포트폴리오 비중 그대로.
+            _unit = max(one_r_by_asset.get(a, 0) or 0 for a in assets_with_creds) or 600.0
             trades = [{"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d, "instrument": a,
                        "direction": v["direction"],
-                       "r": round(v["pnl"] / one_r_by_asset[a], 3)}
+                       "r": round(v["pnl"] / _unit, 3)}
                       for (d, a, s), v in sorted(agg.items())]
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
