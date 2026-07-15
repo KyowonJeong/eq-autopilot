@@ -1956,6 +1956,58 @@ class App:
         return b.place_entry(symbol=sym, side=direction, size=size,
                              stop_loss_price=stop, dry_run=False)
 
+    def _exec_entry_limit_fut(self, b, aid, contract, direction, size, stop, pol, live, tag):
+        """선물 진입 지정가 정책 — 크립토 _exec_entry_limit의 선물판(ProjectX).
+        지정가(type 1) N회 재시도 → 미체결+불리 이동 임계 초과 시 스킵 → 시장가 폴백.
+        ⚠크립토와 다른 점: 보호 손절이 주문에 첨부되지 않으므로 **체결 확인 후** 별도로 건다
+        (미체결 상태에서 스탑부터 걸면 무포지션 스탑이 남는다).
+        반환은 place_entry와 동일 계약({entry|error|stop|stop_error|skipped}) — 후처리 재사용."""
+        import time as _t
+        lp = float(pol["limit_price"])
+        retries = int(pol.get("retries") or 3)
+        interval = float(pol.get("retry_interval_s") or 3)
+        thr = pol.get("skip_if_adverse_price")
+        if not live:
+            self.log(f"   DRY-RUN 체결정책(선물): 지정가 {lp:g} ×{retries}회(간격 {interval:g}s) → "
+                     f"불리 {thr}+ 스킵 → 시장가 폴백 · 손절 {stop}")
+            return b.place_entry(account_id=aid, contract_id=contract, side=direction, size=size,
+                                 order_type=2, stop_loss_price=stop, custom_tag=tag, dry_run=True)
+        self.log(f"   ⏳ 지정가 진입 도전 {lp:g} (×{retries}) — 슬리피지 회피")
+        for i in range(retries):
+            r = b.place_limit_entry(aid, contract, direction, size, lp, custom_tag=f"{tag}-L{i}")
+            oid = r.get("order_id")
+            if r.get("error"):
+                self.log(f"   ⚠ 지정가 주문 거절({str(r['error'])[:80]}) → 시장가 폴백")
+                break
+            _t.sleep(max(1.0, interval))
+            qty = b.position_qty(aid, contract)
+            if qty:                                   # 체결(부분 포함)
+                if oid:
+                    try:
+                        b.cancel_order(aid, oid)      # 잔여 미체결 취소
+                    except Exception:
+                        pass
+                self.log(f"   ✅ 지정가 체결 (시도 {i + 1}, 수량 {qty}) — 슬리피지 0")
+                sr = b.place_protective_stop(aid, contract, direction, qty, stop,
+                                             custom_tag=f"{tag}-{i}") if stop is not None else {}
+                return {"entry": {"orderId": oid, "mode": "limit", "price": lp}, **sr}
+            if oid:
+                try:
+                    b.cancel_order(aid, oid)
+                except Exception:
+                    pass
+        cur = b.current_market_price(contract)
+        if cur is not None and thr is not None:
+            adv = (cur - lp) if str(direction).upper() == "LONG" else (lp - cur)
+            if adv > float(thr):
+                self.log(f"   ⛔ 진입 스킵 — 지정가 대비 불리 이동 {adv:+.2f} > 임계 {thr} "
+                         f"(손익비 보호, 이 신호는 버림)")
+                return {"skipped": True, "error": None, "entry": None, "stop": False,
+                        "stop_error": None, "note": "skipped_adverse"}
+        self.log("   → 시장가 폴백")
+        return b.place_entry(account_id=aid, contract_id=contract, side=direction, size=size,
+                             order_type=2, stop_loss_price=stop, custom_tag=tag, dry_run=False)
+
     def _exec_close_limit(self, b, sym, retries=3, interval=3.0):
         """크립토 시간마감 청산: 현재가 지정가(메이커) N회 도전 — 남으면 호출측 flatten이
         시장가로 마무리(스킵 없음, order_exec.execute_exit 미러)."""
@@ -2467,10 +2519,22 @@ class App:
                             self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
                     if _is_fut:
                         # customTag은 ProjectX '계좌당 유일' 필요 → ms 타임스탬프로 유니크.
-                        res = b.place_entry(account_id=_aid, contract_id=_contract, side=direction,
-                                            size=size, order_type=2, stop_loss_price=stop,
-                                            custom_tag=f"EQ-AP-{int(_recv.timestamp() * 1000)}",
-                                            dry_run=not live)
+                        _tag = f"EQ-AP-{int(_recv.timestamp() * 1000)}"
+                        # ── 선물 체결 정책(대표 2026-07-15): 서버가 지정가 모드를 실어 보내면
+                        #    (LIMIT_EXEC_ASSETS: GC) 크립토와 동일한 지정가→스킵→시장가 흐름.
+                        #    GC는 손절이 타이트해 계약수가 많아(1R=$600 → 23계약) 1틱 슬리피지가
+                        #    왕복 $46 = 커미션의 2.5배 → 지정가 전환 가치 큼. NQ는 서버가 market
+                        #    정책을 주므로 자동으로 아래 시장가 경로. ──
+                        _polf = ((sig.get("exec_policy") or {}).get("entry")
+                                 if isinstance(sig.get("exec_policy"), dict) else None)
+                        if _polf and _polf.get("mode") == "limit_then_market" \
+                                and _polf.get("limit_price") is not None:
+                            res = self._exec_entry_limit_fut(b, _aid, _contract, direction, size,
+                                                             stop, dict(_polf), live, _tag)
+                        else:
+                            res = b.place_entry(account_id=_aid, contract_id=_contract, side=direction,
+                                                size=size, order_type=2, stop_loss_price=stop,
+                                                custom_tag=_tag, dry_run=not live)
                     else:
                         # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
                         # Bitget = Bybit 좌표계 손절에 거래소 베이시스 가산(캘리브레이션, 대표 2026-07-12)

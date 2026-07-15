@@ -317,6 +317,59 @@ class ProjectXBroker(BrokerAdapter):
         except Exception as e:                            # RuntimeError(success:false) → broker reject
             return {"stop_error": str(e), "stop_rejected": True}
 
+    # ── 지정가 체결 정책 지원 (대표 2026-07-15: GC 시장가 슬리피지 = 건당 $64) ─────────
+    # 크립토(bybit)에만 있던 4종을 선물에도 제공 → eqgui의 지정가 정책을 선물에 그대로 이식.
+    # 근거: MGC는 손절이 타이트($26/계약)해 1R=$600이면 23계약 → 1틱($1) 밀리면 왕복 $46.
+    #       커미션($18)보다 슬리피지가 크다. NQ는 11계약뿐이라 영향 작음(건당 $19).
+    def place_limit_entry(self, account_id, contract_id, side, size: int, price,
+                          *, stop_loss_price=None, custom_tag=None, dry_run: bool = False):
+        """지정가(type 1) 진입. 체결 확인은 호출측이 position_qty로 폴링(크립토와 동일 계약).
+        보호 손절은 체결 확인 후 호출측이 place_protective_stop으로 건다 —
+        미체결 상태에서 손절부터 걸면 무포지션 스탑이 남는다."""
+        if dry_run:
+            return {"dry_run": True, "would_place": {"type": 1, "limitPrice": self._align(contract_id, price),
+                                                     "side": _side_code(side), "size": int(size)}}
+        try:
+            r = self.place_entry(account_id=account_id, contract_id=contract_id, side=side,
+                                 size=size, order_type=1, limit_price=price,
+                                 custom_tag=custom_tag, dry_run=False)
+            return {"order_id": (r or {}).get("orderId"), "error": None}
+        except Exception as e:
+            return {"order_id": None, "error": str(e)}
+
+    def position_qty(self, account_id, contract_id):
+        """이 {계좌, 계약}의 현재 포지션 수량(절대값). 미보유 0. 지정가 체결 확인용."""
+        try:
+            d = self._post("/api/Position/searchOpen", {"accountId": int(account_id)})
+            for p in d.get("positions", []) or []:
+                if str(p.get("contractId")) == str(contract_id):
+                    return abs(int(p.get("size", 0) or 0))
+        except Exception:
+            return None          # 조회 실패는 '미체결'과 구분 — 호출측이 판단
+        return 0
+
+    def cancel_order(self, account_id, order_id) -> dict:
+        """미체결 지정가 주문 취소(공개 래퍼)."""
+        return self._post("/api/Order/cancel", {"accountId": int(account_id), "orderId": order_id})
+
+    def current_market_price(self, contract_id):
+        """현재가 = 진행 중 1분봉 종가(POST /api/History/retrieveBars). 실패 시 None.
+        지정가 미체결 후 '불리 이동' 판정용이라 정밀도보다 가용성이 중요."""
+        from datetime import datetime, timedelta, timezone
+        try:
+            now = datetime.now(timezone.utc)
+            d = self._post("/api/History/retrieveBars", {
+                "contractId": contract_id, "live": False,
+                "startTime": (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "unit": 2, "unitNumber": 1, "limit": 3, "includePartialBar": True,
+            })
+            bars = d.get("bars", d if isinstance(d, list) else [])
+            bars = sorted(bars, key=lambda b: (b.get("t") or b.get("timestamp") or ""))
+            return float(bars[-1].get("c")) if bars else None
+        except Exception:
+            return None
+
     def close_contract(self, account_id, contract_id) -> dict:
         """Market-close the whole position for one {account, contract} (POST /api/Position/
         closeContract). Used to flatten a just-entered position when its protective stop was
