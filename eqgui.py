@@ -1988,45 +1988,67 @@ class App:
         _dir = "LONG" if is_long else "SHORT"
         _bar = f"{o:g}→{c:g}" if blk else "봉 조회 실패"
         if d == "close":
-            self.log(f"   📉 X2+BE 블록{k} [{_bar}] {_dir} → **청산**"
+            self.log(f"   📉 X2+TR 블록{k} [{_bar}] {_dir} → **청산**"
                      + (" (24h 만기)" if k >= 5 else " (반대봉 마감)"))
             return True
-        if d == "breakeven":
-            self.log(f"   🛡 X2+BE 블록{k} [{_bar}] {_dir} 순항 → 손절을 **본절**로 이동, 홀드 유지")
+        if d == "trail":
+            _lbl = "본절(=블록0 시가)" if k == 0 else f"{o:g}(블록{k} 시가)"
+            self.log(f"   🛡 X2+TR 블록{k} [{_bar}] {_dir} 순항 → 손절을 **{_lbl}**로 이동, 홀드 유지")
             if live:
-                self._btc_move_stop_be(b, pos, is_long)
+                self._btc_move_stop_be(b, pos, is_long, o)
             return False
-        self.log(f"   ⏸ X2+BE 블록{k} [{_bar}] {_dir} 순항 → 홀드"
+        self.log(f"   ⏸ X2+TR 블록{k} [{_bar}] {_dir} → 홀드"
                  + ("  ⚠판정 불가라 보수적 홀드(24h 만기가 백스톱)" if not blk else ""))
         return False
 
-    def _btc_move_stop_be(self, b, pos, is_long):
-        """보호 손절을 진입가(본절)로 이동. 진입가 = 브로커 포지션의 평균단가.
-        실패해도 홀드는 유지 — 원래 손절이 아직 살아 있으므로 무방비 아님(로그만 경고)."""
+    def _btc_move_stop_be(self, b, pos, is_long, target=None):
+        """보호 손절을 target(순항한 블록의 시가)으로 이동. target=None이면 진입가(=평균단가).
+        블록0의 시가는 진입가와 같으므로 k=0에서는 결과적으로 본절 이동이 된다.
+
+        ⚠️손절은 **유리한 방향으로만** 옮긴다. 규칙상 순항 블록이 이어지면 시가는 단조 개선이라
+        (o_{k+1}=c_k, c_k는 순항분) 역행할 일이 없지만, 봉 데이터가 튀는 경우에 손절이 느슨해지면
+        리스크가 커지므로 여기서 한 번 더 막는다. 실패해도 홀드 유지 — 기존 손절이 살아 있어
+        무방비가 아니다(로그만 경고)."""
         try:
             entry = float(pos.raw.get("avgPrice") or pos.raw.get("entryPrice") or 0)
-            if not entry:
-                self.log("   ⚠ 본절 이동 실패: 평균단가 조회 불가 — 기존 손절 유지"); return
-            r = b.set_stop("BTCUSDT", entry) if hasattr(b, "set_stop") else None
+            tgt = float(target) if target is not None else entry
+            if not tgt:
+                self.log("   ⚠ 손절 이동 실패: 목표가 조회 불가 — 기존 손절 유지"); return
+            cur = None
+            try:
+                cur = float(pos.raw.get("stopLoss") or 0) or None
+            except Exception:
+                cur = None
+            if cur is not None and ((tgt < cur) if is_long else (tgt > cur)):
+                self.log(f"   ⏸ 손절 이동 생략 — 목표 {tgt:g}가 현재 손절 {cur:g}보다 불리(느슨해짐 방지)")
+                return
+            r = b.set_stop("BTCUSDT", tgt) if hasattr(b, "set_stop") else None
             if r is None:
-                self.log(f"   ⚠ 본절 이동 미지원(어댑터) — 기존 손절 유지 (목표 {entry:g})"); return
+                self.log(f"   ⚠ 손절 이동 미지원(어댑터) — 기존 손절 유지 (목표 {tgt:g})"); return
             if r.get("error"):
-                self.log(f"   ⚠ 본절 이동 실패({str(r['error'])[:60]}) — 기존 손절 유지"); return
-            self.log(f"   ✅ 손절 → 본절 {entry:g} 이동 완료")
+                self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:60]}) — 기존 손절 유지"); return
+            self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (본절)" if entry and abs(tgt - entry) < 1e-9 else ""))
         except Exception as e:
-            self.log(f"   ⚠ 본절 이동 예외({e}) — 기존 손절 유지")
+            self.log(f"   ⚠ 손절 이동 예외({e}) — 기존 손절 유지")
 
-    # ── BTC 조건부 출구 X2+BE (2026-07-15 챔피언, 대표 아이디어) ────────────────────
+    # ── BTC 조건부 출구 X2+TR (2026-07-15 챔피언, 대표 아이디어) ────────────────────
     # 규칙: 일 22:00 UTC 진입 → 4H 블록(22-02, 02-06, 06-10, 10-14, 14-18, 18-22)마다 마감 시
     #   ① 방금 닫힌 블록이 **포지션 반대 방향**으로 마감 → 즉시 청산
-    #   ② 첫 블록(22-02)이 **수익 마감** → 보호 손절을 **진입가(본절)**로 이동, 계속 홀드
+    #   ② 블록이 **순항 마감** → 보호 손절을 **그 블록의 시가**로 이동, 계속 홀드
+    #      ⭐블록0의 시가 == 진입가라 '첫 봉 순항 → 본절'이 이 규칙에서 **자동으로** 나온다
+    #        (X2+BE의 k==0 특수분기가 소멸 = 규칙이 하나로 통일됨. 실측 차이 0.0)
+    #      k≥1은 직전 블록 종가(=순항분)를 손절로 삼아 이익을 조금씩 확정 = 트레일링
     #   ③ 마지막(18-22, 24h) → 무조건 청산
     #   손절은 브로커 스탑이 상시 감시(앱 개입 없음).
-    # 검증: 대안 출구 대비 우위 · 부트스트랩 개선 · 평일 음성대조군 통과.
+    # 검증: 대안 출구 대비 우위 · MDD 5셀 전부 개선 · 부트스트랩 개선
+    #       · 평일 음성대조군으로 엣지 실재 확인 · 블록0 항등 실측.
     # ⚠판정 불가(봉 누락·API 실패)면 **홀드** — 잘못 닫느니 두고, 24h 만기가 최종 백스톱.
+    # ⚠️서버 archive_resolver.btc_x2be_resolve와 **같은 규칙**이어야 트랙레코드가 진실이다
+    #   (scripts/x2be_parity_check.py로 3자 대조).
     @staticmethod
     def x2be_decide(k, blk_open, blk_close, is_long):
-        """블록 k(0~5) 마감 시 결정. 반환: 'close' | 'breakeven' | 'hold'.
+        """블록 k(0~5) 마감 시 결정. 반환: 'close' | 'trail' | 'hold'.
+        'trail'이면 손절을 blk_open으로 옮긴다(k=0이면 그게 곧 진입가 = 본절).
         순수 함수 — 백테스트 규칙과 1:1 대조 가능하게 IO 분리."""
         if blk_open is None or blk_close is None:
             return "hold"                       # 판정 불가 → 보수적 홀드
@@ -2035,7 +2057,7 @@ class App:
         against = (blk_close < blk_open) if is_long else (blk_close > blk_open)
         if against:
             return "close"
-        return "breakeven" if k == 0 else "hold"
+        return "trail"                          # 순항 → 그 봉 시가로 손절 이동
 
     def _exec_entry_limit_fut(self, b, aid, contract, direction, size, stop, pol, live, tag):
         """선물 진입 지정가 정책 — 크립토 _exec_entry_limit의 선물판(ProjectX).
