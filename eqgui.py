@@ -88,7 +88,12 @@ HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5
 # 사용자가 시각을 고르는 게 아니라 시스템 세션 마감에 자동으로 맞춘다(3자산·BTC 2세션).
 #   NQ 10-14 ET → 14:00 ET · GC 02-06 ET → 06:00 ET · BTC 22-02/02-06 UTC → 02:00·06:00 UTC
 _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)],
-                "BTC": [("UTC", 2)]}          # H22 단독 복귀(02세션 은퇴 2026-07-14) — 06:00 청산 제거
+                # BTC = X2+BE 조건부 출구(2026-07-15 챔피언): 일 22:00 진입 후 4H 블록마다
+                # 판정(반대봉→청산 / 첫봉 순항→본절 / 24h 만기→청산). 판정 시각 6개.
+                # 옛 E0(02시 무조건 청산)는 마지막 블록(22시)이 대신한다 — 폴백 아님, 규칙이 다름.
+                "BTC": [("UTC", h) for h in (2, 6, 10, 14, 18, 22)]}
+# BTC 조건부 출구가 판정할 블록 인덱스: 마감시각 → k (22:00 진입 기준 0..5)
+_BTC_BLOCK_K = {2: 0, 6: 1, 10: 2, 14: 3, 18: 4, 22: 5}
 AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
 # 세션 진입(신호 도착) 시각 — 진입 전 API 사전 점검용(대표 2026-07-13). NQ·GC 주말 스킵.
 _ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 2)],
@@ -1562,6 +1567,10 @@ class App:
                 try:
                     b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
                                       [j["acct"]] if j["acct"] else [])
+                    # ── BTC 조건부 출구(X2+BE) — 무조건 청산이 아니라 봉을 보고 판정 ──
+                    if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K:
+                        if not self._btc_x2be_step(b, j, live, _tz("UTC")):
+                            continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
                     # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴. 선물은 기존 시장가.
                     if live and j["broker"] in ("bybit", "bitget") and j["asset"] == "BTC":
@@ -1955,6 +1964,78 @@ class App:
         self.log("   → 시장가 폴백")
         return b.place_entry(symbol=sym, side=direction, size=size,
                              stop_loss_price=stop, dry_run=False)
+
+    def _btc_x2be_step(self, b, j, live, utc_tz):
+        """BTC 판정 시각(02/06/10/14/18/22 UTC) 1회 처리. 반환 True=청산 진행 / False=보유 유지.
+        포지션 없으면 True(아래 flatten_all이 no-op으로 잔여 주문만 정리)."""
+        import datetime as _d
+        k = _BTC_BLOCK_K[j["hour"]]
+        try:
+            qty = b.position_qty("BTCUSDT") if hasattr(b, "position_qty") else None
+        except Exception:
+            qty = None
+        if not qty:
+            return True                       # 플랫 → 평소 경로(잔여 정리)
+        pos = next((p for p in b.list_open_positions() if "BTC" in str(p.symbol).upper()), None)
+        if pos is None:
+            return True
+        is_long = pos.net_qty > 0
+        now = _d.datetime.now(utc_tz)
+        end = now.replace(minute=0, second=0, microsecond=0)   # 방금 닫힌 블록의 마감시각
+        blk = b.block_4h("BTCUSDT", end) if hasattr(b, "block_4h") else None
+        o, c = (blk if blk else (None, None))
+        d = self.x2be_decide(k, o, c, is_long)
+        _dir = "LONG" if is_long else "SHORT"
+        _bar = f"{o:g}→{c:g}" if blk else "봉 조회 실패"
+        if d == "close":
+            self.log(f"   📉 X2+BE 블록{k} [{_bar}] {_dir} → **청산**"
+                     + (" (24h 만기)" if k >= 5 else " (반대봉 마감)"))
+            return True
+        if d == "breakeven":
+            self.log(f"   🛡 X2+BE 블록{k} [{_bar}] {_dir} 순항 → 손절을 **본절**로 이동, 홀드 유지")
+            if live:
+                self._btc_move_stop_be(b, pos, is_long)
+            return False
+        self.log(f"   ⏸ X2+BE 블록{k} [{_bar}] {_dir} 순항 → 홀드"
+                 + ("  ⚠판정 불가라 보수적 홀드(24h 만기가 백스톱)" if not blk else ""))
+        return False
+
+    def _btc_move_stop_be(self, b, pos, is_long):
+        """보호 손절을 진입가(본절)로 이동. 진입가 = 브로커 포지션의 평균단가.
+        실패해도 홀드는 유지 — 원래 손절이 아직 살아 있으므로 무방비 아님(로그만 경고)."""
+        try:
+            entry = float(pos.raw.get("avgPrice") or pos.raw.get("entryPrice") or 0)
+            if not entry:
+                self.log("   ⚠ 본절 이동 실패: 평균단가 조회 불가 — 기존 손절 유지"); return
+            r = b.set_stop("BTCUSDT", entry) if hasattr(b, "set_stop") else None
+            if r is None:
+                self.log(f"   ⚠ 본절 이동 미지원(어댑터) — 기존 손절 유지 (목표 {entry:g})"); return
+            if r.get("error"):
+                self.log(f"   ⚠ 본절 이동 실패({str(r['error'])[:60]}) — 기존 손절 유지"); return
+            self.log(f"   ✅ 손절 → 본절 {entry:g} 이동 완료")
+        except Exception as e:
+            self.log(f"   ⚠ 본절 이동 예외({e}) — 기존 손절 유지")
+
+    # ── BTC 조건부 출구 X2+BE (2026-07-15 챔피언, 대표 아이디어) ────────────────────
+    # 규칙: 일 22:00 UTC 진입 → 4H 블록(22-02, 02-06, 06-10, 10-14, 14-18, 18-22)마다 마감 시
+    #   ① 방금 닫힌 블록이 **포지션 반대 방향**으로 마감 → 즉시 청산
+    #   ② 첫 블록(22-02)이 **수익 마감** → 보호 손절을 **진입가(본절)**로 이동, 계속 홀드
+    #   ③ 마지막(18-22, 24h) → 무조건 청산
+    #   손절은 브로커 스탑이 상시 감시(앱 개입 없음).
+    # 검증: 대안 출구 대비 우위 · 부트스트랩 개선 · 평일 음성대조군 통과.
+    # ⚠판정 불가(봉 누락·API 실패)면 **홀드** — 잘못 닫느니 두고, 24h 만기가 최종 백스톱.
+    @staticmethod
+    def x2be_decide(k, blk_open, blk_close, is_long):
+        """블록 k(0~5) 마감 시 결정. 반환: 'close' | 'breakeven' | 'hold'.
+        순수 함수 — 백테스트 규칙과 1:1 대조 가능하게 IO 분리."""
+        if blk_open is None or blk_close is None:
+            return "hold"                       # 판정 불가 → 보수적 홀드
+        if k >= 5:
+            return "close"                      # 24h 만기
+        against = (blk_close < blk_open) if is_long else (blk_close > blk_open)
+        if against:
+            return "close"
+        return "breakeven" if k == 0 else "hold"
 
     def _exec_entry_limit_fut(self, b, aid, contract, direction, size, stop, pol, live, tag):
         """선물 진입 지정가 정책 — 크립토 _exec_entry_limit의 선물판(ProjectX).

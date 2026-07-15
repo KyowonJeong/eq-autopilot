@@ -260,6 +260,45 @@ class BybitBroker(BrokerAdapter):
         except Exception:
             return None
 
+    def set_stop(self, symbol, stop_price):
+        """포지션의 보호 손절가를 변경(X2+BE 본절 이동용). POST /v5/position/trading-stop.
+        Bybit는 stopLoss를 포지션 속성으로 관리 → 값만 덮어쓰면 기존 스탑이 갱신된다
+        (취소→재등록 사이 무방비 구간이 없다). 반환 {"error": None|str}."""
+        try:
+            self._req("POST", "/v5/position/trading-stop", body={
+                "category": self.category, "symbol": self._symbol(symbol),
+                "stopLoss": str(round(float(stop_price), 2)),
+                "positionIdx": 0,          # one-way 모드
+            })
+            return {"error": None}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def block_4h(self, symbol, end_utc):
+        """우리 4H 블록(22-02, 02-06, …)의 (시가, 종가). end_utc = 블록 마감 UTC datetime.
+        ⚠거래소 네이티브 4H 그리드는 00-04라 우리 그리드(+2h 오프셋)와 어긋난다 → **1H 4개를
+        직접 조립**한다(백테스트 build_sheet의 +2h 오프셋 재조립과 동일 규약).
+        반환 (open, close) | None. X2 출구('반대 봉 마감 시 청산') 판정용."""
+        from datetime import timedelta
+        start = end_utc - timedelta(hours=4)
+        try:
+            d = self._req("GET", "/v5/market/kline", {
+                "category": self.category, "symbol": self._symbol(symbol), "interval": "60",
+                "start": int(start.timestamp() * 1000),
+                "end": int((end_utc - timedelta(seconds=1)).timestamp() * 1000),
+                "limit": 10,
+            })
+            lst = d.get("list") or []
+            # Bybit kline: [startMs, open, high, low, close, vol, turnover], 최신→과거 정렬
+            rows = sorted(lst, key=lambda r: int(r[0]))
+            rows = [r for r in rows
+                    if start.timestamp() * 1000 <= int(r[0]) < end_utc.timestamp() * 1000]
+            if len(rows) < 4:            # 봉 누락 = 판정 불가 → 호출측이 홀드(보수적)
+                return None
+            return float(rows[0][1]), float(rows[-1][4])
+        except Exception:
+            return None
+
     def closed_fills(self, start_ms: int) -> list[dict]:
         """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
         GET /v5/position/closed-pnl → [{tid, ts_ms, symbol, pnl, direction}].
