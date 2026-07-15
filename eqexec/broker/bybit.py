@@ -184,6 +184,82 @@ class BybitBroker(BrokerAdapter):
         return {"entry": res, "stop": bool(stop_loss_price),
                 "stop_error": None if stop_loss_price else "no stop provided"}
 
+    # ── 지정가 체결 정책(대표 2026-07-15) — 진입/청산 지정가 도전용 프리미티브 ──
+    def place_limit_entry(self, *, symbol, side, size, price, stop_loss_price=None,
+                          dry_run: bool = True) -> dict:
+        """PostOnly 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place."""
+        sym = self._symbol(symbol)
+        bside = "Buy" if str(side).upper() == "LONG" else "Sell"
+        qty = self._fmt_qty(size)
+        body = {"category": self.category, "symbol": sym, "side": bside,
+                "orderType": "Limit", "price": f"{float(price):g}", "qty": qty,
+                "timeInForce": "PostOnly", "reduceOnly": False}
+        if stop_loss_price:
+            body["stopLoss"] = str(stop_loss_price)
+            body["slTriggerBy"] = "LastPrice"
+        if dry_run:
+            return {"would_place": body}
+        try:
+            r = self._req("POST", "/v5/order/create", body=body)
+            return {"order_id": (r or {}).get("orderId")}
+        except Exception as e:
+            if "10001" in str(e) or "position idx" in str(e).lower():   # 헤지 모드 호환
+                body["positionIdx"] = 1 if bside == "Buy" else 2
+                try:
+                    r = self._req("POST", "/v5/order/create", body=body)
+                    return {"order_id": (r or {}).get("orderId")}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
+            return {"error": str(e)}
+
+    def place_limit_close(self, *, symbol, price, dry_run: bool = True) -> dict:
+        """reduceOnly PostOnly 지정가 청산(현 포지션 반대방향 전량). 반환 {order_id}|{error}|{flat}."""
+        sym = self._symbol(symbol)
+        mine = [p for p in self.list_open_positions() if p.symbol == sym]
+        if not mine:
+            return {"flat": True}
+        pos = mine[0]
+        body = {"category": self.category, "symbol": sym,
+                "side": "Sell" if pos.net_qty > 0 else "Buy",
+                "orderType": "Limit", "price": f"{float(price):g}",
+                "qty": str(pos.raw.get("size") or abs(pos.net_qty)),
+                "timeInForce": "PostOnly", "reduceOnly": True}
+        _pi = pos.raw.get("positionIdx")
+        if _pi is not None:
+            body["positionIdx"] = _pi
+        if dry_run:
+            return {"would_place": body}
+        try:
+            r = self._req("POST", "/v5/order/create", body=body)
+            return {"order_id": (r or {}).get("orderId")}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def cancel_order(self, symbol, order_id) -> bool:
+        try:
+            self._req("POST", "/v5/order/cancel",
+                      body={"category": self.category, "symbol": self._symbol(symbol),
+                            "orderId": str(order_id)})
+            return True
+        except Exception:
+            return False   # 이미 체결/취소된 주문의 취소 실패는 무해
+
+    def position_qty(self, symbol) -> float:
+        """이 심볼 순포지션 수량(체결 확인용) — 0.0=플랫, -1.0=조회 실패."""
+        sym = self._symbol(symbol)
+        try:
+            return sum(abs(p.net_qty) for p in self.list_open_positions() if p.symbol == sym)
+        except Exception:
+            return -1.0
+
+    def current_market_price(self, symbol):
+        try:
+            d = self._req("GET", "/v5/market/tickers",
+                          {"category": self.category, "symbol": self._symbol(symbol)})
+            return float((d.get("list") or [{}])[0].get("lastPrice"))
+        except Exception:
+            return None
+
     def closed_fills(self, start_ms: int) -> list[dict]:
         """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
         GET /v5/position/closed-pnl → [{tid, ts_ms, symbol, pnl, direction}].

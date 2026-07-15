@@ -1527,7 +1527,11 @@ class App:
                 try:
                     b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
                                       [j["acct"]] if j["acct"] else [])
-                    res = b.flatten_all(dry_run=not live)
+                    # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
+                    # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴. 선물은 기존 시장가.
+                    if live and j["broker"] in ("bybit", "bitget") and j["asset"] == "BTC":
+                        self._exec_close_limit(b, "BTCUSDT")
+                    res = b.flatten_all(dry_run=not live)   # 잔여 확인 겸 최종 청산(플랫이면 no-op)
                     if not res.planned:
                         self.log("   no open positions (flat).")
                     elif not live:
@@ -1859,6 +1863,95 @@ class App:
                  else f"\n⏹ Stopped all — {n} asset(s) disarmed.")
         self._refresh_live_panel()
         self._apply_gating()
+
+    # ── 지정가 체결 정책 미러 (대표 2026-07-15, order_exec.execute_entry 레퍼런스와 동일) ──
+    def _exec_entry_limit(self, b, sym, direction, size, stop, pol, live, broker):
+        """크립토 진입: 지정가(메이커) N회 재시도 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
+        체결 확인 = 포지션 수량(진입은 항상 flat에서 시작 — 잔여 청산 확인 후라서).
+        반환은 place_entry와 동일 계약({entry|error|would_place...}) — 기존 후처리 재사용."""
+        import time as _t
+        lp = float(pol["limit_price"])
+        if broker == "bitget":                        # 지정가·임계도 빗겟 좌표계로 보정
+            _basis = _cross_basis_bitget()
+            if _basis:
+                lp = round(lp + _basis, 2)
+        retries = int(pol.get("retries") or 3)
+        interval = float(pol.get("retry_interval_s") or 3)
+        thr = pol.get("skip_if_adverse_price")
+        if not live:
+            self.log(f"   DRY-RUN 체결정책: 지정가 {lp:g} ×{retries}회(간격 {interval:g}s) → "
+                     f"불리 {thr}+ 스킵 → 시장가 폴백 · 손절 {stop}")
+            return b.place_entry(symbol=sym, side=direction, size=size,
+                                 stop_loss_price=stop, dry_run=True)
+        self.log(f"   ⏳ 지정가 진입 도전 {lp:g} (메이커, ×{retries})")
+        for i in range(retries):
+            r = b.place_limit_entry(symbol=sym, side=direction, size=size, price=lp,
+                                    stop_loss_price=stop, dry_run=False)
+            oid = r.get("order_id")
+            if r.get("error"):
+                self.log(f"   ⚠ 지정가 주문 거절({r['error'][:80]}) → 시장가 폴백")
+                break
+            _t.sleep(max(1.0, interval))
+            qty = b.position_qty(sym)
+            if qty and qty > 0:                       # 체결(부분 포함) → 나머지 취소 후 인정
+                if oid:
+                    b.cancel_order(sym, oid)
+                self.log(f"   ✅ 지정가 체결 (시도 {i + 1}, 수량 {qty:g}) — 메이커 수수료")
+                return {"entry": {"orderId": oid, "mode": "limit", "price": lp},
+                        "stop": bool(stop), "stop_error": None}
+            if oid:
+                b.cancel_order(sym, oid)              # 미체결 잔여 주문 정리 후 재시도
+        # 미체결 → 불리 이동 판정
+        cur = b.current_market_price(sym)
+        if cur is not None and thr is not None:
+            adv = (cur - lp) if str(direction).upper() == "LONG" else (lp - cur)
+            if adv > float(thr):
+                self.log(f"   ⛔ 진입 스킵 — 지정가 대비 불리 이동 {adv:+.2f} > 임계 {thr} "
+                         f"(손익비 보호, 이 신호는 버림)")
+                self.root.after(0, lambda a=sym, v=adv: messagebox.showwarning(
+                    "진입 스킵" if self.lang == "ko" else "Entry skipped",
+                    (f"{a}: 지정가 미체결 + 가격이 {v:+.2f} 불리하게 이동 — 정책에 따라 이번 "
+                     f"진입을 건너뜁니다." if self.lang == "ko" else
+                     f"{a}: limit unfilled and price moved {v:+.2f} adversely — entry skipped "
+                     f"per policy.")))
+                return {"skipped": True, "error": None, "entry": None,
+                        "would_place": None, "stop": False, "stop_error": None,
+                        "note": "skipped_adverse"}
+        self.log("   → 시장가 폴백")
+        return b.place_entry(symbol=sym, side=direction, size=size,
+                             stop_loss_price=stop, dry_run=False)
+
+    def _exec_close_limit(self, b, sym, retries=3, interval=3.0):
+        """크립토 시간마감 청산: 현재가 지정가(메이커) N회 도전 — 남으면 호출측 flatten이
+        시장가로 마무리(스킵 없음, order_exec.execute_exit 미러)."""
+        import time as _t
+        try:
+            if not (b.position_qty(sym) > 0):
+                return                                  # 이미 플랫
+            self.log(f"   ⏳ 청산 지정가 도전 (메이커, ×{retries})")
+            for i in range(retries):
+                px = b.current_market_price(sym)
+                if px is None:
+                    return                              # 가격 조회 불가 → 곧장 시장가(flatten)
+                r = b.place_limit_close(symbol=sym, price=px, dry_run=False)
+                if r.get("flat"):
+                    self.log("   ✅ 청산 완료 (지정가)")
+                    return
+                oid = r.get("order_id")
+                if r.get("error"):
+                    self.log(f"   ⚠ 청산 지정가 거절({str(r['error'])[:80]}) → 시장가")
+                    return
+                _t.sleep(max(1.0, interval))
+                if not (b.position_qty(sym) > 0):
+                    self.log(f"   ✅ 청산 체결 (지정가, 시도 {i + 1}) — 메이커 수수료")
+                    if oid:
+                        b.cancel_order(sym, oid)
+                    return
+                if oid:
+                    b.cancel_order(sym, oid)
+            self.log("   → 지정가 미체결 — 시장가로 마무리")
+        except Exception as e:
+            self.log(f"   ⚠ 청산 지정가 단계 오류({str(e)[:80]}) → 시장가로 마무리")
 
     # ── 진입 전 API 사전 점검 (대표 2026-07-13) ──────────────────────────────
     # 무장된 자산마다 다음 진입 70분 전~진입 사이에 1회, 그 자산 브로커 API를 실제 인증해 본다.
@@ -2351,8 +2444,20 @@ class App:
                             if _basis:
                                 stop = round(stop + _basis, 2)
                                 self.log(f"   ⚖ 빗겟 캘리브레이션: 바이빗 대비 {_basis:+.2f} → 손절 {stop}")
-                        res = b.place_entry(symbol=sym, side=direction, size=size,
-                                            stop_loss_price=stop, dry_run=not live)
+                        # ── 체결 정책(대표 2026-07-15): 서버 exec_policy.entry가 지정가 모드면
+                        #    지정가(메이커) N회 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
+                        #    페이로드에 정책 없으면(구 서버) 기존 시장가 그대로. ──
+                        _pol = ((sig.get("exec_policy") or {}).get("entry")
+                                if isinstance(sig.get("exec_policy"), dict) else None)
+                        if _pol and _pol.get("mode") == "limit_then_market" \
+                                and _pol.get("limit_price") is not None:
+                            res = self._exec_entry_limit(b, sym, direction, size, stop,
+                                                         dict(_pol), live, _broker)
+                        else:
+                            res = b.place_entry(symbol=sym, side=direction, size=size,
+                                                stop_loss_price=stop, dry_run=not live)
+                    if res.get("skipped"):
+                        continue                      # 정책 스킵(불리 이동) — 로그·팝업은 이미 출력
                     if res.get("error"):
                         self.log(f"   ❌ 진입 실패: {res.get('error')}")
                         # 눈에 띄는 알림(대표 2026-07-12) — 마진 부족·API 거절 등을 놓치지 않게.

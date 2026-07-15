@@ -163,6 +163,88 @@ class BitgetBroker(BrokerAdapter):
         return {"entry": res, "stop": bool(stop_loss_price),
                 "stop_error": None if stop_loss_price else "no stop provided"}
 
+    # ── 지정가 체결 정책(대표 2026-07-15) — 진입/청산 지정가 도전용 프리미티브 ──
+    def place_limit_entry(self, *, symbol, side, size, price, stop_loss_price=None,
+                          dry_run: bool = True) -> dict:
+        """post_only 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place."""
+        sym = self._symbol(symbol)
+        bside = "buy" if str(side).upper() == "LONG" else "sell"
+        qty = self._fmt_qty(size)
+        body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
+                "marginCoin": "USDT", "side": bside, "orderType": "limit",
+                "price": f"{float(price):g}", "size": qty, "force": "post_only"}
+        if stop_loss_price:
+            body["presetStopLossPrice"] = str(stop_loss_price)
+        if dry_run:
+            return {"would_place": body}
+        try:
+            r = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+            return {"order_id": (r or {}).get("orderId")}
+        except Exception as e:
+            if "side" in str(e).lower() or "40774" in str(e):    # 헤지 모드 호환
+                body["tradeSide"] = "open"
+                try:
+                    r = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+                    return {"order_id": (r or {}).get("orderId")}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
+            return {"error": str(e)}
+
+    def place_limit_close(self, *, symbol, price, dry_run: bool = True) -> dict:
+        """reduceOnly post_only 지정가 청산(전량). 반환 {order_id}|{error}|{flat}."""
+        sym = self._symbol(symbol)
+        mine = [p for p in self.list_open_positions() if p.symbol == sym]
+        if not mine:
+            return {"flat": True}
+        pos = mine[0]
+        body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
+                "marginCoin": "USDT",
+                "side": "sell" if pos.net_qty > 0 else "buy",
+                "orderType": "limit", "price": f"{float(price):g}",
+                "size": self._fmt_qty(abs(pos.net_qty)), "force": "post_only",
+                "reduceOnly": "YES"}
+        if dry_run:
+            return {"would_place": body}
+        try:
+            r = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+            return {"order_id": (r or {}).get("orderId")}
+        except Exception as e:
+            if "side" in str(e).lower() or "40774" in str(e):    # 헤지 모드: tradeSide=close
+                body.pop("reduceOnly", None)
+                body["tradeSide"] = "close"
+                try:
+                    r = self._req("POST", "/api/v2/mix/order/place-order", body=body)
+                    return {"order_id": (r or {}).get("orderId")}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
+            return {"error": str(e)}
+
+    def cancel_order(self, symbol, order_id) -> bool:
+        try:
+            self._req("POST", "/api/v2/mix/order/cancel-order",
+                      body={"symbol": self._symbol(symbol), "productType": self.product,
+                            "marginCoin": "USDT", "orderId": str(order_id)})
+            return True
+        except Exception:
+            return False   # 이미 체결/취소된 주문의 취소 실패는 무해
+
+    def position_qty(self, symbol) -> float:
+        """이 심볼 순포지션 수량(체결 확인용) — 0.0=플랫, -1.0=조회 실패."""
+        sym = self._symbol(symbol)
+        try:
+            return sum(abs(p.net_qty) for p in self.list_open_positions() if p.symbol == sym)
+        except Exception:
+            return -1.0
+
+    def current_market_price(self, symbol):
+        try:
+            d = self._req("GET", "/api/v2/mix/market/ticker",
+                          {"symbol": self._symbol(symbol), "productType": self.product})
+            row = d[0] if isinstance(d, list) else d
+            return float(row.get("lastPr"))
+        except Exception:
+            return None
+
     def closed_fills(self, start_ms: int) -> list[dict]:
         """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
         GET /api/v2/mix/position/history-position → [{tid, ts_ms, symbol, pnl, direction}].
