@@ -33,6 +33,39 @@ APP_DIR = _app_dir()
 os.makedirs(APP_DIR, exist_ok=True)
 CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
+# ── 앱 로그 파일 영속화(대표 2026-07-15): 화면 로그를 일자별 파일에도 기록(타임스탬프 부여).
+#    앱을 닫아도 수신·체결 지연 기록이 남아 사후 감사 가능. 30일 지난 파일은 시작 시 정리. ──
+LOG_DIR = os.path.join(APP_DIR, "logs")
+_LOG_LOCK = threading.Lock()
+
+
+def _log_to_file(msg):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        now = _dt.datetime.now()
+        ts = now.strftime("%H:%M:%S")
+        path = os.path.join(LOG_DIR, f"eq-{now:%Y%m%d}.log")
+        with _LOG_LOCK, open(path, "a", encoding="utf-8") as f:
+            for ln in str(msg).split("\n"):
+                f.write(f"[{ts}] {ln}\n")
+    except Exception:
+        pass                     # 로그 실패가 매매를 막으면 안 됨
+
+
+def _prune_logs(days: int = 30):
+    try:
+        import time as _tm
+        cut = _tm.time() - days * 86400
+        for fn in os.listdir(LOG_DIR):
+            p = os.path.join(LOG_DIR, fn)
+            if fn.startswith("eq-") and fn.endswith(".log") and os.path.getmtime(p) < cut:
+                os.remove(p)
+    except Exception:
+        pass
+
+
+_prune_logs()
+
 URL_HOME = "https://edgequant.app"
 URL_JOIN = "https://app.edgequant.app/?nav=registration"
 # '토큰 받기' = 무료(public) 멤버십 토큰 자동 발급 경로. 채널 입장/타자 불필요.
@@ -1241,7 +1274,9 @@ class App:
             messagebox.showinfo("PIN", self.t("locked_msg")); return
         self.key.config(show="" if self.show.get() else "•")
 
-    def log(self, m): self.q.put(m)
+    def log(self, m):
+        _log_to_file(m)          # 파일에도 영속(타임스탬프 부여) — 대표 2026-07-15
+        self.q.put(m)
 
     def _drain(self):
         while not self.q.empty():
@@ -2475,6 +2510,14 @@ class App:
                             self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
                     else:
                         self.log(f"   ✅ 진입 완료: {res.get('entry', res)}")
+                        # 체결 타임스탬프 + 발송 대비 총 지연(대표 2026-07-15) — 수신 지연(⏱ 캡처)과
+                        # 세트로 '발송→체결' 전 구간을 로그로 증빙.
+                        _fill = _dtl.datetime.now()
+                        try:
+                            _tot = f"{_fill.timestamp() - float(_pub):.1f}s" if _pub else "?"
+                        except (TypeError, ValueError):
+                            _tot = "?"
+                        self.log(f"   ⏱ 체결 확인 {_fill.strftime('%H:%M:%S')} · 발송 후 {_tot}")
                         # LIVE 진입 시각 기록(영속) — 자동청산 잡이 발화창 내 '방금 진입'을
                         # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
                         self._entered_at = _mark_entered(_asset)
