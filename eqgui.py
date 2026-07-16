@@ -2463,10 +2463,18 @@ class App:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
             self.log(f"   일별 합산 {len(trades)}건 → 푸시 (키·잔고 무전송)")
+            # 포트폴리오 비중(자산별 1R 비율) 동봉 — 달러 액수는 안 보내고 최솟값=1 비율만
+            # (프로필 페이지 '포트폴리오 비중' 자동 표시용, 대표 2026-07-15).
+            _ors = {a: float(one_r_by_asset.get(a) or 0) for a in assets_with_creds
+                    if (one_r_by_asset.get(a) or 0) > 0}
+            _base = min(_ors.values()) if _ors else 0
+            risk_weights = ({a: round(v / _base, 2) for a, v in _ors.items()} if _base else None)
             pid = autopilot_crypto.path_id(tok)
             ok_total, srv_handle = None, None
             for i in range(0, len(trades), TR_CHUNK):
                 payload = {"public": public, "trades": trades[i:i + TR_CHUNK]}
+                if risk_weights:
+                    payload["risk_weights"] = risk_weights
                 blob = autopilot_crypto.encrypt(tok, payload)
                 try:
                     r = requests.get(PUSH_BASE + "eqpush",
