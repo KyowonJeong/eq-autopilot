@@ -1562,12 +1562,24 @@ class App:
                     continue
                 live = self._live_now(j.get("live"))   # 이 자산 LIVE 선택 × 발화 순간 게이트 재판정
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
-                self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
-                         f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
                 try:
                     b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
                                       [j["acct"]] if j["acct"] else [])
-                    # ── BTC 조건부 출구(X2+BE) — 무조건 청산이 아니라 봉을 보고 판정 ──
+                    # ── BTC(일요일 전용): 포지션이 없으면 이 블록 판정은 무의미하다 — 평일엔 BTC
+                    # 포지션 자체가 없다(일 22시 진입~월 22시 청산). '세션 마감' 로그 없이 조용히
+                    # 건너뛴다(대표 2026-07-16: 평일마다 뜨던 무의미한 BTC 마감 로그 제거).
+                    # 단 포지션 조회가 실패하면 스킵하지 않고 기존 경로로(안전 — 진짜 홀드 놓침 방지).
+                    if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K:
+                        _bq = "ERR"
+                        try:
+                            _bq = b.position_qty("BTCUSDT") if hasattr(b, "position_qty") else None
+                        except Exception:
+                            _bq = "ERR"
+                        if _bq != "ERR" and not _bq:
+                            continue          # 포지션 확실히 없음 → 무음 스킵
+                    self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
+                             f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
+                    # ── BTC 조건부 출구(X2+TR) — 무조건 청산이 아니라 봉을 보고 판정 ──
                     if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K:
                         if not self._btc_x2be_step(b, j, live, _tz("UTC")):
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
