@@ -1310,12 +1310,14 @@ class App:
                              self._f3(), [sc] if sc else [])
 
     def _busy(self, on):
-        # 작업 중엔 계좌(연결 테스트 겸) 버튼도 잠그고, 끝나면 연결 여부에 맞춰 실행 버튼 복원.
+        # 작업 중엔 계좌(연결 테스트 겸) 버튼도 잠그고, 끝나면 _apply_gating이 버튼별 조건으로
+        # 복원한다. (구버전 `self._connected`로 일괄 복원 → 현재 탭 미연결이면 연결과 무관한
+        # 동기화(푸시) 버튼까지 잠긴 채 다음 하트비트(5분)까지 방치 — 대표 2026-07-16 리포트.)
         try:
             self.b_acc.config(state="disabled" if on else "normal")
         except Exception:
             pass
-        self._set_actions_enabled(False if on else self._connected)
+        self._set_actions_enabled(not on)
 
     def _creds_ok(self):
         # 빠진 필드를 브로커 실제 라벨로 안내 — 옛 고정문구 "이메일과 API Key"는 Bybit 등
