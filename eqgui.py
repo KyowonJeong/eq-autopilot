@@ -185,6 +185,13 @@ _ASSET_BROKERS = {"NQ": ["projectx", "ibkr"],
 _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
                 "BTC": {"ko": "비트코인 (BTC)", "en": "Bitcoin (BTC)"}}
+
+# 선물 시간마감 '지정가 청산' 대상 — order_exec.LIMIT_EXEC_ASSETS(BTC·GC)의 선물판 (대표 2026-07-16).
+#   GC만: 손절이 타이트해 계약수가 많고 틱 슬리피지가 커미션을 지배(비용 실측 2026-07-15,
+#   시장가 건당 $64 vs 지정가 절반체결 $41). NQ는 건당 $19라 미체결 리스크 값어치 없음(보류).
+#   ProjectX 전용(IBKR 브로커엔 place_limit_entry/position_qty 폴링 계약이 없음).
+#   백테스트(costs.ASSET_FILL_EXIT)는 이 배선이 실계정 검증될 때까지 GC 청산 0(시장가) 유지.
+_LIMIT_EXIT_FUT = {"GC": "MGC"}
 _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
@@ -1572,9 +1579,13 @@ class App:
                         if not self._btc_x2be_step(b, j, live, _tz("UTC")):
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
-                    # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴. 선물은 기존 시장가.
+                    # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴.
+                    # 선물 GC = 지정가 도전 → 시장가 폴백(대표 2026-07-16, _LIMIT_EXIT_FUT).
+                    # NQ는 시장가 유지(슬립 미미·미체결 리스크 값어치 없음 — order_exec 정책).
                     if live and j["broker"] in ("bybit", "bitget") and j["asset"] == "BTC":
                         self._exec_close_limit(b, "BTCUSDT")
+                    elif live and j["broker"] == "projectx" and j["asset"] in _LIMIT_EXIT_FUT:
+                        self._exec_close_limit_fut(b, j["asset"])
                     res = b.flatten_all(dry_run=not live)   # 잔여 확인 겸 최종 청산(플랫이면 no-op)
                     if not res.planned:
                         self.log("   no open positions (flat).")
@@ -2140,6 +2151,57 @@ class App:
                 if oid:
                     b.cancel_order(sym, oid)
             self.log("   → 지정가 미체결 — 시장가로 마무리")
+        except Exception as e:
+            self.log(f"   ⚠ 청산 지정가 단계 오류({str(e)[:80]}) → 시장가로 마무리")
+
+    def _exec_close_limit_fut(self, b, asset, retries=3, interval=3.0):
+        """선물(GC) 시간마감 청산: 현재가 지정가(반대편 type1) N회 도전 — 남으면 호출측
+        flatten_all이 시장가+잔여주문 취소로 마무리(스킵 없음, order_exec.execute_exit 미러).
+        _exec_close_limit(크립토)의 선물판: 계좌·계약은 열린 포지션에서 발견, 부분체결은
+        다음 시도에서 잔량 기준 재주문. 보호 스탑은 건드리지 않는다 — 청산 미체결 동안
+        살아 있어야 하고, 체결 후 고아 스탑은 직후 flatten_all이 취소한다(projectx 설계).
+        어떤 실패든 조용히 반환 → 시장가 백스톱이 반드시 마무리(청산 실패 불가)."""
+        import time as _t
+        sym = _LIMIT_EXIT_FUT.get(asset)
+        if not sym:
+            return
+        try:
+            poss = [p for p in b.list_open_positions() if sym in str(p.symbol)]
+            if not poss:
+                return                                # 이미 플랫
+            self.log(f"   ⏳ {asset} 청산 지정가 도전 (×{retries}) — 슬리피지 회피")
+            for p in poss:
+                aid = p.raw.get("_accountId") or p.account_id
+                con = p.raw.get("contractId") or p.symbol
+                close_side = "SHORT" if p.net_qty > 0 else "LONG"
+                for i in range(retries):
+                    qty = b.position_qty(aid, con)
+                    if qty is None:
+                        return                        # 포지션 조회 실패 → 곧장 시장가(flatten)
+                    if qty == 0:
+                        self.log("   ✅ 청산 체결 (지정가) — 슬리피지 0")
+                        break
+                    px = b.current_market_price(con)
+                    if px is None:
+                        return                        # 가격 조회 불가 → 시장가(flatten)
+                    r = b.place_limit_entry(aid, con, close_side, qty, px,
+                                            custom_tag=f"EQ-XC-{int(_t.time() * 1000)}")
+                    if r.get("error"):
+                        self.log(f"   ⚠ 청산 지정가 거절({str(r['error'])[:80]}) → 시장가")
+                        return
+                    oid = r.get("order_id")
+                    _t.sleep(max(1.0, interval))
+                    left = b.position_qty(aid, con)
+                    if oid:
+                        try:
+                            b.cancel_order(aid, oid)  # 미체결 잔여 취소(재주문/flatten과 충돌 방지)
+                        except Exception:
+                            pass
+                    if left == 0:
+                        self.log(f"   ✅ 청산 체결 (지정가, 시도 {i + 1}) — 슬리피지 0")
+                        break
+                else:
+                    self.log("   → 지정가 미체결 — 시장가로 마무리")
         except Exception as e:
             self.log(f"   ⚠ 청산 지정가 단계 오류({str(e)[:80]}) → 시장가로 마무리")
 
