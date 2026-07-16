@@ -2572,12 +2572,15 @@ class App:
                 sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
             except Exception as e:
                 self._feed_errs = getattr(self, "_feed_errs", 0) + 1
-                if self._feed_errs == 1 or self._feed_errs % 10 == 0:
-                    self.log(f"   signal feed error ×{self._feed_errs}: {e}")
+                # 일시적 blip(서버 재배포·순간 지연)은 조용히 재시도한다 — 폴 3초라 1~2회 실패는
+                # 흔하고 무해(다음 폴에서 바로 복구). **지속 장애(20회≈1분 연속 실패)만** 한 번 로그.
+                # (대표 2026-07-16: '쓸데없는 경고' 폭주 제거 — 로그는 진짜 문제일 때만.)
+                if self._feed_errs == 20:
+                    self.log(f"   ⚠ 신호 피드 응답 지연이 1분 이상 지속됩니다: {e}")
                 _t.sleep(SIG_POLL_SECS); continue
-            if getattr(self, "_feed_errs", 0):
-                self.log(f"   signal feed 복구 (오류 {self._feed_errs}회 후)")
-                self._feed_errs = 0
+            if getattr(self, "_feed_errs", 0) >= 20:
+                self.log("   ✓ 신호 피드 정상 복구")
+            self._feed_errs = 0
             sid = sig.get("id")
             # no-trade(거래 없음) 신호도 새로 오면 '받았다'만 표시(포지션은 안 잡음).
             if sid and sid != last_id and not (sig.get("tradeable") and sig.get("direction")):
