@@ -20,6 +20,17 @@
 #   MNQ = $2/pt · MGC = $10/pt
 FUTURES_POINT_VALUE = {"MNQ": 2.0, "MGC": 10.0}
 
+# ── 미니/마이크로 분할 (대표 2026-07-16) ──────────────────────────────────────
+# 마이크로 10계약 = 미니 1계약(같은 명목)인데 **수수료는 미니가 3배 이상 싸다**(TopstepX):
+#   MNQ $1.24 RT × 10 = $12.40  vs  NQ $3.80 RT      → 커미션 −69%
+#   MGC $1.74 RT × 10 = $17.40  vs  GC $4.24 RT      → 커미션 −76%
+# 그래서 마이크로 23계약을 낼 사람은 없다 — 미니 2 + 마이크로 3으로 낸다. 앱도 그렇게 낸다.
+# ⚠️슬리피지는 안 준다(틱 수 동일, 계약당 명목만 10배) — 아끼는 건 커미션뿐.
+# ⚠️백테스트(costs._blended_commission)와 **같은 규칙**이어야 트랙레코드가 진실이다.
+#   발동 빈도는 1R·가격대에 좌우된다(1R=$600 기준 2026년 NQ 2.9%·GC 4.7%, 2022년 GC 84%).
+_MINI_OF = {"MNQ": "NQ", "MGC": "GC"}     # 마이크로 → 같은 명목의 미니(비율 10:1)
+MINI_RATIO = 10
+
 # 크립토 최소 수량/랏 스텝(BTC). 거래소별 실제 최소치는 심볼 규격에서 확인해 조정.
 CRYPTO_LOT_STEP = 0.001
 
@@ -69,5 +80,14 @@ def compute_size(asset, broker, one_r, entry_ref, stop, direction):
                 "risk_pts": round(risk_pts, 2)}
     pv = FUTURES_POINT_VALUE[sym]
     size = max(0, int(round(one_r / (risk_pts * pv))))
-    return {"size": size, "symbol": sym, "kind": kind, "unit": "contracts",
-            "risk_pts": round(risk_pts, 2)}
+    out = {"size": size, "symbol": sym, "kind": kind, "unit": "contracts",
+           "risk_pts": round(risk_pts, 2)}
+    # 마이크로 10계약 이상이면 미니로 묶어 커미션을 3배 아낀다(위 주석 참고).
+    # legs = [(심볼, 계약수), ...] — 호출부는 legs가 있으면 그대로, 없으면 size/symbol 단일 주문.
+    mini = _MINI_OF.get(sym)
+    if mini and size >= MINI_RATIO:
+        n_mini, n_micro = divmod(size, MINI_RATIO)
+        out["legs"] = [(mini, n_mini)] + ([(sym, n_micro)] if n_micro else [])
+    else:
+        out["legs"] = [(sym, size)] if size > 0 else []
+    return out

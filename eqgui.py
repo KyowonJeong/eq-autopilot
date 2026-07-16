@@ -2440,6 +2440,107 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
+    def _run_futures_entry(self, b, sc, legs, direction, stop, sig, live, recv, asset, pub):
+        """선물 진입 — 계약수 10개 이상이면 미니/마이크로 legs로 분할 체결(대표 2026-07-16).
+        legs = [(심볼, 수량), ...]. 예: NQ 23계약 → [('NQ',2),('MNQ',3)] · 5계약 → [('MNQ',5)].
+        미니가 커미션이 3배 싸서 백테스트(costs._blended_commission)도 같은 규칙으로 계산한다.
+
+        leg마다 **독립 진입 + 독립 손절**(손절가는 NQ·MNQ 동일 = 같은 지수·같은 포인트).
+        잔여정리·손절실패 처리는 leg별로 그대로 재사용한다. 자동청산은 flatten_all이라
+        심볼 수와 무관하게 계좌 전체를 비운다(legs 신경 안 씀).
+        ⚠️LIVE 경로 — 어느 leg가 실패해도 나머지는 계속(부분 체결 로그로 드러냄)."""
+        import time as _t
+        import datetime as _dtl
+        legs = [(s, int(q)) for s, q in legs if int(q) > 0]
+        if not legs:
+            self.log("   ⏭ 수량 0 — 건너뜀."); return
+        # 계좌 id (1회)
+        match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
+        if not match:
+            self.log(f"   ❌ 계좌 '{sc}' 없음."); return
+        _aid = match[0]["id"]
+        # leg 심볼별 활성 계약 조회
+        resolved = []
+        for _sym, _qty in legs:
+            _con = self._resolve_contract(b, _sym)
+            if not _con:
+                self.log(f"   ❌ '{_sym}' 활성 계약 없음 — 이 leg 건너뜀."); continue
+            resolved.append((_sym, _qty, _con))
+        if not resolved:
+            self.log("   ❌ 유효 계약 없음 — 진입 중단."); return
+        if len(resolved) > 1:
+            self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
+                     + " (미니 묶음 — 커미션 절감)")
+        # ── 잔여 포지션 정리(leg 계약별) — 연속 세션 순서 보장 ──
+        existing = b.list_open_positions()
+        _mycons = {c for _, _, c in resolved}
+        others = [p for p in existing if p.symbol not in _mycons]
+        if others:
+            self.log(f"   ⚠ 다른 심볼 포지션 {len(others)}개 감지 — 건드리지 않음: "
+                     + ", ".join(f"{p.symbol}" for p in others[:3]))
+        mine = [p for p in existing if p.symbol in _mycons]
+        if mine:
+            if not live:
+                self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(mine)}개 — LIVE면 청산 확인 후 진입.")
+            else:
+                self.log(f"   ♻ 이전 세션 잔여 {len(mine)}개 → 청산 후 진입 (연속 세션)")
+                try:
+                    for p in mine:
+                        b.close_contract(p.raw.get("_accountId") or _aid, p.symbol)
+                    _dead = False
+                    for _chk in range(6):
+                        _t.sleep(1)
+                        if not any(q.symbol in _mycons for q in b.list_open_positions()):
+                            _dead = True; break
+                    if not _dead:
+                        self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!"); return
+                    self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
+                except Exception as _ce:
+                    self.log(f"   ❌ 잔여 청산 실패: {_ce} — 진입 중단."); return
+        # ── 체결 정책(GC 등 지정가) — leg 전부 동일 정책 적용 ──
+        _polf = ((sig.get("exec_policy") or {}).get("entry")
+                 if isinstance(sig.get("exec_policy"), dict) else None)
+        _use_limit = bool(_polf and _polf.get("mode") == "limit_then_market"
+                          and _polf.get("limit_price") is not None)
+        _ok = 0
+        for _sym, _qty, _con in resolved:
+            _tag = f"EQ-AP-{int(recv.timestamp() * 1000)}-{_sym}"
+            try:
+                if _use_limit:
+                    res = self._exec_entry_limit_fut(b, _aid, _con, direction, _qty,
+                                                     stop, dict(_polf), live, _tag)
+                else:
+                    res = b.place_entry(account_id=_aid, contract_id=_con, side=direction,
+                                        size=_qty, order_type=2, stop_loss_price=stop,
+                                        custom_tag=_tag, dry_run=not live)
+            except Exception as _ee:
+                self.log(f"   ❌ {_sym} 진입 예외: {_ee}"); continue
+            if res.get("skipped"):
+                self.log(f"   ⏭ {_sym} 정책 스킵(불리 이동)."); continue
+            if res.get("error"):
+                self.log(f"   ❌ {_sym} 진입 실패: {str(res.get('error'))[:200]}"); continue
+            if not live:
+                self.log(f"   DRY-RUN {_sym} entry: {res.get('would_place')}")
+                if res.get("would_place_stop"):
+                    self.log(f"   DRY-RUN {_sym} stop:  {res.get('would_place_stop')}")
+                _ok += 1; continue
+            self.log(f"   ✅ {_sym} 진입 완료 ×{_qty}")
+            if res.get("stop"):
+                _sp = res.get("stop_price")
+                _adj = (f" (틱 정렬 {stop} → {_sp:g})"
+                        if _sp is not None and float(_sp) != float(stop) else "")
+                self.log(f"   🛡 {_sym} 보호 손절 거치.{_adj}")
+            elif res.get("stop_error"):
+                self._handle_stop_failure(b, _aid, _con, direction, _qty, stop, res)
+            _ok += 1
+        if live and _ok:
+            self._entered_at = _mark_entered(asset)
+            try:
+                _tot = f"{_dtl.datetime.now().timestamp() - float(pub):.1f}s" if pub else "?"
+            except (TypeError, ValueError):
+                _tot = "?"
+            self.log(f"   ⏱ 진입 완료({_ok}/{len(resolved)} leg) · 발송 후 {_tot}")
+
     _HB_BROKER_KEY = {"projectx": "topstep", "ibkr": "ibkr", "bybit": "bybit", "bitget": "bitget"}
 
     def _broker_allowed(self, broker: str) -> bool:
@@ -2550,6 +2651,7 @@ class App:
                              f"진입/손절 확인). 건너뜀."); continue
                 size = _sz["size"]            # 선물=정수 계약 · 크립토=분수 BTC (int() 하면 0.3→0 됨!)
                 sym = _sz["symbol"]
+                _legs = _sz.get("legs") or [(sym, size)]   # 미니/마이크로 분할 (대표 2026-07-16)
                 # 캡처 순간 로그 — 보낸 시각(피드 published_at) · 받은 시각(now) · 지연 · 포지션 정보.
                 import datetime as _dtl
                 _recv = _dtl.datetime.now()
@@ -2572,74 +2674,32 @@ class App:
                     self.log(f"   ⏭ 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀."); continue
                 try:
                     b = _build_broker(_broker, user, key, f3, [sc] if sc else [])
-                    _aid, _contract = None, None
                     if _is_fut:
-                        # ── 선물(Topstep/IBKR): 계약 조회 + 계좌 id + place_entry(account_id, contract_id) ──
-                        _contract = self._resolve_contract(b, sym)
-                        if not _contract:
-                            self.log(f"   ❌ '{sym}' 활성 계약 없음."); continue
-                        self.log(f"   contract: {_contract}")
-                        match = [a for a in b._accounts()
-                                 if str(a.get("name")) == sc or str(a.get("id")) == sc]
-                        if not match:
-                            self.log(f"   ❌ 계좌 '{sc}' 없음."); continue
-                        _aid = match[0]["id"]
-                    # ── 잔여 포지션 정리: "청산 → 죽은 것 확인 → 진입" (대표 2026-07-11) ──
-                    # BTC 연속 세션(22-02 청산 = 02-06 진입 시각)에서 순서가 뒤집히면:
-                    # 스킵하면 새 세션을 영영 놓치고, 확인 없이 들어가면 2배 포지션. 그래서
-                    # '이 자산 심볼' 잔여만 청산·확인 후 진입한다(다른 심볼=수동거래 무접촉).
-                    existing = b.list_open_positions()
-                    _mysym = _contract if _is_fut else b._symbol(sym)
-                    mine = [p for p in existing if p.symbol == _mysym]
-                    others = [p for p in existing if p.symbol != _mysym]
-                    if others:
-                        self.log(f"   ⚠ 다른 심볼 포지션 {len(others)}개 감지 — 건드리지 않음: "
-                                 + ", ".join(f"{p.symbol}" for p in others[:3]))
-                    if mine:
-                        if not live:
-                            self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(mine)}개 — LIVE면 청산 확인 후 진입.")
-                        else:
-                            self.log(f"   ♻ 이전 세션 잔여 포지션 {len(mine)}개 → 청산 후 진입 (연속 세션)")
-                            _dead = False
-                            if _is_fut:
-                                try:
-                                    for p in mine:
-                                        b.close_contract(p.raw.get("_accountId") or _aid, _mysym)
-                                    for _chk in range(6):    # 죽은 것 '확인' 후에만 진입
-                                        _t.sleep(1)
-                                        if not any(q.symbol == _mysym for q in b.list_open_positions()):
-                                            _dead = True; break
-                                except Exception as _ce:
-                                    self.log(f"   ❌ 잔여 청산 실패: {_ce}")
-                            else:
-                                _r = b.close_symbol(sym, dry_run=False)
-                                _dead = bool(_r.get("closed"))
-                                if not _dead:
-                                    self.log(f"   ❌ 잔여 청산 미확인: {_r.get('error')}")
-                            if not _dead:
-                                self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!")
-                                continue
-                            self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
-                    if _is_fut:
-                        # customTag은 ProjectX '계좌당 유일' 필요 → ms 타임스탬프로 유니크.
-                        _tag = f"EQ-AP-{int(_recv.timestamp() * 1000)}"
-                        # ── 선물 체결 정책(대표 2026-07-15): 서버가 지정가 모드를 실어 보내면
-                        #    (LIMIT_EXEC_ASSETS: GC) 크립토와 동일한 지정가→스킵→시장가 흐름.
-                        #    GC는 손절이 타이트해 계약수가 많아(1R=$600 → 23계약) 1틱 슬리피지가
-                        #    왕복 $46 = 커미션의 2.5배 → 지정가 전환 가치 큼. NQ는 서버가 market
-                        #    정책을 주므로 자동으로 아래 시장가 경로. ──
-                        _polf = ((sig.get("exec_policy") or {}).get("entry")
-                                 if isinstance(sig.get("exec_policy"), dict) else None)
-                        if _polf and _polf.get("mode") == "limit_then_market" \
-                                and _polf.get("limit_price") is not None:
-                            res = self._exec_entry_limit_fut(b, _aid, _contract, direction, size,
-                                                             stop, dict(_polf), live, _tag)
-                        else:
-                            res = b.place_entry(account_id=_aid, contract_id=_contract, side=direction,
-                                                size=size, order_type=2, stop_loss_price=stop,
-                                                custom_tag=_tag, dry_run=not live)
+                        # ── 선물(Topstep/IBKR): 미니/마이크로 legs 분할 진입 (대표 2026-07-16) ──
+                        # 계좌·계약조회·잔여정리·진입·손절 전부 leg-aware 헬퍼가 처리.
+                        self._run_futures_entry(b, sc, _legs, direction, stop, sig, live,
+                                                _recv, _asset, _pub)
+                        continue
                     else:
                         # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
+                        # 잔여 포지션 정리(연속 세션 순서 보장) — BTC 22-02 청산 = 02-06 진입 시각에서
+                        # 뒤집히면 2배 포지션. '이 심볼' 잔여만 청산·확인 후 진입(다른 심볼 무접촉).
+                        _mysym = b._symbol(sym)
+                        _existing = b.list_open_positions()
+                        _mine = [p for p in _existing if p.symbol == _mysym]
+                        _others = [p for p in _existing if p.symbol != _mysym]
+                        if _others:
+                            self.log(f"   ⚠ 다른 심볼 포지션 {len(_others)}개 감지 — 건드리지 않음: "
+                                     + ", ".join(f"{p.symbol}" for p in _others[:3]))
+                        if _mine:
+                            if not live:
+                                self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(_mine)}개 — LIVE면 청산 확인 후 진입.")
+                            else:
+                                self.log(f"   ♻ 이전 세션 잔여 {len(_mine)}개 → 청산 후 진입 (연속 세션)")
+                                _r0 = b.close_symbol(sym, dry_run=False)
+                                if not bool(_r0.get("closed")):
+                                    self.log(f"   🛑 잔여 청산 미확인: {_r0.get('error')} — 진입 중단."); continue
+                                self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
                         # Bitget = Bybit 좌표계 손절에 거래소 베이시스 가산(캘리브레이션, 대표 2026-07-12)
                         if _broker == "bitget" and stop is not None:
                             _basis = _cross_basis_bitget()
@@ -2688,13 +2748,7 @@ class App:
                         # LIVE 진입 시각 기록(영속) — 자동청산 잡이 발화창 내 '방금 진입'을
                         # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
                         self._entered_at = _mark_entered(_asset)
-                        if res.get("stop"):
-                            _sp = res.get("stop_price")
-                            _adj = (f" (틱 정렬 {stop} → {_sp:g})"
-                                    if _sp is not None and float(_sp) != float(stop) else "")
-                            self.log(f"   🛡 보호 손절 거치 완료.{_adj}")
-                        elif res.get("stop_error") and _is_fut:  # 선물만 별도 손절 재시도(크립토는 첨부라 불필요)
-                            self._handle_stop_failure(b, _aid, _contract, direction, size, stop, res)
+                        # 크립토 손절은 주문에 첨부(거래소 스탑) — 별도 거치/재시도 불필요.
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")
                     _em = str(e)[:300]
