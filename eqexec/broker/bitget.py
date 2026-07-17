@@ -129,10 +129,12 @@ class BitgetBroker(BrokerAdapter):
         q = round(float(size), 3)
         return f"{q:.3f}".rstrip("0").rstrip(".") or "0"
 
-    def place_entry(self, *, symbol, side, size, stop_loss_price=None,
+    def place_entry(self, *, symbol, side, size, stop_loss_price=None, custom_tag=None,
                     dry_run: bool = True, **_ignored) -> dict:
         """USDT-FUTURES 마켓 진입 (+ presetStopLossPrice 손절 첨부). 크립토엔 account/contract 없음 —
-        symbol·size(BTC 수량)만. ProjectX place_entry와 반환 형태 맞춤(루프 재사용)."""
+        symbol·size(BTC 수량)만. ProjectX place_entry와 반환 형태 맞춤(루프 재사용).
+        custom_tag → clientOid(EQ 주문 표식). ⚠ history-position 응답에 clientOid가 없어
+        트랙레코드 필터는 앱의 EQ 원장이 담당 — 태그는 사후 대조용(2026-07-17)."""
         sym = self._symbol(symbol)
         bside = "buy" if str(side).upper() == "LONG" else "sell"
         qty = self._fmt_qty(size)
@@ -141,6 +143,8 @@ class BitgetBroker(BrokerAdapter):
         margin_mode = getattr(self.cfg, "margin_mode", "crossed")
         body = {"symbol": sym, "productType": self.product, "marginMode": margin_mode,
                 "marginCoin": "USDT", "side": bside, "orderType": "market", "size": qty}
+        if custom_tag:
+            body["clientOid"] = str(custom_tag)[:64]
         if stop_loss_price:
             body["presetStopLossPrice"] = str(stop_loss_price)
         if dry_run:
@@ -165,14 +169,17 @@ class BitgetBroker(BrokerAdapter):
 
     # ── 지정가 체결 정책(대표 2026-07-15) — 진입/청산 지정가 도전용 프리미티브 ──
     def place_limit_entry(self, *, symbol, side, size, price, stop_loss_price=None,
-                          dry_run: bool = True) -> dict:
-        """post_only 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place."""
+                          custom_tag=None, dry_run: bool = True) -> dict:
+        """post_only 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place.
+        custom_tag → clientOid. 호출측이 재시도마다 유니크하게 만들어 넘긴다(중복 = 거절)."""
         sym = self._symbol(symbol)
         bside = "buy" if str(side).upper() == "LONG" else "sell"
         qty = self._fmt_qty(size)
         body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
                 "marginCoin": "USDT", "side": bside, "orderType": "limit",
                 "price": f"{float(price):g}", "size": qty, "force": "post_only"}
+        if custom_tag:
+            body["clientOid"] = str(custom_tag)[:64]
         if stop_loss_price:
             body["presetStopLossPrice"] = str(stop_loss_price)
         if dry_run:

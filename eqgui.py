@@ -505,6 +505,62 @@ def _mark_entered(asset: str) -> dict:
     return d
 
 
+# ── EQ 거래 원장 (대표 2026-07-17) ────────────────────────────────────────────
+# 브로커는 '계좌 전체' 체결을 준다 — 회원이 같은 계좌에서 손수 친 MNQ/MGC/BTC 거래가
+# 트랙레코드에 섞인다. 브로커 조회 응답에는 주문 태그(customTag/orderLinkId)가 없어서
+# 태그만으론 못 거른다 → 앱이 자기가 낸 진입을 여기 적고, 체결을 이 원장과 대조한다.
+_LEDGER_PATH = os.path.join(APP_DIR, ".eqtrades.json")
+_LEDGER_SINCE_PATH = os.path.join(APP_DIR, ".eqtrades_since")
+_LEDGER_KEEP_DAYS = 400                 # 조회창(90일)보다 넉넉히 — 원장이 먼저 마르면 안 됨
+# 자산별 최대 보유시간(h): 진입 1건이 커버하는 체결 창. NQ/GC=당일 세션, BTC=4h 홀드 + 여유.
+_LEDGER_HOLD_H = {"NQ": 12.0, "GC": 12.0, "BTC": 6.0}
+
+
+def _ledger_load() -> list:
+    try:
+        import json as _json
+        with open(_LEDGER_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def _ledger_add(asset: str, symbol: str = "", direction: str = "", tag: str = "") -> None:
+    """EQ가 낸 진입 1건 기록(라이브 진입에서만 호출). 실패해도 조용히 — 진입을 막지 않는다."""
+    try:
+        import json as _json
+        import time as _t
+        d = _ledger_load()
+        d.append({"ts_ms": int(_t.time() * 1000), "asset": asset, "symbol": str(symbol or ""),
+                  "direction": str(direction or ""), "tag": str(tag or "")})
+        cut = (_t.time() - _LEDGER_KEEP_DAYS * 86400) * 1000
+        d = [r for r in d if (r.get("ts_ms") or 0) >= cut]
+        with open(_LEDGER_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _ledger_since() -> float:
+    """원장 필터 적용 시작 시각(ms). 이 이전 체결은 원장이 없으니 옛 방식(전부 포함) —
+    필터는 '앞으로'만(대표 2026-07-17). 기존 회원의 과거 트랙레코드를 지우지 않기 위함.
+    파일이 없으면 지금을 시작점으로 박제(최초 1회)."""
+    try:
+        with open(_LEDGER_SINCE_PATH, encoding="utf-8") as f:
+            return float(f.read().strip())
+    except Exception:
+        pass
+    import time as _t
+    now = _t.time() * 1000
+    try:
+        with open(_LEDGER_SINCE_PATH, "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except Exception:
+        return 0.0                      # 기록 실패 = 필터 못 씀 → 안전하게 옛 방식
+    return now
+
+
 _PUSHED_PATH = os.path.join(APP_DIR, ".lastpush")
 
 
@@ -1934,10 +1990,12 @@ class App:
         self._apply_gating()
 
     # ── 지정가 체결 정책 미러 (대표 2026-07-15, order_exec.execute_entry 레퍼런스와 동일) ──
-    def _exec_entry_limit(self, b, sym, direction, size, stop, pol, live, broker):
+    def _exec_entry_limit(self, b, sym, direction, size, stop, pol, live, broker, tag=None):
         """크립토 진입: 지정가(메이커) N회 재시도 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
         체결 확인 = 포지션 수량(진입은 항상 flat에서 시작 — 잔여 청산 확인 후라서).
-        반환은 place_entry와 동일 계약({entry|error|would_place...}) — 기존 후처리 재사용."""
+        반환은 place_entry와 동일 계약({entry|error|would_place...}) — 기존 후처리 재사용.
+        tag = EQ 주문 표식(orderLinkId/clientOid). 재시도마다 -N을 붙여 유니크하게 —
+        거래소가 중복 링크ID를 거절한다."""
         import time as _t
         lp = float(pol["limit_price"])
         if broker == "bitget":                        # 지정가·임계도 빗겟 좌표계로 보정
@@ -1951,11 +2009,12 @@ class App:
             self.log(f"   DRY-RUN 체결정책: 지정가 {lp:g} ×{retries}회(간격 {interval:g}s) → "
                      f"불리 {thr}+ 스킵 → 시장가 폴백 · 손절 {stop}")
             return b.place_entry(symbol=sym, side=direction, size=size,
-                                 stop_loss_price=stop, dry_run=True)
+                                 stop_loss_price=stop, custom_tag=tag, dry_run=True)
         self.log(f"   ⏳ 지정가 진입 도전 {lp:g} (메이커, ×{retries})")
         for i in range(retries):
             r = b.place_limit_entry(symbol=sym, side=direction, size=size, price=lp,
-                                    stop_loss_price=stop, dry_run=False)
+                                    stop_loss_price=stop,
+                                    custom_tag=(f"{tag}-{i}" if tag else None), dry_run=False)
             oid = r.get("order_id")
             if r.get("error"):
                 self.log(f"   ⚠ 지정가 주문 거절({r['error'][:80]}) → 시장가 폴백")
@@ -1988,7 +2047,8 @@ class App:
                         "note": "skipped_adverse"}
         self.log("   → 시장가 폴백")
         return b.place_entry(symbol=sym, side=direction, size=size,
-                             stop_loss_price=stop, dry_run=False)
+                             stop_loss_price=stop, custom_tag=(f"{tag}-M" if tag else None),
+                             dry_run=False)
 
     def _btc_x2be_step(self, b, j, live, utc_tz):
         """BTC 판정 시각(02/06/10/14/18/22 UTC) 1회 처리. 반환 True=청산 진행 / False=보유 유지.
@@ -2294,6 +2354,25 @@ class App:
             return "GC"
         return None
 
+    @staticmethod
+    def _fill_is_eq(f, asset: str, ledger: list, since_ms: float) -> bool:
+        """이 체결이 EQ 진입에서 나온 것인가 — 회원의 수동 거래를 트랙레코드에서 배제(대표 2026-07-17).
+        원장 시작(since_ms) 이전 체결은 근거가 없으니 포함(옛 방식 유지 — 과거 기록 보존).
+        이후 체결은 같은 자산의 EQ 진입이 있고 그 보유창 안에서 청산된 것만 인정.
+        ⚠ 한계: EQ 보유창 안에 회원이 같은 자산을 손수 치면 구분 못 한다(그땐 EQ 포지션이
+        열려 있어 애초에 충돌하는 상황). 완전 분리는 브로커가 태그를 돌려줘야 가능."""
+        ts = int(f.get("ts_ms") or 0)
+        if ts < since_ms:
+            return True
+        hold_ms = _LEDGER_HOLD_H.get(asset, 12.0) * 3600 * 1000
+        for r in ledger:
+            if r.get("asset") != asset:
+                continue
+            e = int(r.get("ts_ms") or 0)
+            if e - 300_000 <= ts <= e + hold_ms:      # 5분 여유 = 시계 오차
+                return True
+        return False
+
     def _update_tr_status(self):
         """트랙레코드 동기화 상태 라벨 — 마지막 동기화 며칠 전 + 며칠 내 하면 기록이 안 끊기는지.
         브로커 체결 이력 조회창(TR_LOOKBACK_DAYS=90일)이 한계라, 마지막 동기화 + 90일 안에
@@ -2443,10 +2522,16 @@ class App:
                 m = dt.hour * 60 + dt.minute
                 return "22" if (m < 125 or m >= 840) else "02"
 
+            # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). 원장 시작 전 체결은 그대로.
+            _ledger, _since = _ledger_load(), _ledger_since()
+            _mine = 0
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))
                 if not a or a not in assets_with_creds:
+                    continue
+                if not self._fill_is_eq(f, a, _ledger, _since):
+                    _mine += 1
                     continue
                 dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
                 d = dt.date().isoformat()
@@ -2461,6 +2546,8 @@ class App:
                        "direction": v["direction"],
                        "r": round(v["pnl"] / _unit, 3)}
                       for (d, a, s), v in sorted(agg.items())]
+            if _mine:
+                self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
@@ -2609,6 +2696,7 @@ class App:
                     self.log(f"   DRY-RUN {_sym} stop:  {res.get('would_place_stop')}")
                 _ok += 1; continue
             self.log(f"   ✅ {_sym} 진입 완료 ×{_qty}")
+            _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
                 _sp = res.get("stop_price")
                 _adj = (f" (틱 정렬 {stop} → {_sp:g})"
@@ -2798,13 +2886,15 @@ class App:
                         #    페이로드에 정책 없으면(구 서버) 기존 시장가 그대로. ──
                         _pol = ((sig.get("exec_policy") or {}).get("entry")
                                 if isinstance(sig.get("exec_policy"), dict) else None)
+                        _ctag = f"EQ-AP-{int(_dtl.datetime.now().timestamp() * 1000)}"
                         if _pol and _pol.get("mode") == "limit_then_market" \
                                 and _pol.get("limit_price") is not None:
                             res = self._exec_entry_limit(b, sym, direction, size, stop,
-                                                         dict(_pol), live, _broker)
+                                                         dict(_pol), live, _broker, _ctag)
                         else:
                             res = b.place_entry(symbol=sym, side=direction, size=size,
-                                                stop_loss_price=stop, dry_run=not live)
+                                                stop_loss_price=stop, custom_tag=_ctag,
+                                                dry_run=not live)
                     if res.get("skipped"):
                         continue                      # 정책 스킵(불리 이동) — 로그·팝업은 이미 출력
                     if res.get("error"):
@@ -2835,6 +2925,7 @@ class App:
                         # LIVE 진입 시각 기록(영속) — 자동청산 잡이 발화창 내 '방금 진입'을
                         # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
                         self._entered_at = _mark_entered(_asset)
+                        _ledger_add(_asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
                         # 크립토 손절은 주문에 첨부(거래소 스탑) — 별도 거치/재시도 불필요.
                 except Exception as e:
                     self.log(f"   ❌ signal entry failed: {e}")

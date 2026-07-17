@@ -148,11 +148,14 @@ class BybitBroker(BrokerAdapter):
         q = round(float(size), 3)
         return f"{q:.3f}".rstrip("0").rstrip(".") or "0"
 
-    def place_entry(self, *, symbol, side, size, stop_loss_price=None,
+    def place_entry(self, *, symbol, side, size, stop_loss_price=None, custom_tag=None,
                     dry_run: bool = True, **_ignored) -> dict:
         """USDT perp 마켓 진입 (+ 손절 첨부). 크립토엔 account_id/contract 개념 없음 —
         symbol·qty(BTC 수량)만. stopLoss는 주문에 붙여 포지션 손절로 건다(별도 주문 불필요).
-        ProjectX place_entry와 반환 형태 맞춤(루프 재사용): would_place/entry/stop/stop_error."""
+        ProjectX place_entry와 반환 형태 맞춤(루프 재사용): would_place/entry/stop/stop_error.
+        custom_tag → orderLinkId(EQ 주문 표식). ⚠ 트랙레코드 필터는 이걸 못 쓴다 —
+        closed-pnl 응답에 orderLinkId가 없어서(2026-07-17). 필터는 앱의 EQ 원장이 담당.
+        태그는 사후 대조·지원 문의용으로 심어둔다."""
         sym = self._symbol(symbol)
         bside = "Buy" if str(side).upper() == "LONG" else "Sell"
         qty = self._fmt_qty(size)
@@ -160,6 +163,8 @@ class BybitBroker(BrokerAdapter):
             return {"error": "qty<=0"}
         body = {"category": self.category, "symbol": sym, "side": bside,
                 "orderType": "Market", "qty": qty, "reduceOnly": False}
+        if custom_tag:
+            body["orderLinkId"] = str(custom_tag)[:36]     # Bybit 상한 36자
         if stop_loss_price:
             body["stopLoss"] = str(stop_loss_price)
             body["slTriggerBy"] = "LastPrice"
@@ -186,14 +191,17 @@ class BybitBroker(BrokerAdapter):
 
     # ── 지정가 체결 정책(대표 2026-07-15) — 진입/청산 지정가 도전용 프리미티브 ──
     def place_limit_entry(self, *, symbol, side, size, price, stop_loss_price=None,
-                          dry_run: bool = True) -> dict:
-        """PostOnly 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place."""
+                          custom_tag=None, dry_run: bool = True) -> dict:
+        """PostOnly 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place.
+        custom_tag → orderLinkId. 호출측이 재시도마다 유니크하게 만들어 넘긴다(중복 = 거절)."""
         sym = self._symbol(symbol)
         bside = "Buy" if str(side).upper() == "LONG" else "Sell"
         qty = self._fmt_qty(size)
         body = {"category": self.category, "symbol": sym, "side": bside,
                 "orderType": "Limit", "price": f"{float(price):g}", "qty": qty,
                 "timeInForce": "PostOnly", "reduceOnly": False}
+        if custom_tag:
+            body["orderLinkId"] = str(custom_tag)[:36]
         if stop_loss_price:
             body["stopLoss"] = str(stop_loss_price)
             body["slTriggerBy"] = "LastPrice"
