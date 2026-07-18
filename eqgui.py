@@ -319,15 +319,17 @@ T = {
     "tr_off_ind": {"ko": "  ○ 자동 동기화 꺼짐  ", "en": "  ○ Auto-sync off  "},
     "tr_page": {"ko": "공개 페이지", "en": "My page"},
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
-    "tr_note": {"ko": "※ 실거래 트랙레코드를 자동 생성합니다. 앱은 브로커 체결 기록을 로컬에서 "
-                      "R 단위로 변환한 후, 공개용 요약 데이터만 서버에 전송합니다. API 키, 계좌번호, "
-                      "잔고 등 민감 정보는 전송되지 않습니다. 생성된 트랙레코드는 자동 업데이트되며, "
+    "tr_note": {"ko": "※ 실거래 트랙레코드를 자동 생성합니다. EdgeQuant가 실행한 거래만 집계하며, "
+                      "같은 계좌에서 직접 하신 거래는 제외됩니다. 앱은 해당 체결만 로컬에서 R 단위로 "
+                      "변환한 후, 공개용 요약 데이터만 서버에 전송합니다. API 키, 계좌번호, 잔고 등 "
+                      "민감 정보는 전송되지 않습니다. 생성된 트랙레코드는 자동 업데이트되며, "
                       "공개 페이지 링크를 통해 손쉽게 공개할 수 있습니다.",
-                "en": "※ Builds your real-trading track record automatically. The app converts your "
-                      "broker fills to R units locally and sends only the public summary to the server — "
-                      "sensitive data such as API keys, account numbers and balances are never "
-                      "transmitted. The track record updates automatically and can be shared easily "
-                      "via its public page link."},
+                "en": "※ Builds your real-trading track record automatically. Only trades executed by "
+                      "EdgeQuant are counted — trades you place yourself on the same account are "
+                      "excluded. The app converts those fills to R units locally and sends only the "
+                      "public summary to the server — sensitive data such as API keys, account numbers "
+                      "and balances are never transmitted. The track record updates automatically and "
+                      "can be shared easily via its public page link."},
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
     "live_dry": {"ko": "모의(Dry Run) — 체크 해제 시 실거래", "en": "Dry Run — uncheck for LIVE orders"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
