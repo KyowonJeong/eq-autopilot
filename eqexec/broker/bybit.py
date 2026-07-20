@@ -63,6 +63,82 @@ class BybitBroker(BrokerAdapter):
         # Cheap signed read to validate the key.
         self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
 
+    # ── 잔고-맞춤 자동 레버리지 (대표 2026-07-20) ────────────────────────────
+    # 2026-07-19 BTC 첫 라이브 진입이 110007(ab not enough)로 실패 — 잔고 $5,590인데
+    # 레버리지 10x라 명목 $70.7k에 증거금 $7,070이 필요했던 것. BTC는 손절이 가격의 ~0.2%라
+    # '리스크의 ~500배 명목'이 구조적이라, 앱이 진입 전에 잔고를 보고 레버리지를 맞춰 준다.
+    # (상향만 한다 — 유저가 높여둔 값은 존중. 교차 마진에서 실위험은 손절=1R로 고정이고
+    #  레버리지는 증거금 효율만 결정하므로 상향은 위험 증가가 아니다.)
+    def available_usdt(self):
+        """UNIFIED 가용 잔고(USDT, totalAvailableBalance). 실패 시 None."""
+        try:
+            d = self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+            lst = (d or {}).get("list") or []
+            v = (lst[0] or {}).get("totalAvailableBalance") if lst else None
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    def current_leverage(self, symbol):
+        """심볼의 현재 레버리지 설정(포지션 유무 무관 — position/list가 설정값을 준다)."""
+        try:
+            d = self._req("GET", "/v5/position/list",
+                          {"category": self.category, "symbol": self._symbol(symbol)})
+            lst = (d or {}).get("list") or []
+            v = (lst[0] or {}).get("leverage") if lst else None
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    def max_leverage(self, symbol):
+        """심볼 최대 허용 레버리지(instruments-info leverageFilter)."""
+        try:
+            d = self._req("GET", "/v5/market/instruments-info",
+                          {"category": self.category, "symbol": self._symbol(symbol)})
+            lst = (d or {}).get("list") or []
+            v = ((lst[0] or {}).get("leverageFilter") or {}).get("maxLeverage") if lst else None
+            return float(v) if v else None
+        except Exception:
+            return None
+
+    def set_leverage(self, symbol, lev) -> bool:
+        """buy/sell 동시 설정. 110043(leverage not modified)=동일값이므로 성공 취급."""
+        body = {"category": self.category, "symbol": self._symbol(symbol),
+                "buyLeverage": f"{float(lev):g}", "sellLeverage": f"{float(lev):g}"}
+        try:
+            self._req("POST", "/v5/position/set-leverage", body=body)
+            return True
+        except Exception as e:
+            if "110043" in str(e):
+                return True
+            raise
+
+    def ensure_leverage(self, symbol, size, price) -> dict:
+        """이 주문(size×price)이 현재 잔고로 들어가도록 레버리지를 자동 상향.
+        필요 = 명목/(가용×0.85 수수료·변동 버퍼), 30% 여유를 얹고 심볼 상한에서 캡.
+        반환 {ab, notional, cur, new|None, error|None} — 호출측 로그 전용, 예외 없음."""
+        import math
+        try:
+            ab = self.available_usdt()
+            if not ab or not price:
+                return {"error": "잔고 조회 실패", "ab": ab, "cur": None, "new": None}
+            notional = float(size) * float(price)
+            need = notional / (ab * 0.85)
+            cur = self.current_leverage(symbol) or 0.0
+            if cur >= need:
+                return {"ab": ab, "notional": notional, "cur": cur, "new": None, "error": None}
+            target = math.ceil(need * 1.3)
+            mx = self.max_leverage(symbol)
+            if mx:
+                target = min(target, int(mx))
+            if target <= cur:
+                return {"ab": ab, "notional": notional, "cur": cur, "new": None,
+                        "error": f"심볼 상한 {mx:g}x로도 부족(필요 {need:.1f}x) — 잔고를 늘려야 합니다"}
+            self.set_leverage(symbol, target)
+            return {"ab": ab, "notional": notional, "cur": cur, "new": target, "error": None}
+        except Exception as e:
+            return {"error": str(e)[:140], "ab": None, "cur": None, "new": None}
+
     def list_open_positions(self) -> list[Position]:
         d = self._req("GET", "/v5/position/list",
                       {"category": self.category, "settleCoin": self.settle})

@@ -1991,6 +1991,27 @@ class App:
         self._refresh_live_panel()
         self._apply_gating()
 
+    def _auto_leverage(self, b, sym, size, ref_px=None):
+        """잔고-맞춤 레버리지 자동 조정 (대표 2026-07-20 — 110007 잔고부족 진입실패 재발 방지).
+        진입 직전 가용잔고를 앱이 직접 조회해, 이 수량이 들어가도록 레버리지를 상향한다
+        (하향 안 함 · 실위험은 손절=1R 고정이라 위험 증가 아님). 실패해도 진입은 계속 시도.
+        브로커가 ensure_leverage를 지원할 때만(현재 Bybit) 동작 — Bitget은 추후."""
+        if not hasattr(b, "ensure_leverage"):
+            return
+        try:
+            px = b.current_market_price(sym)
+        except Exception:
+            px = None
+        px = px or ref_px
+        if not px:
+            return
+        lv = b.ensure_leverage(sym, size, px)
+        if lv.get("new"):
+            self.log(f"   ⚙ 레버리지 자동 조정 {lv['cur']:g}x → {lv['new']}x "
+                     f"(명목 ${lv['notional']:,.0f} · 가용 ${lv['ab']:,.0f})")
+        elif lv.get("error"):
+            self.log(f"   ⚠ 레버리지 자동 조정 불가: {lv['error']} — 그대로 진행")
+
     # ── 지정가 체결 정책 미러 (대표 2026-07-15, order_exec.execute_entry 레퍼런스와 동일) ──
     def _exec_entry_limit(self, b, sym, direction, size, stop, pol, live, broker, tag=None):
         """크립토 진입: 지정가(메이커) N회 재시도 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
@@ -2012,6 +2033,7 @@ class App:
                      f"불리 {thr}+ 스킵 → 시장가 폴백 · 손절 {stop}")
             return b.place_entry(symbol=sym, side=direction, size=size,
                                  stop_loss_price=stop, custom_tag=tag, dry_run=True)
+        self._auto_leverage(b, sym, size, lp)
         self.log(f"   ⏳ 지정가 진입 도전 {lp:g} (메이커, ×{retries})")
         for i in range(retries):
             r = b.place_limit_entry(symbol=sym, side=direction, size=size, price=lp,
@@ -2894,6 +2916,8 @@ class App:
                             res = self._exec_entry_limit(b, sym, direction, size, stop,
                                                          dict(_pol), live, _broker, _ctag)
                         else:
+                            if live:
+                                self._auto_leverage(b, sym, size)   # 시장가 직행 경로도 동일 보호
                             res = b.place_entry(symbol=sym, side=direction, size=size,
                                                 stop_loss_price=stop, custom_tag=_ctag,
                                                 dry_run=not live)
