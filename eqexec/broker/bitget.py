@@ -62,6 +62,74 @@ class BitgetBroker(BrokerAdapter):
     def authenticate(self) -> None:
         self.list_open_positions()           # signed read validates key+passphrase
 
+    # ── 잔고-맞춤 자동 레버리지 (대표 2026-07-20, Bybit와 동일 계약) ────────────
+    # 진입은 crossed 마진(place_entry 기본)이라 cross 레버리지를 조정한다. 상향만.
+    def _account(self, symbol):
+        return self._req("GET", "/api/v2/mix/account/account",
+                         {"symbol": self._symbol(symbol), "productType": self.product,
+                          "marginCoin": "USDT"})
+
+    def available_usdt(self, symbol="BTCUSDT"):
+        """새 주문에 쓸 수 있는 USDT(crossedMaxAvailable, 없으면 available). 실패 시 None."""
+        try:
+            a = self._account(symbol) or {}
+            v = a.get("crossedMaxAvailable") or a.get("available")
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    def current_leverage(self, symbol):
+        """cross 레버리지 설정(account.crossedMarginLeverage)."""
+        try:
+            a = self._account(symbol) or {}
+            v = a.get("crossedMarginLeverage")
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    def max_leverage(self, symbol):
+        """심볼 최대 레버리지(contracts.maxLever)."""
+        try:
+            d = self._req("GET", "/api/v2/mix/market/contracts",
+                          {"productType": self.product, "symbol": self._symbol(symbol)})
+            lst = d if isinstance(d, list) else []
+            v = (lst[0] or {}).get("maxLever") if lst else None
+            return float(v) if v else None
+        except Exception:
+            return None
+
+    def set_leverage(self, symbol, lev) -> bool:
+        """cross 레버리지 설정(홀드사이드 불필요 — crossed는 롱숏 공통)."""
+        self._req("POST", "/api/v2/mix/account/set-leverage",
+                  body={"symbol": self._symbol(symbol), "productType": self.product,
+                        "marginCoin": "USDT", "leverage": f"{float(lev):g}"})
+        return True
+
+    def ensure_leverage(self, symbol, size, price) -> dict:
+        """Bybit ensure_leverage와 동일 수학: 필요=명목/(가용×0.85), ×1.3 여유, 상한 캡, 상향만.
+        반환 {ab, notional, cur, new|None, error|None} — 호출측 로그 전용, 예외 없음."""
+        import math
+        try:
+            ab = self.available_usdt(symbol)
+            if not ab or not price:
+                return {"error": "잔고 조회 실패", "ab": ab, "cur": None, "new": None}
+            notional = float(size) * float(price)
+            need = notional / (ab * 0.85)
+            cur = self.current_leverage(symbol) or 0.0
+            if cur >= need:
+                return {"ab": ab, "notional": notional, "cur": cur, "new": None, "error": None}
+            target = math.ceil(need * 1.3)
+            mx = self.max_leverage(symbol)
+            if mx:
+                target = min(target, int(mx))
+            if target <= cur:
+                return {"ab": ab, "notional": notional, "cur": cur, "new": None,
+                        "error": f"심볼 상한 {mx:g}x로도 부족(필요 {need:.1f}x) — 잔고를 늘려야 합니다"}
+            self.set_leverage(symbol, target)
+            return {"ab": ab, "notional": notional, "cur": cur, "new": target, "error": None}
+        except Exception as e:
+            return {"error": str(e)[:140], "ab": None, "cur": None, "new": None}
+
     def list_open_positions(self) -> list[Position]:
         d = self._req("GET", "/api/v2/mix/position/all-position",
                       {"productType": self.product, "marginCoin": "USDT"})
