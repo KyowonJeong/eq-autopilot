@@ -331,7 +331,7 @@ T = {
                       "and balances are never transmitted. The track record updates automatically and "
                       "can be shared easily via its public page link."},
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
-    "live_dry": {"ko": "모의(Dry Run) — 체크 해제 시 실거래", "en": "Dry Run — uncheck for LIVE orders"},
+    "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
     "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 신호 확신도에 따라 최대 3R"
@@ -804,12 +804,15 @@ class App:
         ttk.Label(frm, text=self.t("live_1r_note"), foreground="#888",
                   wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
         lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
-        self.live_dry = tk.IntVar(value=1 if d.get("dry_run", True) else 0)
-        self.cb_live_dry = ttk.Checkbutton(lc, text=self.t("live_dry"), variable=self.live_dry,
-                                           command=self._save_current_asset)
-        self.cb_live_dry.pack(side="left", padx=(0, 12))
-        self.b_live_start = ttk.Button(lc, text=self.t("live_start"), command=self._master_start)
+        # 모의/라이브 = '시작 버튼 2종'으로 선택(체크박스 폐지 — 켜둔 채 잊는 함정 제거,
+        # 대표 2026-07-22 실사고: 모의 상태로 신호 캡처 → 실진입 놓침). live_dry는 내부 상태.
+        self.live_dry = tk.IntVar(value=1)
+        self.b_live_start = ttk.Button(lc, text=self.t("live_start"),
+                                       command=lambda: self._master_start(dry=False))
         self.b_live_start.pack(side="left")
+        self.b_demo_start = ttk.Button(lc, text=self.t("demo_start"),
+                                       command=lambda: self._master_start(dry=True))
+        self.b_demo_start.pack(side="left", padx=(8, 0))
         self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
         self.b_live_stop.pack(side="left", padx=(6, 0))
         ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
@@ -1014,19 +1017,13 @@ class App:
                 pass
         if hasattr(self, "tr_ind"):
             self._update_tr_status()
-        # 전역 모의 스위치: 권한 없으면 모의 고정(체크 강제 + 비활성)
-        if hasattr(self, "cb_live_dry"):
-            try:
-                if not live_ok:
-                    self.live_dry.set(1); self.cb_live_dry.config(state="disabled")
-                else:
-                    self.cb_live_dry.config(state="normal")
-            except Exception:
-                pass
+        # 시작 버튼 2종(체크박스 폐지): 라이브 = 권한 + 서버 모의강제 아님 · 모의 = 권한만
         if hasattr(self, "b_live_start"):
             _pu = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
             _pa = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
-            en(self.b_live_start, _pu or _pa)
+            en(self.b_live_start, (_pu or _pa) and live_ok)
+            if hasattr(self, "b_demo_start"):
+                en(self.b_demo_start, _pu or _pa)
         self._refresh_live_panel()
         # fail-closed: 돌던 루프가 '권한'을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
         # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
@@ -1903,9 +1900,16 @@ class App:
         self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
         self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
 
-    def _master_start(self):
-        """[▶ 라이브 시작] — 체크된 자산 전부 연결 테스트 → 전부 통과 시에만 일괄 무장.
-        하나라도 실패하면 아무것도 무장하지 않음(대표 2026-07-13 전체 중단)."""
+    def _master_start(self, dry: bool = True):
+        """[라이브 시작]/[모의 시작] — 체크된 자산 전부 연결 테스트, 전부 통과 시에만 일괄
+        무장(하나라도 실패하면 전체 중단, 대표 2026-07-13). 모의/라이브는 누른 버튼이 결정
+        (체크박스 폐지, 대표 2026-07-22)."""
+        if not dry and (self._gate or {}).get("force_dry_run"):
+            messagebox.showwarning(self.t("sec_live"),
+                                   "서버가 모의 모드를 강제 중입니다 — 지금은 모의 시작만 가능합니다."
+                                   if self.lang == "ko" else
+                                   "Server is forcing dry-run; only demo start is available."); return
+        self.live_dry.set(1 if dry else 0)
         if self._sig_assets or self._auto_jobs:
             messagebox.showinfo(self.t("sec_live"),
                                 "이미 가동 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
@@ -1940,8 +1944,10 @@ class App:
             messagebox.showwarning(self.t("token"),
                                    "멤버십 권한이 없습니다 — 토큰을 확인하세요."
                                    if self.lang == "ko" else "No membership permission — check your token."); return
-        live = not bool(self.live_dry.get())
+        live = not dry
         self.b_live_start.config(state="disabled")
+        if hasattr(self, "b_demo_start"):
+            self.b_demo_start.config(state="disabled")
         self.log("\n══ 라이브 시작 — 연결 테스트 " + "·".join(incl)
                  + f" ({'LIVE' if live else 'dry-run'}) ══")
 
@@ -1958,6 +1964,8 @@ class App:
 
             def done():
                 self.b_live_start.config(state="normal")
+                if hasattr(self, "b_demo_start"):
+                    self.b_demo_start.config(state="normal")
                 if fails:
                     self.log("⛔ 전체 중단 — 아무 자산도 가동하지 않았습니다.")
                     messagebox.showerror(self.t("sec_live"),
@@ -2547,6 +2555,9 @@ class App:
                 return "22" if (m < 125 or m >= 840) else "02"
 
             # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). 원장 시작 전 체결은 그대로.
+            # 예외: admin 등급(운영자 본인, EQ 전용 계좌)은 수동 진입도 EQ 신호 실행이라 포함
+            # (대표 2026-07-22 "수동으로 가도 동기화에 포함 — 딱 내 것만"). 회원은 원장 필터 유지.
+            _admin_all = str((self._gate or {}).get("tier") or "") == "admin"
             _ledger, _since = _ledger_load(), _ledger_since()
             _mine = 0
             agg = {}
@@ -2554,7 +2565,7 @@ class App:
                 a = self._fill_asset(f.get("symbol"))
                 if not a or a not in assets_with_creds:
                     continue
-                if not self._fill_is_eq(f, a, _ledger, _since):
+                if not _admin_all and not self._fill_is_eq(f, a, _ledger, _since):
                     _mine += 1
                     continue
                 dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
