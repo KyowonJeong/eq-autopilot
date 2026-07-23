@@ -15,6 +15,37 @@ try:
 except Exception:
     ZoneInfo = None
 
+
+# ── 타임존: tzdata 없이도 도는 현재시각 (대표 2026-07-20 실사고: Windows tzdata 누락 →
+#    자동청산 ET ZoneInfo 로드 실패 → 로컬시각(KST)으로 잘못 폴백 → 청산 미발화).
+#    UTC는 파이썬 내장이라 무조건 성공. ET는 ZoneInfo가 되면 쓰고, 안 되면 US-Eastern DST 규칙으로
+#    UTC에서 산술 계산 — 청산은 tz DB에 절대 의존하지 않는다(대표: "청산은 최대한 간단하게"). ──
+def _us_eastern_offset(u):
+    """US Eastern의 UTC 오프셋(시간). EDT=-4(3월 둘째 일요일~11월 첫째 일요일), 그 외 EST=-5.
+    DST 판정은 근사 ET 날짜(UTC-5)로 — 청산시각(06·14 ET)은 전환 경계(2am)와 멀어 안전."""
+    et = u - _dt.timedelta(hours=5)                       # 근사 ET 날짜
+    y = et.year
+    mar = 8 + (6 - _dt.date(y, 3, 8).weekday()) % 7       # 3월 둘째 일요일
+    nov = 1 + (6 - _dt.date(y, 11, 1).weekday()) % 7      # 11월 첫째 일요일
+    return -4 if _dt.date(y, 3, mar) <= et.date() < _dt.date(y, 11, nov) else -5
+
+
+def _now_in(tzname):
+    """tzname의 현재 시각(tz-aware). UTC 내장 · ET는 ZoneInfo→실패 시 산술 폴백.
+    tzdata가 없어도 절대 예외를 던지지 않는다 — 청산이 조용히 죽지 않게 한다."""
+    u = _dt.datetime.now(_dt.timezone.utc)
+    if tzname == "UTC":
+        return u
+    if ZoneInfo is not None:
+        try:
+            return u.astimezone(ZoneInfo(tzname))
+        except Exception:
+            pass
+    if "New_York" in tzname:                              # America/New_York 산술 폴백
+        off = _us_eastern_offset(u)
+        return (u + _dt.timedelta(hours=off)).replace(tzinfo=_dt.timezone(_dt.timedelta(hours=off)))
+    return u.astimezone()                                 # 미지의 zone → 로컬(최후)
+
 from eqexec.config import ProjectXCfg
 from eqexec.broker.projectx import ProjectXBroker
 
@@ -106,13 +137,12 @@ MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 
 
 def _next_entry_dt(asset: str):
     """이 자산의 다음 진입(신호 도착) 시각 — tz-aware datetime. NQ·GC는 주말 건너뜀."""
-    from datetime import datetime, timedelta
-    from zoneinfo import ZoneInfo
+    from datetime import timedelta
     best = None
     for tzname, hour in _ASSET_ENTRIES.get(asset, []):
-        tz = ZoneInfo(tzname)
-        d = datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0)
-        if d <= datetime.now(tz):
+        _n = _now_in(tzname)                             # tzdata 없이도 정확(산술 폴백)
+        d = _n.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if d <= _n:
             d += timedelta(days=1)
         if asset in ("NQ", "GC"):
             while d.weekday() >= 5:                  # 토(5)·일(6) 스킵
@@ -1593,22 +1623,16 @@ class App:
         실거래 여부는 발화 순간 _live_now로 재판정(강제 dry run 즉시 반영)."""
         import time as _t
         fired = {}                                     # {(asset,hour): 그 tz의 날짜}
-        _tzs = {}
-
-        def _tz(name):
-            if name not in _tzs:
-                try:
-                    _tzs[name] = ZoneInfo(name) if ZoneInfo else None
-                except Exception as e:
-                    # Windows 등 tzdata 미동봉이면 청산이 조용히 죽는다 → 드러내고 로컬시각 폴백. (2026-06-30)
-                    _tzs[name] = None
-                    self.log(f"⚠ 타임존 로드 실패({name}: {e!r}) — tzdata 누락 의심. 로컬 시각 폴백, 청산 시각 확인!")
-            return _tzs[name]
+        # tz는 _now_in()이 tzdata 없이도 정확히 계산(ET 산술 폴백) — ZoneInfo 로드 실패로
+        # 청산이 죽던 사고 근절(대표 2026-07-20). ZoneInfo 없을 때 1회만 알린다.
+        if ZoneInfo is None and not getattr(self, "_tz_fallback_warned", False):
+            self._tz_fallback_warned = True
+            self.log("ℹ 타임존 DB 없음 — 청산·진입 시각을 UTC 기준 산술 계산으로 처리합니다(정상).")
 
         while self._auto_on:
             jobs = [j for jl in list(self._auto_jobs.values()) for j in jl]   # 무장 자산 동적 스냅샷
             for j in jobs:
-                now = _dt.datetime.now(_tz(j["tz"]))
+                now = _now_in(j["tz"])
                 today = now.strftime("%Y-%m-%d")
                 key = (j["asset"], j["hour"])
                 cur = now.hour * 60 + now.minute
@@ -1645,7 +1669,7 @@ class App:
                              f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
                     # ── BTC 조건부 출구(X2+TR) — 무조건 청산이 아니라 봉을 보고 판정 ──
                     if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K:
-                        if not self._btc_x2be_step(b, j, live, _tz("UTC")):
+                        if not self._btc_x2be_step(b, j, live, _dt.timezone.utc):
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
                     # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴.
