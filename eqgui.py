@@ -465,11 +465,10 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label=""):
 
 
 def _load():
-    """계좌 중심 설정 로드(대표 2026-07-24 멀티계좌). 스키마:
-      asset_broker{자산→브로커} · asset_on{자산 실행여부} · creds{브로커→{f1,f3}} ·
-      accounts{브로커→[{id,one_r,on,label}]}.
-    계좌당 1R(자산 등가중) · 브로커당 여러 계좌. 옛 자산별 스키마(assets{})와 flat 키는 1회
-    무손실 마이그레이션. 비밀(f2)은 브로커 f1을 키로 Keychain에서 async 로드."""
+    """자산별 설정 로드(대표 2026-07-24). 스키마 assets{자산:{broker, creds{broker:{f1,f3}},
+    include, accounts:[{id,one_r,on,label}]}}. **계좌는 자산별**(자산마다 브로커·계좌 독립),
+    계좌당 1R 절대$. 마이그레이션 3종: ①옛 assets(단일 acct→계좌 1개) ②2026-07-24 초기 브로커중심
+    (asset_broker/accounts{broker}) ③flat 키. 비밀(f2)은 브로커 f1을 키로 Keychain async 로드."""
     try:
         import yaml
         with open(CFG_PATH) as f:
@@ -477,62 +476,55 @@ def _load():
     except Exception:
         d = {}
     out = {"lang": d.get("lang", "ko"), "token": d.get("token", "")}
-
-    if d.get("accounts") is not None or d.get("asset_broker") is not None:
-        # ── 새 스키마 ──
-        ab = d.get("asset_broker") or {}
-        asset_broker = {a: (ab.get(a) if ab.get(a) in _ASSET_BROKERS[a] else _ASSET_BROKERS[a][0])
-                        for a in _ASSETS}
-        _on = d.get("asset_on") or {}
-        asset_on = {a: bool(_on.get(a, True)) for a in _ASSETS}
-        creds = {b: {"f1": (v or {}).get("f1", ""), "f3": (v or {}).get("f3", "")}
-                 for b, v in (d.get("creds") or {}).items() if b in _BROKERS}
-        accts = {}
-        for b, lst in (d.get("accounts") or {}).items():
-            if b in _BROKERS:
-                accts[b] = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
-                            for x in (lst or [])]
-    else:
-        # ── 마이그레이션: 옛 assets{자산:{broker,creds{broker:{f1,f3,acct}},one_r,include}} ──
-        assets = d.get("assets") or {}
-        asset_broker, asset_on, creds, accts = {}, {}, {}, {}
-        for a in _ASSETS:
-            s = assets.get(a) or {}
-            brs = _ASSET_BROKERS[a]
-            bk = s.get("broker") if s.get("broker") in brs else brs[0]
-            asset_broker[a] = bk
-            asset_on[a] = bool(s.get("include", True))
-            one_r = float(s.get("one_r", 600) or 600)
-            for b, cr in (s.get("creds") or {}).items():
-                if b in _BROKERS and (cr.get("f1") or "").strip() and b not in creds:
-                    creds[b] = {"f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
-            _crbk = (s.get("creds") or {}).get(bk) or {}
-            if bk not in creds and ((_crbk.get("f1") or s.get("f1") or "").strip()):
-                creds[bk] = {"f1": (_crbk.get("f1") or s.get("f1") or ""),
-                             "f3": (_crbk.get("f3") or s.get("f3") or "")}
-            acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
-            accts.setdefault(bk, [])
-            if not any(x["id"] == acct_id for x in accts[bk]):
-                accts[bk].append(_new_acct(one_r, acct_id, True,
-                                           acct_id[-4:] if acct_id else _broker_label(bk)))
-        # 옛 flat(단일) 키 — 자산 설정이 전혀 없을 때만
-        if not assets:
-            fb = d.get("broker", "projectx")
-            fuser = d.get("f1", (d.get("projectx", {}) or {}).get("user_name", ""))
-            facct = ((d.get("projectx", {}) or {}).get("accounts") or [""])[0]
-            if (fuser or "").strip():
-                creds.setdefault(fb, {"f1": fuser, "f3": d.get("f3", "")})
-                accts.setdefault(fb, [_new_acct(d.get("one_r", 600), facct, True, _broker_label(fb))])
-    # 활성 자산의 브로커엔 계좌·크레덴셜 슬롯 최소 1개 보장
+    assets_raw = d.get("assets") or {}
+    _has_accounts = any(isinstance(v, dict) and "accounts" in v for v in assets_raw.values())
+    _broker_centric = (not _has_accounts) and (d.get("asset_broker") is not None
+                                               or isinstance(d.get("accounts"), dict))
+    acfg = {}
     for a in _ASSETS:
-        bk = asset_broker[a]
+        brs = _ASSET_BROKERS[a]
+        if _broker_centric:
+            # ② 초기 브로커중심 → 자산별로 재조립
+            ab = d.get("asset_broker") or {}
+            bk = ab.get(a) if ab.get(a) in brs else brs[0]
+            creds_all = d.get("creds") or {}
+            creds = {b: {"f1": (creds_all.get(b) or {}).get("f1", ""),
+                         "f3": (creds_all.get(b) or {}).get("f3", "")}
+                     for b in brs if b in creds_all}
+            accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
+                        for x in ((d.get("accounts") or {}).get(bk) or [])]
+            include = bool((d.get("asset_on") or {}).get(a, True))
+        else:
+            s = assets_raw.get(a) or {}
+            bk = s.get("broker") if s.get("broker") in brs else brs[0]
+            creds = {b: {"f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
+                     for b, cr in (s.get("creds") or {}).items() if b in brs}
+            include = bool(s.get("include", True))
+            if s.get("accounts"):                      # ③ 새 자산중심(현행)
+                accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
+                            for x in s["accounts"]]
+            else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
+                one_r = float(s.get("one_r", 600) or 600)
+                _crbk = (s.get("creds") or {}).get(bk) or {}
+                acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
+                accounts = [_new_acct(one_r, acct_id, True,
+                                      acct_id[-4:] if acct_id else _broker_label(bk))]
+        if not accounts:
+            accounts = [_new_acct(600.0, "", True, _broker_label(bk))]
         creds.setdefault(bk, {"f1": "", "f3": ""})
-        if not accts.get(bk):
-            accts[bk] = [_new_acct(600.0, "", True, _broker_label(bk))]
-
-    out.update({"asset_broker": asset_broker, "asset_on": asset_on,
-                "creds": creds, "accounts": accts,
-                "dry_run": bool(d.get("dry_run", True))})
+        acfg[a] = {"broker": bk, "creds": creds, "include": include, "accounts": accounts}
+    # flat(단일) 키 — 자산 설정 전무할 때만
+    if not assets_raw and not _broker_centric and (d.get("f1") or "").strip():
+        fb = d.get("broker", "projectx")
+        for a in _ASSETS:
+            if fb in _ASSET_BROKERS[a]:
+                acfg[a]["broker"] = fb
+                acfg[a]["creds"][fb] = {"f1": d.get("f1", ""), "f3": d.get("f3", "")}
+                facct = ((d.get("projectx", {}) or {}).get("accounts") or [""])[0]
+                acfg[a]["accounts"] = [_new_acct(d.get("one_r", 600), facct, True, _broker_label(fb))]
+                break
+    out["assets"] = acfg
+    out["dry_run"] = bool(d.get("dry_run", True))
     if "cfg_open" in d:
         out["cfg_open"] = bool(d.get("cfg_open"))
     _p = d.get("profile") or {}
@@ -644,18 +636,17 @@ def _mark_pushed() -> None:
         pass
 
 
-def _save_full(lang, token, asset_broker, asset_on, creds, accounts,
-               profile=None, dry_run=None, cfg_open=None):
-    """계좌 중심 설정(asset_broker/asset_on/creds/accounts) + lang/token/전역 dry_run + 공개프로필을
-    yaml에 저장. 비밀(f2)은 여기서 안 씀 — 브로커 크레덴셜 저장 시 Keychain에 이미 넣는다."""
+def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None):
+    """자산별 설정(acfg={자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}) + lang/token/전역
+    dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음."""
     try:
         import yaml
         payload = {"live": False, "lang": lang, "token": token,
-                   "asset_broker": dict(asset_broker or {}),
-                   "asset_on": dict(asset_on or {}),
-                   "creds": {b: dict(v) for b, v in (creds or {}).items()},
-                   "accounts": {b: [dict(x) for x in (lst or [])]
-                                for b, lst in (accounts or {}).items()}}
+                   "assets": {a: {"broker": c.get("broker"),
+                                  "creds": {b: dict(v) for b, v in (c.get("creds") or {}).items()},
+                                  "include": bool(c.get("include", True)),
+                                  "accounts": [dict(x) for x in (c.get("accounts") or [])]}
+                              for a, c in (acfg or {}).items()}}
         if dry_run is not None:
             payload["dry_run"] = bool(dry_run)
         if cfg_open is not None:
@@ -699,12 +690,10 @@ class App:
         self._conn_by_broker = {}        # 브로커 연결테스트 통과 기억(크레덴셜 단위) — 탭 전환 무영향
         _d0 = _load()
         # 계좌 중심 설정(대표 2026-07-24 멀티계좌 · 계좌당 1R · 자산 등가중)
-        self._asset_broker = _d0["asset_broker"]   # {자산: 브로커}
-        self._asset_on = _d0["asset_on"]           # {자산: 실행여부}
-        self._creds = _d0["creds"]                 # {브로커: {f1,f3}} (f2=Keychain)
-        self._accts = _d0["accounts"]              # {브로커: [{id,one_r,on,label}]}
+        # 자산별 설정(대표 2026-07-24): 계좌는 자산 탭 안에서 관리(자산마다 브로커·계좌 독립).
+        self._acfg = _d0["assets"]       # {자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
-        self._broker_name = self._asset_broker[self._asset]
+        self._broker_name = self._acfg[self._asset]["broker"]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         self._token = _d0.get("token", "")
@@ -837,9 +826,9 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
-        # ── 라이브 패널 — 계좌별 세팅 후 한방 실행(대표 2026-07-24 멀티계좌) ──────────
-        #   실행 자산(공통) + 브로커별 계좌 리스트(계좌마다 라벨·1R·on·연결테스트·상태).
-        #   계좌당 단일 1R(자산 등가중) — 펀디드/챌린지를 각자 사이즈로 동시에 굴린다.
+        # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-24 자산별 계좌) ──────────
+        #   계좌·계좌별 1R은 각 **자산 탭 브로커 설정**에서 관리(자산마다 브로커·계좌 독립).
+        #   여기선 자산별 실행 여부·상태·연결테스트·정지만. 시그널 1건 → 그 자산 켜진 계좌 전부 진입.
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_live"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         # 동의(전 자산 공통) — 실행 동작 전 필요, 탭 재빌드에도 상태 유지
@@ -847,21 +836,25 @@ class App:
             self.consent = tk.IntVar()
         ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
                         command=self._update_tr_status).pack(anchor="w", pady=(2, 2))
-        # 실행 자산(공통) — 어느 자산을 굴릴지
+        # 자산별 실행 행 — [자산] 상태 [연결테스트] [정지] ●
         self._live_include = {}
-        arow = ttk.Frame(frm); arow.pack(fill="x", pady=(3, 2))
-        ttk.Label(arow, text=("실행 자산:" if self.lang == "ko" else "Assets:"),
-                  font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 6))
+        self._live_rows = {}       # {asset: (status_lbl, dot)}
+        lv = ttk.Frame(frm); lv.pack(fill="x", pady=(3, 0))
         for _a in _ASSETS:
-            var = tk.IntVar(value=1 if self._asset_on.get(_a, True) else 0)
+            row = ttk.Frame(lv); row.pack(fill="x", pady=1)
+            var = tk.IntVar(value=1 if self._acfg[_a].get("include", True) else 0)
             self._live_include[_a] = var
-            ttk.Checkbutton(arow, text=_a, variable=var,
-                            command=self._on_asset_toggle).pack(side="left", padx=(0, 8))
-        # 브로커별 계좌 리스트(동적 — 계좌 추가/삭제·자산 토글에 재구성)
-        self._live_rows = {}       # {(broker, idx): (status_lbl, dot)}
-        self._acct_widgets = {}    # {(broker, idx): {on, label, one_r}}
-        self._acct_frame = ttk.Frame(frm); self._acct_frame.pack(fill="x", pady=(3, 0))
-        self._rebuild_acct_rows()
+            ttk.Checkbutton(row, text=_a, width=5, variable=var,
+                            command=self._on_asset_toggle).pack(side="left")
+            dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
+            dot.pack(side="right", padx=(6, 0))
+            ttk.Button(row, text=("정지" if self.lang == "ko" else "Stop"), width=5,
+                       command=lambda a=_a: self._panel_stop(a)).pack(side="right", padx=(4, 0))
+            ttk.Button(row, text=self.t("btn_conn"), width=11,
+                       command=lambda a=_a: self._panel_conn_test(a)).pack(side="right", padx=(6, 0))
+            lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
+            lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
+            self._live_rows[_a] = (lbl, dot)
         ttk.Label(frm, text=self.t("live_1r_note"), foreground="#888",
                   wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
         lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
@@ -1250,25 +1243,27 @@ class App:
 
     # ── 계좌 중심 접근 헬퍼(대표 2026-07-24 멀티계좌) ──────────────────────────
     def _broker_of(self, asset):
-        return self._asset_broker.get(asset) or _ASSET_BROKERS[asset][0]
+        return self._acfg[asset]["broker"] or _ASSET_BROKERS[asset][0]
 
-    def _creds_of(self, broker):
-        return self._creds.setdefault(broker, {"f1": "", "f3": ""})
+    def _creds_of(self, asset, broker=None):
+        """자산 탭의 (현재 또는 지정) 브로커 크레덴셜 {f1,f3}. 계좌는 자산별이라 크레덴셜도 자산 내."""
+        bk = broker or self._acfg[asset]["broker"]
+        return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
 
-    def _accts_of(self, broker):
-        """브로커의 계좌 리스트(없으면 빈 슬롯 1개 보장)."""
-        if not self._accts.get(broker):
-            self._accts[broker] = [_new_acct(600.0, "", True, _broker_label(broker))]
-        return self._accts[broker]
+    def _accts_of(self, asset):
+        """자산의 계좌 리스트(없으면 빈 슬롯 1개 보장)."""
+        accts = self._acfg[asset].setdefault("accounts", [])
+        if not accts:
+            accts.append(_new_acct(600.0, "", True, _broker_label(self._acfg[asset]["broker"])))
+        return accts
 
-    def _active_accts(self, broker):
+    def _active_accts(self, asset):
         """on=True인 계좌만(실제 진입/조회 대상)."""
-        return [a for a in self._accts_of(broker) if a.get("on")]
+        return [a for a in self._accts_of(asset) if a.get("on")]
 
     def _save_cfg(self, **kw):
         """_save_full 래퍼 — 현재 앱 상태를 yaml로 영속화."""
-        _save_full(self.lang, self._token, self._asset_broker, self._asset_on,
-                   self._creds, self._accts, self._profile, **kw)
+        _save_full(self.lang, self._token, self._acfg, self._profile, **kw)
 
     def _acur(self):
         """현재 자산 탭의 브로커 + 그 브로커 크레덴셜 {broker,f1,f3}."""
