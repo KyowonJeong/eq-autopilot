@@ -459,52 +459,83 @@ def _pin_ok(pin):
     return bool(h) and hashlib.sha256(pin.encode()).hexdigest() == h
 
 
+def _new_acct(one_r=600.0, acct_id="", on=True, label=""):
+    return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
+            "label": str(label or "")}
+
+
 def _load():
-    """단일 설정 + 자산별 설정(assets={NQ,GC,BTC}) 로드. 하위호환: 옛 flat 키(broker/f1/f3/one_r)는
-    그 브로커를 쓰는 첫 자산 슬롯으로 1회 마이그레이션. 키(f2)는 Keychain에서 async 로드."""
+    """계좌 중심 설정 로드(대표 2026-07-24 멀티계좌). 스키마:
+      asset_broker{자산→브로커} · asset_on{자산 실행여부} · creds{브로커→{f1,f3}} ·
+      accounts{브로커→[{id,one_r,on,label}]}.
+    계좌당 1R(자산 등가중) · 브로커당 여러 계좌. 옛 자산별 스키마(assets{})와 flat 키는 1회
+    무손실 마이그레이션. 비밀(f2)은 브로커 f1을 키로 Keychain에서 async 로드."""
     try:
         import yaml
         with open(CFG_PATH) as f:
             d = yaml.safe_load(f) or {}
     except Exception:
         d = {}
-    px = d.get("projectx", {}); a = px.get("accounts") or []
-    user = px.get("user_name", "")
-    out = {"user": user, "key": px.get("api_key", ""), "acct": (a[0] if a else ""),
-           "lang": d.get("lang", "ko"), "token": d.get("token", ""),
-           "broker": d.get("broker", "projectx"), "f1": d.get("f1", user),
-           "f3": d.get("f3", ""), "one_r": d.get("one_r", 600)}
-    assets = d.get("assets") or {}
-    acfg = {}
-    for _a in _ASSETS:
-        s = assets.get(_a) or {}
-        brs = _ASSET_BROKERS[_a]
-        _bk = s.get("broker") if s.get("broker") in brs else brs[0]
-        # 브로커별 자격증명 분리(대표 2026-07-12: 바이빗 키가 빗겟에 공유되던 것 차단) —
-        # creds[broker] = {f1,f3,acct}. 옛 스키마(자산 상위 f1/f3/acct)는 당시 브로커 창고로 이관.
-        creds = {b: dict(v) for b, v in (s.get("creds") or {}).items() if b in brs}
-        if s.get("f1") and _bk not in creds:
-            creds[_bk] = {"f1": s.get("f1", ""), "f3": s.get("f3", ""), "acct": s.get("acct", "")}
-        cur = creds.get(_bk) or {"f1": "", "f3": "", "acct": ""}
-        acfg[_a] = {"broker": _bk, "one_r": s.get("one_r", 600), "creds": creds,
-                    "include": bool(s.get("include", True)),
-                    # 상위 f1/f3/acct = '현재 브로커' 미러(다운스트림 호환) — 저장·전환 때 갱신
-                    "f1": cur.get("f1", ""), "f3": cur.get("f3", ""), "acct": cur.get("acct", "")}
-    if not assets and out["f1"]:            # 마이그레이션: 옛 flat → 브로커 맞는 첫 자산
-        for _a in _ASSETS:
-            if out["broker"] in _ASSET_BROKERS[_a]:
-                acfg[_a].update({"broker": out["broker"], "f1": out["f1"], "f3": out["f3"],
-                                 "acct": out["acct"], "one_r": out["one_r"]})
-                acfg[_a]["creds"][out["broker"]] = {"f1": out["f1"], "f3": out["f3"],
-                                                    "acct": out["acct"]}
-                break
-    out["assets"] = acfg
-    out["dry_run"] = bool(d.get("dry_run", True))   # 전역 모의 스위치(대표 2026-07-13 한방 라이브)
+    out = {"lang": d.get("lang", "ko"), "token": d.get("token", "")}
+
+    if d.get("accounts") is not None or d.get("asset_broker") is not None:
+        # ── 새 스키마 ──
+        ab = d.get("asset_broker") or {}
+        asset_broker = {a: (ab.get(a) if ab.get(a) in _ASSET_BROKERS[a] else _ASSET_BROKERS[a][0])
+                        for a in _ASSETS}
+        _on = d.get("asset_on") or {}
+        asset_on = {a: bool(_on.get(a, True)) for a in _ASSETS}
+        creds = {b: {"f1": (v or {}).get("f1", ""), "f3": (v or {}).get("f3", "")}
+                 for b, v in (d.get("creds") or {}).items() if b in _BROKERS}
+        accts = {}
+        for b, lst in (d.get("accounts") or {}).items():
+            if b in _BROKERS:
+                accts[b] = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
+                            for x in (lst or [])]
+    else:
+        # ── 마이그레이션: 옛 assets{자산:{broker,creds{broker:{f1,f3,acct}},one_r,include}} ──
+        assets = d.get("assets") or {}
+        asset_broker, asset_on, creds, accts = {}, {}, {}, {}
+        for a in _ASSETS:
+            s = assets.get(a) or {}
+            brs = _ASSET_BROKERS[a]
+            bk = s.get("broker") if s.get("broker") in brs else brs[0]
+            asset_broker[a] = bk
+            asset_on[a] = bool(s.get("include", True))
+            one_r = float(s.get("one_r", 600) or 600)
+            for b, cr in (s.get("creds") or {}).items():
+                if b in _BROKERS and (cr.get("f1") or "").strip() and b not in creds:
+                    creds[b] = {"f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
+            _crbk = (s.get("creds") or {}).get(bk) or {}
+            if bk not in creds and ((_crbk.get("f1") or s.get("f1") or "").strip()):
+                creds[bk] = {"f1": (_crbk.get("f1") or s.get("f1") or ""),
+                             "f3": (_crbk.get("f3") or s.get("f3") or "")}
+            acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
+            accts.setdefault(bk, [])
+            if not any(x["id"] == acct_id for x in accts[bk]):
+                accts[bk].append(_new_acct(one_r, acct_id, True,
+                                           acct_id[-4:] if acct_id else _broker_label(bk)))
+        # 옛 flat(단일) 키 — 자산 설정이 전혀 없을 때만
+        if not assets:
+            fb = d.get("broker", "projectx")
+            fuser = d.get("f1", (d.get("projectx", {}) or {}).get("user_name", ""))
+            facct = ((d.get("projectx", {}) or {}).get("accounts") or [""])[0]
+            if (fuser or "").strip():
+                creds.setdefault(fb, {"f1": fuser, "f3": d.get("f3", "")})
+                accts.setdefault(fb, [_new_acct(d.get("one_r", 600), facct, True, _broker_label(fb))])
+    # 활성 자산의 브로커엔 계좌·크레덴셜 슬롯 최소 1개 보장
+    for a in _ASSETS:
+        bk = asset_broker[a]
+        creds.setdefault(bk, {"f1": "", "f3": ""})
+        if not accts.get(bk):
+            accts[bk] = [_new_acct(600.0, "", True, _broker_label(bk))]
+
+    out.update({"asset_broker": asset_broker, "asset_on": asset_on,
+                "creds": creds, "accounts": accts,
+                "dry_run": bool(d.get("dry_run", True))})
     if "cfg_open" in d:
-        out["cfg_open"] = bool(d.get("cfg_open"))   # 브로커 설정 접이식 상태
+        out["cfg_open"] = bool(d.get("cfg_open"))
     _p = d.get("profile") or {}
-    # 핸들·이름은 서버 자동(2026-07-11) — 입력은 없지만, 서버가 배정한 핸들은 '공개 페이지'
-    # 버튼용으로 로컬 캐시(푸시 응답 pp:ok:N:handle에서 회신받아 저장, 대표 2026-07-12).
     out["profile"] = {"public": bool(_p.get("public")), "handle": _p.get("handle", "")}
     return out
 
@@ -613,13 +644,18 @@ def _mark_pushed() -> None:
         pass
 
 
-def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None):
-    """자산별 설정(acfg={asset:{broker,f1,f3,acct,one_r,include}}) + lang/token/전역 dry_run +
-    공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 각 자산 저장 시 Keychain에 이미 넣는다."""
+def _save_full(lang, token, asset_broker, asset_on, creds, accounts,
+               profile=None, dry_run=None, cfg_open=None):
+    """계좌 중심 설정(asset_broker/asset_on/creds/accounts) + lang/token/전역 dry_run + 공개프로필을
+    yaml에 저장. 비밀(f2)은 여기서 안 씀 — 브로커 크레덴셜 저장 시 Keychain에 이미 넣는다."""
     try:
         import yaml
         payload = {"live": False, "lang": lang, "token": token,
-                   "assets": {a: dict(c) for a, c in (acfg or {}).items()}}
+                   "asset_broker": dict(asset_broker or {}),
+                   "asset_on": dict(asset_on or {}),
+                   "creds": {b: dict(v) for b, v in (creds or {}).items()},
+                   "accounts": {b: [dict(x) for x in (lst or [])]
+                                for b, lst in (accounts or {}).items()}}
         if dry_run is not None:
             payload["dry_run"] = bool(dry_run)
         if cfg_open is not None:
@@ -654,17 +690,21 @@ class App:
         self.frm = None
         self._auto_on = False
         self._sig_on = False
-        # 자산별 무장 상태(대표 2026-07-11): 자동청산/자동진입은 자산마다 독립 토글,
-        # 탭 전환은 보기 전환일 뿐 무장 상태를 절대 안 바꾼다. _*_on은 '루프 살아있음' 플래그.
-        self._auto_jobs = {}    # {asset: [job,...]}
-        self._sig_assets = {}   # {asset: cfg}
+        # 계좌별 무장 상태(대표 2026-07-24 멀티계좌): 자동청산/자동진입은 (브로커,계좌idx)마다
+        # 독립. 탭 전환은 보기 전환일 뿐 무장을 안 바꾼다. _*_on은 '루프 살아있음' 플래그.
+        self._auto_accts = {}   # {(broker,idx): [job,...]}  자동청산
+        self._sig_accts = {}    # {(broker,idx): cfg}        신호대기 진입
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성 (현재 탭 기준)
-        self._conn_by_asset = {}         # 자산별 연결테스트 통과 기억 — 탭 전환이 리셋 안 시킴
+        self._conn_by_broker = {}        # 브로커 연결테스트 통과 기억(크레덴셜 단위) — 탭 전환 무영향
         _d0 = _load()
-        self._acfg = _d0["assets"]       # 자산별 설정 {NQ,GC,BTC:{broker,f1,f3,acct,one_r}}
+        # 계좌 중심 설정(대표 2026-07-24 멀티계좌 · 계좌당 1R · 자산 등가중)
+        self._asset_broker = _d0["asset_broker"]   # {자산: 브로커}
+        self._asset_on = _d0["asset_on"]           # {자산: 실행여부}
+        self._creds = _d0["creds"]                 # {브로커: {f1,f3}} (f2=Keychain)
+        self._accts = _d0["accounts"]              # {브로커: [{id,one_r,on,label}]}
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
-        self._broker_name = self._acfg[self._asset]["broker"]
+        self._broker_name = self._asset_broker[self._asset]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         self._token = _d0.get("token", "")
@@ -797,40 +837,31 @@ class App:
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
 
-        # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-13) ──────────────
+        # ── 라이브 패널 — 계좌별 세팅 후 한방 실행(대표 2026-07-24 멀티계좌) ──────────
+        #   실행 자산(공통) + 브로커별 계좌 리스트(계좌마다 라벨·1R·on·연결테스트·상태).
+        #   계좌당 단일 1R(자산 등가중) — 펀디드/챌린지를 각자 사이즈로 동시에 굴린다.
         ttk.Separator(frm).pack(fill="x", pady=8)
         ttk.Label(frm, text=self.t("sec_live"), font=("Helvetica", 12, "bold")).pack(anchor="w")
-        # 동의(전 자산 공통, 대표 2026-07-13) — 실행 동작 전 필요, 탭 재빌드에도 상태 유지
+        # 동의(전 자산 공통) — 실행 동작 전 필요, 탭 재빌드에도 상태 유지
         if not hasattr(self, "consent"):
             self.consent = tk.IntVar()
         ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
                         command=self._update_tr_status).pack(anchor="w", pady=(2, 2))
-        self._live_rows = {}
+        # 실행 자산(공통) — 어느 자산을 굴릴지
         self._live_include = {}
-        self._live_1r = {}
-        lv = ttk.Frame(frm); lv.pack(fill="x", pady=(3, 0))
+        arow = ttk.Frame(frm); arow.pack(fill="x", pady=(3, 2))
+        ttk.Label(arow, text=("실행 자산:" if self.lang == "ko" else "Assets:"),
+                  font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 6))
         for _a in _ASSETS:
-            row = ttk.Frame(lv); row.pack(fill="x", pady=1)
-            var = tk.IntVar(value=1 if self._acfg[_a].get("include", True) else 0)
+            var = tk.IntVar(value=1 if self._asset_on.get(_a, True) else 0)
             self._live_include[_a] = var
-            cb = ttk.Checkbutton(row, text=_a, width=5, variable=var,
-                                 command=self._save_current_asset)
-            cb.pack(side="left")
-            ttk.Label(row, text="1R $").pack(side="left")
-            _re = ttk.Entry(row, width=7)
-            _re.insert(0, f"{self._acfg[_a].get('one_r', 600):g}")
-            _re.pack(side="left", padx=(0, 4))
-            _re.bind("<FocusOut>", lambda e, a=_a: self._save_panel_1r(a))
-            self._live_1r[_a] = _re
-            dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
-            dot.pack(side="right", padx=(6, 0))
-            ttk.Button(row, text=("정지" if self.lang == "ko" else "Stop"), width=5,
-                       command=lambda a=_a: self._panel_stop(a)).pack(side="right", padx=(4, 0))
-            ttk.Button(row, text=self.t("btn_conn"), width=11,
-                       command=lambda a=_a: self._panel_conn_test(a)).pack(side="right", padx=(6, 0))
-            lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
-            lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
-            self._live_rows[_a] = (lbl, dot)
+            ttk.Checkbutton(arow, text=_a, variable=var,
+                            command=self._on_asset_toggle).pack(side="left", padx=(0, 8))
+        # 브로커별 계좌 리스트(동적 — 계좌 추가/삭제·자산 토글에 재구성)
+        self._live_rows = {}       # {(broker, idx): (status_lbl, dot)}
+        self._acct_widgets = {}    # {(broker, idx): {on, label, one_r}}
+        self._acct_frame = ttk.Frame(frm); self._acct_frame.pack(fill="x", pady=(3, 0))
+        self._rebuild_acct_rows()
         ttk.Label(frm, text=self.t("live_1r_note"), foreground="#888",
                   wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
         lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
@@ -879,7 +910,8 @@ class App:
         # ── 자산별 브로커 설정 — 접이식(대표 2026-07-13: 한 번 셋업하면 열 일이 드묾).
         #    기본: 미설정 자산이 있으면 펼침, 전부 설정돼 있으면 접힘. 상태는 세션 유지+영속.
         if not hasattr(self, "_cfg_open"):
-            _unset = any(self._asset_row_state(_a)[0].startswith("✗") for _a in _ASSETS)
+            _unset = any(not (self._creds_of(self._broker_of(_a)).get("f1") or "").strip()
+                         for _a in _ASSETS if self._asset_on.get(_a, True))
             self._cfg_open = bool(d.get("cfg_open", _unset))
         self._cfg_hdr = tk.Button(
             frm, text=("▾ " if self._cfg_open else "▸ ")
@@ -949,20 +981,30 @@ class App:
             self.f3.insert(0, c.get("f3", ""))
             ttk.Button(r3e, text=self.t("paste"), width=8,
                        command=lambda: self._paste_into(self.f3)).pack(side="left", padx=(4, 0))
-        # 계좌 스코프 — 계좌 개념 있는 브로커만(Topstep/IBKR)
+        # ── 계좌 관리(대표 2026-07-24 멀티계좌) — 등록 계좌 리스트 + 추가/삭제.
+        #   여러 펀디드/챌린지 계좌를 등록해 라이브 패널에서 각자 1R로 동시에 굴린다.
+        #   b_acc(계좌 목록 불러오기)는 항상 생성 — 게이팅(_action_btns)이 참조. 크립토는 계좌
+        #   개념이 없어(API키=계좌) 리스트 UI를 숨기고 계좌 1개(id="")를 자동 유지한다.
+        self.b_acc = ttk.Button(frm, text=self.t("btn_accts"), command=self.healthcheck)
         if spec.get("acct"):
-            r3 = ttk.Frame(frm); r3.pack(fill="x", pady=3)
-            ttk.Label(r3, text=self.t("scope"), width=18).pack(side="left")
-            self.scope = ttk.Combobox(r3, values=[self.t("all")], state="normal")
-            self.scope.set(c.get("acct") or self.t("all")); self.scope.pack(side="left", fill="x", expand=True)
+            ttk.Label(frm, text=("등록 계좌 — 라이브 패널에서 계좌별 1R·실행" if self.lang == "ko"
+                                 else "Registered accounts — per-account 1R in the live panel"),
+                      foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
+            for _i, _ac in enumerate(self._accts_of(self._broker_name)):
+                _ar = ttk.Frame(frm); _ar.pack(fill="x", pady=1)
+                _aid = (_ac.get("id") or "").strip()
+                _nm = _ac.get("label") or (_aid[-4:] if _aid else "?")
+                ttk.Label(_ar, text="• " + _nm + (f"  (…{_aid[-6:]})" if _aid
+                          else ("  (계좌 미지정)" if self.lang == "ko" else "  (no id)"))).pack(side="left")
+                ttk.Button(_ar, text=("삭제" if self.lang == "ko" else "Remove"), width=6,
+                           command=lambda i=_i: self._del_acct(self._broker_name, i)).pack(side="right")
+            addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
+            self.acct_pick = ttk.Combobox(addr, values=[], state="normal")
+            self.acct_pick.pack(side="left", fill="x", expand=True)
+            ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
+                       command=self._add_acct).pack(side="left", padx=(4, 0))
+            self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
-
-        row = ttk.Frame(frm); row.pack(fill="x", pady=(8, 2))
-        # 연결 테스트 버튼은 라이브 패널로 이관 — 계좌 버튼이 연결 테스트를 겸함(대표 2026-07-13).
-        # healthcheck가 연결 검증 + (선물) 계좌 목록 채움 + 진입 정보 로그까지 전부 수행.
-        self.b_acc = ttk.Button(row, text=self.t("btn_accts"), command=self.healthcheck)
-        if spec.get("acct"):
-            self.b_acc.pack(side="left")
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
         frm = _outer_frm                          # 접이식 본문 끝 — 이후(로그)는 바깥에
 
@@ -980,7 +1022,7 @@ class App:
             self._built_once = True
             self.log(self.t("ready"))
         else:
-            _ok = self._conn_by_asset.get(self._asset)
+            _ok = self._conn_by_broker.get(self._broker_name)
             self.log(f"▸ {self._asset} · {_broker_label(self._broker_name)} — "
                      + (("연결됨 ✓ (테스트 통과, 재연결 불필요)" if self.lang == "ko"
                          else "connected ✓ (test passed, no retest needed)") if _ok else
@@ -1063,12 +1105,12 @@ class App:
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
         if getattr(self, "_sig_on", False) and not perm_auto:
             self._sig_on = False
-            self._sig_assets.clear()
+            self._sig_accts.clear()
             self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
-            self._auto_jobs.clear()
+            self._auto_accts.clear()
             self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
         self._update_gate_label()
@@ -1206,44 +1248,75 @@ class App:
     def _f3(self):
         return self.f3.get().strip() if hasattr(self, "f3") else ""
 
-    def _acur(self):
-        """현재 자산 탭의 설정 dict {broker,f1,f3,acct,one_r}."""
-        return self._acfg[self._asset]
+    # ── 계좌 중심 접근 헬퍼(대표 2026-07-24 멀티계좌) ──────────────────────────
+    def _broker_of(self, asset):
+        return self._asset_broker.get(asset) or _ASSET_BROKERS[asset][0]
 
-    def _save_current_asset(self):
-        """현재 탭의 위젯 값을 self._acfg[현재자산] 슬롯에 저장 + 비밀은 Keychain + yaml 영속화."""
-        c = self._acfg[self._asset]
-        c["broker"] = self._broker_name
-        cr = c.setdefault("creds", {}).setdefault(self._broker_name, {})
-        if hasattr(self, "user"):
-            cr["f1"] = self.user.get().strip()
-        cr["f3"] = self._f3()
-        cr["acct"] = self._scope()
-        # 상위 미러 = 현재 브로커 창고 (다운스트림 c.get("f1") 호환)
-        c["f1"], c["f3"], c["acct"] = cr.get("f1", ""), cr.get("f3", ""), cr.get("acct", "")
-        if hasattr(self, "one_r"):
+    def _creds_of(self, broker):
+        return self._creds.setdefault(broker, {"f1": "", "f3": ""})
+
+    def _accts_of(self, broker):
+        """브로커의 계좌 리스트(없으면 빈 슬롯 1개 보장)."""
+        if not self._accts.get(broker):
+            self._accts[broker] = [_new_acct(600.0, "", True, _broker_label(broker))]
+        return self._accts[broker]
+
+    def _active_accts(self, broker):
+        """on=True인 계좌만(실제 진입/조회 대상)."""
+        return [a for a in self._accts_of(broker) if a.get("on")]
+
+    def _save_cfg(self, **kw):
+        """_save_full 래퍼 — 현재 앱 상태를 yaml로 영속화."""
+        _save_full(self.lang, self._token, self._asset_broker, self._asset_on,
+                   self._creds, self._accts, self._profile, **kw)
+
+    def _acur(self):
+        """현재 자산 탭의 브로커 + 그 브로커 크레덴셜 {broker,f1,f3}."""
+        bk = self._broker_name
+        cr = self._creds_of(bk)
+        return {"broker": bk, "f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
+
+    def _collect_acct_widgets(self):
+        """라이브 패널 계좌 행 위젯값(on·라벨·1R) → self._accts 반영(저장은 호출부가)."""
+        for (bk, idx), w in getattr(self, "_acct_widgets", {}).items():
+            accts = self._accts_of(bk)
+            if idx >= len(accts):
+                continue
             try:
-                c["one_r"] = float(str(self.one_r.get()).replace(",", "").strip())
+                accts[idx]["on"] = bool(w["on"].get())
+            except Exception:
+                pass
+            try:
+                accts[idx]["label"] = str(w["label"].get()).strip()
+            except Exception:
+                pass
+            try:
+                _v = float(str(w["one_r"].get()).replace(",", "").strip())
+                if _v > 0:
+                    accts[idx]["one_r"] = _v
             except (TypeError, ValueError):
                 pass
+
+    def _save_current_asset(self):
+        """현재 탭 크레덴셜(f1,f3) → 브로커 창고, 비밀(f2) → Keychain, 실행자산·계좌위젯 반영·영속화.
+        계좌ID·1R·on·라벨은 라이브 패널 계좌 위젯이 관리(브로커별 창고, 자산 무관)."""
+        bk = self._broker_name
+        self._asset_broker[self._asset] = bk
+        cr = self._creds_of(bk)
+        if hasattr(self, "user"):
+            cr["f1"] = self.user.get().strip()
+        if hasattr(self, "f3"):
+            cr["f3"] = self._f3()
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
-            _kc_save(c["f1"], self.key.get())
-        # 라이브 패널 1R 입력 반영(대표 2026-07-13 '1R도 자산 옆에')
-        for _a, _e in getattr(self, "_live_1r", {}).items():
-            try:
-                _v = float(str(_e.get()).replace(",", "").strip())
-                if _v > 0:
-                    self._acfg[_a]["one_r"] = _v
-            except Exception:
-                pass
-        # 참여 체크(라이브 패널) 반영 — LIVE/모의는 전역 스위치로 이동(대표 2026-07-13)
+            _kc_save(cr.get("f1", ""), self.key.get())
+        # 실행 자산(라이브 패널 체크) 반영
         for _a, _v in getattr(self, "_live_include", {}).items():
             try:
-                self._acfg[_a]["include"] = bool(_v.get())
+                self._asset_on[_a] = bool(_v.get())
             except Exception:
                 pass
-        _save_full(self.lang, self._token, self._acfg, self._profile,
-                   dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
+        self._collect_acct_widgets()             # 계좌 위젯(라벨·1R·on)
+        self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
         self._refresh_live_panel()
 
     def _persist(self):
@@ -1251,13 +1324,13 @@ class App:
 
     def _on_asset(self, asset):
         """자산 탭 전환 — 현재 탭 저장 → 자산 바꿈 → 그 자산 브로커로 → 재빌드."""
-        if asset == self._asset or asset not in self._acfg:
+        if asset == self._asset or asset not in _ASSETS:
             return
         self._save_current_asset()
         self._asset = asset
-        self._broker_name = self._acfg[asset]["broker"]
-        # 탭 전환 = 보기 전환일 뿐 — 연결은 자산별 기억 복원, 돌던 루프·체크박스는 안 건드림.
-        self._connected = bool(self._conn_by_asset.get(asset, False))
+        self._broker_name = self._broker_of(asset)
+        # 탭 전환 = 보기 전환일 뿐 — 연결은 브로커별 기억 복원, 돌던 루프는 안 건드림.
+        self._connected = bool(self._conn_by_broker.get(self._broker_name, False))
         self._unlocked = False
         self._build()
 
@@ -1269,30 +1342,11 @@ class App:
             if _broker_label(b) == sel:
                 self._broker_name = b
                 break
-        # 미러를 새 브로커 창고로 스위치 — 바이빗↔빗겟 자격증명 완전 분리(대표 2026-07-12)
-        c = self._acfg[self._asset]
-        c["broker"] = self._broker_name
-        cr = c.setdefault("creds", {}).setdefault(self._broker_name, {"f1": "", "f3": "", "acct": ""})
-        c["f1"], c["f3"], c["acct"] = cr.get("f1", ""), cr.get("f3", ""), cr.get("acct", "")
-        # 무장 상태도 브로커별(대표 2026-07-12): 이 자산이 '이전 브로커'로 무장돼 있었다면 해제 —
-        # 새 브로커는 연결 테스트 → 다시 시작해야 무장된다(신호대기·자동청산 동일).
-        a = self._asset
-        if a in self._sig_assets and self._sig_assets[a].get("broker") != self._broker_name:
-            del self._sig_assets[a]
-            if not self._sig_assets:
-                self._sig_on = False
-            self.log(f"⏹ {a} 신호 대기 해제 — 브로커 변경({self._broker_name}). 연결 테스트 후 다시 시작하세요.")
-        if a in self._auto_jobs and (self._auto_jobs[a] or [{}])[0].get("broker") != self._broker_name:
-            del self._auto_jobs[a]
-            if not self._auto_jobs:
-                self._auto_on = False
-            self.log(f"⏹ {a} 자동청산 해제 — 브로커 변경({self._broker_name}). 연결 테스트 후 다시 시작하세요.")
-        self._connected = False
-        self._conn_by_asset.pop(self._asset, None)   # 브로커가 바뀌면 연결테스트 다시
+        self._asset_broker[self._asset] = self._broker_name
+        # 새 브로커는 연결 테스트를 다시 통과해야 함(브로커별 크레덴셜 분리).
+        self._connected = bool(self._conn_by_broker.get(self._broker_name, False))
         self._unlocked = False
-        # ⚠️ _persist() 금지 — 위젯엔 아직 '이전 브로커' 값이 있어 새 창고를 오염시킨다.
-        # 위에서 창고 저장·미러 스위치를 끝냈으니 yaml만 직접 영속화하고 재빌드.
-        _save_full(self.lang, self._token, self._acfg, self._profile)
+        self._save_cfg()
         self._build()
 
     def _set_lang(self, *_):
@@ -1384,10 +1438,9 @@ class App:
         self.root.after(120, self._drain)
 
     def _scope(self):
-        if not hasattr(self, "scope"):
-            return ""
-        s = self.scope.get().strip()
-        return "" if s in ("", self.t("all"), T["all"]["ko"], T["all"]["en"]) else s
+        # 단일 계좌 스코프 UI 폐지(멀티계좌로 이관, 대표 2026-07-24) — 연결테스트/계좌목록은
+        # 계좌 없이 크레덴셜로 조회한다. 항상 빈 스코프.
+        return ""
 
     def _broker(self):
         sc = self._scope()
@@ -1430,12 +1483,59 @@ class App:
         return True
 
     def _fill_scope(self, names):
-        if not hasattr(self, "scope"):
+        # 불러온 계좌 목록 → '계좌 추가' 콤보 채움(대표 2026-07-24 멀티계좌)
+        if not hasattr(self, "acct_pick"):
             return
-        cur = self.scope.get()
-        self.scope["values"] = [self.t("all")] + names
-        if cur not in ([self.t("all")] + names):
-            self.scope.set(self.t("all"))
+        try:
+            self.acct_pick["values"] = names
+            if names and not self.acct_pick.get().strip():
+                self.acct_pick.set(names[0])
+        except Exception:
+            pass
+
+    def _add_acct(self):
+        """브로커 설정에서 계좌 추가 — acct_pick의 선택/입력값을 계좌ID로 등록(중복 방지)."""
+        bk = self._broker_name
+        try:
+            val = str(self.acct_pick.get()).strip()
+        except Exception:
+            val = ""
+        aid = val.split("·")[-1].strip() if "·" in val else val
+        if not aid:
+            messagebox.showwarning(self.t("btn_accts"),
+                                   "추가할 계좌를 선택하거나 입력하세요." if self.lang == "ko"
+                                   else "Pick or type an account first."); return
+        accts = self._accts_of(bk)
+        if any((x.get("id") or "").strip() == aid for x in accts):
+            messagebox.showinfo(self.t("btn_accts"),
+                                "이미 등록된 계좌입니다." if self.lang == "ko"
+                                else "Already registered."); return
+        # 첫 계좌가 빈 슬롯(id 미지정)이면 그걸 채우고, 아니면 새 계좌로 추가
+        if len(accts) == 1 and not (accts[0].get("id") or "").strip():
+            accts[0]["id"] = aid
+            accts[0]["label"] = accts[0].get("label") or aid[-4:]
+        else:
+            accts.append(_new_acct(600.0, aid, True, aid[-4:]))
+        self._save_cfg()
+        self._build()
+
+    def _del_acct(self, bk, idx):
+        """등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지, 무장 중이면 해제."""
+        accts = self._accts_of(bk)
+        if idx >= len(accts):
+            return
+        lbl = accts[idx].get("label") or (accts[idx].get("id") or "")[-4:] or "?"
+        if not messagebox.askyesno(("계좌 삭제" if self.lang == "ko" else "Remove account"),
+                                   (f"'{lbl}' 계좌를 삭제할까요?" if self.lang == "ko"
+                                    else f"Remove account '{lbl}'?")):
+            return
+        for d in (self._sig_accts, self._auto_accts):
+            d.pop((bk, idx), None)
+        del accts[idx]
+        if not accts:
+            accts.append(_new_acct(600.0, "", True, _broker_label(bk)))
+        self._save_cfg()
+        self._build()
 
     def _run(self, fn):
         self._busy(True)
@@ -1476,7 +1576,7 @@ class App:
             for p in pos: self.log(f"   • {p.account_name} / {p.symbol}  net={p.net_qty}")
             if not pos: self.log("   (flat)")
             self._connected = True                # 통과 → 나머지 기능 활성화(_busy 복원이 반영)
-            self._conn_by_asset[self._asset] = True   # 탭 전환 후 복귀해도 재연결 불필요
+            self._conn_by_broker[self._broker_name] = True   # 탭 전환 후 복귀해도 재연결 불필요
             # 진입 관련 계정 정보(읽기전용): 레버리지·마진모드·가용잔고 — 진입 전에 설정 상태를
             # 앱 로그에서 바로 확인(대표 2026-07-12). 변경은 안 함, 실패 시 조용히 생략.
             try:
@@ -1524,61 +1624,6 @@ class App:
             for e in res.errors: self.log(f"   ⚠ {e}")
             self.log("✅ flat" if not res.errors else "⚠ INCOMPLETE — check broker now!")
         self._run(w)
-
-    def toggle_auto(self):
-        """자동청산 토글 — **현재 자산만** 무장/해제(대표 2026-07-11). 탭 전환은 무장에 무영향.
-        루프는 무장 자산이 하나라도 있으면 돌고, self._auto_jobs를 매 사이클 동적으로 읽는다."""
-        a = self._asset
-        if a in self._auto_jobs:
-            del self._auto_jobs[a]
-            if not self._auto_jobs:
-                self._auto_on = False
-            self._set_auto_ind(False, [a])
-            self.log(f"⏹ {a} 자동청산 해제." + ("" if self._auto_jobs else " (가동 자산 없음 — 루프 종료)"))
-            self._refresh_live_panel()
-            return
-        if not self._consent_ok():
-            return
-        self._save_current_asset()
-        c = self._acfg[a]
-        f1 = (c.get("f1") or "").strip()
-        if not f1:
-            messagebox.showwarning(self.t("input_needed"),
-                                   f"{a}: 브로커 키를 입력하세요." if self.lang == "ko"
-                                   else f"{a}: enter the broker key."); return
-        # 자산별 연결 테스트 통과 필수(대표 2026-07-11)
-        if not self._conn_by_asset.get(a):
-            messagebox.showwarning(self.t("btn_conn"),
-                                   f"{a}: 먼저 '연결 테스트'를 통과하세요." if self.lang == "ko"
-                                   else f"{a}: pass 'Test connection' first."); return
-        if not self._broker_allowed(c["broker"]):
-            self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동청산 불가.")
-            return
-        _sp = _BROKER_SPEC.get(c["broker"], {})
-        acct = (c.get("acct") or "").strip()
-        if _sp.get("acct") and not acct:
-            messagebox.showwarning(self.t("input_needed"),
-                                   f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
-                                   else f"{a}: pick an account."); return
-        cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                "f3": c.get("f3", ""), "acct": acct}
-        live = not bool(self.live_dry.get())          # 전역 모의 스위치(발화 순간 게이트 재판정)
-        jobs = [{"asset": a, "tz": tzname, "hour": hour, "live": live, **cred}
-                for tzname, hour in _ASSET_EXITS.get(a, [])]
-        if not jobs:
-            self.log(f"➖ {a}: 세션 마감 스케줄 없음 — 자동청산 미지원.")
-            return
-        self._auto_jobs[a] = jobs
-        self._set_auto_ind(True, [a])
-        _sumry = " · ".join(f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
-                            for j in jobs)
-        self.log(f"\n▶ {a} 자동청산 가동 [{_sumry}] · 현재 가동: {'·'.join(sorted(self._auto_jobs))} · "
-                 f"{'LIVE' if live else 'dry-run'}. (keep the app open & the computer awake)")
-        self.log(f"   {self.t('warn_mix')}")
-        if not self._auto_on:
-            self._auto_on = True
-            threading.Thread(target=self._auto_loop, daemon=True).start()
-        self._refresh_live_panel()
 
     def _handle_stop_failure(self, b, aid, contract, direction, size, stop, res):
         """Protective stop didn't land after a market entry. Broker rejection = permanent (e.g. price
@@ -1630,7 +1675,7 @@ class App:
             self.log("ℹ 타임존 DB 없음 — 청산·진입 시각을 UTC 기준 산술 계산으로 처리합니다(정상).")
 
         while self._auto_on:
-            jobs = [j for jl in list(self._auto_jobs.values()) for j in jl]   # 무장 자산 동적 스냅샷
+            jobs = [j for jl in list(self._auto_accts.values()) for j in jl]   # 무장 계좌 동적 스냅샷
             for j in jobs:
                 now = _now_in(j["tz"])
                 today = now.strftime("%Y-%m-%d")
@@ -1695,88 +1740,34 @@ class App:
             _t.sleep(15)
 
     # ── auto-ENTRY on EdgeQuant signal ──────────────────────────────────────
-    def toggle_sig(self):
-        """신호 대기(자동진입) 토글 — **현재 자산만** 무장/해제(대표 2026-07-11). 탭 전환 무영향.
-        루프는 무장 자산이 하나라도 있으면 돌고, self._sig_assets를 신호 처리 시 동적으로 읽는다."""
-        a = self._asset
-        if a in self._sig_assets:
-            del self._sig_assets[a]
-            if not self._sig_assets:
-                self._sig_on = False
-            self._set_sig_ind(False, [a])
-            self.log(f"⏹ {a} 신호 대기 해제." + ("" if self._sig_assets else " (가동 자산 없음 — 루프 종료)"))
-            self._refresh_live_panel()
-            return
-        if not self._consent_ok():
-            return
-        if not self._token:
-            messagebox.showwarning(self.t("token"), self.t("gate_none")); return
-        self._save_current_asset()               # 현재 탭 값 반영
-        c = self._acfg[a]
-        f1 = (c.get("f1") or "").strip()
+    # ── 라이브 패널 상태 표시(대표 2026-07-24 멀티계좌) ─────────────
+    def _acct_row_state(self, broker, idx, acct):
+        """(요약문, 점 색) — 계좌 설정·연결·무장 상태를 한 줄로."""
+        f1 = (self._creds_of(broker).get("f1") or "").strip()
         try:
-            one_r = float(c.get("one_r", 0))
+            one_r = float(acct.get("one_r", 0))
         except (TypeError, ValueError):
             one_r = 0.0
-        if not f1 or one_r <= 0:
-            messagebox.showwarning(self.t("sig_1r"),
-                                   f"{a}: 브로커 키와 1R 금액을 설정하세요." if self.lang == "ko"
-                                   else f"{a}: set the broker key and 1R amount."); return
-        # 자산별 연결 테스트 통과 필수(대표 2026-07-11 — NQ만 테스트했는데 GC까지 붙던 버그)
-        if not self._conn_by_asset.get(a):
-            messagebox.showwarning(self.t("btn_conn"),
-                                   f"{a}: 먼저 '연결 테스트'를 통과하세요." if self.lang == "ko"
-                                   else f"{a}: pass 'Test connection' first."); return
-        if not self._broker_allowed(c["broker"]):
-            self.log(f"➖ {a}: 브로커 [{c['broker']}] 지원 꺼짐(서버) — 자동진입 불가.")
-            return
-        _sp = _BROKER_SPEC.get(c["broker"], {})
-        acct = (c.get("acct") or "").strip()
-        if _sp.get("acct") and not acct:
-            messagebox.showwarning(self.t("input_needed"),
-                                   f"{a}: 사용 계좌를 지정하세요." if self.lang == "ko"
-                                   else f"{a}: pick an account."); return
-        live = not bool(self.live_dry.get())          # 전역 모의 스위치(발주 순간 게이트 재판정)
-        self._sig_assets[a] = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                               "f3": c.get("f3", ""), "acct": acct, "one_r": one_r, "live": live}
-        self._set_sig_ind(True, [a])
-        _sumry = " · ".join(f"{k}:{v['broker']}(1R${v['one_r']:g})" for k, v in sorted(self._sig_assets.items()))
-        self.log(f"\n▶ {a} 신호 대기 가동 — 현재 가동 [{_sumry}] · {'LIVE' if live else 'dry-run'}.")
-        if not self._sig_on:
-            self._sig_on = True
-            url = _feed_url(self._token)             # 멤버별 신호 피드
-            self.log("   polling feed")
-            threading.Thread(target=self._sig_loop, args=(url,), daemon=True).start()
-        self._refresh_live_panel()
-
-    # ── 라이브 패널 (대표 2026-07-13 "자산별 세팅 후 한방 라이브") ─────────────
-    def _asset_row_state(self, a):
-        """(요약문, 점 색) — 설정·연결·무장 상태를 한 줄로."""
-        c = self._acfg.get(a) or {}
-        f1 = (c.get("f1") or "").strip()
-        try:
-            one_r = float(c.get("one_r", 0))
-        except (TypeError, ValueError):
-            one_r = 0.0
-        _sp = _BROKER_SPEC.get(c.get("broker"), {})
-        need_acct = bool(_sp.get("acct"))
+        _sp = _BROKER_SPEC.get(broker, {})
+        aid = (acct.get("id") or "").strip()
         missing = []
         if not f1:
             missing.append("키" if self.lang == "ko" else "key")
         if one_r <= 0:
             missing.append("1R")
-        if need_acct and not (c.get("acct") or "").strip():
+        if _sp.get("acct") and not aid:
             missing.append("계좌" if self.lang == "ko" else "account")
         if missing:
-            return (("✗ 미설정: " if self.lang == "ko" else "✗ missing: ") + " · ".join(missing)
-                    + f"  ({_broker_label(c.get('broker'))})", "#9ca3af")
-        armed = a in self._sig_assets or a in self._auto_jobs
-        live = (self._sig_assets.get(a) or (self._auto_jobs.get(a) or [{}])[0]).get("live")
-        acct = (c.get("acct") or "").strip()
-        base = (f"✓ {_broker_label(c.get('broker'))}"
-                + (f" ···{acct[-4:]}" if acct else "")
-                + ("" if self._conn_by_asset.get(a) else
-                   (" · 연결 테스트 전" if self.lang == "ko" else " · not tested")))
+            return (("✗ 미설정: " if self.lang == "ko" else "✗ missing: ")
+                    + " · ".join(missing), "#9ca3af")
+        key = (broker, idx)
+        sig = getattr(self, "_sig_accts", {}).get(key)
+        auto = getattr(self, "_auto_accts", {}).get(key)
+        armed = bool(sig or auto)
+        live = bool((sig or {}).get("live") if sig else ((auto or [{}])[0].get("live") if auto else False))
+        base = (("✓ 연결됨" if self.lang == "ko" else "✓ connected")
+                if self._conn_by_broker.get(broker)
+                else ("✓ · 연결 테스트 전" if self.lang == "ko" else "✓ · not tested"))
         if armed:
             base += " · " + (("가동 중(실거래)" if live else "가동 중(모의)") if self.lang == "ko"
                              else ("RUNNING live" if live else "RUNNING dry"))
@@ -1784,15 +1775,104 @@ class App:
         return base, "#9ca3af"
 
     def _refresh_live_panel(self):
-        if not getattr(self, "_live_rows", None):
-            return
-        for a, (lbl, dot) in self._live_rows.items():
+        for key, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
-                txt, col = self._asset_row_state(a)
+                bk, idx = key
+                accts = self._accts_of(bk)
+                if idx >= len(accts):
+                    continue
+                txt, col = self._acct_row_state(bk, idx, accts[idx])
                 lbl.config(text=txt)
                 dot.config(foreground=col)
             except Exception:
                 pass
+
+    def _brokers_in_use(self):
+        """활성 자산이 쓰는 브로커들(중복 제거·순서 유지)."""
+        seen = []
+        for a in _ASSETS:
+            if self._asset_on.get(a):
+                bk = self._broker_of(a)
+                if bk not in seen:
+                    seen.append(bk)
+        return seen
+
+    def _rebuild_acct_rows(self):
+        """라이브 패널 계좌 리스트를 다시 그림(계좌 추가/삭제·자산 토글 시)."""
+        af = getattr(self, "_acct_frame", None)
+        if af is None:
+            return
+        for w in af.winfo_children():
+            w.destroy()
+        self._live_rows = {}
+        self._acct_widgets = {}
+        for bk in self._brokers_in_use():
+            ttk.Label(af, text=("계좌" if self.lang == "ko" else "Accounts") + f" — {_broker_label(bk)}",
+                      font=("Helvetica", 10, "bold"), foreground="#555").pack(anchor="w", pady=(5, 1))
+            for idx, acct in enumerate(self._accts_of(bk)):
+                self._acct_row(bk, idx, acct)
+        self._refresh_live_panel()
+
+    def _acct_row(self, bk, idx, acct):
+        """계좌 한 줄: [on] 라벨 · 1R$ · [연결테스트] [정지] ●상태."""
+        row = ttk.Frame(self._acct_frame); row.pack(fill="x", pady=1)
+        key = (bk, idx)
+        on = tk.IntVar(value=1 if acct.get("on", True) else 0)
+        ttk.Checkbutton(row, variable=on, width=2,
+                        command=self._save_acct_widgets).pack(side="left")
+        lbl_e = ttk.Entry(row, width=10)
+        lbl_e.insert(0, acct.get("label")
+                     or ((acct.get("id") or "")[-4:] if acct.get("id") else _broker_label(bk)))
+        lbl_e.pack(side="left", padx=(0, 4))
+        lbl_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
+        ttk.Label(row, text="1R $").pack(side="left")
+        r_e = ttk.Entry(row, width=7)
+        r_e.insert(0, f"{float(acct.get('one_r', 600) or 600):g}")
+        r_e.pack(side="left", padx=(0, 4))
+        r_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
+        self._acct_widgets[key] = {"on": on, "label": lbl_e, "one_r": r_e}
+        dot = tk.Label(row, text="●", foreground="#9ca3af", font=("Helvetica", 12, "bold"))
+        dot.pack(side="right", padx=(6, 0))
+        ttk.Button(row, text=("정지" if self.lang == "ko" else "Stop"), width=5,
+                   command=lambda: self._panel_stop(bk, idx)).pack(side="right", padx=(4, 0))
+        ttk.Button(row, text=self.t("btn_conn"), width=11,
+                   command=lambda: self._panel_conn_test(bk)).pack(side="right", padx=(6, 0))
+        slbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
+        slbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._live_rows[key] = (slbl, dot)
+
+    def _save_acct_widgets(self):
+        """계좌 행 위젯값(on·라벨·1R) → self._accts 반영 + 영속."""
+        for (bk, idx), w in getattr(self, "_acct_widgets", {}).items():
+            accts = self._accts_of(bk)
+            if idx >= len(accts):
+                continue
+            try:
+                accts[idx]["on"] = bool(w["on"].get())
+            except Exception:
+                pass
+            try:
+                accts[idx]["label"] = str(w["label"].get()).strip()
+            except Exception:
+                pass
+            try:
+                _v = float(str(w["one_r"].get()).replace(",", "").strip())
+                if _v > 0:
+                    accts[idx]["one_r"] = _v
+            except (TypeError, ValueError):
+                pass
+        self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
+        self._refresh_live_panel()
+
+    def _on_asset_toggle(self):
+        """실행 자산 체크 변경 → asset_on 반영 + 계좌 리스트 재구성(브로커 목록이 바뀔 수 있음)."""
+        for a, var in getattr(self, "_live_include", {}).items():
+            try:
+                self._asset_on[a] = bool(var.get())
+            except Exception:
+                pass
+        self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
+        self._rebuild_acct_rows()
 
     def _toggle_cfg(self):
         """자산별 브로커 설정 접기/펼치기(대표 2026-07-13)."""
@@ -1804,137 +1884,119 @@ class App:
         self._cfg_hdr.config(text=("▾ " if self._cfg_open else "▸ ")
                              + ("자산별 브로커 설정 (NQ·GC·BTC)" if self.lang == "ko"
                                 else "Per-asset broker setup (NQ·GC·BTC)"))
-        _save_full(self.lang, self._token, self._acfg, self._profile,
-                   dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
-                   cfg_open=self._cfg_open)
+        self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
+                       cfg_open=self._cfg_open)
 
-    def _panel_stop(self, a):
-        """패널 자산 줄 정지 — 이 자산만 가동 해제(자동 청산+신호 대기 둘 다)."""
+    def _panel_stop(self, bk, idx):
+        """라이브 패널 계좌 줄 정지 — 이 계좌만 가동 해제(자동청산+신호대기 둘 다)."""
+        key = (bk, idx)
         ch = False
-        if a in self._auto_jobs:
-            del self._auto_jobs[a]; ch = True
-        if a in self._sig_assets:
-            del self._sig_assets[a]; ch = True
-        if not self._auto_jobs:
+        if key in self._auto_accts:
+            del self._auto_accts[key]; ch = True
+        if key in self._sig_accts:
+            del self._sig_accts[key]; ch = True
+        if not self._auto_accts:
             self._auto_on = False
-        if not self._sig_assets:
+        if not self._sig_accts:
             self._sig_on = False
         if ch:
-            self.log(f"⏹ {a} 가동 해제." + ("" if (self._auto_jobs or self._sig_assets)
-                                            else " (가동 자산 없음 — 루프 종료)"))
-            self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
-            self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+            _acc = self._accts_of(bk)
+            _lbl = _acc[idx].get("label") if idx < len(_acc) else ""
+            self.log(f"⏹ {_broker_label(bk)} · {_lbl} 계좌 가동 해제."
+                     + ("" if (self._auto_accts or self._sig_accts) else " (가동 계좌 없음 — 루프 종료)"))
+            self._set_auto_ind(bool(self._auto_accts), [])
+            self._set_sig_ind(bool(self._sig_accts), [])
         self._refresh_live_panel()
 
-    def _save_panel_1r(self, a):
-        """라이브 패널의 자산별 1R 입력 저장(대표 2026-07-13 '1R도 자산 옆에')."""
-        try:
-            v = float(str(self._live_1r[a].get()).replace(",", "").strip())
-            if v > 0:
-                self._acfg[a]["one_r"] = v
-        except (TypeError, ValueError, KeyError):
-            pass
-        _save_full(self.lang, self._token, self._acfg, self._profile,
-                   dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
-        self._refresh_live_panel()
-
-    def _panel_conn_test(self, a):
-        """라이브 패널 자산 줄의 연결 테스트 버튼(대표 2026-07-13) — 저장된 설정으로 무음 점검."""
+    def _panel_conn_test(self, bk):
+        """라이브 패널 계좌 줄의 연결 테스트 — 그 브로커 크레덴셜로 무음 점검(계좌 공통)."""
         self._save_current_asset()
-        txt, _ = self._asset_row_state(a)
-        if txt.startswith("✗"):
-            # 계좌'만' 미설정인 Topstep은 테스트를 허용 — 계좌 목록은 연결이 돼야 받아오므로
-            # 여기서 막으면 신규 자산 설정이 영영 못 나감(테스터 실사고 2026-07-14 GC 데드락).
-            # 연결 성공이 계좌 드롭다운을 채워 주고, 무장(라이브 시작)은 여전히 계좌 지정 필수.
-            c = self._acfg.get(a) or {}
-            _sp = _BROKER_SPEC.get(c.get("broker"), {})
-            try:
-                _r_ok = float(c.get("one_r", 0)) > 0
-            except (TypeError, ValueError):
-                _r_ok = False
-            _acct_only = (bool((c.get("f1") or "").strip()) and _r_ok
-                          and bool(_sp.get("acct")) and not (c.get("acct") or "").strip())
-            if not _acct_only:
-                messagebox.showwarning(self.t("btn_conn"), f"{a}: {txt}")
-                return
-        self.log(f"\n── {a} 연결 테스트 ({_broker_label(self._acfg[a].get('broker'))}) ──")
+        if not (self._creds_of(bk).get("f1") or "").strip():
+            messagebox.showwarning(self.t("btn_conn"), f"{_broker_label(bk)}: "
+                                   + ("키 미설정" if self.lang == "ko" else "key not set"))
+            return
+        self.log(f"\n── {_broker_label(bk)} 연결 테스트 ──")
 
         def w():
-            err = self._conn_check_asset(a)
+            err = self._conn_check_broker(bk)
             def done():
                 if err:
-                    self.log(f"❌ {a}: {err}")
+                    self.log(f"❌ {_broker_label(bk)}: {err}")
                 else:
-                    self.log(f"✅ {a} 연결 OK")
-                    if (self._acfg.get(a) or {}).get("broker") == "projectx" \
-                            and not ((self._acfg.get(a) or {}).get("acct") or "").strip():
-                        self.log(("   → 자산 탭의 '사용 계좌'에서 계좌를 선택한 뒤 라이브를 시작하세요."
-                                  if self.lang == "ko" else
-                                  "   → pick an account in the asset tab, then go live."))
+                    self.log(f"✅ {_broker_label(bk)} 연결 OK")
                 self._refresh_live_panel()
             self.root.after(0, done)
         threading.Thread(target=w, daemon=True).start()
 
-    def _conn_check_asset(self, a):
-        """자산 설정값으로 무음 연결 테스트(스레드 컨텍스트) — 성공 시 _conn_by_asset 세팅.
-        반환: None(성공) | 오류 문자열."""
-        c = self._acfg.get(a) or {}
-        f1 = (c.get("f1") or "").strip()
+    def _conn_check_broker(self, bk):
+        """브로커 크레덴셜로 무음 연결 테스트 + (projectx) 등록 계좌ID 유효성 검사(스레드 컨텍스트).
+        성공 시 _conn_by_broker[bk]=True. 반환: None(성공) | 오류 문자열."""
+        cr = self._creds_of(bk)
+        f1 = (cr.get("f1") or "").strip()
         try:
-            b = _build_broker(c.get("broker"), f1, _kc_load(f1) or "", c.get("f3", ""),
-                              [c.get("acct")] if c.get("acct") else [])
+            b = _build_broker(bk, f1, _kc_load(f1) or "", cr.get("f3", ""), [])
             b.healthcheck()
-            if c.get("broker") == "projectx":
+            if bk == "projectx":
                 names = [str(x.get("name")) for x in b._accounts()]
-                acct = (c.get("acct") or "").strip()
-                if acct and acct not in names:
-                    return (f"저장된 계좌 '{acct}'가 계좌 목록에 없음" if self.lang == "ko"
-                            else f"saved account '{acct}' not in account list")
-                if a == self._asset:   # 현재 탭 자산이면 계좌 드롭다운도 채움 — 계좌 선택 유도
+                if bk == self._broker_name:   # 현재 탭 브로커면 '계좌 추가' 콤보도 채움
                     self.root.after(0, lambda n=names: self._fill_scope(n))
-            self._conn_by_asset[a] = True
+                for ac in self._active_accts(bk):
+                    aid = (ac.get("id") or "").strip()
+                    if not aid:
+                        return ("등록 계좌 중 계좌ID 미지정 — 브로커 설정에서 계좌를 추가하세요"
+                                if self.lang == "ko" else "a registered account has no id — add one")
+                    if aid not in names:
+                        return (f"등록 계좌 '{aid}'가 계좌 목록에 없음" if self.lang == "ko"
+                                else f"registered account '{aid}' not in list")
+            self._conn_by_broker[bk] = True
             try:
                 for _ln in (b.entry_info() or []):
-                    self.log(f"   ℹ {a} {_ln}")
+                    self.log(f"   ℹ {_broker_label(bk)} {_ln}")
             except Exception:
                 pass
             return None
         except Exception as e:
             return str(e)[:200]
 
-    def _master_arm_asset(self, a, live, arm_sig):
-        """마스터 플로우 전용 무장(검증은 프리플라이트에서 완료) — 자동청산 + (권한 시) 신호대기."""
-        c = self._acfg[a]
-        f1 = (c.get("f1") or "").strip()
-        cred = {"broker": c["broker"], "f1": f1, "f2": (_kc_load(f1) or ""),
-                "f3": c.get("f3", ""), "acct": (c.get("acct") or "").strip()}
+    def _master_arm(self, bk, idx, live, arm_sig):
+        """계좌 (bk,idx) 무장 — 자동청산 + (권한 시) 신호대기. 그 계좌가 굴리는 자산은
+        '실행 자산 중 이 브로커를 쓰는 것' 전부(자산 등가중, 계좌 1R 공통, 대표 2026-07-24)."""
+        acct = self._accts_of(bk)[idx]
+        cr = self._creds_of(bk)
+        f1 = (cr.get("f1") or "").strip()
+        aid = (acct.get("id") or "").strip()
+        assets = [a for a in _ASSETS if self._asset_on.get(a) and self._broker_of(a) == bk]
+        cred = {"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
+                "f3": cr.get("f3", ""), "acct": aid}
         jobs = [{"asset": a, "tz": tzname, "hour": hour, "live": live, **cred}
-                for tzname, hour in _ASSET_EXITS.get(a, [])]
+                for a in assets for tzname, hour in _ASSET_EXITS.get(a, [])]
+        key = (bk, idx)
         if jobs:
-            self._auto_jobs[a] = jobs
+            self._auto_accts[key] = jobs
             if not self._auto_on:
                 self._auto_on = True
                 threading.Thread(target=self._auto_loop, daemon=True).start()
         if arm_sig:
-            self._sig_assets[a] = {**cred, "one_r": float(c.get("one_r", 0)), "live": live}
+            self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
+                                    "live": live, "assets": assets, "label": acct.get("label", "")}
             if not self._sig_on:
                 self._sig_on = True
                 threading.Thread(target=self._sig_loop, args=(_feed_url(self._token),),
                                  daemon=True).start()
-        self._set_auto_ind(bool(self._auto_jobs), sorted(self._auto_jobs))
-        self._set_sig_ind(bool(self._sig_assets), sorted(self._sig_assets))
+        self._set_auto_ind(bool(self._auto_accts))
+        self._set_sig_ind(bool(self._sig_accts))
 
     def _master_start(self, dry: bool = True):
-        """[라이브 시작]/[모의 시작] — 체크된 자산 전부 연결 테스트, 전부 통과 시에만 일괄
-        무장(하나라도 실패하면 전체 중단, 대표 2026-07-13). 모의/라이브는 누른 버튼이 결정
-        (체크박스 폐지, 대표 2026-07-22)."""
+        """[라이브 시작]/[모의 시작] — 실행 자산의 브로커들을 연결 테스트, 전부 통과 시에만
+        각 브로커의 켜진 계좌를 일괄 무장(하나라도 실패 시 전체 중단). 계좌마다 자기 1R로.
+        모의/라이브는 누른 버튼이 결정(체크박스 폐지, 대표 2026-07-22)."""
         if not dry and (self._gate or {}).get("force_dry_run"):
             messagebox.showwarning(self.t("sec_live"),
                                    "서버가 모의 모드를 강제 중입니다 — 지금은 모의 시작만 가능합니다."
                                    if self.lang == "ko" else
                                    "Server is forcing dry-run; only demo start is available."); return
         self.live_dry.set(1 if dry else 0)
-        if self._sig_assets or self._auto_jobs:
+        if self._sig_accts or self._auto_accts:
             messagebox.showinfo(self.t("sec_live"),
                                 "이미 가동 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
                                 if self.lang == "ko" else
@@ -1949,15 +2011,36 @@ class App:
             messagebox.showwarning(self.t("sec_live"),
                                    "참여 자산이 없습니다 — 자산을 체크하세요."
                                    if self.lang == "ko" else "No assets checked."); return
-        # 프리플라이트: 설정 완결성(전체 중단 원칙 — 하나라도 미비면 시작 안 함)
-        bad = []
+        brokers = []
         for a in incl:
-            txt, _ = self._asset_row_state(a)
-            if txt.startswith("✗"):
-                bad.append(f"{a}: {txt}")
-            elif not self._broker_allowed(self._acfg[a].get("broker")):
-                bad.append(f"{a}: 브로커 지원 꺼짐(서버)" if self.lang == "ko"
-                           else f"{a}: broker disabled (server)")
+            _bk = self._broker_of(a)
+            if _bk not in brokers:
+                brokers.append(_bk)
+        # 프리플라이트: 브로커 크레덴셜 + 켜진 계좌(계좌ID·1R) 완결성 (전체 중단 원칙)
+        bad = []
+        for bk in brokers:
+            if not (self._creds_of(bk).get("f1") or "").strip():
+                bad.append(f"{_broker_label(bk)}: " + ("키 미설정" if self.lang == "ko" else "key missing"))
+                continue
+            if not self._broker_allowed(bk):
+                bad.append(f"{_broker_label(bk)}: " + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
+                                                       else "broker disabled (server)"))
+                continue
+            _act = self._active_accts(bk)
+            if not _act:
+                bad.append(f"{_broker_label(bk)}: " + ("켜진 계좌 없음" if self.lang == "ko" else "no account on"))
+                continue
+            _need_id = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
+            for ac in _act:
+                _nm = ac.get("label") or "?"
+                try:
+                    _r = float(ac.get("one_r", 0))
+                except (TypeError, ValueError):
+                    _r = 0.0
+                if _r <= 0:
+                    bad.append(f"{_broker_label(bk)} {_nm}: 1R")
+                if _need_id and not (ac.get("id") or "").strip():
+                    bad.append(f"{_broker_label(bk)} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
         if bad:
             messagebox.showwarning(self.t("sec_live"), "\n".join(bad)); return
         g = self._gate or {}
@@ -1972,36 +2055,40 @@ class App:
         self.b_live_start.config(state="disabled")
         if hasattr(self, "b_demo_start"):
             self.b_demo_start.config(state="disabled")
-        self.log("\n══ 라이브 시작 — 연결 테스트 " + "·".join(incl)
-                 + f" ({'LIVE' if live else 'dry-run'}) ══")
+        _blabels = "·".join(_broker_label(b) for b in brokers)
+        self.log(f"\n══ 라이브 시작 — 연결 테스트 {_blabels} ({'LIVE' if live else 'dry-run'}) ══")
 
         def w():
             fails = []
-            for a in incl:
-                self.log(f"── {a} 연결 테스트 ({_broker_label(self._acfg[a].get('broker'))}) ──")
-                err = self._conn_check_asset(a)
+            for bk in brokers:
+                self.log(f"── {_broker_label(bk)} 연결 테스트 ──")
+                err = self._conn_check_broker(bk)
                 if err:
-                    fails.append(f"{a}: {err}")
-                    self.log(f"❌ {a}: {err}")
+                    fails.append(f"{_broker_label(bk)}: {err}")
+                    self.log(f"❌ {_broker_label(bk)}: {err}")
                 else:
-                    self.log(f"✅ {a} 연결 OK")
+                    self.log(f"✅ {_broker_label(bk)} 연결 OK")
 
             def done():
                 self.b_live_start.config(state="normal")
                 if hasattr(self, "b_demo_start"):
                     self.b_demo_start.config(state="normal")
                 if fails:
-                    self.log("⛔ 전체 중단 — 아무 자산도 가동하지 않았습니다.")
+                    self.log("⛔ 전체 중단 — 아무 계좌도 가동하지 않았습니다.")
                     messagebox.showerror(self.t("sec_live"),
                                          ("연결 실패 — 전체 중단:\n" if self.lang == "ko"
                                           else "Connection failed — aborted:\n") + "\n".join(fails))
                     self._refresh_live_panel(); return
-                for a in incl:
-                    self._master_arm_asset(a, live, arm_sig=perm_auto)
+                narmed = 0
+                for bk in brokers:
+                    for idx, ac in enumerate(self._accts_of(bk)):
+                        if ac.get("on"):
+                            self._master_arm(bk, idx, live, arm_sig=perm_auto)
+                            narmed += 1
                 _what = ("자동 청산" + (" + 신호 대기" if perm_auto else " (신호 대기는 Autopilot 등급)")
                          if self.lang == "ko" else
                          "auto-close" + (" + signal watch" if perm_auto else ""))
-                self.log(f"🚀 라이브 가동 시작 [{ '·'.join(incl) }] — {_what} · "
+                self.log(f"🚀 라이브 가동 시작 — {narmed}개 계좌 [{_blabels}] · {_what} · "
                          f"{'LIVE' if live else 'dry-run(모의)'}")
                 self.log(f"   {self.t('warn_mix')}")
                 self._refresh_live_panel()
@@ -2010,16 +2097,16 @@ class App:
         self._run(w)
 
     def _master_stop(self):
-        """[⏹ 전체 정지] — 모든 자산 무장 해제(루프는 무장 0이면 자연 종료)."""
-        n = len(set(list(self._sig_assets) + list(self._auto_jobs)))
-        self._sig_assets.clear()
-        self._auto_jobs.clear()
+        """[⏹ 전체 정지] — 모든 계좌 무장 해제(루프는 무장 0이면 자연 종료)."""
+        n = len(set(list(self._sig_accts) + list(self._auto_accts)))
+        self._sig_accts.clear()
+        self._auto_accts.clear()
         self._sig_on = False
         self._auto_on = False
         self._set_auto_ind(False, [])
         self._set_sig_ind(False, [])
-        self.log(f"\n⏹ 전체 정지 — {n}개 자산 가동 해제." if self.lang == "ko"
-                 else f"\n⏹ Stopped all — {n} asset(s) disarmed.")
+        self.log(f"\n⏹ 전체 정지 — {n}개 계좌 가동 해제." if self.lang == "ko"
+                 else f"\n⏹ Stopped all — {n} account(s) disarmed.")
         self._refresh_live_panel()
         self._apply_gating()
 
@@ -2341,16 +2428,21 @@ class App:
     def _precheck_tick(self):
         try:
             from datetime import datetime
-            armed = dict(self._sig_assets)
-            for a, jobs in (self._auto_jobs or {}).items():
-                if a not in armed and jobs:
-                    armed[a] = jobs[0]
-            for a, cfg in armed.items():
+            # 무장 계좌 → (브로커, 자산) 조합 수집(중복 제거) — 점검은 브로커 크레덴셜 단위
+            # (대표 2026-07-24 멀티계좌: 같은 브로커 여러 계좌는 크레덴셜이 같아 1회면 충분).
+            seen = {}
+            for _cfg in list(self._sig_accts.values()):
+                for _a in _cfg.get("assets", []):
+                    seen.setdefault((_cfg["broker"], _a), _cfg)
+            for _jobs in list(self._auto_accts.values()):
+                for _j in _jobs:
+                    seen.setdefault((_j["broker"], _j["asset"]), _j)
+            for (bk, a), cfg in seen.items():
                 ent = _next_entry_dt(a)
                 if ent is None:
                     continue
                 mins = (ent - datetime.now(ent.tzinfo)).total_seconds() / 60.0
-                key = (a, ent.isoformat())
+                key = (bk, a, ent.isoformat())
                 if not (0 < mins <= PRECHECK_WINDOW_MIN) or self._precheck_done.get(key):
                     continue
                 self._precheck_done[key] = True
@@ -2482,7 +2574,7 @@ class App:
         """공개 동의 토글 = 즉시 영속(전역·회원 단위 — 탭 전환과 무관). 다음 동기화(수동/자동)가
         새 공개 상태를 서버에 반영한다."""
         self._profile = {**(self._profile or {}), "public": bool(self.tr_public.get())}
-        _save_full(self.lang, self._token, self._acfg, self._profile)
+        self._save_cfg()
         self.log("🔓 공개 트랙레코드: 공개 동의 " + ("ON — 다음 동기화 때 페이지 공개"
                  if self.tr_public.get() else "OFF — 다음 동기화 때 페이지 비공개"))
 
@@ -2524,31 +2616,31 @@ class App:
         public = bool(self.tr_public.get())
         self._profile = {**(self._profile or {}), "public": public}   # handle 캐시 보존
         self._save_current_asset()                          # 프로필 포함 영속화
-        # creds 스냅샷(메인 스레드) — 자산별 '모든 브로커 창고' 순회(대표 2026-07-12):
-        # 브로커를 갈아탔어도(바이빗→빗겟 등) 예전 브로커 체결까지 전부 트랙레코드에 수집.
-        credlist, one_r_by_asset = [], {}
-        for a, c in self._acfg.items():
-            try:
-                one_r = float(c.get("one_r", 0))
-            except (TypeError, ValueError):
-                one_r = 0.0
-            one_r_by_asset[a] = one_r or 600.0
-            for bk, cr in (c.get("creds") or {}).items():
-                f1 = (cr.get("f1") or "").strip()
-                if not f1:
+        # creds 스냅샷(메인 스레드) — 계좌 중심(대표 2026-07-24 멀티계좌): 브로커별 등록 계좌 전부.
+        # 계좌마다 자기 1R을 함께 실어, 아래서 $손익합÷참여계좌 1R합으로 배수를 보존한다(전 계좌 합산).
+        credlist = []
+        for bk, accts in self._accts.items():
+            cr = self._creds.get(bk, {})
+            f1 = (cr.get("f1") or "").strip()
+            if not f1:
+                continue
+            _sp = _BROKER_SPEC.get(bk, {})
+            for ac in accts:
+                aid = (ac.get("id") or "").strip()
+                if _sp.get("acct") and not aid:
                     continue
-                _sp = _BROKER_SPEC.get(bk, {})
-                acct = (cr.get("acct") or "").strip()
-                if _sp.get("acct") and not acct:
-                    continue
-                credlist.append({"asset": a, "broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
-                                 "f3": cr.get("f3", ""), "acct": acct})
-        assets_with_creds = {e["asset"] for e in credlist}
+                try:
+                    one_r = float(ac.get("one_r", 600) or 600)
+                except (TypeError, ValueError):
+                    one_r = 600.0
+                credlist.append({"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
+                                 "f3": cr.get("f3", ""), "acct": aid, "one_r": one_r,
+                                 "label": ac.get("label", "")})
         if not credlist:
             if not auto:
                 messagebox.showwarning(self.t("input_needed"),
-                                       "브로커·키가 설정된 자산이 없습니다." if self.lang == "ko"
-                                       else "No asset has broker credentials configured.")
+                                       "브로커·키가 설정된 계좌가 없습니다." if self.lang == "ko"
+                                       else "No account has broker credentials configured.")
             return
         tok = self._token
         self.log(f"\n📤 트랙레코드 동기화{'(일일 자동)' if auto else ''} — {'공개' if public else '비공개'} · "
@@ -2560,43 +2652,41 @@ class App:
             import autopilot_crypto
             start_ms = int((_t.time() - TR_LOOKBACK_DAYS * 86400) * 1000)
             fills = []
-            seen_brokers = set()                            # 같은 브로커·키·계좌 중복 조회 방지
+            seen = set()                                    # (broker,f1,acct) 중복 조회 방지
             for c in credlist:
-                bk = (c["broker"], c["f1"], c["acct"])
-                if bk in seen_brokers:
+                key = (c["broker"], c["f1"], c["acct"])
+                if key in seen:
                     continue
-                seen_brokers.add(bk)
+                seen.add(key)
                 try:
                     b = _build_broker(c["broker"], c["f1"], c["f2"], c["f3"],
                                       [c["acct"]] if c["acct"] else [])
                     got = b.closed_fills(start_ms)
+                    for f in got:                           # 이 계좌 1R·식별자 태그 → R 정규화용
+                        f["_one_r"] = c["one_r"]
+                        f["_acct_id"] = c["acct"] or c["broker"]
                     fills.extend(got)
-                    self.log(f"   {c['broker']}: 체결 {len(got)}건")
+                    self.log(f"   {_broker_label(c['broker'])}"
+                             + (f" [{c['label']}]" if c["label"] else "") + f": 체결 {len(got)}건")
                 except AttributeError:
-                    self.log(f"   {c['broker']}: 체결 이력 미지원(지원 예정) — 건너뜀")
+                    self.log(f"   {_broker_label(c['broker'])}: 체결 이력 미지원(지원 예정) — 건너뜀")
                 except Exception as e:
-                    self.log(f"   ⚠ {c['broker']} 체결 조회 실패: {e}")
-            # (date, asset[, BTC세션])별 합산 → trade 1건 · R = 실현손익/그 자산 1R.
-            # NQ/GC = 하루 1거래. BTC = 하루 2세션(22·02 UTC 진입)이라 세션별로 쪼갠다 —
-            # 날짜로만 합치면 두 거래가 1건으로 뭉개지고 방향도 첫 체결 것만 남는다(대표 2026-07-11).
+                    self.log(f"   ⚠ {_broker_label(c['broker'])} 체결 조회 실패: {e}")
+            # (date, asset[, BTC세션])별 합산 → trade 1건. NQ/GC=하루 1거래, BTC=하루 2세션(22·02).
             import datetime as _dtd
 
             def _btc_sess(dt):
-                # 청산시각(UTC)으로 세션 판정: 22세션은 익일 02:00 예정청산(=02:05 전) 또는
-                # 진입 직후 조기청산(14:00 이후), 그 사이는 02세션(02:00 진입, 06:00 예정청산·손절 포함).
                 m = dt.hour * 60 + dt.minute
                 return "22" if (m < 125 or m >= 840) else "02"
 
-            # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). 원장 시작 전 체결은 그대로.
-            # 예외: admin 등급(운영자 본인, EQ 전용 계좌)은 수동 진입도 EQ 신호 실행이라 포함
-            # (대표 2026-07-22 "수동으로 가도 동기화에 포함 — 딱 내 것만"). 회원은 원장 필터 유지.
+            # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). admin 등급은 수동도 포함.
             _admin_all = str((self._gate or {}).get("tier") or "") == "admin"
             _ledger, _since = _ledger_load(), _ledger_since()
             _mine = 0
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))
-                if not a or a not in assets_with_creds:
+                if not a:
                     continue
                 if not _admin_all and not self._fill_is_eq(f, a, _ledger, _since):
                     _mine += 1
@@ -2604,28 +2694,28 @@ class App:
                 dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
                 d = dt.date().isoformat()
                 k = (d, a, _btc_sess(dt) if a == "BTC" else "")
-                e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG")})
+                e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
+                                       "accts": {}})
                 e["pnl"] += float(f.get("pnl") or 0)
-            # R 정규화 = 자산 중 최대 1R 기준 통일(대표 2026-07-15) — 자산별 1R이 다르면
-            # 자산별로 나눌 때 실제 비중이 지워짐(BTC $50 승리가 NQ $600 승리와 같은 +1R로 보임).
-            # 최대 1R로 통일하면 곡선이 실제 달러 비례 = 회원이 설정한 포트폴리오 비중 그대로.
-            _unit = max(one_r_by_asset.get(a, 0) or 0 for a in assets_with_creds) or 600.0
-            trades = [{"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d, "instrument": a,
-                       "direction": v["direction"],
-                       "r": round(v["pnl"] / _unit, 3)}
-                      for (d, a, s), v in sorted(agg.items())]
+                # 참여 계좌 1R(계좌 식별자별 — 같은 계좌 여러 체결은 1R 한 번만). $합/1R합의 분모.
+                e["accts"][f.get("_acct_id")] = float(f.get("_one_r") or 600.0)
+            # R 정규화(대표 2026-07-24 멀티계좌) = **$손익 합 ÷ 참여 계좌 1R 합** — 시그널의 진짜
+            # 배수를 보존한다(계좌 A +$1200@1R600 + 계좌 B +$600@1R300 = $1800÷$900 = +2R,
+            # 계좌 수만큼 뻥튀기 안 됨). 계좌당 단일 1R·자산 등가중.
+            trades = []
+            for (d, a, s), v in sorted(agg.items()):
+                _rsum = sum(v["accts"].values()) or 600.0
+                trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d,
+                               "instrument": a, "direction": v["direction"],
+                               "r": round(v["pnl"] / _rsum, 3)})
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
             self.log(f"   일별 합산 {len(trades)}건 → 푸시 (키·잔고 무전송)")
-            # 포트폴리오 비중(자산별 1R 비율) 동봉 — 달러 액수는 안 보내고 최솟값=1 비율만
-            # (프로필 페이지 '포트폴리오 비중' 자동 표시용, 대표 2026-07-15).
-            _ors = {a: float(one_r_by_asset.get(a) or 0) for a in assets_with_creds
-                    if (one_r_by_asset.get(a) or 0) > 0}
-            _base = min(_ors.values()) if _ors else 0
-            risk_weights = ({a: round(v / _base, 2) for a, v in _ors.items()} if _base else None)
+            # 계좌당 단일 1R·자산 등가중(대표 2026-07-24) — 자산 간 포트폴리오 비중은 균등이라 미동봉.
+            risk_weights = None
             pid = autopilot_crypto.path_id(tok)
             ok_total, srv_handle = None, None
             for i in range(0, len(trades), TR_CHUNK):
@@ -2797,15 +2887,111 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
+    def _enter_account(self, cfg, sig, asset, direction, stop, mult):
+        """단일 계좌 진입 — cfg(broker,f1,f2,f3,acct,one_r,label,live)로 사이징+발주.
+        로그는 계좌 라벨을 앞에 붙여 멀티계좌를 구분한다(대표 2026-07-24). 계좌 실패는
+        그 계좌만 스킵 — 다른 계좌 진입은 계속 진행한다."""
+        import datetime as _dtl
+        from eqexec import sizing
+        _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
+        f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
+        lbl = cfg.get("label") or (sc[-4:] if sc else _broker_label(_broker))
+        live = self._live_now(cfg.get("live"))
+        _eff_r = one_r * mult
+        _sz = sizing.compute_size(asset, _broker, _eff_r, sig.get("entry_ref"), stop, direction)
+        if not _sz:
+            self.log(f"   ⏭ [{lbl}] 사이징 불가(진입/손절 확인) — 건너뜀."); return
+        size = _sz["size"]; sym = _sz["symbol"]
+        _legs = _sz.get("legs") or [(sym, size)]
+        if size <= 0:
+            self.log(f"   ⏭ [{lbl}] 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.")
+            return
+        self.log(f"   [{lbl}] {asset} {direction} x{size} ({sym}) · 손절 {stop} · "
+                 f"1R=${one_r:g}×{mult:.2f}=${_eff_r:g}(거리 {_sz['risk_pts']}) · "
+                 f"{'LIVE' if live else 'dry-run'}{(' [' + sc + ']') if sc else ''}")
+        _pub = sig.get("published_at")
+        _recv = _dtl.datetime.now()
+        _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))
+        try:
+            b = _build_broker(_broker, user, key, f3, [sc] if sc else [])
+            if _is_fut:
+                # 선물(Topstep/IBKR): 미니/마이크로 legs 분할 진입 — 계좌·계약조회·잔여정리·
+                # 진입·손절 전부 leg-aware 헬퍼가 그 계좌(sc)에서 처리(대표 2026-07-16).
+                self._run_futures_entry(b, sc, _legs, direction, stop, sig, live, _recv, asset, _pub)
+                return
+            # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
+            _mysym = b._symbol(sym)
+            _existing = b.list_open_positions()
+            _mine = [p for p in _existing if p.symbol == _mysym]
+            _others = [p for p in _existing if p.symbol != _mysym]
+            if _others:
+                self.log(f"   ⚠ [{lbl}] 다른 심볼 포지션 {len(_others)}개 감지 — 건드리지 않음: "
+                         + ", ".join(f"{p.symbol}" for p in _others[:3]))
+            if _mine:
+                if not live:
+                    self.log(f"   (DRY-RUN) [{lbl}] 이전 세션 잔여 {len(_mine)}개 — LIVE면 청산 후 진입.")
+                else:
+                    self.log(f"   ♻ [{lbl}] 이전 세션 잔여 {len(_mine)}개 → 청산 후 진입 (연속 세션)")
+                    _r0 = b.close_symbol(sym, dry_run=False)
+                    if not bool(_r0.get("closed")):
+                        self.log(f"   🛑 [{lbl}] 잔여 청산 미확인: {_r0.get('error')} — 진입 중단."); return
+                    self.log(f"   ✅ [{lbl}] 잔여 청산 확인 — 진입 진행.")
+            if _broker == "bitget" and stop is not None:
+                _basis = _cross_basis_bitget()
+                if _basis:
+                    stop = round(stop + _basis, 2)
+                    self.log(f"   ⚖ [{lbl}] 빗겟 캘리브레이션: 바이빗 대비 {_basis:+.2f} → 손절 {stop}")
+            _pol = ((sig.get("exec_policy") or {}).get("entry")
+                    if isinstance(sig.get("exec_policy"), dict) else None)
+            _ctag = f"EQ-AP-{int(_dtl.datetime.now().timestamp() * 1000)}"
+            if _pol and _pol.get("mode") == "limit_then_market" and _pol.get("limit_price") is not None:
+                res = self._exec_entry_limit(b, sym, direction, size, stop, dict(_pol), live, _broker, _ctag)
+            else:
+                if live:
+                    self._auto_leverage(b, sym, size)
+                res = b.place_entry(symbol=sym, side=direction, size=size,
+                                    stop_loss_price=stop, custom_tag=_ctag, dry_run=not live)
+            if res.get("skipped"):
+                return
+            if res.get("error"):
+                self.log(f"   ❌ [{lbl}] 진입 실패: {res.get('error')}")
+                _em = str(res.get("error"))[:300]; _hint = _entry_fail_hint(_em, self.lang == "ko")
+                self.root.after(0, lambda m=_em, a=asset, h=_hint, L=lbl: messagebox.showerror(
+                    "진입 실패" if self.lang == "ko" else "Entry failed",
+                    (f"[{L}] {a} 진입 주문이 거절되었습니다:\n\n{m}\n\n{h}" if self.lang == "ko"
+                     else f"[{L}] {a} entry order was rejected:\n\n{m}\n\n{h}")))
+                return
+            if not live:
+                self.log(f"   DRY-RUN [{lbl}] entry: {res.get('would_place')}")
+                if res.get("would_place_stop"):
+                    self.log(f"   DRY-RUN [{lbl}] stop:  {res.get('would_place_stop')}")
+            else:
+                self.log(f"   ✅ [{lbl}] 진입 완료: {res.get('entry', res)}")
+                _fill = _dtl.datetime.now()
+                try:
+                    _tot = f"{_fill.timestamp() - float(_pub):.1f}s" if _pub else "?"
+                except (TypeError, ValueError):
+                    _tot = "?"
+                self.log(f"   ⏱ [{lbl}] 체결 확인 {_fill.strftime('%H:%M:%S')} · 발송 후 {_tot}")
+                self._entered_at = _mark_entered(asset)
+                _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
+        except Exception as e:
+            self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
+            _em = str(e)[:300]
+            self.root.after(0, lambda m=_em, a=asset, L=lbl: messagebox.showerror(
+                "진입 실패" if self.lang == "ko" else "Entry failed",
+                (f"[{L}] {a} 진입 중 오류:\n\n{m}" if self.lang == "ko"
+                 else f"[{L}] {a} entry error:\n\n{m}")))
+
     def _sig_loop(self, url):
-        # 무장 자산 설정은 self._sig_assets에서 동적으로 읽는다(자산별 무장/해제 즉시 반영).
-        # {asset: {broker,f1,f2,f3,acct,one_r}} — 신호의 instrument로 해당 자산 설정을 찾아 진입.
+        # 무장 계좌 설정은 self._sig_accts에서 동적으로 읽는다(계좌별 무장/해제 즉시 반영).
+        # {(broker,idx): {broker,f1,f2,f3,acct,one_r,live,assets,label}} — 신호 자산을 굴리는
+        # 계좌 전부에 각자 1R로 진입한다(대표 2026-07-24 멀티계좌).
         import time as _t
         import requests
         import autopilot_crypto
-        from eqexec import sizing
         last_id = None
-        entered_day = {}       # 자산별 {asset: 발행날짜}. 같은 자산 같은 날 재진입 금지, 새 날이면 자동 리셋
+        entered_day = {}       # {(key, dedup_key): 발행날짜}. 계좌·세션별 하루 1회 재진입 금지
         while self._sig_on:
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
@@ -2840,15 +3026,13 @@ class App:
                 _asset = str(sig.get("instrument") or "").upper()   # NQ/GC/BTC
                 _sess = sig.get("session")                          # BTC 2세션(22/2), 나머지 None
                 _dedup_key = f"{_asset}:{_sess}" if _sess is not None else _asset  # 세션별 재진입 판정
-                cfg = self._sig_assets.get(_asset)   # 동적 — 미무장 자산 신호는 스킵
-                # 이 자산 미설정(탭에 브로커·키·1R 없음) → 진입 안 함. 다른 자산 신호만 처리.
-                if not cfg:
-                    self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산은 자동진입 미설정, 건너뜀.")
+                # 이 자산을 굴리는 무장 계좌 전부(동적) — assets에 자산이 포함된 계좌
+                targets = [(key, cfg) for key, cfg in list(self._sig_accts.items())
+                           if _asset in cfg.get("assets", [])]
+                if not targets:
+                    self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산 자동진입 미설정(켜진 계좌 없음), 건너뜀.")
                     _t.sleep(SIG_POLL_SECS); continue
-                _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
-                f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
-                live = self._live_now(cfg.get("live"))   # 이 자산 LIVE 선택 × 발주 순간 게이트 재판정
-                # 신호 발행 시각 → 나이(신선도) + 발행 '날짜'(하루 1회 재진입 판정)
+                # 신선도/발행일 게이트 (시그널 단위 1회, 계좌 무관)
                 import datetime as _dtd
                 _pub_ts = sig.get("published_at")
                 try:
@@ -2857,13 +3041,6 @@ class App:
                                 if _pub_ts is not None else None)
                 except (TypeError, ValueError):
                     _age, _sig_day = None, None
-                # 🚫 재진입 금지(자산별 하루 1회): 이 자산이 이 '발행 날짜'에 이미 진입했으면 스킵
-                # (놓쳤든 청산됐든 같은 날 같은 자산 재진입 X). 다른 자산·다음 날 새 신호엔 자동 재진입.
-                if _sig_day is not None and entered_day.get(_dedup_key) == _sig_day:
-                    self.log(f"\n⏹ 신호 [{sid}] {_asset} 무시 — 오늘({_sig_day}) 이미 진입함(재진입 금지). "
-                             f"다음 날 새 신호에 다시 진입합니다.")
-                    _t.sleep(SIG_POLL_SECS)
-                    continue
                 # 🛑 오래된 신호로 실수 진입 방지: published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이 아니면
                 # 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
                 if _age is None or _age > MAX_SIGNAL_AGE_SEC:
@@ -2874,136 +3051,45 @@ class App:
                     else:
                         _why = f"발행 {_age / 60:.0f}분 전(오래됨)"
                     self.log(f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 새 신호를 기다립니다.")
-                    _t.sleep(SIG_POLL_SECS)
-                    continue
-                entered_day[_dedup_key] = _sig_day   # 이 자산·세션 이 날 진입 처리 완료 → 같은 날 재진입 금지(성공/실패 무관)
+                    _t.sleep(SIG_POLL_SECS); continue
                 direction, stop = sig.get("direction"), sig.get("stop_price")
-                # 계약 수 = 사용자 1R($) × 신호 size 배수(신뢰도 사이징, 시스템 공식과 동일 —
-                # 백테스트/트랙레코드 R 계산이 이 배수를 전제. 대표 2026-07-12 감사에서 누락 발견).
-                # 배수는 0~3으로 클램프(랜딩 '거래당 최대 3R' 캡과 일치).
+                # size 배수(신뢰도 사이징) — 0~3 클램프(랜딩 '거래당 최대 3R' 캡과 일치).
                 try:
                     _mult = float(sig.get("size_mult") or 1.0)
                 except (TypeError, ValueError):
                     _mult = 1.0
                 _mult = max(0.0, min(_mult, 3.0))
-                _eff_r = one_r * _mult
-                _sz = sizing.compute_size(_asset, _broker, _eff_r,
-                                          sig.get("entry_ref"), stop, direction)
-                if not _sz:
-                    self.log(f"\n⏭ 신호 [{sid}] — 사이징 불가(자산 {_asset}·브로커 {_broker}·"
-                             f"진입/손절 확인). 건너뜀."); continue
-                size = _sz["size"]            # 선물=정수 계약 · 크립토=분수 BTC (int() 하면 0.3→0 됨!)
-                sym = _sz["symbol"]
-                _legs = _sz.get("legs") or [(sym, size)]   # 미니/마이크로 분할 (대표 2026-07-16)
-                # 캡처 순간 로그 — 보낸 시각(피드 published_at) · 받은 시각(now) · 지연 · 포지션 정보.
                 import datetime as _dtl
-                _recv = _dtl.datetime.now()
-                _pub = sig.get("published_at")
+                _recv = _dtl.datetime.now(); _pub = sig.get("published_at")
                 try:
                     _sent = _dtl.datetime.fromtimestamp(float(_pub)) if _pub else None
                     _lat = f"{_recv.timestamp() - float(_pub):.1f}s"
                 except (TypeError, ValueError):
                     _sent, _lat = None, "?"
-                self.log(f"\n📶 신호 캡처 [{sid}] — {_asset or sym} {direction} x{size} {sym}")
-                self.log(f"   포지션: {direction} · 수량 {size} ({sym}) · 손절 {stop} · 진입참조 "
-                         f"{sig.get('entry_ref')} · 1R=${one_r:g}×{_mult:.2f}x=${_eff_r:g}"
-                         f"(손절거리 {_sz['risk_pts']})")
+                # 🚫 재진입 금지(계좌·세션별 하루 1회) → 발주 대상 계좌 선별
+                _fire = []
+                for _key, _cfg in targets:
+                    if _sig_day is not None and entered_day.get((_key, _dedup_key)) == _sig_day:
+                        self.log(f"   ⏹ [{_cfg.get('label')}] {_asset} 오늘({_sig_day}) 이미 진입 — 재진입 금지.")
+                        continue
+                    entered_day[(_key, _dedup_key)] = _sig_day   # 성공/실패 무관 — 같은 날 재진입 금지
+                    _fire.append(_cfg)
+                if not _fire:
+                    _t.sleep(SIG_POLL_SECS); continue
+                self.log(f"\n📶 신호 캡처 [{sid}] — {_asset} {direction} · 손절 {stop} · "
+                         f"진입참조 {sig.get('entry_ref')} · size×{_mult:.2f} · {len(_fire)}개 계좌 동시 진입")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
                          f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
-                _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))
-                self.log(f"   → {sym} @ {_broker} → {'LIVE' if live else 'dry-run'} 진입"
-                         f"{(' [' + sc + ']') if sc else ''}")
-                if size <= 0:
-                    self.log(f"   ⏭ 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀."); continue
-                try:
-                    b = _build_broker(_broker, user, key, f3, [sc] if sc else [])
-                    if _is_fut:
-                        # ── 선물(Topstep/IBKR): 미니/마이크로 legs 분할 진입 (대표 2026-07-16) ──
-                        # 계좌·계약조회·잔여정리·진입·손절 전부 leg-aware 헬퍼가 처리.
-                        self._run_futures_entry(b, sc, _legs, direction, stop, sig, live,
-                                                _recv, _asset, _pub)
-                        continue
-                    else:
-                        # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
-                        # 잔여 포지션 정리(연속 세션 순서 보장) — BTC 22-02 청산 = 02-06 진입 시각에서
-                        # 뒤집히면 2배 포지션. '이 심볼' 잔여만 청산·확인 후 진입(다른 심볼 무접촉).
-                        _mysym = b._symbol(sym)
-                        _existing = b.list_open_positions()
-                        _mine = [p for p in _existing if p.symbol == _mysym]
-                        _others = [p for p in _existing if p.symbol != _mysym]
-                        if _others:
-                            self.log(f"   ⚠ 다른 심볼 포지션 {len(_others)}개 감지 — 건드리지 않음: "
-                                     + ", ".join(f"{p.symbol}" for p in _others[:3]))
-                        if _mine:
-                            if not live:
-                                self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(_mine)}개 — LIVE면 청산 확인 후 진입.")
-                            else:
-                                self.log(f"   ♻ 이전 세션 잔여 {len(_mine)}개 → 청산 후 진입 (연속 세션)")
-                                _r0 = b.close_symbol(sym, dry_run=False)
-                                if not bool(_r0.get("closed")):
-                                    self.log(f"   🛑 잔여 청산 미확인: {_r0.get('error')} — 진입 중단."); continue
-                                self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
-                        # Bitget = Bybit 좌표계 손절에 거래소 베이시스 가산(캘리브레이션, 대표 2026-07-12)
-                        if _broker == "bitget" and stop is not None:
-                            _basis = _cross_basis_bitget()
-                            if _basis:
-                                stop = round(stop + _basis, 2)
-                                self.log(f"   ⚖ 빗겟 캘리브레이션: 바이빗 대비 {_basis:+.2f} → 손절 {stop}")
-                        # ── 체결 정책(대표 2026-07-15): 서버 exec_policy.entry가 지정가 모드면
-                        #    지정가(메이커) N회 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
-                        #    페이로드에 정책 없으면(구 서버) 기존 시장가 그대로. ──
-                        _pol = ((sig.get("exec_policy") or {}).get("entry")
-                                if isinstance(sig.get("exec_policy"), dict) else None)
-                        _ctag = f"EQ-AP-{int(_dtl.datetime.now().timestamp() * 1000)}"
-                        if _pol and _pol.get("mode") == "limit_then_market" \
-                                and _pol.get("limit_price") is not None:
-                            res = self._exec_entry_limit(b, sym, direction, size, stop,
-                                                         dict(_pol), live, _broker, _ctag)
-                        else:
-                            if live:
-                                self._auto_leverage(b, sym, size)   # 시장가 직행 경로도 동일 보호
-                            res = b.place_entry(symbol=sym, side=direction, size=size,
-                                                stop_loss_price=stop, custom_tag=_ctag,
-                                                dry_run=not live)
-                    if res.get("skipped"):
-                        continue                      # 정책 스킵(불리 이동) — 로그·팝업은 이미 출력
-                    if res.get("error"):
-                        self.log(f"   ❌ 진입 실패: {res.get('error')}")
-                        # 눈에 띄는 알림(대표 2026-07-12) — 마진 부족·API 거절 등을 놓치지 않게.
-                        _em = str(res.get("error"))[:300]
-                        _hint = _entry_fail_hint(_em, self.lang == "ko")
-                        self.root.after(0, lambda m=_em, a=_asset, h=_hint: messagebox.showerror(
-                            "진입 실패" if self.lang == "ko" else "Entry failed",
-                            (f"{a} 진입 주문이 거절되었습니다:\n\n{m}\n\n{h}"
-                             if self.lang == "ko" else
-                             f"{a} entry order was rejected:\n\n{m}\n\n{h}")))
-                        continue
-                    if not live:
-                        self.log(f"   DRY-RUN entry: {res.get('would_place')}")
-                        if res.get("would_place_stop"):
-                            self.log(f"   DRY-RUN stop:  {res.get('would_place_stop')}")
-                    else:
-                        self.log(f"   ✅ 진입 완료: {res.get('entry', res)}")
-                        # 체결 타임스탬프 + 발송 대비 총 지연(대표 2026-07-15) — 수신 지연(⏱ 캡처)과
-                        # 세트로 '발송→체결' 전 구간을 로그로 증빙.
-                        _fill = _dtl.datetime.now()
-                        try:
-                            _tot = f"{_fill.timestamp() - float(_pub):.1f}s" if _pub else "?"
-                        except (TypeError, ValueError):
-                            _tot = "?"
-                        self.log(f"   ⏱ 체결 확인 {_fill.strftime('%H:%M:%S')} · 발송 후 {_tot}")
-                        # LIVE 진입 시각 기록(영속) — 자동청산 잡이 발화창 내 '방금 진입'을
-                        # 알아보고 새 포지션을 죽이지 않게(연속 세션 순서 보장).
-                        self._entered_at = _mark_entered(_asset)
-                        _ledger_add(_asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
-                        # 크립토 손절은 주문에 첨부(거래소 스탑) — 별도 거치/재시도 불필요.
-                except Exception as e:
-                    self.log(f"   ❌ signal entry failed: {e}")
-                    _em = str(e)[:300]
-                    self.root.after(0, lambda m=_em, a=_asset: messagebox.showerror(
-                        "진입 실패" if self.lang == "ko" else "Entry failed",
-                        (f"{a} 진입 중 오류:\n\n{m}" if self.lang == "ko"
-                         else f"{a} entry error:\n\n{m}")))
+                # 계좌별 병렬 발주 — 순차 지연으로 계좌 간 진입가가 벌어지는 것 방지(대표 2026-07-24).
+                # 각 계좌는 독립 스레드로 동시에 쏘고(스레드마다 독립 브로커 객체), 로그는 계좌
+                # 라벨 [펀디드]/[챌린지]로 구분된다. 한 계좌 실패는 그 계좌만 스킵(다른 계좌 진행).
+                _ths = []
+                for _cfg in _fire:
+                    _th = threading.Thread(target=self._enter_account,
+                                           args=(_cfg, sig, _asset, direction, stop, _mult), daemon=True)
+                    _th.start(); _ths.append(_th)
+                for _th in _ths:
+                    _th.join(timeout=45)
             _t.sleep(SIG_POLL_SECS)
 
 
