@@ -2400,14 +2400,23 @@ class App:
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod
     def _fill_asset(symbol: str):
-        """체결 심볼 → 자산. BTCUSDT→BTC · MNQ 계약→NQ · MGC 계약→GC. 모르면 None(제외)."""
+        """체결 심볼 → 자산. 마이크로(MGC·MNQ)와 풀사이즈(GCE·ENQ·GC·NQ)를 **모두** 인식한다
+        (대표 2026-07-24 실사고: 미니/마이크로 분할 진입 시 풀 GC='GCE'가 None으로 드롭돼
+        $3578 체결이 트랙레코드에서 통째로 누락). ProjectX 계약ID='CON.F.US.<ROOT>.<만기>'라
+        ROOT로 판별하고, 형식이 달라도 티커 토큰으로 폴백. 모르면 None(제외)."""
         s = str(symbol or "").upper()
-        if "BTCUSDT" in s:
+        if "BTC" in s:
             return "BTC"
-        if ".MNQ." in s or s.startswith("MNQ"):
-            return "NQ"
-        if ".MGC." in s or s.startswith("MGC"):
+        parts = s.split(".")
+        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+        if root in ("MGC", "GCE", "GC"):
             return "GC"
+        if root in ("MNQ", "ENQ", "NQ"):
+            return "NQ"
+        # 폴백: CON 형식이 아니어도 명확한 티커 토큰이 있으면 매핑
+        for _tok, _a in (("MGC", "GC"), ("GCE", "GC"), ("MNQ", "NQ"), ("ENQ", "NQ")):
+            if _tok in s:
+                return _a
         return None
 
     @staticmethod
