@@ -1023,6 +1023,18 @@ class App:
                        command=self._add_acct).pack(side="left", padx=(4, 0))
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
+            # 선물 자산 간 계좌 설정 복사(대표 2026-07-26 #20) — NQ·GC는 같은 프롭 계좌로 운용
+            _srcs = [a for a in _ASSETS if a != self._asset
+                     and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
+            if _srcs:
+                cprow = ttk.Frame(frm); cprow.pack(fill="x", pady=(2, 2))
+                ttk.Label(cprow, text=("계좌 설정 복사 ←" if self.lang == "ko"
+                                       else "Copy account setup ←"),
+                          foreground="#888").pack(side="left")
+                for _src in _srcs:
+                    ttk.Button(cprow, text=_src, width=5,
+                               command=lambda a=_src: self._copy_acct_setup(a)
+                               ).pack(side="left", padx=(4, 0))
         else:
             # 크립토(Bybit/Bitget) — 계좌ID 개념 없음. 단일 계좌(id="")의 1R만 노출.
             ttk.Label(frm, text=("거래 규모 (1R)" if self.lang == "ko" else "Sizing (1R)"),
@@ -1478,9 +1490,10 @@ class App:
             pass
         self._set_actions_enabled(not on)
 
-    def _creds_ok(self):
+    def _creds_ok(self, silent=False):
         # 빠진 필드를 브로커 실제 라벨로 안내 — 옛 고정문구 "이메일과 API Key"는 Bybit 등
         # 크립토(이메일 칸 없음)에서 대혼란(테스터 리포트 2026-07-12).
+        # silent=True: 팝업 없이 True/False만(계좌 추가 후 자동 연결 테스트 게이트, #19).
         spec = _BROKER_SPEC.get(self._broker_name, {})
         _missing = []
         if not self.user.get().strip():
@@ -1488,6 +1501,8 @@ class App:
         if spec.get("f2") and not self._secret():
             _missing.append(spec.get("f2"))
         if _missing:
+            if silent:
+                return False
             _f = " · ".join(_missing)
             messagebox.showwarning(
                 self.t("input_needed"),
@@ -1513,6 +1528,30 @@ class App:
                 self.acct_pick.set(names[0])
         except Exception:
             pass
+
+    def _copy_acct_setup(self, src_asset):
+        """다른 선물 자산(src)의 계좌 구성(계좌 목록·1R·프롭/자본% 모드)을 현재 자산으로 복사.
+        NQ·GC는 같은 프롭 계좌로 운용하므로 설정을 한 번에 맞춘다(대표 2026-07-26 #20).
+        브로커·크레덴셜은 자산별 독립이라 건드리지 않는다 — 계좌 구성만 복사."""
+        import copy as _copy
+        dst = self._asset
+        src_accts = self._accts_of(src_asset)
+        if not src_accts or not any((x.get("id") or "").strip() for x in src_accts):
+            messagebox.showinfo(self.t("btn_accts"),
+                                (f"{src_asset}에 복사할 계좌가 없습니다." if self.lang == "ko"
+                                 else f"No accounts to copy from {src_asset}.")); return
+        if not messagebox.askyesno(
+                ("계좌 설정 복사" if self.lang == "ko" else "Copy account setup"),
+                (f"{src_asset}의 계좌 구성을 {dst}(으)로 덮어쓸까요? (브로커·키는 유지)"
+                 if self.lang == "ko" else
+                 f"Overwrite {dst}'s account setup with {src_asset}'s? (broker/keys kept)")):
+            return
+        self._collect_acct_widgets()
+        self._acfg[dst]["accounts"] = [_copy.deepcopy(a) for a in src_accts]
+        self._save_cfg()
+        self._build()
+        self.log(f"📋 {src_asset} → {dst} 계좌 설정 복사 완료 "
+                 f"({len(src_accts)}개 계좌)")
 
     def _add_acct(self):
         """자산 탭 설정에서 계좌 추가 — acct_pick의 선택/입력값을 이 자산의 계좌ID로 등록(중복 방지)."""
@@ -1541,6 +1580,9 @@ class App:
             accts.append(_new_acct(600.0, aid, True, aid[-4:]))
         self._save_cfg()
         self._build()
+        # 계좌 추가 직후 연결 테스트 자동 실행 (대표 2026-07-26 #19) — 크레덴셜이 있을 때만
+        if self._creds_ok(silent=True):
+            self.healthcheck()
 
     def _del_acct(self, asset, idx):
         """이 자산의 등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지. 인덱스가 밀리므로
