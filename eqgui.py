@@ -1579,10 +1579,13 @@ class App:
         else:
             accts.append(_new_acct(600.0, aid, True, aid[-4:]))
         self._save_cfg()
+        # 자동 연결 테스트(#19): creds 판정은 재빌드 '전'(위젯 값 살아있을 때), 실행은 재빌드
+        # '후' 지연(위젯 재생성 완료 뒤). 순서가 뒤집히면 연결 테스트가 빈 크레덴셜로 실패하거나
+        # 재빌드 도중 위젯 접근으로 계좌 목록이 깜빡였음(대표 2026-07-26 리포트).
+        _auto_test = self._creds_ok(silent=True)
         self._build()
-        # 계좌 추가 직후 연결 테스트 자동 실행 (대표 2026-07-26 #19) — 크레덴셜이 있을 때만
-        if self._creds_ok(silent=True):
-            self.healthcheck()
+        if _auto_test:
+            self.root.after(350, self.healthcheck)
 
     def _del_acct(self, asset, idx):
         """이 자산의 등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지. 인덱스가 밀리므로
