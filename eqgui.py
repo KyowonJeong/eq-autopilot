@@ -461,17 +461,23 @@ def _pin_ok(pin):
 
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 900.0, "r_buffer": 300.0,
                   "r_steady": 600.0, "buffer": 9000.0, "start_bal": 150000.0}
+_PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 
 
-def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None):
+def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
         p["on"] = bool(p["on"]); p["type"] = "funded" if p["type"] == "funded" else "test"
         for k in ("r_test", "r_buffer", "r_steady", "buffer", "start_bal"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
+    pc = dict(_PCT_DEFAULTS)
+    if isinstance(pct, dict):
+        pc["on"] = bool(pct.get("on"))
+        pc["pct"] = _as_float(pct.get("pct"), _PCT_DEFAULTS["pct"])
+        pc["floor"] = _as_float(pct.get("floor"), _PCT_DEFAULTS["floor"])
     return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
-            "label": str(label or ""), "prop": p}
+            "label": str(label or ""), "prop": p, "pct": pc}
 
 
 def _as_float(v, default=0.0):
@@ -510,7 +516,7 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"))
+                                  x.get("prop"), x.get("pct"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -521,7 +527,7 @@ def _load():
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                      x.get("prop"))
+                                      x.get("prop"), x.get("pct"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -1783,7 +1789,7 @@ class App:
             missing.append("켜진 계좌" if self.lang == "ko" else "account on")
         else:
             if any(_as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on")
-                   for ac in active):
+                   and not (ac.get("pct") or {}).get("on") for ac in active):
                 missing.append("1R")
             if _sp.get("acct") and any(not (ac.get("id") or "").strip() for ac in active):
                 missing.append("계좌ID" if self.lang == "ko" else "acct id")
@@ -1809,6 +1815,73 @@ class App:
                              else ("RUNNING live" if live else "RUNNING dry"))
             return base, ("#21c55e" if live else "#eab308")
         return base + (" · 준비됨" if self.lang == "ko" else " · ready"), "#9ca3af"
+
+    def _pct_btn_text(self, pc):
+        if (pc or {}).get("on"):
+            return (f"자본 {_as_float(pc.get('pct'), 0.4):g}%" if self.lang == "ko"
+                    else f"{_as_float(pc.get('pct'), 0.4):g}% eq")
+        return "자본%: 끔" if self.lang == "ko" else "% sizing: off"
+
+    def _pct_dialog(self, idx):
+        """계좌별 자본 비례 사이징(대표 2026-07-26 #18): 1R = 잔고 × pct%, 최소 floor.
+        발주 순간 잔고 조회(선물=account_balance / 크립토=available_usdt). 프롭 모드와 배타."""
+        ko = self.lang == "ko"
+        try:
+            acct = self._accts_of(self._asset)[idx]
+        except Exception:
+            return
+        if (acct.get("prop") or {}).get("on"):
+            messagebox.showinfo("EQ", ("프롭 자동 사이징이 켜져 있어 자본 비례를 함께 쓸 수 없습니다. "
+                                       "프롭을 끄고 다시 시도하세요." if ko else
+                                       "Prop auto-sizing is on; disable it first to use % sizing."))
+            return
+        pc = dict(_PCT_DEFAULTS); pc.update(acct.get("pct") or {})
+        win = tk.Toplevel(self.root)
+        win.title(("자본 비례 사이징 — " + (acct.get("label") or "")) if ko
+                  else ("Capital-proportional sizing — " + (acct.get("label") or "")))
+        win.resizable(False, False); win.grab_set()
+        frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
+        on_v = tk.IntVar(value=1 if pc.get("on") else 0)
+        ttk.Checkbutton(frm, variable=on_v,
+                        text=("자본 비례 사이징 사용(잔고의 %로 1R 자동)" if ko else
+                              "Enable capital-proportional sizing (1R = % of balance)")
+                        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(frm, text=("잔고 대비 비율 %" if ko else "Percent of balance %")).grid(row=1, column=0, sticky="w")
+        pe = ttk.Entry(frm, width=8); pe.insert(0, f"{_as_float(pc.get('pct'), 0.4):g}")
+        pe.grid(row=1, column=1, sticky="w")
+        ttk.Label(frm, text=("최소 1R $ (수수료 방어)" if ko else "Min 1R $ (fee floor)")).grid(row=2, column=0, sticky="w")
+        fe = ttk.Entry(frm, width=8); fe.insert(0, f"{_as_float(pc.get('floor'), 200.0):g}")
+        fe.grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, foreground="#888", wraplength=360, justify="left",
+                  text=(("발주 순간 계좌 잔고를 조회해 1R = 잔고 × 비율로 계산합니다(선물·크립토 모두). "
+                         "권장 0.4%는 13년 최악 낙폭(약 42R)에서도 자본의 ~17%에 그치는 안전 비율입니다. "
+                         "잔고 조회가 안 되면 24시간 내 마지막 성공값을 쓰고, 그것도 없으면 그 계좌는 "
+                         "이번 진입을 건너뜁니다.") if ko else
+                        ("At order time the account balance is read and 1R = balance × percent "
+                         "(futures and crypto alike). The suggested 0.4% keeps even the 13-year "
+                         "worst drawdown (~42R) to ~17% of capital. If the balance can't be read, "
+                         "the last value within 24h is used; if none, that account skips the entry."))
+                  ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 8))
+
+        def _ok():
+            newc = {"on": bool(on_v.get()), "pct": _as_float(pe.get(), 0.4),
+                    "floor": _as_float(fe.get(), 200.0)}
+            if newc["on"] and (newc["pct"] <= 0 or newc["pct"] > 100):
+                messagebox.showwarning("EQ", "비율은 0~100 사이여야 합니다." if ko
+                                       else "Percent must be between 0 and 100."); return
+            acct["pct"] = newc
+            try:
+                w = self._acct_widgets.get(idx) or {}
+                if w.get("pct_btn"):
+                    w["pct_btn"].config(text=self._pct_btn_text(newc))
+                if w.get("one_r"):
+                    w["one_r"].config(state=("disabled" if newc["on"] else "normal"))
+            except Exception:
+                pass
+            self._save_acct_widgets(); win.destroy()
+
+        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=4, column=1)
+        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=4, column=2)
 
     def _prop_btn_text(self, pr):
         if not (pr or {}).get("on"):
@@ -1923,8 +1996,13 @@ class App:
                         command=lambda i=idx: self._prop_dialog(i))
         pb.pack(side="left", padx=(4, 0))
         self._acct_widgets[idx]["prop_btn"] = pb
-        if pr.get("on"):
-            r_e.config(state="disabled")               # 프롭 자동 사이징 중엔 수동 1R 비활성
+        pc = acct.get("pct") or {}
+        cb = ttk.Button(row, text=self._pct_btn_text(pc), width=10,
+                        command=lambda i=idx: self._pct_dialog(i))
+        cb.pack(side="left", padx=(4, 0))
+        self._acct_widgets[idx]["pct_btn"] = cb
+        if pr.get("on") or pc.get("on"):
+            r_e.config(state="disabled")               # 자동 사이징 중엔 수동 1R 비활성
         if aid:
             ttk.Label(row, text=f"…{aid[-6:]}", foreground="#888").pack(side="left", padx=(4, 0))
         elif spec.get("acct"):
@@ -2054,6 +2132,7 @@ class App:
         if arm_sig:
             self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
                                     "prop": dict(acct.get("prop") or {}),
+                                    "pct": dict(acct.get("pct") or {}),
                                     "live": live, "label": acct.get("label", "")}
             if not self._sig_on:
                 self._sig_on = True
@@ -2105,7 +2184,8 @@ class App:
             _need_id = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
             for ac in _act:
                 _nm = ac.get("label") or "?"
-                if _as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on"):
+                if (_as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on")
+                        and not (ac.get("pct") or {}).get("on")):
                     bad.append(f"{a} {_nm}: 1R")
                 if _need_id and not (ac.get("id") or "").strip():
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
@@ -2963,6 +3043,43 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
+    def _acct_balance(self, cfg):
+        """계좌 잔고($) 통합 조회 — 선물(account_balance) / 크립토(available_usdt).
+        성공 시 (self._bal_cache에 캐시). 24h 내 마지막 성공값 폴백. 실패·무값 시 None."""
+        import time as _t
+        b = _build_broker(cfg["broker"], cfg["f1"], cfg["f2"], cfg["f3"],
+                          [cfg["acct"]] if cfg.get("acct") else [])
+        bal = None
+        try:
+            if hasattr(b, "account_balance"):
+                bal = b.account_balance(cfg.get("acct"))
+            elif hasattr(b, "available_usdt"):
+                bal = b.available_usdt()
+        except Exception:
+            bal = None
+        ck = (cfg["broker"], cfg.get("acct") or cfg.get("f1"))
+        cache = getattr(self, "_bal_cache", None)
+        if cache is None:
+            cache = self._bal_cache = {}
+        if bal is not None and bal > 0:
+            cache[ck] = (float(bal), _t.time())
+            return float(bal)
+        hit = cache.get(ck)
+        if hit and (_t.time() - hit[1]) <= 86400:
+            return hit[0]                               # 24h 내 마지막 성공값 폴백
+        return None
+
+    def _pct_one_r(self, pc, cfg, lbl):
+        """자본 비례 1R = 잔고 × pct%, 최소 floor. 잔고 조회 실패 시 None(호출부가 스킵)."""
+        bal = self._acct_balance(cfg)
+        if bal is None:
+            return None
+        pct = _as_float(pc.get("pct"), 0.4)
+        floor = _as_float(pc.get("floor"), 200.0)
+        r = max(bal * pct / 100.0, floor)
+        self.log(f"   ⚙ [{lbl}] 자본 비례 1R=${r:,.0f} (잔고 ${bal:,.0f} × {pct:g}%, 최소 ${floor:g})")
+        return r
+
     def _prop_one_r(self, pr, cfg, lbl):
         """프롭 페이즈 1R 해석. 테스트기=r_test 고정. 펀디드=발주 순간 잔고로
         (잔고−시작잔고)≥버퍼 → 안정기, 아니면 버퍼기 — 매일 재평가·히스테리시스 없음.
@@ -3008,8 +3125,14 @@ class App:
         lbl = cfg.get("label") or (sc[-4:] if sc else _broker_label(_broker))
         live = self._live_now(cfg.get("live"))
         _pr = cfg.get("prop") or {}
+        _pc = cfg.get("pct") or {}
         if _pr.get("on"):
             one_r = self._prop_one_r(_pr, cfg, lbl)    # 페이즈별 1R(대표 2026-07-26 #16)
+        elif _pc.get("on"):
+            _pr1 = self._pct_one_r(_pc, cfg, lbl)      # 자본 비례 1R(대표 2026-07-26 #18)
+            if _pr1 is None:
+                self.log(f"   ⏭ [{lbl}] 잔고 조회 불가(24h 내 값 없음) — 자본 비례 진입 건너뜀."); return
+            one_r = _pr1
         _eff_r = one_r * mult
         _sz = sizing.compute_size(asset, _broker, _eff_r, sig.get("entry_ref"), stop, direction)
         if not _sz:
