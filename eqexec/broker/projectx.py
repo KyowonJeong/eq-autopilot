@@ -95,6 +95,18 @@ class ProjectXBroker(BrokerAdapter):
                      if str(a.get("name", "")).lower() in want or str(a.get("id")) in want]
         return accts
 
+    def account_balance(self, acct):
+        """계좌(이름 또는 id) 현재 잔고($) — 프롭 페이즈 자동 사이징용(대표 2026-07-26).
+        못 찾거나 API 실패 시 None(호출부가 버퍼기 1R로 폴백)."""
+        want = str(acct or "").strip().lower()
+        if not want:
+            return None
+        for a in self._accounts():
+            if str(a.get("name", "")).lower() == want or str(a.get("id")) == want:
+                bal = a.get("balance")
+                return float(bal) if bal is not None else None
+        return None
+
     def search_contracts(self, text: str, live: bool = False) -> list[dict]:
         """POST /api/Contract/search {searchText, live} -> {contracts:[{id, name, description,
         tickSize, tickValue, activeContract, ...}]}. Used to resolve the current front-month

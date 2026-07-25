@@ -459,9 +459,19 @@ def _pin_ok(pin):
     return bool(h) and hashlib.sha256(pin.encode()).hexdigest() == h
 
 
-def _new_acct(one_r=600.0, acct_id="", on=True, label=""):
+_PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 900.0, "r_buffer": 300.0,
+                  "r_steady": 600.0, "buffer": 9000.0, "start_bal": 150000.0}
+
+
+def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None):
+    p = dict(_PROP_DEFAULTS)
+    if isinstance(prop, dict):
+        p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
+        p["on"] = bool(p["on"]); p["type"] = "funded" if p["type"] == "funded" else "test"
+        for k in ("r_test", "r_buffer", "r_steady", "buffer", "start_bal"):
+            p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
     return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
-            "label": str(label or "")}
+            "label": str(label or ""), "prop": p}
 
 
 def _as_float(v, default=0.0):
@@ -499,7 +509,8 @@ def _load():
             creds = {b: {"f1": (creds_all.get(b) or {}).get("f1", ""),
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
-            accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
+            accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
+                                  x.get("prop"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -509,7 +520,8 @@ def _load():
                      for b, cr in (s.get("creds") or {}).items() if b in brs}
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
-                accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"))
+                accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
+                                      x.get("prop"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -1770,7 +1782,8 @@ class App:
         if not active:
             missing.append("켜진 계좌" if self.lang == "ko" else "account on")
         else:
-            if any(_as_float(ac.get("one_r")) <= 0 for ac in active):
+            if any(_as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on")
+                   for ac in active):
                 missing.append("1R")
             if _sp.get("acct") and any(not (ac.get("id") or "").strip() for ac in active):
                 missing.append("계좌ID" if self.lang == "ko" else "acct id")
@@ -1796,6 +1809,82 @@ class App:
                              else ("RUNNING live" if live else "RUNNING dry"))
             return base, ("#21c55e" if live else "#eab308")
         return base + (" · 준비됨" if self.lang == "ko" else " · ready"), "#9ca3af"
+
+    def _prop_btn_text(self, pr):
+        if not (pr or {}).get("on"):
+            return "프롭: 끔" if self.lang == "ko" else "Prop: off"
+        if pr.get("type") == "funded":
+            return "프롭: 펀디드" if self.lang == "ko" else "Prop: funded"
+        return "프롭: 테스트" if self.lang == "ko" else "Prop: test"
+
+    def _prop_dialog(self, idx):
+        """계좌별 프롭 자동 사이징 설정(대표 2026-07-26 태스크 #16).
+        유형=정적 태그(통과 시 펀디드는 새 계좌라 전환 감지 불필요), 버퍼기↔안정기는
+        발주 순간 잔고로 매일 재평가(히스테리시스 없음)."""
+        ko = self.lang == "ko"
+        try:
+            acct = self._accts_of(self._asset)[idx]
+        except Exception:
+            return
+        pr = dict(_PROP_DEFAULTS); pr.update(acct.get("prop") or {})
+        win = tk.Toplevel(self.root)
+        win.title(("프롭 자동 사이징 — " + (acct.get("label") or "")) if ko
+                  else ("Prop auto-sizing — " + (acct.get("label") or "")))
+        win.resizable(False, False); win.grab_set()
+        frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
+        on_v = tk.IntVar(value=1 if pr.get("on") else 0)
+        ttk.Checkbutton(frm, variable=on_v,
+                        text=("프롭 자동 사이징 사용(수동 1R 대신 페이즈별 1R)" if ko else
+                              "Enable prop auto-sizing (phase 1R replaces manual 1R)")
+                        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ty_v = tk.StringVar(value=pr.get("type") or "test")
+        ttk.Label(frm, text=("계좌 유형" if ko else "Account type")).grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(frm, text=("테스트기(챌린지)" if ko else "Test (challenge)"),
+                        variable=ty_v, value="test").grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(frm, text=("펀디드" if ko else "Funded"),
+                        variable=ty_v, value="funded").grid(row=1, column=2, sticky="w")
+        ents = {}
+        _rows = [("r_test", "테스트기 1R $" if ko else "Test 1R $"),
+                 ("r_buffer", "버퍼기 1R $" if ko else "Buffer 1R $"),
+                 ("r_steady", "안정기 1R $" if ko else "Steady 1R $"),
+                 ("buffer", "버퍼 크기 $" if ko else "Buffer size $"),
+                 ("start_bal", "시작 잔고 $" if ko else "Starting balance $")]
+        for i, (k, lab) in enumerate(_rows, start=2):
+            ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
+            e = ttk.Entry(frm, width=10)
+            e.insert(0, f"{_as_float(pr.get(k), _PROP_DEFAULTS[k]):g}")
+            e.grid(row=i, column=1, sticky="w", pady=1)
+            ents[k] = e
+        ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                  text=(("펀디드는 발주 순간 잔고로 버퍼기(<버퍼)·안정기(≥버퍼)를 자동 판정합니다. "
+                         "잔고 조회 실패 시 버퍼기 1R로 안전 폴백. 트랙레코드 R 환산은 안정기 1R 기준.") if ko else
+                        ("Funded accounts pick Buffer (<buffer) or Steady (≥buffer) from the live "
+                         "balance at order time; on lookup failure the app falls back to Buffer 1R. "
+                         "Track-record R normalization uses the Steady 1R."))
+                  ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 8))
+
+        def _ok():
+            newp = {"on": bool(on_v.get()), "type": ty_v.get()}
+            for k in ents:
+                newp[k] = _as_float(ents[k].get(), _PROP_DEFAULTS[k])
+            if newp["on"] and any(newp[k] <= 0 for k in ("r_test", "r_buffer", "r_steady", "buffer")):
+                messagebox.showwarning("EQ", "1R·버퍼 값은 0보다 커야 합니다." if ko
+                                       else "1R and buffer values must be > 0.")
+                return
+            acct["prop"] = newp
+            try:
+                w = self._acct_widgets.get(idx) or {}
+                if w.get("prop_btn"):
+                    w["prop_btn"].config(text=self._prop_btn_text(newp))
+                if w.get("one_r"):
+                    w["one_r"].config(state=("disabled" if newp["on"] else "normal"))
+            except Exception:
+                pass
+            self._save_acct_widgets()
+            win.destroy()
+
+        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=8, column=1)
+        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=8, column=2)
 
     def _refresh_live_panel(self):
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
@@ -1828,6 +1917,14 @@ class App:
         r_e.pack(side="left", padx=(0, 4))
         r_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
         self._acct_widgets[idx] = {"on": on, "label": lbl_e, "one_r": r_e}
+        pr = acct.get("prop") or {}
+        _pb_txt = self._prop_btn_text(pr)
+        pb = ttk.Button(row, text=_pb_txt, width=11,
+                        command=lambda i=idx: self._prop_dialog(i))
+        pb.pack(side="left", padx=(4, 0))
+        self._acct_widgets[idx]["prop_btn"] = pb
+        if pr.get("on"):
+            r_e.config(state="disabled")               # 프롭 자동 사이징 중엔 수동 1R 비활성
         if aid:
             ttk.Label(row, text=f"…{aid[-6:]}", foreground="#888").pack(side="left", padx=(4, 0))
         elif spec.get("acct"):
@@ -1956,6 +2053,7 @@ class App:
                 threading.Thread(target=self._auto_loop, daemon=True).start()
         if arm_sig:
             self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
+                                    "prop": dict(acct.get("prop") or {}),
                                     "live": live, "label": acct.get("label", "")}
             if not self._sig_on:
                 self._sig_on = True
@@ -2007,7 +2105,7 @@ class App:
             _need_id = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
             for ac in _act:
                 _nm = ac.get("label") or "?"
-                if _as_float(ac.get("one_r")) <= 0:
+                if _as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on"):
                     bad.append(f"{a} {_nm}: 1R")
                 if _need_id and not (ac.get("id") or "").strip():
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
@@ -2607,9 +2705,12 @@ class App:
                 aid = (ac.get("id") or "").strip()
                 if _sp.get("acct") and not aid:
                     continue
+                _prc = ac.get("prop") or {}
+                _tr_r = (_as_float(_prc.get("r_steady"), 600.0) if _prc.get("on")
+                         else _as_float(ac.get("one_r"), 600.0))
                 credlist.append({"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
                                  "f3": cr.get("f3", ""), "acct": aid,
-                                 "one_r": _as_float(ac.get("one_r"), 600.0),
+                                 "one_r": _tr_r,
                                  "label": ac.get("label", "")})
         if not credlist:
             if not auto:
@@ -2862,6 +2963,40 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
+    def _prop_one_r(self, pr, cfg, lbl):
+        """프롭 페이즈 1R 해석. 테스트기=r_test 고정. 펀디드=발주 순간 잔고로
+        (잔고−시작잔고)≥버퍼 → 안정기, 아니면 버퍼기 — 매일 재평가·히스테리시스 없음.
+        잔고 조회 실패 시 버퍼기 1R 폴백(보수). 방패≥버퍼+$5,000이면 chunk 출금 가능 알림."""
+        if pr.get("type") != "funded":
+            r = _as_float(pr.get("r_test"), 900.0)
+            self.log(f"   ⚙ [{lbl}] 프롭 테스트기 1R=${r:g}")
+            return r
+        rb = _as_float(pr.get("r_buffer"), 300.0)
+        rs = _as_float(pr.get("r_steady"), 600.0)
+        buf = _as_float(pr.get("buffer"), 9000.0)
+        sb = _as_float(pr.get("start_bal"), 150000.0)
+        try:
+            b = _build_broker(cfg["broker"], cfg["f1"], cfg["f2"], cfg["f3"],
+                              [cfg["acct"]] if cfg.get("acct") else [])
+            bal = b.account_balance(cfg.get("acct"))
+            if bal is None:
+                raise RuntimeError("잔고 없음(계좌 미발견)")
+            shield = float(bal) - sb
+            if shield >= buf:
+                self.log(f"   ⚙ [{lbl}] 프롭 안정기 1R=${rs:g} (방패 ${shield:,.0f} ≥ ${buf:,.0f})")
+                if shield >= buf + 5000:
+                    self.log(f"   💰 [{lbl}] chunk 출금 가능 — 방패 ${shield:,.0f} ≥ 버퍼+$5,000 "
+                             f"(꽉 채워 $5,000 인출 타이밍)")
+                return rs
+            self.log(f"   ⚙ [{lbl}] 프롭 버퍼기 1R=${rb:g} (방패 ${shield:,.0f} < ${buf:,.0f})")
+            return rb
+        except AttributeError:
+            self.log(f"   ⚠ [{lbl}] 이 브로커는 잔고 조회 미지원 — 버퍼기 1R=${rb:g} 폴백")
+            return rb
+        except Exception as e:
+            self.log(f"   ⚠ [{lbl}] 잔고 조회 실패({str(e)[:80]}) — 버퍼기 1R=${rb:g} 폴백")
+            return rb
+
     def _enter_account(self, cfg, sig, asset, direction, stop, mult):
         """단일 계좌 진입 — cfg(broker,f1,f2,f3,acct,one_r,label,live)로 사이징+발주.
         로그는 계좌 라벨을 앞에 붙여 멀티계좌를 구분한다(대표 2026-07-24). 계좌 실패는
@@ -2872,6 +3007,9 @@ class App:
         f3, sc, one_r = cfg["f3"], cfg["acct"], cfg["one_r"]
         lbl = cfg.get("label") or (sc[-4:] if sc else _broker_label(_broker))
         live = self._live_now(cfg.get("live"))
+        _pr = cfg.get("prop") or {}
+        if _pr.get("on"):
+            one_r = self._prop_one_r(_pr, cfg, lbl)    # 페이즈별 1R(대표 2026-07-26 #16)
         _eff_r = one_r * mult
         _sz = sizing.compute_size(asset, _broker, _eff_r, sig.get("entry_ref"), stop, direction)
         if not _sz:
