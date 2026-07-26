@@ -72,12 +72,36 @@ class BybitBroker(BrokerAdapter):
     # (상향만 한다 — 유저가 높여둔 값은 존중. 교차 마진에서 실위험은 손절=1R로 고정이고
     #  레버리지는 증거금 효율만 결정하므로 상향은 위험 증가가 아니다.)
     def available_usdt(self):
-        """UNIFIED 가용 잔고(USDT, totalAvailableBalance). 실패 시 None."""
+        """UNIFIED 가용 잔고(USDT). 실패 시 None.
+        ⚠ UNIFIED 계좌는 마진 모드(격리/일반 등)에 따라 계좌 집계 필드 totalAvailableBalance가
+        빈 문자열로 온다 → 그때는 계좌 다른 집계 필드, 다시 없으면 USDT 코인 잔고로 폴백한다
+        (대표 2026-07-26: BTC 잔고 '필드 비어있음' 사건. 레버리지 자동조정도 이 함수를 쓴다)."""
+        def _num(v):
+            try:
+                return float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
         try:
             d = self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
             lst = (d or {}).get("list") or []
-            v = (lst[0] or {}).get("totalAvailableBalance") if lst else None
-            return float(v) if v not in (None, "") else None
+            if not lst:
+                return None
+            acct = lst[0] or {}
+            # 1) 계좌 집계 필드 — 가용마진 우선, 없으면 마진/지갑/에쿼티 순
+            for k in ("totalAvailableBalance", "totalMarginBalance",
+                      "totalWalletBalance", "totalEquity"):
+                n = _num(acct.get(k))
+                if n is not None:
+                    return n
+            # 2) 그래도 없으면 USDT 코인 잔고로 폴백(격리/일반 마진 계좌)
+            for c in acct.get("coin") or []:
+                if str(c.get("coin")).upper() == "USDT":
+                    for k in ("availableToWithdraw", "availableBalance",
+                              "walletBalance", "equity"):
+                        n = _num(c.get(k))
+                        if n is not None:
+                            return n
+            return None
         except Exception:
             return None
 

@@ -72,11 +72,19 @@ class BitgetBroker(BrokerAdapter):
                           "marginCoin": "USDT"})
 
     def available_usdt(self, symbol="BTCUSDT"):
-        """새 주문에 쓸 수 있는 USDT(crossedMaxAvailable, 없으면 available). 실패 시 None."""
+        """새 주문에 쓸 수 있는 USDT. 가용마진 우선, 없으면 자산/에쿼티로 폴백(필드 공백 대응,
+        대표 2026-07-26). 실패 시 None."""
         try:
             a = self._account(symbol) or {}
-            v = a.get("crossedMaxAvailable") or a.get("available")
-            return float(v) if v not in (None, "") else None
+            for k in ("crossedMaxAvailable", "available", "maxTransferOut",
+                      "usdtEquity", "accountEquity"):
+                v = a.get(k)
+                if v not in (None, ""):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+            return None
         except Exception:
             return None
 
