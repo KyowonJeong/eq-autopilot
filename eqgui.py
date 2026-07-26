@@ -1073,6 +1073,10 @@ class App:
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left", padx=(4, 0))
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
+            # Topstep 계좌 목록을 백그라운드로 자동 로드 → '계좌 추가' 콤보를 미리 채운다
+            # (대표 2026-07-26: 연결테스트를 따로 안 눌러도 목록이 바로 떠서 계좌를 한 번에 추가).
+            if self._broker_of(self._asset) == "projectx":
+                self._autoload_topstep_scope(self._asset)
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
             # 선물 자산 간 계좌 설정 복사(대표 2026-07-26 #20) — NQ·GC는 같은 프롭 계좌로 운용
             _srcs = [a for a in _ASSETS if a != self._asset
@@ -1585,6 +1589,39 @@ class App:
         except Exception:
             pass
 
+    def _autoload_topstep_scope(self, asset):
+        """Topstep(projectx) 자산 탭 진입 시 브로커 계좌 목록을 백그라운드로 받아 '계좌 추가'
+        콤보를 미리 채운다(대표 2026-07-26 버그: 예전엔 '연결 테스트'를 눌러야만 _fill_scope가
+        호출돼 그 전엔 콤보가 비어 계좌를 못 골랐다). (브로커,사용자)별 캐시로 탭 전환마다
+        재조회하지 않는다. 실패 시 조용히 생략 — '연결 테스트'를 누르면 원인이 로그에 나온다."""
+        cr = self._creds_of(asset)
+        f1 = (cr.get("f1") or "").strip()
+        if not f1:
+            return
+        ck = ("projectx", f1)
+        cache = getattr(self, "_scope_cache", None)
+        if cache is None:
+            cache = self._scope_cache = {}
+        if ck in cache:                       # 이미 받은 목록이면 즉시 채우고 끝(재조회 없음)
+            self._fill_scope(cache[ck])
+            return
+        import threading as _th
+
+        def w():
+            try:
+                b = _build_broker("projectx", f1, _kc_load(f1) or "", cr.get("f3", ""), [])
+                names = [str(a.get("name")) for a in b._accounts()]
+            except Exception:
+                names = None
+            if names:
+                cache[ck] = names
+
+                def _apply():
+                    if self._asset == asset:  # 아직 그 탭이면 콤보 채움(탭 전환 후 오채움 방지)
+                        self._fill_scope(names)
+                self.root.after(0, _apply)
+        _th.Thread(target=w, daemon=True).start()
+
     def _copy_acct_setup(self, src_asset):
         """다른 선물 자산(src)의 계좌 구성(계좌 목록·1R·프롭/자본% 모드)을 현재 자산으로 복사.
         NQ·GC는 같은 프롭 계좌로 운용하므로 설정을 한 번에 맞춘다(대표 2026-07-26 #20).
@@ -1620,6 +1657,16 @@ class App:
             val = ""
         aid = val.split("·")[-1].strip() if "·" in val else val
         if not aid:
+            # Topstep인데 콤보가 아직 비어있으면(계좌 목록 로드 전) 로드를 띄우고 안내
+            # (대표 2026-07-26: 연결테스트 안 눌러도 목록이 뜨게 — 자동 로드 재시도).
+            _empty_combo = not list(self.acct_pick["values"] or [])
+            if self._broker_of(asset) == "projectx" and _empty_combo:
+                self._autoload_topstep_scope(asset)
+                messagebox.showinfo(self.t("btn_accts"),
+                                    "계좌 목록을 불러오는 중입니다 — 잠시 후 목록에서 계좌를 골라 "
+                                    "다시 '계좌 추가'를 누르세요." if self.lang == "ko" else
+                                    "Loading your account list — pick an account and press Add again.")
+                return
             messagebox.showwarning(self.t("btn_accts"),
                                    "추가할 계좌를 선택하거나 입력하세요." if self.lang == "ko"
                                    else "Pick or type an account first."); return
