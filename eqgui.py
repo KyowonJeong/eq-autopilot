@@ -960,6 +960,10 @@ class App:
         self.b_demo_start.pack(side="left", padx=(8, 0))
         self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
         self.b_live_stop.pack(side="left", padx=(6, 0))
+        # 모든 자산·계좌 포지션 즉시 시장가 청산 — 패닉 버튼(대표 2026-07-27). 무장 해제(전체
+        # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
+        ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko" else "Close all positions"),
+                   command=self._close_all_positions).pack(side="left", padx=(6, 0))
         # 서버 신호 없이 전 자산 전 계좌 잔고·1R을 한 번에 확인(대표 2026-07-26).
         ttk.Button(lc, text=("전 자산 1R 조회" if self.lang == "ko" else "Preview 1R (all)"),
                    command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
@@ -3522,6 +3526,61 @@ class App:
         """전 자산 전 계좌 잔고·1R 미리보기(라이브 패널 버튼, 대표 2026-07-26)."""
         ko = self.lang == "ko"
         self._run_1r_preview(list(_ASSETS), ("전 자산 · 잔고 & 1R" if ko else "All assets · Balance & 1R"))
+
+    def _close_all_positions(self):
+        """패닉 버튼(대표 2026-07-27): 크레덴셜이 설정된 모든 자산·계좌의 포지션을 시장가로
+        전부 청산(flatten_all = 포지션 청산 + 잔여 주문 취소). 무장 상태와 무관하게 동작 —
+        비상시 무조건 눌러서 정리하는 용도. (브로커,계좌) 단위 중복 제거(NQ·GC 공유 계좌 1회만)."""
+        ko = self.lang == "ko"
+        if not messagebox.askyesno(
+                "전체 청산" if ko else "Close all",
+                ("모든 자산·모든 계좌의 열린 포지션을 지금 시장가로 전부 청산하고 잔여 주문을 "
+                 "취소합니다.\n\n진행할까요?" if ko else
+                 "Close every open position on every configured account at market and cancel "
+                 "remaining orders.\n\nProceed?")):
+            return
+        self.log("\n🧹 " + ("전체 청산 — 모든 자산·계좌 flatten" if ko else "Close all — flatten every account"))
+
+        def w():
+            import threading  # noqa: F401
+            seen = set()
+            n_closed = 0
+            for a in _ASSETS:
+                bk = self._broker_of(a)
+                cr = self._creds_of(a)
+                f1 = (cr.get("f1") or "").strip()
+                if not f1:
+                    continue
+                f2 = _kc_load(f1) or ""
+                f3 = cr.get("f3", "")
+                if _BROKER_SPEC.get(bk, {}).get("acct"):
+                    aids = [(ac.get("id") or "").strip() for ac in self._accts_of(a)
+                            if (ac.get("id") or "").strip()]
+                else:
+                    aids = [""]
+                for aid in aids:
+                    key = (bk, f1, aid)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lbl = f"{a}·{aid[-4:] if aid else _broker_label(bk)}"
+                    try:
+                        b = _build_broker(bk, f1, f2, f3, [aid] if aid else [])
+                        res = b.flatten_all(dry_run=False)
+                        closed = ", ".join(f"{p.symbol}" for p in (res.closed or [])) or "—"
+                        errs = getattr(res, "errors", None) or []
+                        n_closed += len(res.closed or [])
+                        self.log(f"   [{lbl}] closed: {closed}"
+                                 + (f" · ⚠ {'; '.join(str(e)[:60] for e in errs)}" if errs else ""))
+                    except AttributeError:
+                        self.log(f"   ⏭ [{lbl}] 이 브로커는 일괄 청산 미지원 — 건너뜀")
+                    except Exception as e:
+                        self.log(f"   ❌ [{lbl}] 청산 실패: {str(e)[:100]}")
+                        self._report_error("close_all", e)
+            self.log("   ✅ " + (f"전체 청산 완료 — 포지션 {n_closed}개 정리" if ko
+                                else f"Close-all done — {n_closed} positions flattened"))
+        import threading as _th
+        _th.Thread(target=w, daemon=True).start()
 
     def _pct_one_r(self, pc, cfg, lbl):
         """자본 비례 1R = 잔고 × pct%, 최소 floor(수수료 방어). 잔고 조회 실패 시 None(호출부가 스킵).
