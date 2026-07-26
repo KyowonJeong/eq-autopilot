@@ -3356,7 +3356,7 @@ class App:
                         mode = ("고정" if ko else "Fixed")
                         r = _as_float(ac.get("one_r"), 600.0); note = ("수동" if ko else "manual")
                     balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
-                    rstr = (f"${r:,.0f}" if r is not None else ("실패" if ko else "n/a"))
+                    rstr = (f"${r:,.0f}" if r is not None else ("진입 안 함" if ko else "no entry"))
                     self.log(f"   ⚙ [{asset}·{lbl}] 잔고 {balstr} · {mode} 1R {rstr} ({note})")
                     rows.append(f"   [{lbl}] {mode} · {'잔고' if ko else 'Bal'} {balstr}  |  1R {rstr}")
                 blocks.append("\n".join(rows))
@@ -3375,7 +3375,9 @@ class App:
         self._run_1r_preview(list(_ASSETS), ("전 자산 · 잔고 & 1R" if ko else "All assets · Balance & 1R"))
 
     def _pct_one_r(self, pc, cfg, lbl):
-        """자본 비례 1R = 잔고 × pct%, 최소 floor. 잔고 조회 실패 시 None(호출부가 스킵)."""
+        """자본 비례 1R = 잔고 × pct%, 최소 floor(수수료 방어). 잔고 조회 실패 시 None(호출부가 스킵).
+        ※ 선물(나스닥·금) '계약수 0.75 미만 진입금지'는 sizing.compute_size에서 처리(자본 크기 자체는
+        본인 자유라 여기서 막지 않음, 대표 2026-07-26)."""
         bal = self._acct_balance(cfg)
         if bal is None:
             return None

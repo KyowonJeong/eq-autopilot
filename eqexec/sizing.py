@@ -79,7 +79,12 @@ def compute_size(asset, broker, one_r, entry_ref, stop, direction):
         return {"size": size, "symbol": sym, "kind": kind, "unit": "BTC",
                 "risk_pts": round(risk_pts, 2)}
     pv = FUTURES_POINT_VALUE[sym]
-    size = max(0, int(round(one_r / (risk_pts * pv))))
+    raw = one_r / (risk_pts * pv)                  # 이론 계약수(반올림 전)
+    # 계약수 0.75 미만이면 0으로 떨궈 진입 금지(대표 2026-07-26): 선물(나스닥·금)은 1R 대비
+    # 손절이 커서 1계약도 못 잡을 땐, 반올림으로 억지 1계약(=예정 리스크 초과)을 내지 않는다.
+    # 크립토는 분수 수량(랏 0.001)이라 소액도 정상 사이징 → 이 컷오프 없음(위 crypto 분기).
+    size = int(round(raw)) if raw >= 0.75 else 0
+    size = max(0, size)
     out = {"size": size, "symbol": sym, "kind": kind, "unit": "contracts",
            "risk_pts": round(risk_pts, 2)}
     # 마이크로 10계약 이상이면 미니로 묶어 커미션을 3배 아낀다(위 주석 참고).
