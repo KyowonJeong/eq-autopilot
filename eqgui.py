@@ -748,6 +748,17 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("EQ Autopilot")
+        # ── 예외 자동 리포트(대표 2026-07-27 "필수") — 회원 머신의 미처리 예외를 서버(/eqerr)로.
+        #    키·계좌번호·잔고 무전송(마스킹), EQ_ERR_REPORT=0 으로 끔. 실패해도 앱 무사.
+        self._err_sent = {}
+        try:
+            import threading as _th0
+            root.report_callback_exception = (
+                lambda et, ev, tb: self._report_error("tk", ev))
+            _th0.excepthook = (
+                lambda a: self._report_error(f"thread:{getattr(a.thread, 'name', '?')}", a.exc_value))
+        except Exception:
+            pass
         # 기본 창 크기 — 섹션이 늘어(트랙레코드·자산탭·진입정보) 잘리지 않게 확대(대표 2026-07-12).
         # 화면이 그보다 작으면 화면 높이에 맞춤.
         try:
@@ -1925,6 +1936,7 @@ class App:
                             self.log("   ✅ flat")
                 except Exception as e:
                     self.log(f"   ❌ auto-close failed — {e}")
+                    self._report_error("auto_close", e)   # 예외 리포트(대표 2026-07-27)
             _t.sleep(15)
 
     # ── auto-ENTRY on EdgeQuant signal ──────────────────────────────────────
@@ -3182,6 +3194,75 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
+    _APP_VER = "2026.07.27"
+
+    def _report_error(self, ctx, err):
+        """예외 자동 리포트(대표 2026-07-27 "필수") — 서버 /eqerr로 익명 전송해 회원 머신의
+        버그를 운영자가 본다("대표의 발견력을 회원 수만큼 스케일"). 전송 내용: 앱버전·OS·
+        컨텍스트 태그·마스킹된 에러 문자열·토큰 해시 12자(익명 그룹핑)뿐 — 키·계좌번호·잔고
+        무전송(5자리+ 숫자열 → # 마스킹). 중복 1시간 억제·시간당 10건 캡. 실패해도 조용히."""
+        import os as _os
+        import re as _re
+        import time as _t
+        import threading as _th
+        try:
+            if _os.environ.get("EQ_ERR_REPORT", "1") == "0":
+                return
+            msg = _re.sub(r"\d{5,}", "#", str(err))[:400]
+            key = (str(ctx)[:40], msg[:80])
+            now = _t.time()
+            self._err_sent = {k: v for k, v in getattr(self, "_err_sent", {}).items()
+                              if now - v < 3600}
+            if key in self._err_sent or len(self._err_sent) >= 10:
+                return
+            self._err_sent[key] = now
+
+            def w():
+                try:
+                    import hashlib
+                    import platform
+                    import requests
+                    tid = hashlib.sha256((self._token or "").encode()).hexdigest()[:12]
+                    requests.post(PUSH_BASE + "eqerr", timeout=6, json={
+                        "ver": self._APP_VER, "os": platform.system(),
+                        "tid": tid, "ctx": str(ctx)[:60], "err": msg})
+                except Exception:
+                    pass
+            _th.Thread(target=w, daemon=True).start()
+        except Exception:
+            pass
+
+    _JITTER_TICK = {"NQ": 0.25, "GC": 0.1}   # 자산별 틱 크기(마이크로·미니 동일 그리드)
+
+    def _jitter_stop(self, asset, entry_ref, stop, lbl):
+        """보호 손절가 지터(대표 2026-07-27): 발주 순간 0~수 틱 무작위 오프셋을 **넓히는 방향
+        (진입에서 멀어지는 쪽)으로만** 얹는다 — 전 회원 손절가가 틱까지 동일해지는 클러스터
+        식별을 깨는 저비용 보험. ⚠절대 조이지 않는다(대표: "절대 줄이는 방향 안 돼") —
+        조이면 정본 손절은 사는데 지터 손절만 먼저 털리는 회원이 생김. 넓히면 정본 손절이
+        터질 때만 같이 터져 신호 대비 조기 이탈이 없고, 추가 리스크는 손절거리의 ~0.5% 이내.
+        신호 카드·사이징은 정본 손절 그대로(계약수 불변). 선물(NQ·GC)만 — BTC는 X2+BE
+        본절 이동 로직이 있어 제외. EQ_STOP_JITTER=0 으로 끔."""
+        import os as _os
+        import random as _rnd
+        if _os.environ.get("EQ_STOP_JITTER", "1") == "0":
+            return stop
+        tick = self._JITTER_TICK.get(asset)
+        try:
+            e, s = float(entry_ref), float(stop)
+        except (TypeError, ValueError):
+            return stop
+        dist = abs(e - s)
+        if not tick or dist <= 0:
+            return stop
+        jmax = max(1, min(6, int(dist * 0.005 / tick)))   # 거리의 ~0.5% 이내, 1~6틱
+        j = _rnd.randint(0, jmax)                          # 0=지터 없음도 허용(값 분산)
+        if not j:
+            return stop
+        widen = -1.0 if e > s else 1.0                     # 롱=손절이 아래→더 내림 / 숏=더 올림
+        new = round(s + widen * j * tick, 4)
+        self.log(f"   🎲 [{lbl}] 손절 지터 +{j}틱 넓힘 → {new:g} (주문 프라이버시 · 조기이탈 없음 · 추가리스크 ≤0.5%)")
+        return new
+
     def _run_futures_entry(self, b, sc, legs, direction, stop, sig, live, recv, asset, pub):
         """선물 진입 — 계약수 10개 이상이면 미니/마이크로 legs로 분할 체결(대표 2026-07-16).
         legs = [(심볼, 수량), ...]. 예: NQ 23계약 → [('NQ',2),('MNQ',3)] · 5계약 → [('MNQ',5)].
@@ -3633,6 +3714,8 @@ class App:
             if _is_fut:
                 # 선물(Topstep/IBKR): 미니/마이크로 legs 분할 진입 — 계좌·계약조회·잔여정리·
                 # 진입·손절 전부 leg-aware 헬퍼가 그 계좌(sc)에서 처리(대표 2026-07-16).
+                if stop is not None:                      # 손절 지터(넓힘만) — 계좌·진입마다 무작위
+                    stop = self._jitter_stop(asset, sig.get("entry_ref"), stop, lbl)
                 self._run_futures_entry(b, sc, _legs, direction, stop, sig, live, _recv, asset, _pub)
                 return
             # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
@@ -3693,6 +3776,7 @@ class App:
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
+            self._report_error(f"entry:{asset}", e)      # 예외 리포트(대표 2026-07-27)
             _em = str(e)[:300]
             self.root.after(0, lambda m=_em, a=asset, L=lbl: messagebox.showerror(
                 "진입 실패" if self.lang == "ko" else "Entry failed",
