@@ -3280,7 +3280,8 @@ class App:
             messagebox.showinfo("EQ", (f"{asset}: 켜진 계좌가 없습니다." if ko
                                        else f"{asset}: no active accounts."))
             return
-        self.log(f"\n💵 [{asset}] 1R 미리보기 — 계좌별 현재 1R (서버 신호 없이 잔고만 조회)")
+        is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))   # 계좌ID 개념=선물 / 없으면 크립토
+        self.log(f"\n💵 [{asset}] 잔고·1R 미리보기 (서버 신호 없이 잔고만 조회)")
 
         def w():
             f2 = _kc_load(f1) or ""
@@ -3289,27 +3290,60 @@ class App:
             for ac in accts:
                 aid = (ac.get("id") or "").strip()
                 lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
-                cfg = {"broker": bk, "f1": f1, "f2": f2, "f3": f3, "acct": aid}
+                # 잔고 직접 조회 — 선물=account_balance / 크립토=available_usdt. _acct_balance의
+                # bal>0 게이트·캐시를 우회해 0/저잔고도 그대로 표시(대표 2026-07-26 BTC 조회 실패 대응).
+                bal = None
+                try:
+                    b = _build_broker(bk, f1, f2, f3, [aid] if aid else [])
+                    if is_fut and hasattr(b, "account_balance"):
+                        bal = b.account_balance(aid)
+                    elif hasattr(b, "available_usdt"):
+                        bal = b.available_usdt()
+                    elif hasattr(b, "account_balance"):
+                        bal = b.account_balance(aid)
+                    bal = float(bal) if bal is not None else None
+                except Exception as e:
+                    self.log(f"   ⚠ [{lbl}] 잔고 조회 오류: {str(e)[:80]}")
                 _pr = ac.get("prop") or {}
                 _pc = ac.get("pct") or {}
                 r = None
-                try:
-                    if _pr.get("on"):
-                        r = self._prop_one_r(_pr, cfg, lbl); mode = ("프롭" if ko else "Prop")
-                    elif _pc.get("on"):
-                        r = self._pct_one_r(_pc, cfg, lbl); mode = ("자본비례" if ko else "% equity")
+                if _pr.get("on"):                              # 프롭 페이즈(선물)
+                    mode = ("프롭" if ko else "Prop")
+                    if _pr.get("type") == "funded":
+                        rb = _as_float(_pr.get("r_buffer"), 300.0)
+                        if bal is None:
+                            r = rb; note = ("버퍼기·잔고조회실패 폴백" if ko else "buffer (no balance)")
+                        else:
+                            buf = _as_float(_pr.get("buffer"), 9000.0)
+                            rs = _as_float(_pr.get("r_steady"), 600.0)
+                            if bal >= buf:
+                                r = rs; note = (f"안정기 방패 ${bal:,.0f}≥${buf:,.0f}" if ko
+                                                else f"steady, shield ${bal:,.0f}")
+                            else:
+                                r = rb; note = (f"버퍼기 방패 ${bal:,.0f}<${buf:,.0f}" if ko
+                                                else f"buffer, shield ${bal:,.0f}")
                     else:
-                        r = _as_float(ac.get("one_r"), 600.0); mode = ("고정" if ko else "Fixed")
-                        self.log(f"   ⚙ [{lbl}] {mode} 1R=${r:g}")
-                except Exception as e:
-                    self.log(f"   ⚠ [{lbl}] 1R 계산 오류: {str(e)[:80]}")
-                if r is None:
-                    lines.append(f"[{lbl}] " + ("1R 조회 실패(잔고 못 읽음)" if ko
-                                                else "1R lookup failed (no balance)"))
-                else:
-                    lines.append(f"[{lbl}] {mode} · 1R = ${r:,.0f}")
-            msg = "\n".join(lines) if lines else ("계좌 없음" if ko else "no accounts")
-            self.root.after(0, lambda m=msg: messagebox.showinfo(f"{asset} · 1R", m))
+                        r = _as_float(_pr.get("r_test"), 900.0); note = ("테스트기" if ko else "test")
+                elif _pc.get("on"):                            # 자본 비례(잔고×%)
+                    mode = ("자본비례" if ko else "% equity")
+                    if bal is None:
+                        note = ("잔고 조회 실패" if ko else "no balance")
+                    else:
+                        pct = _as_float(_pc.get("pct"), 0.4)
+                        floor = _as_float(_pc.get("floor"), 200.0)
+                        r = max(bal * pct / 100.0, floor)
+                        note = (f"${bal:,.0f}×{pct:g}%" if r > floor else f"최소 ${floor:g}")
+                else:                                          # 고정
+                    mode = ("고정" if ko else "Fixed")
+                    r = _as_float(ac.get("one_r"), 600.0); note = ("수동" if ko else "manual")
+                balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
+                rstr = (f"${r:,.0f}" if r is not None else ("실패" if ko else "n/a"))
+                self.log(f"   ⚙ [{lbl}] 잔고 {balstr} · {mode} 1R {rstr} ({note})")
+                lines.append(f"[{lbl}]  ·  {mode}\n   {'잔고' if ko else 'Balance'} {balstr}"
+                             f"   |   1R {rstr}\n   ({note})")
+            msg = "\n\n".join(lines) if lines else ("계좌 없음" if ko else "no accounts")
+            _title = (f"{asset} · 잔고 & 1R" if ko else f"{asset} · Balance & 1R")
+            self.root.after(0, lambda m=msg, t=_title: messagebox.showinfo(t, m))
         _th.Thread(target=w, daemon=True).start()
 
     def _pct_one_r(self, pc, cfg, lbl):
