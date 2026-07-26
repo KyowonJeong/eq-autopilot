@@ -586,6 +586,44 @@ def _mark_entered(asset: str) -> dict:
     return d
 
 
+# ── 실제 1R 원장 (대표 2026-07-26 A안) — 트랙레코드 R 환산 정확화 ─────────────
+# 계좌·시점마다 1R이 달라지는 사이징(프롭 페이즈·자본 비례)에서 고정 1R 나눗셈은 R을
+# 왜곡한다. 발주 순간의 '실제 1R'을 (자산|계좌)별 시계열로 남겨 두고, 트랙레코드 수집 때
+# 체결 시각 직전 진입의 1R로 나눈다(시각 매칭 — BTC 세션 날짜 경계 문제도 우회).
+_RLEDGER_PATH = os.path.join(APP_DIR, ".r_ledger.json")
+
+
+def _record_real_r(asset: str, acct: str, one_r: float) -> None:
+    """실제 진입 1R 기록: {asset|acct: [[entry_epoch, one_r], ...]} (계좌당 최근 500건 유지)."""
+    import time as _t
+    import json as _json
+    try:
+        with open(_RLEDGER_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except Exception:
+        d = {}
+    k = f"{asset}|{acct or ''}"
+    d.setdefault(k, []).append([_t.time(), float(one_r)])
+    d[k] = d[k][-500:]
+    try:
+        with open(_RLEDGER_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _lookup_real_r(ledger: dict, asset: str, acct: str, fill_ts: float, fallback: float) -> float:
+    """체결 시각(fill_ts, epoch) 직전(≤)의 그 (자산|계좌) 진입 1R. 없으면 fallback."""
+    rows = (ledger or {}).get(f"{asset}|{acct or ''}") or []
+    best_ts, best_r = -1.0, None
+    for ts, r in rows:
+        if ts <= fill_ts + 60 and ts > best_ts:      # +60s: 진입-첫체결 미세 지연 허용
+            best_ts, best_r = ts, r
+    return float(best_r) if best_r is not None else float(fallback)
+
+
 # ── EQ 거래 원장 (대표 2026-07-17) ────────────────────────────────────────────
 # 브로커는 '계좌 전체' 체결을 준다 — 회원이 같은 계좌에서 손수 친 MNQ/MGC/BTC 거래가
 # 트랙레코드에 섞인다. 브로커 조회 응답에는 주문 태그(customTag/orderLinkId)가 없어서
@@ -2883,6 +2921,14 @@ class App:
             # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). admin 등급은 수동도 포함.
             _admin_all = str((self._gate or {}).get("tier") or "") == "admin"
             _ledger, _since = _ledger_load(), _ledger_since()
+            try:                                     # 실제 1R 원장 로드(A안 트랙레코드 R 정확화)
+                import json as _json2
+                with open(_RLEDGER_PATH, encoding="utf-8") as _rf:
+                    _rledger = _json2.load(_rf)
+                if not isinstance(_rledger, dict):
+                    _rledger = {}
+            except Exception:
+                _rledger = {}
             _mine = 0
             agg = {}
             for f in fills:
@@ -2898,17 +2944,25 @@ class App:
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
                                        "accts": {}})
                 e["pnl"] += float(f.get("pnl") or 0)
-                # 참여 계좌 1R(계좌 식별자별 — 같은 계좌 여러 체결은 1R 한 번만). $합/1R합의 분모.
-                e["accts"][f.get("_acct_id")] = float(f.get("_one_r") or 600.0)
+                # 참여 계좌 1R = 그 체결 시각 직전 진입의 '실제 1R'(R 원장). 없으면 계좌 명목값
+                # 폴백. 프롭 페이즈·자본 비례로 시점마다 1R이 달라도 정확히 정규화(대표 A안).
+                e["accts"][f.get("_acct_id")] = _lookup_real_r(
+                    _rledger, a, f.get("_acct_id"),
+                    (f.get("ts_ms") or 0) / 1000.0, float(f.get("_one_r") or 600.0))
             # R 정규화(대표 2026-07-24 멀티계좌) = **$손익 합 ÷ 참여 계좌 1R 합** — 시그널의 진짜
             # 배수를 보존한다(계좌 A +$1200@1R600 + 계좌 B +$600@1R300 = $1800÷$900 = +2R,
             # 계좌 수만큼 뻥튀기 안 됨). 계좌당 단일 1R·자산 등가중.
             trades = []
+            _CASH_BASE = 600.0                        # 상대 현금 기준단위(=1R $600을 1.0으로). 절대액 미노출.
             for (d, a, s), v in sorted(agg.items()):
                 _rsum = sum(v["accts"].values()) or 600.0
+                _naccts = len(v["accts"]) or 1
                 trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d,
                                "instrument": a, "direction": v["direction"],
-                               "r": round(v["pnl"] / _rsum, 3)})
+                               # r = 손익비(실제 1R로 정규화, 사이징 무관). cash_rel = 상대 현금
+                               # (계좌당 $600 기준 — 큰 사이징·복리일수록 커짐, 절대액은 숨김, 대표 C안).
+                               "r": round(v["pnl"] / _rsum, 3),
+                               "cash_rel": round(v["pnl"] / (_naccts * _CASH_BASE), 3)})
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
@@ -3190,6 +3244,8 @@ class App:
         self.log(f"   [{lbl}] {asset} {direction} x{size} ({sym}) · 손절 {stop} · "
                  f"1R=${one_r:g}×{mult:.2f}=${_eff_r:g}(거리 {_sz['risk_pts']}) · "
                  f"{'LIVE' if live else 'dry-run'}{(' [' + sc + ']') if sc else ''}")
+        if live:                                    # 실제 진입 1R 원장 기록(A안, 트랙레코드 R 정확화)
+            _record_real_r(asset, sc, one_r)
         _pub = sig.get("published_at")
         _recv = _dtl.datetime.now()
         _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))
