@@ -55,7 +55,9 @@ class BitgetBroker(BrokerAdapter):
             r = requests.post(url, data=payload, headers=headers, timeout=_TIMEOUT)
         r.raise_for_status()
         d = r.json()
-        if str(d.get("code")) not in ("00000", "0", "None"):
+        # Bitget은 성공 시 항상 code="00000". str(None)=="None"을 허용 목록에 두면 code 없는
+        # 변형 응답을 성공으로 오판(주문 미발주인데 '완료') → "None" 제거, 명시적 성공코드만 통과.
+        if str(d.get("code")) not in ("00000", "0"):
             raise RuntimeError(f"Bitget {path} failed: code={d.get('code')} {d.get('msg')}")
         return d.get("data", d)
 
@@ -204,7 +206,10 @@ class BitgetBroker(BrokerAdapter):
         custom_tag → clientOid(EQ 주문 표식). ⚠ history-position 응답에 clientOid가 없어
         트랙레코드 필터는 앱의 EQ 원장이 담당 — 태그는 사후 대조용(2026-07-17)."""
         sym = self._symbol(symbol)
-        bside = "buy" if str(side).upper() == "LONG" else "sell"
+        _s = str(side).upper()
+        if _s not in ("LONG", "SHORT"):               # LONG/SHORT 외 값이 조용히 sell 되면 방향 반전
+            return {"error": f"invalid side: {side!r} (expected LONG/SHORT)"}
+        bside = "buy" if _s == "LONG" else "sell"
         qty = self._fmt_qty(size)
         if float(qty) <= 0:
             return {"error": "qty<=0"}
@@ -241,7 +246,10 @@ class BitgetBroker(BrokerAdapter):
         """post_only 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place.
         custom_tag → clientOid. 호출측이 재시도마다 유니크하게 만들어 넘긴다(중복 = 거절)."""
         sym = self._symbol(symbol)
-        bside = "buy" if str(side).upper() == "LONG" else "sell"
+        _s = str(side).upper()
+        if _s not in ("LONG", "SHORT"):
+            return {"error": f"invalid side: {side!r} (expected LONG/SHORT)"}
+        bside = "buy" if _s == "LONG" else "sell"
         qty = self._fmt_qty(size)
         body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
                 "marginCoin": "USDT", "side": bside, "orderType": "limit",

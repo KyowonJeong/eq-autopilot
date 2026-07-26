@@ -459,8 +459,10 @@ def _pin_ok(pin):
     return bool(h) and hashlib.sha256(pin.encode()).hexdigest() == h
 
 
+# Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
+# 이익만 0부터 적립) → '방패'는 잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 확인).
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 900.0, "r_buffer": 300.0,
-                  "r_steady": 600.0, "buffer": 9000.0, "start_bal": 150000.0}
+                  "r_steady": 600.0, "buffer": 9000.0}
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 
 
@@ -469,7 +471,7 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
         p["on"] = bool(p["on"]); p["type"] = "funded" if p["type"] == "funded" else "test"
-        for k in ("r_test", "r_buffer", "r_steady", "buffer", "start_bal"):
+        for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
@@ -2011,8 +2013,7 @@ class App:
         _rows = [("r_test", "테스트기 1R $" if ko else "Test 1R $"),
                  ("r_buffer", "버퍼기 1R $" if ko else "Buffer 1R $"),
                  ("r_steady", "안정기 1R $" if ko else "Steady 1R $"),
-                 ("buffer", "버퍼 크기 $" if ko else "Buffer size $"),
-                 ("start_bal", "시작 잔고 $" if ko else "Starting balance $")]
+                 ("buffer", "버퍼 크기 $" if ko else "Buffer size $")]
         for i, (k, lab) in enumerate(_rows, start=2):
             ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
             e = ttk.Entry(frm, width=10)
@@ -2021,10 +2022,13 @@ class App:
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
                   text=(("펀디드는 발주 순간 잔고로 버퍼기(<버퍼)·안정기(≥버퍼)를 자동 판정합니다. "
-                         "잔고 조회 실패 시 버퍼기 1R로 안전 폴백. 트랙레코드 R 환산은 안정기 1R 기준.") if ko else
+                         "Topstep 펀디드는 잔고가 $0부터 이익만 쌓이므로 잔고=방패입니다(예: 잔고 "
+                         "$9,000 도달 시 안정기). 잔고 조회 실패 시 버퍼기 1R로 안전 폴백. "
+                         "트랙레코드 R 환산은 안정기 1R 기준.") if ko else
                         ("Funded accounts pick Buffer (<buffer) or Steady (≥buffer) from the live "
-                         "balance at order time; on lookup failure the app falls back to Buffer 1R. "
-                         "Track-record R normalization uses the Steady 1R."))
+                         "balance at order time. A Topstep funded balance starts at $0 and accrues "
+                         "profit, so balance = shield (e.g. Steady kicks in at $9,000 balance). On "
+                         "lookup failure the app falls back to Buffer 1R. Track-record R uses Steady 1R."))
                   ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 8))
 
         def _ok():
@@ -2377,6 +2381,23 @@ class App:
         elif lv.get("error"):
             self.log(f"   ⚠ 레버리지 자동 조정 불가: {lv['error']} — 그대로 진행")
 
+    def _confirm_pos_qty(self, get_qty, tries=3):
+        """position_qty를 재시도해 '확정' 수량(>=0)을 얻는다. 조회 실패(크립토 −1 / 선물 None)는
+        재시도, 끝까지 실패면 −1.0(불확실) 반환. 지정가 체결 확인을 조회 실패와 확실히 구분해
+        시장가 이중진입을 막는 tonight-critical 가드(대표 2026-07-26)."""
+        import time as _t
+        q = None
+        for _i in range(max(1, tries)):
+            try:
+                q = get_qty()
+            except Exception:
+                q = None
+            if q is not None and q >= 0:
+                return float(q)
+            if _i < tries - 1:
+                _t.sleep(0.6)
+        return -1.0
+
     # ── 지정가 체결 정책 미러 (대표 2026-07-15, order_exec.execute_entry 레퍼런스와 동일) ──
     def _exec_entry_limit(self, b, sym, direction, size, stop, pol, live, broker, tag=None):
         """크립토 진입: 지정가(메이커) N회 재시도 → 불리 이동 임계 초과 시 스킵 → 시장가 폴백.
@@ -2409,16 +2430,37 @@ class App:
                 self.log(f"   ⚠ 지정가 주문 거절({r['error'][:80]}) → 시장가 폴백")
                 break
             _t.sleep(max(1.0, interval))
-            qty = b.position_qty(sym)
-            if qty and qty > 0:                       # 체결(부분 포함) → 나머지 취소 후 인정
+            qty = self._confirm_pos_qty(lambda: b.position_qty(sym))
+            if qty > 0:                               # 체결 확정 → 나머지 취소 후 인정
                 if oid:
                     b.cancel_order(sym, oid)
                 self.log(f"   ✅ 지정가 체결 (시도 {i + 1}, 수량 {qty:g}) — 메이커 수수료")
                 return {"entry": {"orderId": oid, "mode": "limit", "price": lp},
                         "stop": bool(stop), "stop_error": None}
             if oid:
-                b.cancel_order(sym, oid)              # 미체결 잔여 주문 정리 후 재시도
-        # 미체결 → 불리 이동 판정
+                b.cancel_order(sym, oid)              # 미체결/불확실 잔여 주문 정리
+            if qty < 0:                               # 조회 불확실 → 재지정가 금지(이중진입 위험)
+                self.log("   ⚠ 체결 확인 불가(조회 실패) — 재시도 중단, 폴백 전 포지션 재확인")
+                break
+        # 미체결 → 시장가 폴백 전, 지정가가 실은 체결됐는데 조회를 놓쳤는지 최종 확인
+        # (놓친 채 시장가를 내면 2배 포지션 — tonight-critical, 대표 2026-07-26).
+        _final = self._confirm_pos_qty(lambda: b.position_qty(sym))
+        if _final > 0:
+            self.log(f"   ✅ 최종 확인: 이미 체결됨(수량 {_final:g}) — 시장가 폴백 취소")
+            return {"entry": {"orderId": None, "mode": "limit", "price": lp},
+                    "stop": bool(stop), "stop_error": None}
+        if _final < 0:
+            self.log("   🛑 포지션 조회 불가로 체결 여부 불확실 — 이중진입 방지 위해 시장가 폴백 "
+                     "보류. 앱에서 수동 확인 필요.")
+            self.root.after(0, lambda a=sym: messagebox.showwarning(
+                "체결 확인 불가" if self.lang == "ko" else "Fill unconfirmed",
+                (f"{a}: 지정가 체결 여부를 확인하지 못했습니다(거래소 조회 실패). 이중진입을 막기 "
+                 f"위해 시장가 진입을 보류했습니다 — 거래소에서 포지션을 직접 확인해 주세요." if self.lang == "ko"
+                 else f"{a}: could not confirm the limit fill (exchange query failed). Market entry "
+                 f"was held to avoid a double position — please check the position on the exchange.")))
+            return {"skipped": True, "error": None, "entry": None, "would_place": None,
+                    "stop": False, "stop_error": None, "note": "fill_unconfirmed"}
+        # 확실히 미체결 → 불리 이동 판정
         cur = b.current_market_price(sym)
         if cur is not None and thr is not None:
             adv = (cur - lp) if str(direction).upper() == "LONG" else (lp - cur)
@@ -2557,14 +2599,14 @@ class App:
                 self.log(f"   ⚠ 지정가 주문 거절({str(r['error'])[:80]}) → 시장가 폴백")
                 break
             _t.sleep(max(1.0, interval))
-            qty = b.position_qty(aid, contract)
-            if qty:                                   # 체결(부분 포함)
+            qty = self._confirm_pos_qty(lambda: b.position_qty(aid, contract))
+            if qty > 0:                               # 체결 확정
                 if oid:
                     try:
                         b.cancel_order(aid, oid)      # 잔여 미체결 취소
                     except Exception:
                         pass
-                self.log(f"   ✅ 지정가 체결 (시도 {i + 1}, 수량 {qty}) — 슬리피지 0")
+                self.log(f"   ✅ 지정가 체결 (시도 {i + 1}, 수량 {qty:g}) — 슬리피지 0")
                 sr = b.place_protective_stop(aid, contract, direction, qty, stop,
                                              custom_tag=f"{tag}-{i}") if stop is not None else {}
                 return {"entry": {"orderId": oid, "mode": "limit", "price": lp}, **sr}
@@ -2573,6 +2615,20 @@ class App:
                     b.cancel_order(aid, oid)
                 except Exception:
                     pass
+            if qty < 0:                               # 조회 불확실 → 재지정가 금지(이중진입 위험)
+                self.log("   ⚠ 체결 확인 불가(조회 실패) — 재시도 중단, 폴백 전 포지션 재확인")
+                break
+        # 시장가 폴백 전 최종 확인 — 지정가가 실은 체결됐는데 조회를 놓쳤다면 이중진입 방지.
+        _final = self._confirm_pos_qty(lambda: b.position_qty(aid, contract))
+        if _final > 0:
+            self.log(f"   ✅ 최종 확인: 이미 체결됨(수량 {_final:g}) — 시장가 폴백 취소")
+            sr = b.place_protective_stop(aid, contract, direction, _final, stop,
+                                         custom_tag=f"{tag}-F") if stop is not None else {}
+            return {"entry": {"orderId": None, "mode": "limit", "price": lp}, **sr}
+        if _final < 0:
+            self.log("   🛑 포지션 조회 불가로 체결 여부 불확실 — 이중진입 방지 위해 시장가 폴백 보류.")
+            return {"skipped": True, "error": None, "entry": None, "stop": False,
+                    "stop_error": None, "note": "fill_unconfirmed"}
         cur = b.current_market_price(contract)
         if cur is not None and thr is not None:
             adv = (cur - lp) if str(direction).upper() == "LONG" else (lp - cur)
@@ -2636,14 +2692,31 @@ class App:
             for p in poss:
                 aid = p.raw.get("_accountId") or p.account_id
                 con = p.raw.get("contractId") or p.symbol
-                close_side = "SHORT" if p.net_qty > 0 else "LONG"
+                orig_long = p.net_qty > 0                  # 청산 대상 포지션의 원래 방향
+                close_side = "SHORT" if orig_long else "LONG"
                 for i in range(retries):
-                    qty = b.position_qty(aid, con)
-                    if qty is None:
+                    # 부호 있는 순포지션 재확인 — projectx는 reduceOnly가 없어, 보호 스탑이 먼저
+                    # 터진 뒤 청산 지정가가 '새 반대 포지션'을 여는 레이스가 있다. 매 시도 부호를
+                    # 확인해 반전을 감지하면 즉시 중단하고 시장가 flatten에 위임한다(대표 2026-07-26).
+                    net = None
+                    try:
+                        for _q in b.list_open_positions():
+                            if str(con) == str(_q.symbol) or str(con) in str(_q.symbol):
+                                net = _q.net_qty
+                                break
+                        else:
+                            net = 0.0
+                    except Exception:
+                        net = None
+                    if net is None:
                         return                        # 포지션 조회 실패 → 곧장 시장가(flatten)
-                    if qty == 0:
+                    if net == 0:
                         self.log("   ✅ 청산 체결 (지정가) — 슬리피지 0")
                         break
+                    if (net > 0) != orig_long:         # 부호 반전 = 청산이 반대 포지션을 열었음
+                        self.log("   🛑 청산 중 반대 포지션 감지 — 지정가 청산 중단, 시장가 flatten 위임")
+                        return
+                    qty = abs(int(net))
                     px = b.current_market_price(con)
                     if px is None:
                         return                        # 가격 조회 불가 → 시장가(flatten)
@@ -2654,12 +2727,12 @@ class App:
                         return
                     oid = r.get("order_id")
                     _t.sleep(max(1.0, interval))
-                    left = b.position_qty(aid, con)
                     if oid:
                         try:
                             b.cancel_order(aid, oid)  # 미체결 잔여 취소(재주문/flatten과 충돌 방지)
                         except Exception:
                             pass
+                    left = b.position_qty(aid, con)
                     if left == 0:
                         self.log(f"   ✅ 청산 체결 (지정가, 시도 {i + 1}) — 슬리피지 0")
                         break
@@ -2965,6 +3038,11 @@ class App:
             trades = []
             for (d, a, s), v in sorted(agg.items()):
                 _rsum = sum(v["accts"].values()) or 600.0
+                # 규모 배수 = 현재 1R 합 ÷ 그 회원 '첫 진입 1R 합'(개인 기준선). 공개 상수 600으로
+                # 나누면 서버가 rsum=scale×600으로 절대 1R을 역산할 수 있어 개인정보 유출 →
+                # 회원마다 다른(서버 미지) baseline으로 나눠 역산·상호비교를 막는다(대표 2026-07-26).
+                # 크기 안 바꾼 회원은 scale=1.0 유지, 자본 키운 회원만 배수가 커진다.
+                _bsum = sum(v.get("base", {}).values()) or _rsum
                 trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d,
                                "instrument": a, "direction": v["direction"],
                                # r = 손익비 = 그날 손익 ÷ 그날 실제 1R 합(사이징 무관, 절대 비교 가능).
@@ -2973,7 +3051,7 @@ class App:
                                # 반영(대표 2026-07-26 "곡선이 날마다 업뎃돼도 됨. 어차피 상대금액").
                                # 절대 달러는 전송하지 않는다(개인정보). 규모 정보는 서버가 별도 산출.
                                "r": round(v["pnl"] / _rsum, 3),
-                               "scale": round(_rsum / 600.0, 4)})   # 규모 배수(600 상쇄→비율만 노출)
+                               "scale": round(_rsum / _bsum, 4)})   # 개인 기준선 대비 규모 배수
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
@@ -3191,8 +3269,11 @@ class App:
         return r
 
     def _prop_one_r(self, pr, cfg, lbl):
-        """프롭 페이즈 1R 해석. 테스트기=r_test 고정. 펀디드=발주 순간 잔고로
-        (잔고−시작잔고)≥버퍼 → 안정기, 아니면 버퍼기 — 매일 재평가·히스테리시스 없음.
+        """프롭 페이즈 1R 해석. 테스트기=r_test 고정. 펀디드=발주 순간 잔고(방패)로
+        잔고≥버퍼 → 안정기, 아니면 버퍼기 — 매일 재평가·히스테리시스 없음.
+        ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) →
+        방패=잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 $0 확인). 예전엔
+        방패=잔고−150,000이라 방패가 늘 −150k → 영원히 버퍼기에 갇혀 안정기로 못 넘어갔음.
         잔고 조회 실패 시 버퍼기 1R 폴백(보수). 방패≥버퍼+$5,000이면 chunk 출금 가능 알림."""
         if pr.get("type") != "funded":
             r = _as_float(pr.get("r_test"), 900.0)
@@ -3201,14 +3282,13 @@ class App:
         rb = _as_float(pr.get("r_buffer"), 300.0)
         rs = _as_float(pr.get("r_steady"), 600.0)
         buf = _as_float(pr.get("buffer"), 9000.0)
-        sb = _as_float(pr.get("start_bal"), 150000.0)
         try:
             b = _build_broker(cfg["broker"], cfg["f1"], cfg["f2"], cfg["f3"],
                               [cfg["acct"]] if cfg.get("acct") else [])
             bal = b.account_balance(cfg.get("acct"))
             if bal is None:
                 raise RuntimeError("잔고 없음(계좌 미발견)")
-            shield = float(bal) - sb
+            shield = float(bal)                          # Topstep funded 0-based: 방패=잔고
             if shield >= buf:
                 self.log(f"   ⚙ [{lbl}] 프롭 안정기 1R=${rs:g} (방패 ${shield:,.0f} ≥ ${buf:,.0f})")
                 if shield >= buf + 5000:
@@ -3256,7 +3336,10 @@ class App:
                  f"1R=${one_r:g}×{mult:.2f}=${_eff_r:g}(거리 {_sz['risk_pts']}) · "
                  f"{'LIVE' if live else 'dry-run'}{(' [' + sc + ']') if sc else ''}")
         if live:                                    # 실제 진입 1R 원장 기록(A안, 트랙레코드 R 정확화)
-            _record_real_r(asset, sc, one_r)
+            # 키는 (자산|계좌ID) — 크립토는 계좌ID가 비어(sc="") 브로커명으로 대체해야 조회측
+            # (_acct_id = acct or broker, 2914)과 키가 맞는다. 예전엔 기록=sc("")/조회="bybit"로
+            # 영구 불일치 → %-크립토 트랙레코드가 실측 1R 대신 명목값으로 왜곡됐음(대표 2026-07-26).
+            _record_real_r(asset, sc or _broker, one_r)
         _pub = sig.get("published_at")
         _recv = _dtl.datetime.now()
         _is_fut = bool(_BROKER_SPEC.get(_broker, {}).get("futures"))

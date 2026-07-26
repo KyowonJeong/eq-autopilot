@@ -51,7 +51,9 @@ class BybitBroker(BrokerAdapter):
                               timeout=_TIMEOUT)
         r.raise_for_status()
         d = r.json()
-        if d.get("retCode") not in (0, None):
+        # Bybit v5는 성공 시 항상 retCode=0. retCode 부재(None)를 성공으로 치던 예전 코드는
+        # 코드 없는 변형 200 응답을 '주문 성공'으로 오판할 수 있어 명시적으로 0만 통과시킨다.
+        if d.get("retCode") != 0:
             raise RuntimeError(f"Bybit {path} failed: retCode={d.get('retCode')} {d.get('retMsg')}")
         return d.get("result", d)
 
@@ -233,7 +235,10 @@ class BybitBroker(BrokerAdapter):
         closed-pnl 응답에 orderLinkId가 없어서(2026-07-17). 필터는 앱의 EQ 원장이 담당.
         태그는 사후 대조·지원 문의용으로 심어둔다."""
         sym = self._symbol(symbol)
-        bside = "Buy" if str(side).upper() == "LONG" else "Sell"
+        _s = str(side).upper()
+        if _s not in ("LONG", "SHORT"):               # LONG/SHORT 외 값이 조용히 SELL 되면 방향 반전
+            return {"error": f"invalid side: {side!r} (expected LONG/SHORT)"}
+        bside = "Buy" if _s == "LONG" else "Sell"
         qty = self._fmt_qty(size)
         if float(qty) <= 0:
             return {"error": "qty<=0"}
@@ -271,7 +276,10 @@ class BybitBroker(BrokerAdapter):
         """PostOnly 지정가 진입(+손절 첨부). 반환 {order_id}|{error}. dry_run: would_place.
         custom_tag → orderLinkId. 호출측이 재시도마다 유니크하게 만들어 넘긴다(중복 = 거절)."""
         sym = self._symbol(symbol)
-        bside = "Buy" if str(side).upper() == "LONG" else "Sell"
+        _s = str(side).upper()
+        if _s not in ("LONG", "SHORT"):
+            return {"error": f"invalid side: {side!r} (expected LONG/SHORT)"}
+        bside = "Buy" if _s == "LONG" else "Sell"
         qty = self._fmt_qty(size)
         body = {"category": self.category, "symbol": sym, "side": bside,
                 "orderType": "Limit", "price": f"{float(price):g}", "qty": qty,
@@ -348,14 +356,27 @@ class BybitBroker(BrokerAdapter):
         """포지션의 보호 손절가를 변경(X2+BE 본절 이동용). POST /v5/position/trading-stop.
         Bybit는 stopLoss를 포지션 속성으로 관리 → 값만 덮어쓰면 기존 스탑이 갱신된다
         (취소→재등록 사이 무방비 구간이 없다). 반환 {"error": None|str}."""
+        _body = {"category": self.category, "symbol": self._symbol(symbol),
+                 "stopLoss": str(round(float(stop_price), 2)),
+                 "positionIdx": 0}          # one-way 모드(기본)
         try:
-            self._req("POST", "/v5/position/trading-stop", body={
-                "category": self.category, "symbol": self._symbol(symbol),
-                "stopLoss": str(round(float(stop_price), 2)),
-                "positionIdx": 0,          # one-way 모드
-            })
+            self._req("POST", "/v5/position/trading-stop", body=_body)
             return {"error": None}
         except Exception as e:
+            # 헤지(양방향) 계정: positionIdx 0이 안 맞음 → 실제 보유 포지션의 idx로 1회 재시도
+            # (X2+BE 본절 이동이 헤지 계정에서 조용히 실패해 트레일이 사라지는 것 방지).
+            if "10001" in str(e) or "position idx" in str(e).lower():
+                try:
+                    sym = self._symbol(symbol)
+                    for p in self.list_open_positions():
+                        if p.symbol == sym:
+                            _pi = p.raw.get("positionIdx")
+                            if _pi is not None:
+                                _body["positionIdx"] = _pi
+                                self._req("POST", "/v5/position/trading-stop", body=_body)
+                                return {"error": None}
+                except Exception as e2:
+                    return {"error": f"{e2} (hedge retry)"}
             return {"error": str(e)}
 
     def block_4h(self, symbol, end_utc):
