@@ -464,6 +464,7 @@ def _pin_ok(pin):
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 900.0, "r_buffer": 300.0,
                   "r_steady": 600.0, "buffer": 9000.0}
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
+_PAYOUT_CHUNK = 5000.0   # Topstep 회당 출금 단위 — 방패가 버퍼+이 값 이상이면 출금 권장 팝업
 
 
 def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
@@ -3455,12 +3456,33 @@ class App:
             if bal is None:
                 raise RuntimeError("잔고 없음(계좌 미발견)")
             shield = float(bal)                          # Topstep funded 0-based: 방패=잔고
+            _pk = (cfg.get("broker"), (cfg.get("acct") or lbl))
+            _alerted = getattr(self, "_payout_alerted", None)
+            if _alerted is None:
+                _alerted = self._payout_alerted = set()
             if shield >= buf:
                 self.log(f"   ⚙ [{lbl}] 프롭 안정기 1R=${rs:g} (방패 ${shield:,.0f} ≥ ${buf:,.0f})")
-                if shield >= buf + 5000:
-                    self.log(f"   💰 [{lbl}] chunk 출금 가능 — 방패 ${shield:,.0f} ≥ 버퍼+$5,000 "
-                             f"(꽉 채워 $5,000 인출 타이밍)")
+                if shield >= buf + _PAYOUT_CHUNK:
+                    self.log(f"   💰 [{lbl}] 출금 가능 — 방패 ${shield:,.0f} ≥ 버퍼+${_PAYOUT_CHUNK:,.0f}")
+                    # 출금 가능 시점 팝업 — 한 번만(중복 방지). 문턱 아래로 내려가면 리셋되어
+                    # 다음 도달 때 다시 알린다. 권장 톤 — 출금 여부는 대표 판단(대표 2026-07-26).
+                    if _pk not in _alerted:
+                        _alerted.add(_pk)
+                        _ko = self.lang == "ko"
+                        _msg = ((f"[{lbl}] 펀디드 출금 가능 시점입니다.\n\n"
+                                 f"방패(잔고) ${shield:,.0f} 가 버퍼 ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f}에 "
+                                 f"도달했습니다.\n\n원하시면 ${_PAYOUT_CHUNK:,.0f} 인출을 고려해 보세요 "
+                                 f"(출금 여부는 본인 판단입니다).") if _ko else
+                                (f"[{lbl}] Funded payout is available.\n\n"
+                                 f"Shield (balance) ${shield:,.0f} reached buffer ${buf:,.0f} + "
+                                 f"${_PAYOUT_CHUNK:,.0f}.\n\nYou may want to consider a ${_PAYOUT_CHUNK:,.0f} "
+                                 f"withdrawal (the decision is yours)."))
+                        self.root.after(0, lambda m=_msg, k=_ko: messagebox.showinfo(
+                            "출금 가능" if k else "Payout available", m))
+                elif _pk in _alerted:
+                    _alerted.discard(_pk)                # 문턱 아래(출금 후 등) → 다음 도달 때 재알림
                 return rs
+            _alerted.discard(_pk)
             self.log(f"   ⚙ [{lbl}] 프롭 버퍼기 1R=${rb:g} (방패 ${shield:,.0f} < ${buf:,.0f})")
             return rb
         except AttributeError:
