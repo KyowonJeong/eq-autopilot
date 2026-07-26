@@ -624,6 +624,14 @@ def _lookup_real_r(ledger: dict, asset: str, acct: str, fill_ts: float, fallback
     return float(best_r) if best_r is not None else float(fallback)
 
 
+def _lookup_baseline_r(ledger: dict, asset: str, acct: str, fallback: float) -> float:
+    """그 (자산|계좌)의 '첫 진입 1R' = 개인 기준선. 상대 현금(cash_rel)의 분모.
+    개인마다 달라 서로 역산·비교 불가하고, 자본이 커지면 현재 1R/기준선 배수가 커져
+    상대 규모가 성장한다(대표 2026-07-26 — $600 고정 기준 금지)."""
+    rows = (ledger or {}).get(f"{asset}|{acct or ''}") or []
+    return float(rows[0][1]) if rows else float(fallback)
+
+
 # ── EQ 거래 원장 (대표 2026-07-17) ────────────────────────────────────────────
 # 브로커는 '계좌 전체' 체결을 준다 — 회원이 같은 계좌에서 손수 친 MNQ/MGC/BTC 거래가
 # 트랙레코드에 섞인다. 브로커 조회 응답에는 주문 태그(customTag/orderLinkId)가 없어서
@@ -2942,27 +2950,30 @@ class App:
                 d = dt.date().isoformat()
                 k = (d, a, _btc_sess(dt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
-                                       "accts": {}})
+                                       "accts": {}, "base": {}})
                 e["pnl"] += float(f.get("pnl") or 0)
                 # 참여 계좌 1R = 그 체결 시각 직전 진입의 '실제 1R'(R 원장). 없으면 계좌 명목값
                 # 폴백. 프롭 페이즈·자본 비례로 시점마다 1R이 달라도 정확히 정규화(대표 A안).
-                e["accts"][f.get("_acct_id")] = _lookup_real_r(
-                    _rledger, a, f.get("_acct_id"),
-                    (f.get("ts_ms") or 0) / 1000.0, float(f.get("_one_r") or 600.0))
+                _aid = f.get("_acct_id")
+                _fb = float(f.get("_one_r") or 600.0)
+                e["accts"][_aid] = _lookup_real_r(
+                    _rledger, a, _aid, (f.get("ts_ms") or 0) / 1000.0, _fb)
+                e.setdefault("base", {})[_aid] = _lookup_baseline_r(_rledger, a, _aid, _fb)
             # R 정규화(대표 2026-07-24 멀티계좌) = **$손익 합 ÷ 참여 계좌 1R 합** — 시그널의 진짜
             # 배수를 보존한다(계좌 A +$1200@1R600 + 계좌 B +$600@1R300 = $1800÷$900 = +2R,
             # 계좌 수만큼 뻥튀기 안 됨). 계좌당 단일 1R·자산 등가중.
             trades = []
-            _CASH_BASE = 600.0                        # 상대 현금 기준단위(=1R $600을 1.0으로). 절대액 미노출.
             for (d, a, s), v in sorted(agg.items()):
                 _rsum = sum(v["accts"].values()) or 600.0
-                _naccts = len(v["accts"]) or 1
                 trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d,
                                "instrument": a, "direction": v["direction"],
-                               # r = 손익비(실제 1R로 정규화, 사이징 무관). cash_rel = 상대 현금
-                               # (계좌당 $600 기준 — 큰 사이징·복리일수록 커짐, 절대액은 숨김, 대표 C안).
+                               # r = 손익비 = 그날 손익 ÷ 그날 실제 1R 합(사이징 무관, 절대 비교 가능).
+                               # cash_rel = r과 동일 계산이나 공개 페이지는 이를 '누적한 뒤' 곡선의
+                               # 매 점을 그 시점 규모로 재정규화한다 → 자본 투입·복리가 다이나믹하게
+                               # 반영(대표 2026-07-26 "곡선이 날마다 업뎃돼도 됨. 어차피 상대금액").
+                               # 절대 달러는 전송하지 않는다(개인정보). 규모 정보는 서버가 별도 산출.
                                "r": round(v["pnl"] / _rsum, 3),
-                               "cash_rel": round(v["pnl"] / (_naccts * _CASH_BASE), 3)})
+                               "scale": round(_rsum / 600.0, 4)})   # 규모 배수(600 상쇄→비율만 노출)
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
