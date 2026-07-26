@@ -943,6 +943,9 @@ class App:
         self.b_demo_start.pack(side="left", padx=(8, 0))
         self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
         self.b_live_stop.pack(side="left", padx=(6, 0))
+        # 서버 신호 없이 전 자산 전 계좌 잔고·1R을 한 번에 확인(대표 2026-07-26).
+        ttk.Button(lc, text=("전 자산 1R 조회" if self.lang == "ko" else "Preview 1R (all)"),
+                   command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
         ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
                   justify="left").pack(anchor="w", pady=(2, 0))
         self._refresh_live_panel()
@@ -3262,89 +3265,114 @@ class App:
             return hit[0]                               # 24h 내 마지막 성공값 폴백
         return None
 
-    def _preview_one_r(self, asset):
-        """서버 신호 없이 그 자산 전 계좌의 현재 1R($)만 계산해 보여준다(진입 프리뷰, 대표 2026-07-26).
-        브로커 연결→잔고 조회→모드별(프롭 페이즈 / 자본 비례 / 고정) 1R. 계약수는 손절거리가 있어야
-        나오므로 진입 순간에만 — 여기선 1R 달러만. 잔고 조회는 백그라운드 스레드(앱 안 멈춤)."""
+    def _fetch_balance_diag(self, bk, f1, f2, f3, aid, is_fut):
+        """잔고 직접 조회 + 실패 원인 표면화. 반환 (bal|None, err|None).
+        _acct_balance의 bal>0 게이트·캐시를 우회 — 0/저잔고도 그대로. 크립토 None이면
+        authenticate로 인증 실패인지 필드 없음인지 구분해 로그로 드러낸다(대표 2026-07-26)."""
+        try:
+            b = _build_broker(bk, f1, f2, f3, [aid] if aid else [])
+        except Exception as e:
+            return None, f"브로커 생성 실패: {str(e)[:100]}"
+        try:
+            if is_fut and hasattr(b, "account_balance"):
+                v = b.account_balance(aid)
+            elif hasattr(b, "available_usdt"):
+                v = b.available_usdt()
+            elif hasattr(b, "account_balance"):
+                v = b.account_balance(aid)
+            else:
+                return None, "잔고 조회 메서드 없음"
+            if v is not None:
+                return float(v), None
+            # None → 왜인지 표면화: 인증부터 확인
+            try:
+                b.authenticate()
+                return None, "인증은 됐으나 잔고 필드가 비어있음(계좌 유형/통화 확인)"
+            except Exception as ae:
+                return None, f"인증 실패: {str(ae)[:120]}"
+        except Exception as e:
+            return None, str(e)[:120]
+
+    def _run_1r_preview(self, assets, title):
+        """서버 신호 없이 지정 자산들의 전 계좌 잔고·1R을 조회해 팝업+로그로 보여준다.
+        1R은 그 잔고로 인라인 계산(프롭 페이즈/자본 비례/고정) → 잔고와 일관. 백그라운드 스레드."""
         import threading as _th
         ko = self.lang == "ko"
-        bk = self._broker_of(asset)
-        cr = self._creds_of(asset)
-        f1 = (cr.get("f1") or "").strip()
-        if not f1:
-            messagebox.showwarning("EQ", (f"{asset}: 브로커 키가 설정되지 않았습니다." if ko
-                                          else f"{asset}: broker credentials not set."))
-            return
-        accts = [a for a in self._accts_of(asset) if a.get("on", True)]
-        if not accts:
-            messagebox.showinfo("EQ", (f"{asset}: 켜진 계좌가 없습니다." if ko
-                                       else f"{asset}: no active accounts."))
-            return
-        is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))   # 계좌ID 개념=선물 / 없으면 크립토
-        self.log(f"\n💵 [{asset}] 잔고·1R 미리보기 (서버 신호 없이 잔고만 조회)")
+        self.log(f"\n💵 {title} — {'서버 신호 없이 잔고만 조회' if ko else 'balance-only, no server signal'}")
 
         def w():
-            f2 = _kc_load(f1) or ""
-            f3 = cr.get("f3", "")
-            lines = []
-            for ac in accts:
-                aid = (ac.get("id") or "").strip()
-                lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
-                # 잔고 직접 조회 — 선물=account_balance / 크립토=available_usdt. _acct_balance의
-                # bal>0 게이트·캐시를 우회해 0/저잔고도 그대로 표시(대표 2026-07-26 BTC 조회 실패 대응).
-                bal = None
-                try:
-                    b = _build_broker(bk, f1, f2, f3, [aid] if aid else [])
-                    if is_fut and hasattr(b, "account_balance"):
-                        bal = b.account_balance(aid)
-                    elif hasattr(b, "available_usdt"):
-                        bal = b.available_usdt()
-                    elif hasattr(b, "account_balance"):
-                        bal = b.account_balance(aid)
-                    bal = float(bal) if bal is not None else None
-                except Exception as e:
-                    self.log(f"   ⚠ [{lbl}] 잔고 조회 오류: {str(e)[:80]}")
-                _pr = ac.get("prop") or {}
-                _pc = ac.get("pct") or {}
-                r = None
-                if _pr.get("on"):                              # 프롭 페이즈(선물)
-                    mode = ("프롭" if ko else "Prop")
-                    if _pr.get("type") == "funded":
-                        rb = _as_float(_pr.get("r_buffer"), 300.0)
-                        if bal is None:
-                            r = rb; note = ("버퍼기·잔고조회실패 폴백" if ko else "buffer (no balance)")
-                        else:
-                            buf = _as_float(_pr.get("buffer"), 9000.0)
-                            rs = _as_float(_pr.get("r_steady"), 600.0)
-                            if bal >= buf:
-                                r = rs; note = (f"안정기 방패 ${bal:,.0f}≥${buf:,.0f}" if ko
-                                                else f"steady, shield ${bal:,.0f}")
+            blocks = []
+            for asset in assets:
+                bk = self._broker_of(asset)
+                cr = self._creds_of(asset)
+                f1 = (cr.get("f1") or "").strip()
+                if not f1:
+                    blocks.append(f"● {asset}: " + ("브로커 키 미설정" if ko else "no credentials"))
+                    continue
+                accts = [a for a in self._accts_of(asset) if a.get("on", True)]
+                if not accts:
+                    blocks.append(f"● {asset}: " + ("켜진 계좌 없음" if ko else "no active accounts"))
+                    continue
+                f2 = _kc_load(f1) or ""
+                f3 = cr.get("f3", "")
+                is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
+                rows = [f"● {asset}"]
+                for ac in accts:
+                    aid = (ac.get("id") or "").strip()
+                    lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
+                    bal, err = self._fetch_balance_diag(bk, f1, f2, f3, aid, is_fut)
+                    if err:
+                        self.log(f"   ⚠ [{asset}·{lbl}] 잔고 조회 실패 — {err}")
+                    _pr = ac.get("prop") or {}
+                    _pc = ac.get("pct") or {}
+                    r = None
+                    if _pr.get("on"):                              # 프롭 페이즈(선물)
+                        mode = ("프롭" if ko else "Prop")
+                        if _pr.get("type") == "funded":
+                            rb = _as_float(_pr.get("r_buffer"), 300.0)
+                            if bal is None:
+                                r = rb; note = ("버퍼기·잔고조회실패 폴백" if ko else "buffer (no balance)")
                             else:
-                                r = rb; note = (f"버퍼기 방패 ${bal:,.0f}<${buf:,.0f}" if ko
-                                                else f"buffer, shield ${bal:,.0f}")
-                    else:
-                        r = _as_float(_pr.get("r_test"), 900.0); note = ("테스트기" if ko else "test")
-                elif _pc.get("on"):                            # 자본 비례(잔고×%)
-                    mode = ("자본비례" if ko else "% equity")
-                    if bal is None:
-                        note = ("잔고 조회 실패" if ko else "no balance")
-                    else:
-                        pct = _as_float(_pc.get("pct"), 0.4)
-                        floor = _as_float(_pc.get("floor"), 200.0)
-                        r = max(bal * pct / 100.0, floor)
-                        note = (f"${bal:,.0f}×{pct:g}%" if r > floor else f"최소 ${floor:g}")
-                else:                                          # 고정
-                    mode = ("고정" if ko else "Fixed")
-                    r = _as_float(ac.get("one_r"), 600.0); note = ("수동" if ko else "manual")
-                balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
-                rstr = (f"${r:,.0f}" if r is not None else ("실패" if ko else "n/a"))
-                self.log(f"   ⚙ [{lbl}] 잔고 {balstr} · {mode} 1R {rstr} ({note})")
-                lines.append(f"[{lbl}]  ·  {mode}\n   {'잔고' if ko else 'Balance'} {balstr}"
-                             f"   |   1R {rstr}\n   ({note})")
-            msg = "\n\n".join(lines) if lines else ("계좌 없음" if ko else "no accounts")
-            _title = (f"{asset} · 잔고 & 1R" if ko else f"{asset} · Balance & 1R")
-            self.root.after(0, lambda m=msg, t=_title: messagebox.showinfo(t, m))
+                                buf = _as_float(_pr.get("buffer"), 9000.0)
+                                rs = _as_float(_pr.get("r_steady"), 600.0)
+                                if bal >= buf:
+                                    r = rs; note = (f"안정기 방패 ${bal:,.0f}≥${buf:,.0f}" if ko
+                                                    else f"steady, shield ${bal:,.0f}")
+                                else:
+                                    r = rb; note = (f"버퍼기 방패 ${bal:,.0f}<${buf:,.0f}" if ko
+                                                    else f"buffer, shield ${bal:,.0f}")
+                        else:
+                            r = _as_float(_pr.get("r_test"), 900.0); note = ("테스트기" if ko else "test")
+                    elif _pc.get("on"):                            # 자본 비례(잔고×%)
+                        mode = ("자본비례" if ko else "% equity")
+                        if bal is None:
+                            note = ("잔고 조회 실패" if ko else "no balance")
+                        else:
+                            pct = _as_float(_pc.get("pct"), 0.4)
+                            floor = _as_float(_pc.get("floor"), 200.0)
+                            r = max(bal * pct / 100.0, floor)
+                            note = (f"${bal:,.0f}×{pct:g}%" if r > floor else f"최소 ${floor:g}")
+                    else:                                          # 고정
+                        mode = ("고정" if ko else "Fixed")
+                        r = _as_float(ac.get("one_r"), 600.0); note = ("수동" if ko else "manual")
+                    balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
+                    rstr = (f"${r:,.0f}" if r is not None else ("실패" if ko else "n/a"))
+                    self.log(f"   ⚙ [{asset}·{lbl}] 잔고 {balstr} · {mode} 1R {rstr} ({note})")
+                    rows.append(f"   [{lbl}] {mode} · {'잔고' if ko else 'Bal'} {balstr}  |  1R {rstr}")
+                blocks.append("\n".join(rows))
+            msg = "\n\n".join(blocks) if blocks else ("계좌 없음" if ko else "no accounts")
+            self.root.after(0, lambda m=msg, t=title: messagebox.showinfo(t, m))
         _th.Thread(target=w, daemon=True).start()
+
+    def _preview_one_r(self, asset):
+        """그 자산 전 계좌 잔고·1R 미리보기(자산 탭 버튼)."""
+        ko = self.lang == "ko"
+        self._run_1r_preview([asset], (f"{asset} · 잔고 & 1R" if ko else f"{asset} · Balance & 1R"))
+
+    def _preview_one_r_all(self):
+        """전 자산 전 계좌 잔고·1R 미리보기(라이브 패널 버튼, 대표 2026-07-26)."""
+        ko = self.lang == "ko"
+        self._run_1r_preview(list(_ASSETS), ("전 자산 · 잔고 & 1R" if ko else "All assets · Balance & 1R"))
 
     def _pct_one_r(self, pc, cfg, lbl):
         """자본 비례 1R = 잔고 × pct%, 최소 floor. 잔고 조회 실패 시 None(호출부가 스킵)."""
