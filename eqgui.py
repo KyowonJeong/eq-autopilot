@@ -1088,6 +1088,11 @@ class App:
             ttk.Label(frm, text=("거래 규모 (1R)" if self.lang == "ko" else "Sizing (1R)"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
             self._acct_edit_row(frm, 0, _accts[0], spec, deletable=False, show_on=False)
+        # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
+        ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
+                              else "Preview 1R — all accounts"),
+                   command=lambda a=self._asset: self._preview_one_r(a)
+                   ).pack(anchor="w", pady=(4, 1))
         ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
         frm = _outer_frm                          # 접이식 본문 끝 — 이후(로그)는 바깥에
 
@@ -3256,6 +3261,56 @@ class App:
         if hit and (_t.time() - hit[1]) <= 86400:
             return hit[0]                               # 24h 내 마지막 성공값 폴백
         return None
+
+    def _preview_one_r(self, asset):
+        """서버 신호 없이 그 자산 전 계좌의 현재 1R($)만 계산해 보여준다(진입 프리뷰, 대표 2026-07-26).
+        브로커 연결→잔고 조회→모드별(프롭 페이즈 / 자본 비례 / 고정) 1R. 계약수는 손절거리가 있어야
+        나오므로 진입 순간에만 — 여기선 1R 달러만. 잔고 조회는 백그라운드 스레드(앱 안 멈춤)."""
+        import threading as _th
+        ko = self.lang == "ko"
+        bk = self._broker_of(asset)
+        cr = self._creds_of(asset)
+        f1 = (cr.get("f1") or "").strip()
+        if not f1:
+            messagebox.showwarning("EQ", (f"{asset}: 브로커 키가 설정되지 않았습니다." if ko
+                                          else f"{asset}: broker credentials not set."))
+            return
+        accts = [a for a in self._accts_of(asset) if a.get("on", True)]
+        if not accts:
+            messagebox.showinfo("EQ", (f"{asset}: 켜진 계좌가 없습니다." if ko
+                                       else f"{asset}: no active accounts."))
+            return
+        self.log(f"\n💵 [{asset}] 1R 미리보기 — 계좌별 현재 1R (서버 신호 없이 잔고만 조회)")
+
+        def w():
+            f2 = _kc_load(f1) or ""
+            f3 = cr.get("f3", "")
+            lines = []
+            for ac in accts:
+                aid = (ac.get("id") or "").strip()
+                lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
+                cfg = {"broker": bk, "f1": f1, "f2": f2, "f3": f3, "acct": aid}
+                _pr = ac.get("prop") or {}
+                _pc = ac.get("pct") or {}
+                r = None
+                try:
+                    if _pr.get("on"):
+                        r = self._prop_one_r(_pr, cfg, lbl); mode = ("프롭" if ko else "Prop")
+                    elif _pc.get("on"):
+                        r = self._pct_one_r(_pc, cfg, lbl); mode = ("자본비례" if ko else "% equity")
+                    else:
+                        r = _as_float(ac.get("one_r"), 600.0); mode = ("고정" if ko else "Fixed")
+                        self.log(f"   ⚙ [{lbl}] {mode} 1R=${r:g}")
+                except Exception as e:
+                    self.log(f"   ⚠ [{lbl}] 1R 계산 오류: {str(e)[:80]}")
+                if r is None:
+                    lines.append(f"[{lbl}] " + ("1R 조회 실패(잔고 못 읽음)" if ko
+                                                else "1R lookup failed (no balance)"))
+                else:
+                    lines.append(f"[{lbl}] {mode} · 1R = ${r:,.0f}")
+            msg = "\n".join(lines) if lines else ("계좌 없음" if ko else "no accounts")
+            self.root.after(0, lambda m=msg: messagebox.showinfo(f"{asset} · 1R", m))
+        _th.Thread(target=w, daemon=True).start()
 
     def _pct_one_r(self, pc, cfg, lbl):
         """자본 비례 1R = 잔고 × pct%, 최소 floor. 잔고 조회 실패 시 None(호출부가 스킵)."""
