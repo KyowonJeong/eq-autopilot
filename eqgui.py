@@ -216,12 +216,11 @@ _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
                 "BTC": {"ko": "비트코인 (BTC)", "en": "Bitcoin (BTC)"}}
 
-# 선물 시간마감 '지정가 청산' 대상 — order_exec.LIMIT_EXEC_ASSETS(BTC·GC)의 선물판 (대표 2026-07-16).
-#   GC만: 손절이 타이트해 계약수가 많고 틱 슬리피지가 커미션을 지배(비용 실측 2026-07-15,
-#   시장가 건당 $64 vs 지정가 절반체결 $41). NQ는 건당 $19라 미체결 리스크 값어치 없음(보류).
-#   ProjectX 전용(IBKR 브로커엔 place_limit_entry/position_qty 폴링 계약이 없음).
-#   백테스트(costs.ASSET_FILL_EXIT)는 이 배선이 실계정 검증될 때까지 GC 청산 0(시장가) 유지.
-_LIMIT_EXIT_FUT = {"GC": "MGC"}
+# 선물 시간마감 '지정가 청산' 대상 — 대표 2026-07-27 "청산은 비트 빼고 시장가": 선물(NQ·GC)은
+#   지정가 도전 없이 즉시 시장가 청산. 빈 dict = 전 선물 시장가(백테스트 비용 가정과도 일치).
+#   BTC(크립토)만 지정가 도전 → 시장가 폴백 유지(_exec_close_limit).
+#   (구 GC 지정가 배선은 _exec_close_limit_fut에 보존 — 재개하려면 {"GC": "MGC"}로 복원.)
+_LIMIT_EXIT_FUT = {}
 _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
@@ -1921,8 +1920,8 @@ class App:
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
                     # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴.
-                    # 선물 GC = 지정가 도전 → 시장가 폴백(대표 2026-07-16, _LIMIT_EXIT_FUT).
-                    # NQ는 시장가 유지(슬립 미미·미체결 리스크 값어치 없음 — order_exec 정책).
+                    # 선물(NQ·GC)은 즉시 시장가(대표 2026-07-27 "청산은 비트 빼고 시장가").
+                    # _LIMIT_EXIT_FUT가 비어 있어 아래 elif는 현재 불발 — flatten_all이 곧 청산.
                     if live and j["broker"] in ("bybit", "bitget") and j["asset"] == "BTC":
                         self._exec_close_limit(b, "BTCUSDT")
                     elif live and j["broker"] == "projectx" and j["asset"] in _LIMIT_EXIT_FUT:
