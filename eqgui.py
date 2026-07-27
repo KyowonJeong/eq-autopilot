@@ -486,7 +486,7 @@ _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모�
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
 
-def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
+def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
@@ -504,7 +504,7 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
         pc["pct"] = _as_float(pct.get("pct"), _PCT_DEFAULTS["pct"])
         pc["floor"] = _as_float(pct.get("floor"), _PCT_DEFAULTS["floor"])
     return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
-            "label": str(label or ""), "prop": p, "pct": pc}
+            "label": str(label or ""), "prop": p, "pct": pc, "manual": bool(manual)}
 
 
 def _as_float(v, default=0.0):
@@ -543,7 +543,7 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"), x.get("pct"))
+                                  x.get("prop"), x.get("pct"), x.get("manual", False))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -554,7 +554,7 @@ def _load():
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                      x.get("prop"), x.get("pct"))
+                                      x.get("prop"), x.get("pct"), x.get("manual", False))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -1430,6 +1430,10 @@ class App:
             _v = _as_float(w["one_r"].get(), 0.0)
             if _v > 0:
                 accts[idx]["one_r"] = _v
+            try:
+                accts[idx]["manual"] = bool(w["manual"].get())
+            except Exception:
+                pass
 
     def _save_current_asset(self):
         """현재 탭 크레덴셜(f1,f3) → 이 자산 브로커 창고, 비밀(f2) → Keychain, 실행자산·계좌위젯
@@ -2253,6 +2257,12 @@ class App:
                         command=lambda i=idx: self._pct_dialog(i))
         cb.pack(side="left", padx=(4, 0))
         self._acct_widgets[idx]["pct_btn"] = cb
+        # 수동 모드(대표 2026-07-27): 신호 티켓만 받고 자동 진입 안 함(진입은 사용자가 직접).
+        # API 없는 프롭(예: 평가·Sim Funded 단계)에서 신호를 손으로 실행할 때. 자동 청산은 별개.
+        man = tk.IntVar(value=1 if acct.get("manual") else 0)
+        ttk.Checkbutton(row, text=("수동" if self.lang == "ko" else "Manual"), variable=man,
+                        command=self._save_acct_widgets).pack(side="left", padx=(6, 0))
+        self._acct_widgets[idx]["manual"] = man
         if pr.get("on") or pc.get("on"):
             r_e.config(state="disabled")               # 자동 사이징 중엔 수동 1R 비활성
         if aid:
@@ -2373,7 +2383,9 @@ class App:
         aid = (acct.get("id") or "").strip()
         cred = {"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
                 "f3": cr.get("f3", ""), "acct": aid}
-        jobs = [{"asset": asset, "tz": tzname, "hour": hour, "live": live, **cred}
+        # 수동 모드 계좌 = 티켓만, 자동 청산 안 함(진입도 청산도 사용자가 직접 — API 없는 프롭 대응).
+        jobs = [] if acct.get("manual") else \
+               [{"asset": asset, "tz": tzname, "hour": hour, "live": live, **cred}
                 for tzname, hour in _ASSET_EXITS.get(asset, [])]
         key = (asset, idx)
         if jobs:
@@ -2385,6 +2397,7 @@ class App:
             self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
                                     "prop": dict(acct.get("prop") or {}),
                                     "pct": dict(acct.get("pct") or {}),
+                                    "manual": bool(acct.get("manual")),   # 수동 모드=티켓만·자동진입 안 함
                                     "live": live, "label": acct.get("label", "")}
             if not self._sig_on:
                 self._sig_on = True
@@ -2463,6 +2476,14 @@ class App:
             tested = {}                       # 브로커별 연결 테스트 1회(같은 브로커 중복 방지)
             for a in incl:
                 bk = self._broker_of(a)
+                # 수동 전용 자산(활성 계좌가 전부 수동 모드)은 발주를 안 하므로 브로커 연결 불필요.
+                # 연결 테스트를 건너뛰어 '연결 실패로 전체 중단'되지 않게 한다(대표 2026-07-27).
+                _act = [ac for ac in self._accts_of(a) if ac.get("on")]
+                if _act and all(ac.get("manual") for ac in _act):
+                    self.log(f"── {a} · " + ("수동 모드(신호 티켓만) — 연결 테스트 건너뜀"
+                                             if self.lang == "ko" else
+                                             "manual mode (signal tickets only) — skipping connection test"))
+                    continue
                 if bk in tested:
                     err = tested[bk]
                     self.log(f"── {a} · {_broker_label(bk)} — "
@@ -3844,6 +3865,44 @@ class App:
             self.log(f"   ⚠ [{lbl}] 잔고 조회 실패({str(e)[:80]}) — 버퍼기 1R=${rb:g} 폴백")
             return rb
 
+    def _manual_ticket(self, cfg, sig, asset, direction, stop, mult):
+        """수동 모드 계좌 — 발주 없이 '실행 티켓'만 표시(대표 2026-07-27). 사용자가 이 숫자를
+        보고 본인 브로커 화면에 직접 진입한다(예: 프롭 평가·Sim Funded 단계처럼 API 없는 계좌).
+        브로커 연결 불필요 — 사이징은 순수 계산(1R = 계좌 설정값, 자동 사이징 API 조회 안 함)."""
+        from eqexec import sizing
+        lbl = cfg.get("label") or _broker_label(cfg.get("broker"))
+        one_r = float(cfg.get("one_r") or 0) * float(mult or 1.0)
+        entry_ref = sig.get("entry_ref")
+        _sz = sizing.compute_size(asset, cfg.get("broker"), one_r, entry_ref, stop, direction)
+        _ko = self.lang == "ko"
+        if not _sz:
+            _qty = "?"
+            _unit = ""
+        else:
+            _qty = _sz["size"]
+            _unit = "계약" if (_ko and _sz.get("unit") == "contracts") else \
+                    ("contracts" if _sz.get("unit") == "contracts" else _sz.get("unit", ""))
+            if _sz["size"] <= 0:
+                _qty = "0 (1R 대비 손절 큼 — 진입 보류 권장)" if _ko else "0 (stop too wide for 1R)"
+        _bar = "─" * 34
+        self.log(f"\n📝 {_bar}")
+        self.log(f"📝 [{lbl}] 수동 실행 티켓 — {asset} {direction}" if _ko else
+                 f"📝 [{lbl}] MANUAL ticket — {asset} {direction}")
+        self.log(f"     {'방향' if _ko else 'Side'} : {direction}")
+        self.log(f"     {'진입 참조' if _ko else 'Entry'} : {entry_ref}")
+        self.log(f"     {'손절가' if _ko else 'Stop'}  : {stop}")
+        self.log(f"     {'수량' if _ko else 'Qty'}  : {_qty} {_unit}   (1R ${one_r:g})")
+        self.log(("     → 브로커 화면에 직접 입력하세요. 자동 진입 안 함(수동 모드)." if _ko else
+                  "     → Enter this on your broker manually. No auto-entry (manual mode)."))
+        self.log(f"📝 {_bar}")
+        # 팝업으로도 띄워 놓쳐도 보이게(수동은 사용자가 즉시 봐야 하므로).
+        _title = f"수동 티켓 — {asset} {direction}" if _ko else f"Manual ticket — {asset} {direction}"
+        _msg = ((f"[{lbl}]  {asset} {direction}\n\n진입 참조: {entry_ref}\n손절가: {stop}\n"
+                 f"수량: {_qty} {_unit}  (1R ${one_r:g})\n\n브로커 화면에 직접 입력하세요.") if _ko else
+                (f"[{lbl}]  {asset} {direction}\n\nEntry: {entry_ref}\nStop: {stop}\n"
+                 f"Qty: {_qty} {_unit}  (1R ${one_r:g})\n\nEnter this on your broker manually."))
+        self.root.after(0, lambda t=_title, m=_msg: messagebox.showinfo(t, m))
+
     def _enter_account(self, cfg, sig, asset, direction, stop, mult):
         """단일 계좌 진입 — cfg(broker,f1,f2,f3,acct,one_r,label,live)로 사이징+발주.
         로그는 계좌 라벨을 앞에 붙여 멀티계좌를 구분한다(대표 2026-07-24). 계좌 실패는
@@ -4043,17 +4102,22 @@ class App:
                 except (TypeError, ValueError):
                     _sent, _lat = None, "?"
                 # 🚫 재진입 금지(계좌·세션별 하루 1회) → 발주 대상 계좌 선별
+                # 수동 계좌(manual)는 자동 발주 대상이 아니라 '티켓만' 표시(진입은 사용자가 직접).
                 _fire = []
+                _manual = []
                 for _key, _cfg in targets:
                     if _sig_day is not None and entered_day.get((_key, _dedup_key)) == _sig_day:
                         self.log(f"   ⏹ [{_cfg.get('label')}] {_asset} 오늘({_sig_day}) 이미 진입 — 재진입 금지.")
                         continue
                     entered_day[(_key, _dedup_key)] = _sig_day   # 성공/실패 무관 — 같은 날 재진입 금지
-                    _fire.append(_cfg)
+                    (_manual if _cfg.get("manual") else _fire).append(_cfg)
+                if _manual:                                       # 수동 티켓(발주 없음)
+                    for _cfg in _manual:
+                        self._manual_ticket(_cfg, sig, _asset, direction, stop, _mult)
                 if not _fire:
                     _t.sleep(SIG_POLL_SECS); continue
                 self.log(f"\n📶 신호 캡처 [{sid}] — {_asset} {direction} · 손절 {stop} · "
-                         f"진입참조 {sig.get('entry_ref')} · size×{_mult:.2f} · {len(_fire)}개 계좌 동시 진입")
+                         f"진입참조 {sig.get('entry_ref')} · size×{_mult:.2f} · {len(_fire)}개 계좌 자동 진입")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
                          f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
                 # 계좌별 병렬 발주 — 순차 지연으로 계좌 간 진입가가 벌어지는 것 방지(대표 2026-07-24).
