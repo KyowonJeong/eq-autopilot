@@ -478,6 +478,10 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None):
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
+        # G' 마이그레이션(2026-07-27): 구 기본값 그대로인 계좌만 새 챔피언으로 자동 이행
+        # (900/300/600·방패 9000 → 1200/300/450·방패 3000). 커스텀 값은 절대 안 건드림.
+        if (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (900.0, 300.0, 600.0, 9000.0):
+            p["r_test"], p["r_steady"], p["buffer"] = 1200.0, 450.0, 3000.0
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
         pc["on"] = bool(pct.get("on"))
