@@ -795,6 +795,7 @@ class App:
         root.after(120, self._drain)
         root.after(800, lambda: self._heartbeat(periodic=True))   # 시작 직후 + 주기 권한 갱신
         root.after(5 * 60 * 1000, self._autopush_tick)             # 일일 자동 트랙레코드 동기화
+        threading.Thread(target=self._build_watch, daemon=True).start()   # 빌드 교체 감지(#31)
         self._precheck_done = {}                                    # {(asset, entry_iso): True}
         root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
 
@@ -3000,6 +3001,47 @@ class App:
             webbrowser.open(f"{PUSH_BASE}?u={h}")
 
     AUTOPUSH_EVERY_S = 24 * 3600      # 일일 자동 동기화 주기
+
+    def _build_watch(self):
+        """빌드 교체 감지 (2026-07-27 GC 미진입 실사고 — 앱을 켜둔 채 실행 파일이 새 빌드로
+        교체되면, 지연 임포트가 새 파일을 옛 오프셋으로 읽다 진입 스레드가 죽는다).
+        5분마다 실행 파일 지문(mtime·size)을 확인, 바뀌면 로그 + 경고 팝업 1회.
+        자동 재시작은 하지 않는다(포지션 보유 중일 수 있음). EQ_BUILD_WATCH=0 으로 끔."""
+        import os as _os
+        import sys as _sys
+        import time as _t
+        if _os.environ.get("EQ_BUILD_WATCH", "1") == "0":
+            return
+        exe = _sys.executable
+        try:
+            _st = _os.stat(exe)
+            fp = (_st.st_mtime, _st.st_size)
+        except OSError:
+            return
+        while True:
+            _t.sleep(300)
+            try:
+                _st = _os.stat(exe)
+                changed = (_st.st_mtime, _st.st_size) != fp
+            except OSError:
+                continue                       # 교체 순간 일시 부재 — 다음 사이클 재확인
+            if changed:
+                _ko = self.lang == "ko"
+                self.log("\n🔁 " + ("새 버전이 배포되었습니다 — 실행 파일이 바뀌었습니다. "
+                                    "포지션이 없는 시점에 앱을 재시작하세요. 재시작 전까지 "
+                                    "새 기능 로딩이 실패할 수 있습니다." if _ko else
+                                    "A new build was deployed — the executable changed. Restart "
+                                    "the app when no position is open; until then, loading new "
+                                    "modules may fail."))
+                _pt = "새 버전 배포됨 — 재시작 필요" if _ko else "New build deployed — restart needed"
+                _pm = (("EQ Autopilot의 새 버전이 배포되었습니다.\n\n켜 둔 앱은 예전 버전인 채로 "
+                        "돌다가, 새 기능을 처음 부르는 순간 오류가 날 수 있습니다.\n\n포지션이 "
+                        "없는 시점에 앱을 종료했다가 다시 실행해 주세요.") if _ko else
+                       ("A new build of EQ Autopilot was deployed.\n\nThis running app is still the "
+                        "old version and may fail the first time it loads a new module.\n\nPlease "
+                        "quit and relaunch when no position is open."))
+                self.root.after(0, lambda t=_pt, m=_pm: messagebox.showwarning(t, m))
+                return                          # 1회 경고 후 종료(스팸 방지)
 
     def _autopush_tick(self):
         """1시간마다 깨어나 24h 경과 시 트랙레코드 자동 동기화(무소음). 조건: 동의 체크 +
