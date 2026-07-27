@@ -202,15 +202,15 @@ def _feed_url(token):
 
 
 # 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
-_BROKERS = ["projectx", "ibkr", "bybit", "bitget", "ninjatrader"]
+_BROKERS = ["projectx", "tradovate", "ibkr", "bybit", "bitget"]
 
 # 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
 #   ⚠️ BTC를 CME MBTC 선물로 안 함 — MBTC는 주말 휴장인데 BTC 엣지가 주말(일요일)에 몰려 있어
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
 _ASSETS = ["NQ", "GC", "BTC"]
-_ASSET_BROKERS = {"NQ": ["projectx", "ibkr"],
-                  "GC": ["projectx", "ibkr"],
+_ASSET_BROKERS = {"NQ": ["projectx", "tradovate", "ibkr"],
+                  "GC": ["projectx", "tradovate", "ibkr"],
                   "BTC": ["bybit", "bitget"]}
 _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
@@ -232,8 +232,11 @@ _BROKER_SPEC = {
     "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
                     "f3": "Passphrase", "acct": False, "futures": False, "preview": True,
                     "f1_secret": True},
-    "ninjatrader": {"label": "NinjaTrader (ATI)", "f1": "NT 계좌 (비우면 전체)", "f2": None,
-                    "f3": None, "acct": False, "futures": False, "preview": True},
+    # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
+    #   (API 키 페어 콜론 연결 — 셋째 토막 'demo'면 데모 서버). preview=데모 실검증 전.
+    "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "Password",
+                    "f3": "API cid:sec[:demo]", "acct": True, "futures": True,
+                    "preview": True},
 }
 
 
@@ -260,10 +263,20 @@ def _build_broker(broker, f1, f2, f3, accounts):
         from eqexec.broker.bitget import BitgetBroker
         from eqexec.config import BitgetCfg
         return BitgetBroker(BitgetCfg(api_key=f1, api_secret=f2, passphrase=f3))
-    if broker == "ninjatrader":
-        from eqexec.broker.ninjatrader import NinjaTraderBroker
-        from eqexec.config import NinjaTraderCfg
-        return NinjaTraderBroker(NinjaTraderCfg(accounts=([f1] if f1 else [])))
+    if broker == "tradovate":
+        from eqexec.broker.tradovate import TradovateBroker
+        from eqexec.config import TradovateCfg
+        import hashlib as _hl
+        import uuid as _uu
+        parts = [p.strip() for p in str(f3 or "").split(":")]
+        _env = "demo" if "demo" in [p.lower() for p in parts[2:]] else "live"
+        # deviceId = 머신 고정 해시 — 기기 인증 반복(캡차) 방지, 개인정보 아님
+        _dev = _hl.sha256(str(_uu.getnode()).encode()).hexdigest()[:24]
+        return TradovateBroker(TradovateCfg(env=_env, name=(f1 or ""), password=(f2 or ""),
+                                            cid=(parts[0] if parts and parts[0] else ""),
+                                            sec=(parts[1] if len(parts) > 1 else ""),
+                                            app_id="EdgeQuant-Autopilot",
+                                            device_id=_dev, accounts=acc))
     raise ValueError(f"unknown broker {broker!r}")
 
 

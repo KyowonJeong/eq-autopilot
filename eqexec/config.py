@@ -27,8 +27,9 @@ class TradovateCfg:
     @property
     def base_url(self) -> str:
         # Tradovate REST base. demo for eval/testing, live for funded.
-        return ("https://live.tradovateapi.com" if self.env == "live"
-                else "https://demo.tradovateapi.com")
+        # /v1 포함 — 실제 REST 경로는 https://{demo|live}.tradovateapi.com/v1/...
+        return ("https://live.tradovateapi.com/v1" if self.env == "live"
+                else "https://demo.tradovateapi.com/v1")
 
 
 @dataclass
@@ -66,12 +67,6 @@ class BitgetCfg:
     passphrase: str = ""
     product_type: str = "USDT-FUTURES"
 
-
-@dataclass
-class NinjaTraderCfg:
-    # Auto-close via NT8 ATI/OIF — NT8 must be running with AT Interface enabled.
-    incoming_dir: str = ""            # blank → <Documents>/NinjaTrader 8/incoming
-    accounts: list[str] = field(default_factory=list)   # blank → FLATTENEVERYTHING (all)
 
 
 @dataclass
