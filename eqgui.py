@@ -478,8 +478,9 @@ def _pin_ok(pin):
 # 이익만 0부터 적립) → '방패'는 잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 확인).
 # payouts = 이 계좌의 지금까지 출금 횟수(0~5, 대표 2026-07-27 밤 — 960조합 풀그리드 신챔피언):
 #   펀디드 1R = 전 구간 $300 고정(버퍼/안정 구분 소멸 — 얇게 끝까지)
-#   방패기(0~1발): 잔고 $6,000 방패 유지(연타 2일 흡수), $12,000 도달 시 $6,000 출금
-#   속도기(2발~):  방패 해제, 잔고 $6,000 도달 즉시 $6,000
+#   Fast-Payout(대표 2026-07-27 심야): 자격($150+ 익절 5일·직전 출금 후 순익+)이 차는 순간
+#   잔고의 절반을 즉시 출금(회당 $6,000 한도). 모으기 금지 — Live 전환은 리스크팀 재량·예고
+#   없음(Topstep 서면)이라 잔고에 머무는 돈=반값 리스크. 남는 절반=자연 방패(별도 방패 규칙 소멸)
 #   회전(합산 5발): 라이브 전환 — 잔여는 소멸이 아니라 Live 시작 잔고로 이월(Topstep 서면 2026-07-27)
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
                   "r_steady": 300.0, "buffer": 6000.0, "payouts": 0}
@@ -2176,22 +2177,20 @@ class App:
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("펀디드는 발주 순간 잔고와 '출금 횟수'로 단계를 자동 판정합니다(신챔피언): "
-                         "펀디드 1R은 전 구간 $300 고정 · 방패기(0~1발)=잔고 $12,000 도달 시 "
-                         "$6,000 출금($6,000 방패 유지) · 속도기(2발~)=$6,000 도달 즉시 $6,000 · "
-                         "마지막(4발)=익절 5일 재충족 즉시 있는 만큼 부분 출금. "
-                         "5발이면 라이브 전환 — 잔여는 Live 시작 잔고로 이월됩니다(Topstep 확인). "
-                         "출금 횟수는 출금 팝업에서 '예'로 자동 +1 되며 여기서 수동 조정도 됩니다. "
-                         "잔고 조회 실패 시 버퍼기 1R로 안전 폴백.") if ko else
-                        ("Funded accounts pick their stage from the live balance and the payout "
-                         "count (champion): funded 1R is a flat $300 throughout · Shield (payouts "
-                         "0-1) pays $6,000 at $12,000, keeping a $6,000 shield · Speed (2+) pays "
-                         "$6,000 as soon as $6,000 · Final (4) takes a partial payout as soon as the "
-                         "win-day requirement refills. At five payouts the login becomes a "
-                         "Live-transition candidate — the remaining balance carries into the Live "
-                         "account (confirmed by Topstep). The count "
-                         "auto-increments via the payout popup and can be adjusted here. On "
-                         "balance-lookup failure the app falls back to Buffer 1R."))
+                  text=(("펀디드 1R은 전 구간 $300 고정, 출금은 Fast-Payout 하나입니다: 출금 "
+                         "자격($150+ 익절일 5일·직전 출금 후 순익 플러스)이 차는 순간 잔고의 "
+                         "절반을 즉시 출금(회당 $6,000 한도). 모으지 않습니다 — Live 전환은 예고 "
+                         "없이 올 수 있고, 남은 잔고는 이월돼도 회수가 느립니다(Topstep 서면). "
+                         "5발이면 이 계정은 라이브 전환 대상 — 새 계정으로 교체합니다. "
+                         "출금 횟수는 출금 팝업에서 '예'로 자동 +1 되며 여기서 수동 조정도 됩니다.") if ko else
+                        ("Funded 1R is a flat $300 throughout, and there is exactly one payout rule "
+                         "— Fast-Payout: the moment you qualify (five $150+ winning days, net "
+                         "positive since the last payout), withdraw half the balance immediately "
+                         "($6,000/payout cap). No hoarding — the Live call-up can come without "
+                         "warning, and remaining balances carry over but recover slowly (Topstep, "
+                         "in writing). At five payouts the login becomes a Live-transition "
+                         "candidate — rotate to a fresh login. The count auto-increments via the "
+                         "payout popup and can be adjusted here."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
 
         def _ok():
@@ -3609,29 +3608,18 @@ class App:
                     _pr = ac.get("prop") or {}
                     _pc = ac.get("pct") or {}
                     r = None
-                    if _pr.get("on"):                              # 프롭 단계(G정책)
+                    if _pr.get("on"):                              # 프롭(Fast-Payout 체제)
                         mode = ("프롭" if ko else "Prop")
                         if _pr.get("type") == "funded":
-                            rb = _as_float(_pr.get("r_buffer"), 300.0)
                             rs = _as_float(_pr.get("r_steady"), 300.0)
                             _pcv = max(0, min(5, int(_as_float(_pr.get("payouts"), 0))))
                             if _pcv >= 5:
                                 note = ("5발 완료 — 라이브 전환 대상·진입 안 함" if ko
                                         else "5/5 — Live-transition candidate, no entry")
-                            elif _pcv >= 2:
-                                r = rs
-                                note = ((f"{'마지막' if _pcv == 4 else '속도기'} {_pcv}/5발·방패 해제")
-                                        if ko else f"{'final' if _pcv == 4 else 'speed'} {_pcv}/5, no shield")
-                            elif bal is None:
-                                r = rb; note = ("버퍼기·잔고조회실패 폴백" if ko else "buffer (no balance)")
                             else:
-                                buf = _as_float(_pr.get("buffer"), 6000.0)
-                                if bal >= buf:
-                                    r = rs; note = (f"안정기 {_pcv}/5발·방패 ${bal:,.0f}≥${buf:,.0f}" if ko
-                                                    else f"steady {_pcv}/5, shield ${bal:,.0f}")
-                                else:
-                                    r = rb; note = (f"버퍼기 {_pcv}/5발·방패 ${bal:,.0f}<${buf:,.0f}" if ko
-                                                    else f"buffer {_pcv}/5, shield ${bal:,.0f}")
+                                r = rs
+                                note = (f"펀디드 {_pcv}/5발 · Fast-Payout(자격 즉시 절반)" if ko
+                                        else f"funded {_pcv}/5 · fast-payout (half on qualify)")
                         else:
                             r = _as_float(_pr.get("r_test"), 1200.0); note = ("테스트기" if ko else "test")
                     elif _pc.get("on"):                            # 자본 비례(잔고×%)
@@ -3777,15 +3765,15 @@ class App:
         self.root.after(0, _ask)
 
     def _prop_one_r(self, pr, cfg, lbl):
-        """프롭 1R 해석 — G' 개정(대표 2026-07-27, 계정 예산 격자 재최적화: 중앙 +53%·바닥 플러스).
-        테스트기=r_test 고정. 펀디드=발주 순간 잔고 + '출금 횟수'로 단계 판정:
-          펀디드 1R = 전 구간 $300 고정(신챔피언 — 버퍼/안정 구분 소멸),
-                         방패기(0~1발): 잔고 $12,000($6,000 방패 + $6,000) 도달 시 $6,000 출금 팝업
-          속도기(2발~):  방패 해제 — 항상 안정기 1R, 잔고 $6,000 도달 시 $6,000 출금 팝업
-          마지막(4발):   익절 5일 재충족 즉시 있는 만큼 부분 출금 안내(남기면 소멸)
-          5발 완료:      진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
-        ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) → 방패=잔고.
-        잔고 조회 실패 시 버퍼기 1R 폴백(보수)."""
+        """프롭 1R 해석 — Fast-Payout 체제(대표 2026-07-27 심야 "최대한 빨리 페이아웃…그걸로 하자").
+        테스트기=r_test($1,200) 고정. 펀디드=전 구간 $300 고정 + 출금 규칙 하나:
+          Fast-Payout: 출금 자격($150+ 익절일 5일·직전 출금 후 순익+)이 차는 순간 잔고의
+          절반을 즉시 출금(회당 $6,000 한도·최소 $250). 모으기 금지 — Live 전환은 리스크팀
+          재량·예고 없음(Topstep 서면)이라 잔고에 머무는 돈=반값 리스크. 남는 절반=자연 방패.
+          앱은 자격 시점을 API로 알 수 없으므로 잔고 $1,500+에서 출금 횟수당 1회 리마인드 팝업.
+          5발 완료: 진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
+        ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) → 잔고=쿠션.
+        잔고 조회 실패 시 펀디드 1R($300) 그대로(사이징에 잔고 불필요)."""
         if pr.get("type") != "funded":
             r = _as_float(pr.get("r_test"), 1200.0)
             self.log(f"   ⚙ [{lbl}] 프롭 테스트기 1R=${r:g}")
@@ -3805,68 +3793,42 @@ class App:
             bal = b.account_balance(cfg.get("acct"))
             if bal is None:
                 raise RuntimeError("잔고 없음(계좌 미발견)")
-            shield = float(bal)                          # Topstep funded 0-based: 방패=잔고
-            _pk = (cfg.get("broker"), (cfg.get("acct") or lbl), pcnt)   # 단계별 1회 알림
+            bal = float(bal)                             # Topstep funded 0-based: 잔고=쿠션
+            _pk = (cfg.get("broker"), (cfg.get("acct") or lbl), pcnt)   # 출금 횟수당 1회 알림
             _alerted = getattr(self, "_payout_alerted", None)
             if _alerted is None:
                 _alerted = self._payout_alerted = set()
-            if pcnt >= 2:                                # ── 속도기(2발~)·마지막(4발): 방패 해제 ──
-                _stage = ("마지막(5번째 출금)" if pcnt == 4 else f"속도기({pcnt + 1}번째 출금)") if _ko else \
-                         ("final payout (5th)" if pcnt == 4 else f"speed stage (payout #{pcnt + 1})")
-                self.log(f"   ⚙ [{lbl}] 프롭 {_stage} 1R=${rs:g} (방패 해제 · 잔고 ${shield:,.0f})")
-                _thr = 500.0 if pcnt == 4 else _PAYOUT_CHUNK   # 마지막=부분($250+) · 속도기=$6,000
-                if shield >= _thr:
-                    if _pk not in _alerted:
-                        _alerted.add(_pk)
-                        if pcnt == 4:
-                            _msg = ((f"[{lbl}] 마지막(5번째) 출금 시점입니다.\n\n익절 $150+ 5일이 다시 "
-                                     f"차는 즉시 있는 만큼(현재 잔고 ${shield:,.0f}, 회당 최대 "
-                                     f"${_PAYOUT_CHUNK:,.0f}·50% 캡) 출금하세요 — 5발이면 라이브 전환 "
-                                     f"대상이 되고 남기는 잔고는 소멸됩니다.") if _ko else
-                                    (f"[{lbl}] Final (5th) payout window.\n\nAs soon as the 5 win-day "
-                                     f"requirement refills, withdraw what is available (balance "
-                                     f"${shield:,.0f}, cap ${_PAYOUT_CHUNK:,.0f} / 50%) — the fifth "
-                                     f"payout makes this login a Live-transition candidate; the "
-                                     f"remaining balance carries into the Live account."))
-                        else:
-                            _msg = ((f"[{lbl}] 속도기 출금 시점입니다({pcnt + 1}번째).\n\n잔고 "
-                                     f"${shield:,.0f} ≥ ${_PAYOUT_CHUNK:,.0f} — ${_PAYOUT_CHUNK:,.0f} "
-                                     f"출금을 고려해 보세요(방패 없이 바로 회전).") if _ko else
-                                    (f"[{lbl}] Speed-stage payout (#{pcnt + 1}).\n\nBalance "
-                                     f"${shield:,.0f} ≥ ${_PAYOUT_CHUNK:,.0f} — consider a "
-                                     f"${_PAYOUT_CHUNK:,.0f} withdrawal (no shield, fast rotation)."))
-                        self._payout_popup(cfg, lbl, "출금 가능" if _ko else "Payout available", _msg)
-                else:
-                    _alerted.discard(_pk)
-                return rs
-            # ── 방패기(0~1발): $3,000 방패 규칙(G' — 방패=DLL 동액, 최악 하루 흡수) ──
-            if shield >= buf:
-                self.log(f"   ⚙ [{lbl}] 프롭 안정기 1R=${rs:g} (방패 ${shield:,.0f} ≥ ${buf:,.0f})")
-                if shield >= buf + _PAYOUT_CHUNK:
-                    self.log(f"   💰 [{lbl}] 출금 가능 — 방패 ${shield:,.0f} ≥ 버퍼+${_PAYOUT_CHUNK:,.0f}")
-                    if _pk not in _alerted:
-                        _alerted.add(_pk)
-                        _msg = ((f"[{lbl}] 펀디드 출금 가능 시점입니다({pcnt + 1}번째).\n\n"
-                                 f"방패(잔고) ${shield:,.0f} 가 버퍼 ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f}에 "
-                                 f"도달했습니다.\n\n원하시면 ${_PAYOUT_CHUNK:,.0f} 인출을 고려해 보세요 "
-                                 f"(출금 여부는 본인 판단입니다).") if _ko else
-                                (f"[{lbl}] Funded payout is available (#{pcnt + 1}).\n\n"
-                                 f"Shield (balance) ${shield:,.0f} reached buffer ${buf:,.0f} + "
-                                 f"${_PAYOUT_CHUNK:,.0f}.\n\nYou may want to consider a ${_PAYOUT_CHUNK:,.0f} "
-                                 f"withdrawal (the decision is yours)."))
-                        self._payout_popup(cfg, lbl, "출금 가능" if _ko else "Payout available", _msg)
-                elif _pk in _alerted:
-                    _alerted.discard(_pk)                # 문턱 아래(출금 후 등) → 다음 도달 때 재알림
-                return rs
-            _alerted.discard(_pk)
-            self.log(f"   ⚙ [{lbl}] 프롭 버퍼기 1R=${rb:g} (방패 ${shield:,.0f} < ${buf:,.0f})")
-            return rb
+            _stage = (f"펀디드 {pcnt}/5발" if _ko else f"funded {pcnt}/5")
+            self.log(f"   ⚙ [{lbl}] 프롭 {_stage} 1R=${rs:g} (Fast-Payout · 잔고 ${bal:,.0f})")
+            # ── Fast-Payout 리마인드: 절반이 뽑을 만해지면(잔고 $1,500+) 이 발 최초 1회 ──
+            if bal >= 1_500.0:
+                if _pk not in _alerted:
+                    _alerted.add(_pk)
+                    _half = min(bal * 0.5, _PAYOUT_CHUNK)
+                    _tail = ((" 이번이 5번째 출금이면 이 계정은 라이브 전환 대상이 됩니다 — 남는 "
+                              "잔고는 Live로 이월되지만 회수가 느립니다.") if pcnt == 4 else "") if _ko \
+                            else ((" This would be the 5th payout — the login becomes a "
+                                   "Live-transition candidate; remaining balance carries into Live "
+                                   "but recovers slowly.") if pcnt == 4 else "")
+                    _msg = ((f"[{lbl}] Fast-Payout ({pcnt + 1}번째 출금).\n\n출금 자격($150+ 익절일 "
+                             f"5일 · 직전 출금 후 순익 플러스)이 차 있다면, 지금 잔고 ${bal:,.0f}의 "
+                             f"절반(≈${_half:,.0f}, 회당 최대 ${_PAYOUT_CHUNK:,.0f})을 바로 출금하세요. "
+                             f"모으지 않습니다 — Live 전환은 예고 없이 올 수 있습니다.{_tail}") if _ko else
+                            (f"[{lbl}] Fast-Payout (payout #{pcnt + 1}).\n\nIf you currently qualify "
+                             f"(five $150+ winning days, net positive since the last payout), withdraw "
+                             f"half of the ${bal:,.0f} balance now (≈${_half:,.0f}, cap "
+                             f"${_PAYOUT_CHUNK:,.0f}). No hoarding — the Live call-up can come without "
+                             f"warning.{_tail}"))
+                    self._payout_popup(cfg, lbl, "출금 리마인드" if _ko else "Payout reminder", _msg)
+            else:
+                _alerted.discard(_pk)                    # 문턱 아래(출금 직후 등) → 다음 도달 때 재알림
+            return rs
         except AttributeError:
-            self.log(f"   ⚠ [{lbl}] 이 브로커는 잔고 조회 미지원 — 버퍼기 1R=${rb:g} 폴백")
-            return rb
+            self.log(f"   ⚠ [{lbl}] 이 브로커는 잔고 조회 미지원 — 펀디드 1R=${rs:g} 그대로")
+            return rs
         except Exception as e:
-            self.log(f"   ⚠ [{lbl}] 잔고 조회 실패({str(e)[:80]}) — 버퍼기 1R=${rb:g} 폴백")
-            return rb
+            self.log(f"   ⚠ [{lbl}] 잔고 조회 실패({str(e)[:80]}) — 펀디드 1R=${rs:g} 그대로")
+            return rs
 
     def _manual_ticket(self, cfg, sig, asset, direction, stop, mult):
         """수동 모드 계좌 — 발주 없이 '실행 티켓'만 표시(대표 2026-07-27). 사용자가 이 숫자를
