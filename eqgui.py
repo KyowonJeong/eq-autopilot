@@ -445,6 +445,22 @@ def _kc_load(account):
         return ""
 
 
+def _kc_del(account):
+    """비밀 삭제(PIN 재설정용). 없는 항목이어도 조용히 통과."""
+    if _IS_MAC:
+        try:
+            subprocess.run(["/usr/bin/security", "delete-generic-password", "-a", account or "default",
+                            "-s", KC_SERVICE], capture_output=True, timeout=8)
+        except Exception:
+            pass
+        return
+    try:
+        import keyring
+        keyring.delete_password(KC_SERVICE, account or "default")
+    except Exception:
+        pass
+
+
 def _pin_hash():
     return _kc_load("__eqpin__")
 
@@ -1487,8 +1503,10 @@ class App:
             _pin_set(p)
         else:
             p = simpledialog.askstring("PIN", self.t("pin_enter"), show="*", parent=self.root)
+            if p is None:
+                return
             if not p or not _pin_ok(p):
-                messagebox.showwarning("PIN", self.t("pin_wrong")); return
+                self._pin_forgot(); return
         self._unlocked = True
         self.key.config(state="normal")
         self.b_lock.config(text=self.t("lock"))
@@ -1507,11 +1525,45 @@ class App:
             _pin_set(pin)
         else:
             pin = simpledialog.askstring("PIN", self.t("pin_enter"), show="*", parent=self.root)
+            if pin is None:
+                return
             if not pin or not _pin_ok(pin):
-                messagebox.showwarning("PIN", self.t("pin_wrong")); return
+                self._pin_forgot(); return
         self._f1_unlocked = True
         self.user.config(state="normal", show="")
         self.b_lock_f1.config(text=self.t("lock"))
+
+    def _pin_forgot(self):
+        """PIN 오입력 시 재설정 제안 (대표 2026-07-27 'PIN 재설정 기능이 없더라').
+        보안 원칙: PIN 재설정 = 보호 대상(키체인의 브로커 비밀키)도 함께 삭제 — 잊은 PIN이
+        키 열람 우회로가 되지 않게. 설정에 등록된 모든 브로커 f1의 비밀 + PIN 해시를 지운다.
+        키는 각 브로커 설정에서 다시 붙여넣으면 된다(계좌·1R 등 나머지 설정은 그대로)."""
+        _ko = self.lang == "ko"
+        if not messagebox.askyesno(
+                "PIN",
+                (self.t("pin_wrong") + "\n\nPIN을 잊으셨나요? 재설정할 수 있습니다.\n\n"
+                 "⚠ 재설정하면 이 앱에 저장된 모든 API 비밀키가 삭제되며, 각 브로커 설정에서 "
+                 "다시 붙여넣어야 합니다(계좌 목록·1R 등 다른 설정은 유지). 계속할까요?") if _ko else
+                (self.t("pin_wrong") + "\n\nForgot your PIN? You can reset it.\n\n"
+                 "⚠ Resetting deletes every API secret stored by this app — you will need to "
+                 "paste each broker key again (accounts, 1R and other settings are kept). "
+                 "Continue?")):
+            return
+        for _a, _s in (self._acfg or {}).items():            # 등록된 브로커 비밀 전부 삭제
+            for _b, _cr in (_s.get("creds") or {}).items():
+                _f1 = (_cr.get("f1") or "").strip()
+                if _f1:
+                    _kc_del(_f1)
+        _kc_del("__eqpin__")
+        self._unlocked = False
+        self._f1_unlocked = False
+        _np = simpledialog.askstring("PIN", self.t("pin_new"), show="*", parent=self.root)
+        if _np:
+            _pin_set(_np)
+        self.log("🔐 " + ("PIN 재설정 완료 — 저장된 API 비밀키가 삭제되었습니다. 각 브로커 "
+                          "설정에서 키를 다시 입력하세요." if _ko else
+                          "PIN reset — stored API secrets were deleted. Re-enter each broker key "
+                          "in its settings."))
 
     def _paste_f1(self):
         """f1 붙여넣기 — 비밀 취급 브로커(크립토)는 잠금해제 후에만."""
