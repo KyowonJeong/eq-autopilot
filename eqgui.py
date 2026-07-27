@@ -2165,11 +2165,10 @@ class App:
         ttk.Radiobutton(frm, text=("펀디드" if ko else "Funded"),
                         variable=ty_v, value="funded").grid(row=1, column=2, sticky="w")
         ents = {}
-        _rows = [("r_test", "테스트기 1R $" if ko else "Test 1R $"),
-                 ("r_buffer", "버퍼기 1R $" if ko else "Buffer 1R $"),
-                 ("r_steady", "안정기 1R $" if ko else "Steady 1R $"),
-                 ("buffer", "버퍼 크기 $" if ko else "Buffer size $"),
+        _rows = [("r_test", "챌린지 1R $" if ko else "Challenge 1R $"),
+                 ("r_steady", "펀디드 1R $" if ko else "Funded 1R $"),
                  ("payouts", "출금 횟수 (0~5)" if ko else "Payouts so far (0~5)")]
+        # r_buffer·buffer 필드는 Fast-Payout 채택으로 미사용 — 저장값은 유지(마이그레이션 호환)
         for i, (k, lab) in enumerate(_rows, start=2):
             ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
             e = ttk.Entry(frm, width=10)
