@@ -476,12 +476,13 @@ def _pin_ok(pin):
 
 # Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
 # 이익만 0부터 적립) → '방패'는 잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 확인).
-# payouts = 이 계좌의 지금까지 출금 횟수(0~5, 대표 2026-07-27 G' 개정 — 계정 예산 격자 재최적화):
-#   방패기(0~1발): 잔고 $3,000 방패 유지(=DLL, 최악 하루 흡수), $9,000 도달 시 $6,000 출금
-#   속도기(2발~):  방패 해제·항상 안정기 1R, 잔고 $6,000 도달 즉시 $6,000
-#   회전(합산 5발): 라이브 전환 대상 — 잔여는 소멸, 새 계정으로 재시작(파일럿 실측 전 가정)
+# payouts = 이 계좌의 지금까지 출금 횟수(0~5, 대표 2026-07-27 밤 — 960조합 풀그리드 신챔피언):
+#   펀디드 1R = 전 구간 $300 고정(버퍼/안정 구분 소멸 — 얇게 끝까지)
+#   방패기(0~1발): 잔고 $6,000 방패 유지(연타 2일 흡수), $12,000 도달 시 $6,000 출금
+#   속도기(2발~):  방패 해제, 잔고 $6,000 도달 즉시 $6,000
+#   회전(합산 5발): 라이브 전환 — 잔여는 소멸이 아니라 Live 시작 잔고로 이월(Topstep 서면 2026-07-27)
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
-                  "r_steady": 450.0, "buffer": 3000.0, "payouts": 0}
+                  "r_steady": 300.0, "buffer": 6000.0, "payouts": 0}
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
@@ -494,10 +495,11 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
-        # G' 마이그레이션(2026-07-27): 구 기본값 그대로인 계좌만 새 챔피언으로 자동 이행
-        # (900/300/600·방패 9000 → 1200/300/450·방패 3000). 커스텀 값은 절대 안 건드림.
-        if (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (900.0, 300.0, 600.0, 9000.0):
-            p["r_test"], p["r_steady"], p["buffer"] = 1200.0, 450.0, 3000.0
+        # 챔피언 마이그레이션(2026-07-27): 구 기본값 그대로인 계좌만 신챔피언으로 자동 이행
+        # (900/300/600·9000 및 1200/300/450·3000 → 1200/300/300·방패 6000). 커스텀 값은 불변.
+        if (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) in (
+                (900.0, 300.0, 600.0, 9000.0), (1200.0, 300.0, 450.0, 3000.0)):
+            p["r_test"], p["r_steady"], p["buffer"] = 1200.0, 300.0, 6000.0
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
         pc["on"] = bool(pct.get("on"))
@@ -2174,19 +2176,20 @@ class App:
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("펀디드는 발주 순간 잔고와 '출금 횟수'로 단계를 자동 판정합니다(G' 정책): "
-                         "방패기(0~1발)=잔고 $3,000 방패, $9,000 도달 시 $6,000 출금 · "
-                         "속도기(2발~)=방패 해제·항상 안정기 1R, $6,000 도달 즉시 $6,000 · "
-                         "마지막(4발)=익절 5일 재충족 즉시 있는 만큼 부분 출금(남기면 소멸). "
-                         "5발이면 라이브 전환 대상 — 새 계정으로 재시작하세요. "
+                  text=(("펀디드는 발주 순간 잔고와 '출금 횟수'로 단계를 자동 판정합니다(신챔피언): "
+                         "펀디드 1R은 전 구간 $300 고정 · 방패기(0~1발)=잔고 $12,000 도달 시 "
+                         "$6,000 출금($6,000 방패 유지) · 속도기(2발~)=$6,000 도달 즉시 $6,000 · "
+                         "마지막(4발)=익절 5일 재충족 즉시 있는 만큼 부분 출금. "
+                         "5발이면 라이브 전환 — 잔여는 Live 시작 잔고로 이월됩니다(Topstep 확인). "
                          "출금 횟수는 출금 팝업에서 '예'로 자동 +1 되며 여기서 수동 조정도 됩니다. "
                          "잔고 조회 실패 시 버퍼기 1R로 안전 폴백.") if ko else
                         ("Funded accounts pick their stage from the live balance and the payout "
-                         "count (policy G'): Shield (payouts 0-1) keeps a $3,000 shield and pays "
-                         "$6,000 at $9,000 · Speed (2+) drops the shield, always Steady 1R, pays "
-                         "$6,000 at $6,000 · Final (4) takes a partial payout as soon as the win-day "
-                         "requirement refills (leftovers are forfeited). Five payouts make the login "
-                         "a Live-transition candidate — restart on a fresh login. The count "
+                         "count (champion): funded 1R is a flat $300 throughout · Shield (payouts "
+                         "0-1) pays $6,000 at $12,000, keeping a $6,000 shield · Speed (2+) pays "
+                         "$6,000 as soon as $6,000 · Final (4) takes a partial payout as soon as the "
+                         "win-day requirement refills. At five payouts the login becomes a "
+                         "Live-transition candidate — the remaining balance carries into the Live "
+                         "account (confirmed by Topstep). The count "
                          "auto-increments via the payout popup and can be adjusted here. On "
                          "balance-lookup failure the app falls back to Buffer 1R."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
@@ -3610,7 +3613,7 @@ class App:
                         mode = ("프롭" if ko else "Prop")
                         if _pr.get("type") == "funded":
                             rb = _as_float(_pr.get("r_buffer"), 300.0)
-                            rs = _as_float(_pr.get("r_steady"), 450.0)
+                            rs = _as_float(_pr.get("r_steady"), 300.0)
                             _pcv = max(0, min(5, int(_as_float(_pr.get("payouts"), 0))))
                             if _pcv >= 5:
                                 note = ("5발 완료 — 라이브 전환 대상·진입 안 함" if ko
@@ -3622,7 +3625,7 @@ class App:
                             elif bal is None:
                                 r = rb; note = ("버퍼기·잔고조회실패 폴백" if ko else "buffer (no balance)")
                             else:
-                                buf = _as_float(_pr.get("buffer"), 3000.0)
+                                buf = _as_float(_pr.get("buffer"), 6000.0)
                                 if bal >= buf:
                                     r = rs; note = (f"안정기 {_pcv}/5발·방패 ${bal:,.0f}≥${buf:,.0f}" if ko
                                                     else f"steady {_pcv}/5, shield ${bal:,.0f}")
@@ -3776,8 +3779,8 @@ class App:
     def _prop_one_r(self, pr, cfg, lbl):
         """프롭 1R 해석 — G' 개정(대표 2026-07-27, 계정 예산 격자 재최적화: 중앙 +53%·바닥 플러스).
         테스트기=r_test 고정. 펀디드=발주 순간 잔고 + '출금 횟수'로 단계 판정:
-          방패기(0~1발): 잔고<$3,000 → 버퍼기 1R($300) · ≥$3,000 → 안정기 1R($450),
-                         잔고 $9,000($3,000 방패 + $6,000) 도달 시 $6,000 출금 권장 팝업
+          펀디드 1R = 전 구간 $300 고정(신챔피언 — 버퍼/안정 구분 소멸),
+                         방패기(0~1발): 잔고 $12,000($6,000 방패 + $6,000) 도달 시 $6,000 출금 팝업
           속도기(2발~):  방패 해제 — 항상 안정기 1R, 잔고 $6,000 도달 시 $6,000 출금 팝업
           마지막(4발):   익절 5일 재충족 즉시 있는 만큼 부분 출금 안내(남기면 소멸)
           5발 완료:      진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
@@ -3788,8 +3791,8 @@ class App:
             self.log(f"   ⚙ [{lbl}] 프롭 테스트기 1R=${r:g}")
             return r
         rb = _as_float(pr.get("r_buffer"), 300.0)
-        rs = _as_float(pr.get("r_steady"), 450.0)
-        buf = _as_float(pr.get("buffer"), 3000.0)
+        rs = _as_float(pr.get("r_steady"), 300.0)
+        buf = _as_float(pr.get("buffer"), 6000.0)
         pcnt = max(0, min(5, int(_as_float(pr.get("payouts"), 0))))
         _ko = self.lang == "ko"
         if pcnt >= 5:
@@ -3823,8 +3826,8 @@ class App:
                                     (f"[{lbl}] Final (5th) payout window.\n\nAs soon as the 5 win-day "
                                      f"requirement refills, withdraw what is available (balance "
                                      f"${shield:,.0f}, cap ${_PAYOUT_CHUNK:,.0f} / 50%) — the fifth "
-                                     f"payout makes this login a Live-transition candidate and "
-                                     f"anything left behind is forfeited."))
+                                     f"payout makes this login a Live-transition candidate; the "
+                                     f"remaining balance carries into the Live account."))
                         else:
                             _msg = ((f"[{lbl}] 속도기 출금 시점입니다({pcnt + 1}번째).\n\n잔고 "
                                      f"${shield:,.0f} ≥ ${_PAYOUT_CHUNK:,.0f} — ${_PAYOUT_CHUNK:,.0f} "
