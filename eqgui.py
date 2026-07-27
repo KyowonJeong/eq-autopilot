@@ -1881,7 +1881,10 @@ class App:
             for j in jobs:
                 now = _now_in(j["tz"])
                 today = now.strftime("%Y-%m-%d")
-                key = (j["asset"], j["hour"])
+                # 🐞 2026-07-27 실사고: 키가 (자산,시각)뿐이라 같은 자산 다계좌 무장 시 첫
+                # 계좌 발화가 나머지 계좌를 '오늘 이미 청산'으로 건너뛰게 했다(GC 2계좌 중
+                # EXPRESS 실계좌 미청산). 계좌를 키에 포함해 계좌마다 하루 1회 독립 발화.
+                key = (j["asset"], j["hour"], j.get("acct") or j["broker"])
                 cur = now.hour * 60 + now.minute
                 due = j["hour"] * 60
                 if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
@@ -1937,6 +1940,17 @@ class App:
                             self.log(f"   ⚠ {e}")
                         if not res.errors:
                             self.log("   ✅ flat")
+                        else:
+                            # 🚨 청산 후에도 포지션이 남았거나 실패 — 로그만으론 못 본다(2026-07-27
+                            # Follower 계좌 청산 거부 실사고). 팝업으로 즉시 수동 개입 요청.
+                            _errs = "\n".join(str(e)[:120] for e in res.errors[:4])
+                            _pt = ("자동청산 실패 — 수동 확인 필요" if self.lang == "ko"
+                                   else "Auto-close failed — manual action needed")
+                            _pm = ((f"{_lab} 자동청산이 완전히 끝나지 않았습니다.\n\n{_errs}\n\n"
+                                    "브로커 화면에서 포지션을 직접 확인·청산하세요.") if self.lang == "ko"
+                                   else (f"Auto-close for {_lab} did not fully complete.\n\n{_errs}\n\n"
+                                         "Check and close the position directly on your broker."))
+                            self.root.after(0, lambda t=_pt, m=_pm: messagebox.showwarning(t, m))
                 except Exception as e:
                     self.log(f"   ❌ auto-close failed — {e}")
                     self._report_error("auto_close", e)   # 예외 리포트(대표 2026-07-27)
