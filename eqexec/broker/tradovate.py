@@ -174,13 +174,17 @@ class TradovateBroker(BrokerAdapter):
                 continue
             mon = _MONTH_CODES.index(tail[0])              # 0~11
             yr = int(tail[1:]) % 100
-            if len(tail[1:]) == 1:                         # 한 자리 연도 → 현재 십년대 보정
+            if len(tail[1:]) == 1:                         # 한 자리 연도 → 현재 십년대 해석
                 dec = (now.tm_year % 100) // 10 * 10
                 yr = dec + yr
-                if (yr * 12 + mon) < cur_key - 6:          # 과거로 밀리면 다음 십년대
-                    yr += 10
+                if (yr * 12 + mon) < cur_key - 1:          # 과거면 다음 십년대 후보로 승격하되
+                    _bumped = (yr + 10) * 12 + mon         # 18개월 내 미래일 때만 인정
+                    if _bumped - cur_key <= 18:            # (예: 2029년 말의 H0 → 2030 OK,
+                        yr += 10                           #  2026년의 U4 → 2034는 기각)
+                    else:
+                        continue
             key = yr * 12 + mon
-            if key < cur_key:                              # 이미 만기 지난 월물 제외
+            if key < cur_key or key - cur_key > 18:        # 만기 지남·18개월 초과 원월물 제외
                 continue
             cands.append({"id": it.get("id"), "name": name, "activeContract": False,
                           "_key": key})
