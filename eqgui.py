@@ -2210,9 +2210,13 @@ class App:
             for k in ents:
                 newp[k] = _as_float(ents[k].get(), _PROP_DEFAULTS[k])
             newp["payouts"] = max(0, min(5, int(_as_float(ents["payouts"].get(), 0))))
-            if newp["on"] and any(newp[k] <= 0 for k in ("r_test", "r_buffer", "r_steady", "buffer")):
-                messagebox.showwarning("EQ", "1R·버퍼 값은 0보다 커야 합니다." if ko
-                                       else "1R and buffer values must be > 0.")
+            # 다이얼로그에서 뺀 레거시 필드(r_buffer·buffer)는 기존 저장값 유지 — 여기서
+            # 참조하다 KeyError로 저장이 조용히 죽던 사고 수리(대표 2026-07-28 "저장 안 됨").
+            for k in ("r_buffer", "buffer"):
+                newp[k] = _as_float(pr.get(k), _PROP_DEFAULTS[k])
+            if newp["on"] and any(newp[k] <= 0 for k in ("r_test", "r_steady")):
+                messagebox.showwarning("EQ", "1R 값은 0보다 커야 합니다." if ko
+                                       else "1R values must be > 0.")
                 return
             acct["prop"] = newp
             try:
