@@ -3265,19 +3265,6 @@ class App:
             except Exception:
                 _rledger = {}
             _mine = 0
-            # ── 진단 덤프(대표 2026-07-29 GC 반토막 추적): GC 원본 체결 전부를 파일로. 다음 빌드서 제거. ──
-            try:
-                import json as _dj
-                _dbg = [{"symbol": f.get("symbol"), "pnl": f.get("pnl"), "ts_ms": f.get("ts_ms"),
-                         "acct": f.get("_acct_id"), "one_r": f.get("_one_r"),
-                         "asset": self._fill_asset(f.get("symbol")),
-                         "is_eq": self._fill_is_eq(f, self._fill_asset(f.get("symbol")) or "", _ledger, _since)
-                                  if self._fill_asset(f.get("symbol")) else None}
-                        for f in fills if "GC" in str(f.get("symbol") or "").upper()]
-                with open(os.path.join(APP_DIR, ".dbg_gc_fills.json"), "w") as _df:
-                    _dj.dump(_dbg, _df, indent=1)
-            except Exception:
-                pass
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))
