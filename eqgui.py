@@ -684,6 +684,7 @@ _LEDGER_SINCE_PATH = os.path.join(APP_DIR, ".eqtrades_since")
 _LEDGER_KEEP_DAYS = 400                 # 조회창(90일)보다 넉넉히 — 원장이 먼저 마르면 안 됨
 # 자산별 최대 보유시간(h): 진입 1건이 커버하는 체결 창. NQ/GC=당일 세션, BTC=4h 홀드 + 여유.
 _LEDGER_HOLD_H = {"NQ": 12.0, "GC": 12.0, "BTC": 6.0}
+_SYM_MATCH_DAYS = 7      # EQ가 연 '그 계약'의 청산 매칭창(일) — 시간창 넘긴 수동 청산 포착(대표 2026-07-29)
 
 
 def _ledger_load() -> list:
@@ -3029,18 +3030,28 @@ class App:
     def _fill_is_eq(f, asset: str, ledger: list, since_ms: float) -> bool:
         """이 체결이 EQ 진입에서 나온 것인가 — 회원의 수동 거래를 트랙레코드에서 배제(대표 2026-07-17).
         원장 시작(since_ms) 이전 체결은 근거가 없으니 포함(옛 방식 유지 — 과거 기록 보존).
-        이후 체결은 같은 자산의 EQ 진입이 있고 그 보유창 안에서 청산된 것만 인정.
-        ⚠ 한계: EQ 보유창 안에 회원이 같은 자산을 손수 치면 구분 못 한다(그땐 EQ 포지션이
-        열려 있어 애초에 충돌하는 상황). 완전 분리는 브로커가 태그를 돌려줘야 가능."""
+        인정 조건(둘 중 하나):
+          (a) 같은 **계약 심볼**의 EQ 진입이 있고 그 진입 이후(−5분)~계약 매칭창(기본 7일) 안 —
+              풀계약(GCE)을 12시간 넘겨 수동 보유 후 청산해도 그 익절이 잡힌다(대표 2026-07-29
+              실사고: GCE 분할진입을 늦게 청산→시간창 밖 드롭→트랙레코드 6.6R이 0.59R로 반토막).
+          (b) (폴백) 같은 자산의 EQ 진입이 있고 보유창(자산별 12h 등) 안 — 심볼이 안 실린 옛 진입 대비.
+        ⚠ 한계: 같은 계약을 EQ 청산 후 회원이 손수 재거래하면 매칭창 안에선 구분 못 한다(희소)."""
         ts = int(f.get("ts_ms") or 0)
         if ts < since_ms:
             return True
-        hold_ms = _LEDGER_HOLD_H.get(asset, 12.0) * 3600 * 1000
+        fsym = str(f.get("symbol") or "")
+        sym_win = _SYM_MATCH_DAYS * 86400 * 1000       # (a) 계약심볼 매칭창
+        hold_ms = _LEDGER_HOLD_H.get(asset, 12.0) * 3600 * 1000   # (b) 자산 보유창
         for r in ledger:
             if r.get("asset") != asset:
                 continue
             e = int(r.get("ts_ms") or 0)
-            if e - 300_000 <= ts <= e + hold_ms:      # 5분 여유 = 시계 오차
+            rsym = str(r.get("symbol") or "")
+            # (a) 계약 심볼 일치 → 늦은 청산도 인정(진입−5분 ~ +7일)
+            if fsym and rsym and fsym == rsym and (e - 300_000) <= ts <= (e + sym_win):
+                return True
+            # (b) 폴백: 자산 보유창
+            if e - 300_000 <= ts <= e + hold_ms:
                 return True
         return False
 
