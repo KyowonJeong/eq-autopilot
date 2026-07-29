@@ -3220,22 +3220,28 @@ class App:
             import autopilot_crypto
             start_ms = int((_t.time() - TR_LOOKBACK_DAYS * 86400) * 1000)
             fills = []
-            seen = set()                                    # (broker,f1,acct) 중복 조회 방지
+            # 계좌 id → 1R 맵(설정 계좌). 로테이션으로 빠진 계좌는 여기 없어 폴백(대표 2026-07-29).
+            _r_by_acct = {c["acct"]: c["one_r"] for c in credlist if c.get("acct")}
+            _R_FALLBACK = 600.0
+            # 로그인(브로커,f1) 단위로 1회 조회 — closed_fills가 그 로그인의 '전 계좌(비활성 포함)'
+            # 체결을 계좌 id 부착해 돌려준다. 계좌별 1R은 위 맵으로, 없으면 폴백(닫힌 계좌).
+            seen = set()
             for c in credlist:
-                key = (c["broker"], c["f1"], c["acct"])
+                key = (c["broker"], c["f1"])
                 if key in seen:
                     continue
                 seen.add(key)
                 try:
-                    b = _build_broker(c["broker"], c["f1"], c["f2"], c["f3"],
-                                      [c["acct"]] if c["acct"] else [])
+                    b = _build_broker(c["broker"], c["f1"], c["f2"], c["f3"], [])   # 계좌 미지정=전부
                     got = b.closed_fills(start_ms)
-                    for f in got:                           # 이 계좌 1R·식별자 태그 → R 정규화용
-                        f["_one_r"] = c["one_r"]
-                        f["_acct_id"] = c["acct"] or c["broker"]
+                    for f in got:
+                        _fa = str(f.get("acct") or "")
+                        f["_one_r"] = _r_by_acct.get(_fa, _R_FALLBACK)   # 닫힌 계좌=폴백 1R
+                        f["_acct_id"] = _fa or c["broker"]
                     fills.extend(got)
-                    self.log(f"   {_broker_label(c['broker'])}"
-                             + (f" [{c['label']}]" if c["label"] else "") + f": 체결 {len(got)}건")
+                    _n_acct = len({f.get("acct") for f in got})
+                    self.log(f"   {_broker_label(c['broker'])}: 체결 {len(got)}건 "
+                             f"(계좌 {_n_acct}개 — 로테이션으로 닫힌 계좌 포함)")
                 except AttributeError:
                     self.log(f"   {_broker_label(c['broker'])}: 체결 이력 미지원(지원 예정) — 건너뜀")
                 except Exception as e:
@@ -3259,6 +3265,19 @@ class App:
             except Exception:
                 _rledger = {}
             _mine = 0
+            # ── 진단 덤프(대표 2026-07-29 GC 반토막 추적): GC 원본 체결 전부를 파일로. 다음 빌드서 제거. ──
+            try:
+                import json as _dj
+                _dbg = [{"symbol": f.get("symbol"), "pnl": f.get("pnl"), "ts_ms": f.get("ts_ms"),
+                         "acct": f.get("_acct_id"), "one_r": f.get("_one_r"),
+                         "asset": self._fill_asset(f.get("symbol")),
+                         "is_eq": self._fill_is_eq(f, self._fill_asset(f.get("symbol")) or "", _ledger, _since)
+                                  if self._fill_asset(f.get("symbol")) else None}
+                        for f in fills if "GC" in str(f.get("symbol") or "").upper()]
+                with open(os.path.join(APP_DIR, ".dbg_gc_fills.json"), "w") as _df:
+                    _dj.dump(_dbg, _df, indent=1)
+            except Exception:
+                pass
             agg = {}
             for f in fills:
                 a = self._fill_asset(f.get("symbol"))

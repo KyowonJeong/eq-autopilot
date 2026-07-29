@@ -84,10 +84,11 @@ class ProjectXBroker(BrokerAdapter):
         return d
 
     # ── reads ─────────────────────────────────────────────────────────────
-    def _accounts(self) -> list[dict]:
+    def _accounts(self, active_only: bool = True) -> list[dict]:
         # POST /api/Account/search {onlyActiveAccounts} -> {accounts:[{id,name,balance,canTrade,
-        # isVisible}], success, errorCode, errorMessage}  (confirmed against the docs)
-        d = self._post("/api/Account/search", {"onlyActiveAccounts": True})
+        # isVisible}], ...}. active_only=False면 로테이션으로 닫힌 계좌까지 포함(트랙레코드용,
+        # 대표 2026-07-29: 프롭 로테이션으로 빠진 계좌의 과거 체결이 트랙레코드에서 누락되던 버그).
+        d = self._post("/api/Account/search", {"onlyActiveAccounts": bool(active_only)})
         accts = d.get("accounts", d if isinstance(d, list) else [])
         want = {a.lower() for a in (self.cfg.accounts or [])}
         if want:
@@ -232,7 +233,10 @@ class ProjectXBroker(BrokerAdapter):
         from datetime import datetime, timezone
         start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
         out = []
-        for a in self._accounts():
+        # 트랙레코드 = 비활성(로테이션으로 닫힌) 계좌까지 전부 조회(대표 2026-07-29 실사고:
+        # 프롭 계좌 로테이션 후 그 계좌의 과거 익절이 통째 누락). fill마다 계좌 id 부착 →
+        # 호출측이 계좌별 1R로 정규화(닫힌 계좌는 1R을 몰라 폴백).
+        for a in self._accounts(active_only=False):
             try:
                 d = self._post("/api/Trade/search",
                                {"accountId": a["id"], "startTimestamp": start_iso})
@@ -248,9 +252,11 @@ class ProjectXBroker(BrokerAdapter):
                     out.append({
                         "tid": str(t.get("id") or ""),
                         "ts_ms": ts_ms,
-                        "symbol": str(t.get("contractId") or ""),     # 예: CON.F.US.MNQ.U25
+                        "symbol": str(t.get("contractId") or ""),     # 예: CON.F.US.GCE.Q26
                         "pnl": float(pnl) - float(t.get("fees") or 0),
                         "direction": "LONG" if int(t.get("side") or 0) == 1 else "SHORT",
+                        "acct": str(a.get("id") or ""),               # 계좌 id(정규화·닫힌계좌 판별)
+                        "acct_name": str(a.get("name") or ""),
                     })
                 except (TypeError, ValueError):
                     continue
