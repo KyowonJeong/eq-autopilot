@@ -70,6 +70,16 @@ class BitgetCfg:
 
 
 @dataclass
+class NT8Cfg:
+    """NinjaTrader 8 브리지(Lucid 경로) — broker/nt8.py 참조. Windows 전용."""
+    port: int = 8377
+    token: str = ""
+    accounts: list[str] = field(default_factory=list)   # NT8 계정 이름 그대로
+    symbol_map: dict = field(default_factory=dict)      # {"MNQ": "MNQ 09-26", ...}
+    journal_path: str = ""
+
+
+@dataclass
 class ScheduleCfg:
     tz: str = "America/New_York"
     cutoffs: list[str] = field(default_factory=list)   # ["HH:MM", ...]
@@ -82,6 +92,7 @@ class Config:
     projectx: ProjectXCfg = field(default_factory=ProjectXCfg)
     tradovate: TradovateCfg = field(default_factory=TradovateCfg)
     ibkr: IBKRCfg = field(default_factory=IBKRCfg)
+    nt8: NT8Cfg = field(default_factory=NT8Cfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
     poll_seconds: int = 20
     log_file: str = "eqexec.log"
@@ -91,6 +102,7 @@ def _coerce(d: dict[str, Any]) -> Config:
     px = ProjectXCfg(**{**ProjectXCfg().__dict__, **(d.get("projectx") or {})})
     tv = TradovateCfg(**{**TradovateCfg().__dict__, **(d.get("tradovate") or {})})
     ib = IBKRCfg(**{**IBKRCfg().__dict__, **(d.get("ibkr") or {})})
+    nt = NT8Cfg(**{**NT8Cfg().__dict__, **(d.get("nt8") or {})})
     sc = ScheduleCfg(**{**ScheduleCfg().__dict__, **(d.get("schedule") or {})})
     return Config(
         live=bool(d.get("live", False)),
@@ -98,6 +110,7 @@ def _coerce(d: dict[str, Any]) -> Config:
         projectx=px,
         tradovate=tv,
         ibkr=ib,
+        nt8=nt,
         schedule=sc,
         poll_seconds=int(d.get("poll_seconds", 20)),
         log_file=d.get("log_file", "eqexec.log"),
@@ -116,14 +129,18 @@ def load(path: str) -> Config:
 
 
 def _validate(cfg: Config) -> None:
-    if cfg.broker not in ("projectx", "tradovate", "ibkr"):
-        raise ValueError(f"unsupported broker '{cfg.broker}' (supported: projectx, tradovate, ibkr)")
+    if cfg.broker not in ("projectx", "tradovate", "ibkr", "nt8"):
+        raise ValueError(f"unsupported broker '{cfg.broker}' "
+                         "(supported: projectx, tradovate, ibkr, nt8)")
     if cfg.broker == "projectx":
         if not cfg.projectx.base_url:
             raise ValueError("projectx.base_url required (e.g. https://api.topstepx.com)")
     elif cfg.broker == "tradovate":
         if cfg.tradovate.env not in ("demo", "live"):
             raise ValueError("tradovate.env must be 'demo' or 'live'")
+    elif cfg.broker == "nt8":
+        if not cfg.nt8.token:
+            raise ValueError("nt8.token required (앱-애드온 공유 브리지 토큰)")
     elif cfg.broker == "ibkr":
         if not cfg.ibkr.port:
             raise ValueError("ibkr.port required (7497 TWS paper / 7496 live / 4002,4001 Gateway)")

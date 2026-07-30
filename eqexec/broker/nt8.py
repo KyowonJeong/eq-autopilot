@@ -1,0 +1,280 @@
+# EdgeQuant — Author: Kyowon Jeong — Started: 2026-04-13
+# =========================
+# broker/nt8.py — NinjaTrader 8 브리지 어댑터 (Lucid 경로, A안: 앱=두뇌 / NT8=씬 팔)
+#
+# Lucid는 API 크레덴셜을 주지 않는다(대표 2026-07-29 확정). 유일한 자동화 통로는
+# NinjaTrader 플랫폼 자체이므로, 이 어댑터는 브로커 REST 대신 **localhost HTTP 브리지**를
+# 연다. NT8 쪽에는 씬 애드온(EQAutopilotBridge.cs)이 1초 주기로 붙어서:
+#   GET  /v1/pending  → 대기 명령(entry/stop/flatten)을 가져가 NT8 계정 API로 실행
+#   POST /v1/ack      → 명령별 실행 결과(tid 멱등)
+#   POST /v1/state    → 계정·포지션·잔고 스냅샷 + 하트비트
+# 앱(두뇌)은 다른 어댑터와 동일한 place_entry/flatten_all 계약만 쓰면 된다.
+#
+# 안전 원칙:
+#   - 바인드는 127.0.0.1 고정(외부 노출 없음), 토큰 헤더(X-EQ-Bridge-Token) 검증.
+#   - dry_run=True는 절대 큐에 넣지 않는다(would_place만 반환).
+#   - tid 멱등: 같은 tid는 두 번 실행되지 않는다(재시작 대비 저널 파일).
+#   - 알몸 포지션 불가: entry는 stop_loss_price가 있으면 브래킷 명령 하나로 보내고,
+#     애드온이 스탑 제출 실패 시 진입분을 즉시 플래튼한다(ProjectX placeoso 원칙과 동일).
+#   - 하트비트 5초 초과 = unhealthy → 발주 거부(fail-closed).
+#
+# ⚠️ Windows 전용 경로(맥 미지원 확정, 대표 2026-07-29). 앱과 NT8은 같은 머신에서 돈다.
+# =========================
+from __future__ import annotations
+
+import json
+import logging
+import os
+import secrets
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .base import BrokerAdapter, FlattenResult, Position
+
+log = logging.getLogger("eqexec.nt8")
+
+_ACK_TIMEOUT_S = 20          # 명령 → 애드온 ack 대기 상한(로컬이라 보통 <2s)
+_HEARTBEAT_MAX_S = 5.0       # 이 이상 state 푸시가 없으면 unhealthy
+
+
+class _BridgeState:
+    """어댑터 ↔ HTTP 핸들러 공유 상태(락 보호)."""
+
+    def __init__(self, journal_path: str):
+        self.lock = threading.Lock()
+        self.pending: list[dict] = []          # 아직 애드온이 안 가져간 명령
+        self.acks: dict[str, dict] = {}        # tid → 결과
+        self.seen_tids: set[str] = set()       # 멱등 저널(재시작 복원)
+        self.last_state: dict = {}             # 애드온이 push한 최신 스냅샷
+        self.last_state_ts: float = 0.0
+        self.journal_path = journal_path
+        self._load_journal()
+
+    def _load_journal(self):
+        try:
+            with open(self.journal_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        self.seen_tids.add(json.loads(line)["tid"])
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            pass
+
+    def journal(self, cmd: dict):
+        self.seen_tids.add(cmd["tid"])
+        try:
+            os.makedirs(os.path.dirname(self.journal_path), exist_ok=True)
+            with open(self.journal_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"tid": cmd["tid"], "op": cmd.get("op"),
+                                    "ts": time.time()}) + "\n")
+        except OSError as ex:
+            log.warning("nt8 journal write failed: %s", ex)
+
+
+def _make_handler(state: _BridgeState, token: str):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):              # 기본 stderr 로그 침묵
+            pass
+
+        def _auth_ok(self) -> bool:
+            return secrets.compare_digest(
+                self.headers.get("X-EQ-Bridge-Token", ""), token)
+
+        def _send(self, code: int, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def do_GET(self):
+            if not self._auth_ok():
+                return self._send(401, {"error": "bad token"})
+            if self.path == "/v1/ping":
+                return self._send(200, {"ok": True, "ts": time.time()})
+            if self.path == "/v1/pending":
+                with state.lock:
+                    cmds, state.pending = state.pending, []
+                return self._send(200, {"commands": cmds})
+            return self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self._auth_ok():
+                return self._send(401, {"error": "bad token"})
+            try:
+                body = self._read_json()
+            except Exception as ex:
+                return self._send(400, {"error": str(ex)})
+            if self.path == "/v1/ack":
+                tid = body.get("tid")
+                if tid:
+                    with state.lock:
+                        state.acks[tid] = body
+                return self._send(200, {"ok": True})
+            if self.path == "/v1/state":
+                with state.lock:
+                    state.last_state = body
+                    state.last_state_ts = time.time()
+                return self._send(200, {"ok": True})
+            return self._send(404, {"error": "not found"})
+
+    return Handler
+
+
+class NT8Broker(BrokerAdapter):
+    """NT8 브리지 — 다른 어댑터와 동일 계약, 실행만 NinjaTrader 애드온에 위임."""
+
+    name = "nt8"
+
+    def __init__(self, cfg):
+        # cfg: NT8Cfg(port, token, accounts, symbol_map, journal_path)
+        self.cfg = cfg
+        self.port = int(getattr(cfg, "port", 8377) or 8377)
+        self.token = getattr(cfg, "token", "") or ""
+        self.accounts = list(getattr(cfg, "accounts", []) or [])
+        self.symbol_map = dict(getattr(cfg, "symbol_map", {}) or {})
+        journal = (getattr(cfg, "journal_path", "") or
+                   os.path.join(os.path.expanduser("~"), ".eqexec", "nt8_journal.jsonl"))
+        self._state = _BridgeState(journal)
+        self._server: ThreadingHTTPServer | None = None
+
+    # ── 수명 ──
+    def authenticate(self) -> None:
+        """브리지 서버 기동(이미 떠 있으면 no-op). NT8 접속 대기는 healthcheck가 담당."""
+        if self._server is not None:
+            return
+        if not self.token:
+            raise RuntimeError("nt8.token required — 앱과 애드온이 공유하는 브리지 토큰")
+        handler = _make_handler(self._state, self.token)
+        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
+        t = threading.Thread(target=self._server.serve_forever,
+                             name="eq-nt8-bridge", daemon=True)
+        t.start()
+        log.info("nt8 bridge listening on 127.0.0.1:%d", self.port)
+
+    def shutdown(self):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+
+    def healthcheck(self) -> bool:
+        age = time.time() - self._state.last_state_ts
+        return self._state.last_state_ts > 0 and age <= _HEARTBEAT_MAX_S
+
+    # ── 조회(애드온이 push한 스냅샷 기반) ──
+    def _snapshot(self) -> dict:
+        with self._state.lock:
+            return dict(self._state.last_state)
+
+    def list_open_positions(self) -> list[Position]:
+        out = []
+        for p in self._snapshot().get("positions", []):
+            q = int(p.get("net_qty") or 0)
+            if q != 0:
+                out.append(Position(account_id=str(p.get("account", "")),
+                                    account_name=str(p.get("account", "")),
+                                    symbol=str(p.get("instrument", "")),
+                                    net_qty=q, raw=p))
+        return out
+
+    def position_qty(self, account_id, contract) -> int:
+        sym = self._nt_symbol(contract)
+        for p in self._snapshot().get("positions", []):
+            if (str(p.get("account")) == str(account_id)
+                    and str(p.get("instrument")) == sym):
+                return int(p.get("net_qty") or 0)
+        return 0
+
+    def account_balance(self, acct):
+        for a in self._snapshot().get("accounts", []):
+            if str(a.get("name")) == str(acct):
+                return a.get("cash_value")
+        return None
+
+    # ── 명령 ──
+    def _nt_symbol(self, contract) -> str:
+        """EQ 계약 표기 → NT8 인스트루먼트 문자열(예: 'MNQ' → 'MNQ 09-26').
+        롤오버는 symbol_map 갱신으로 처리(설정 파일 한 줄)."""
+        c = str(contract)
+        return self.symbol_map.get(c, c)
+
+    def _enqueue_and_wait(self, cmd: dict) -> dict:
+        tid = cmd["tid"]
+        with self._state.lock:
+            if tid in self._state.seen_tids:
+                return {"duplicate": True, "tid": tid}   # 멱등: 이미 나간 명령
+            self._state.journal(cmd)
+            self._state.pending.append(cmd)
+        deadline = time.time() + _ACK_TIMEOUT_S
+        while time.time() < deadline:
+            with self._state.lock:
+                ack = self._state.acks.pop(tid, None)
+            if ack is not None:
+                if not ack.get("ok"):
+                    raise RuntimeError(f"nt8 command failed: {ack.get('error')}")
+                return ack
+            time.sleep(0.1)
+        raise TimeoutError(f"nt8 ack timeout ({cmd.get('op')}, tid={tid}) — "
+                           "NT8 애드온 연결 상태를 확인하세요")
+
+    def place_entry(self, account_id, contract_id, side, size: int, *,
+                    order_type: int = 2, limit_price=None, stop_price=None,
+                    stop_loss_ticks=None, stop_loss_price=None, take_profit_ticks=None,
+                    custom_tag=None, dry_run: bool = True):
+        """ProjectX/Tradovate와 동일 호출 계약. stop_loss_price가 있으면 브래킷 —
+        애드온이 스탑 제출 실패 시 진입분 즉시 플래튼(알몸 포지션 불가)."""
+        if not self.healthcheck() and not dry_run:
+            raise RuntimeError("nt8 bridge unhealthy (하트비트 없음) — 발주 거부")
+        sym = self._nt_symbol(contract_id)
+        cmd = {"op": "entry", "tid": custom_tag or f"eq-{uuid.uuid4().hex[:12]}",
+               "account": str(account_id), "instrument": sym,
+               "side": ("buy" if str(side).lower() in ("buy", "long", "0") else "sell"),
+               "qty": int(size),
+               "order_type": ("limit" if int(order_type) == 1 else "market"),
+               "limit_price": limit_price,
+               "stop_loss_price": stop_loss_price}
+        if dry_run:
+            return {"dry_run": True, "would_place": cmd}
+        ack = self._enqueue_and_wait(cmd)
+        return {"entry": ack, "stop": ack.get("stop_order_id"),
+                "stop_price": stop_loss_price}
+
+    def place_protective_stop(self, account_id, contract, entry_side, size: int,
+                              stop_price, dry_run: bool = True):
+        sym = self._nt_symbol(contract)
+        cmd = {"op": "stop", "tid": f"eqs-{uuid.uuid4().hex[:12]}",
+               "account": str(account_id), "instrument": sym,
+               "side": ("sell" if str(entry_side).lower() in ("buy", "long", "0")
+                        else "buy"),
+               "qty": int(size), "stop_price": stop_price}
+        if dry_run:
+            return {"dry_run": True, "would_place": cmd}
+        return self._enqueue_and_wait(cmd)
+
+    def close_contract(self, account_id, contract) -> dict:
+        sym = self._nt_symbol(contract)
+        cmd = {"op": "close", "tid": f"eqc-{uuid.uuid4().hex[:12]}",
+               "account": str(account_id), "instrument": sym}
+        return self._enqueue_and_wait(cmd)
+
+    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+        planned = self.list_open_positions()
+        res = FlattenResult(dry_run=dry_run, planned=planned)
+        if dry_run:
+            return res
+        cmd = {"op": "flatten", "tid": f"eqf-{uuid.uuid4().hex[:12]}",
+               "accounts": self.accounts or None}
+        try:
+            self._enqueue_and_wait(cmd)
+            res.closed = planned
+        except Exception as ex:                          # noqa: BLE001 — 전부 보고
+            res.errors.append(str(ex))
+        return res

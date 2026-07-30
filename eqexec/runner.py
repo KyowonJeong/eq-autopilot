@@ -19,6 +19,7 @@ from .broker.base import FlattenResult
 from .broker.ibkr import IBKRBroker
 from .broker.projectx import ProjectXBroker
 from .broker.tradovate import TradovateBroker
+from .broker.nt8 import NT8Broker
 from .scheduler import CutoffScheduler
 
 
@@ -43,6 +44,8 @@ def _build_broker(cfg):
         return TradovateBroker(cfg.tradovate)
     if cfg.broker == "ibkr":
         return IBKRBroker(cfg.ibkr)
+    if cfg.broker == "nt8":
+        return NT8Broker(cfg.nt8)
     raise ValueError(f"unsupported broker: {cfg.broker}")
 
 
