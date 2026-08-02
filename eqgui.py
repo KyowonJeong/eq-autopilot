@@ -2662,12 +2662,30 @@ class App:
                  f"was held to avoid a double position — please check the position on the exchange.")))
             return {"skipped": True, "error": None, "entry": None, "would_place": None,
                     "stop": False, "stop_error": None, "note": "fill_unconfirmed"}
-        # 확실히 미체결 → 불리 이동 판정
+        # 확실히 미체결 → 불리 이동 3구간 판정(대표 2026-08-03, BTC 첫 스킵 사건 후 개정):
+        #   ≤임계(0.30R) 풀사이즈 시장가 · 임계~캡(0.75R) 비중축소 시장가(리스크 1R 고정) · 캡 초과 스킵
         cur = b.current_market_price(sym)
         if cur is not None and thr is not None:
             adv = (cur - lp) if str(direction).upper() == "LONG" else (lp - cur)
             if adv > float(thr):
-                self.log(f"   ⛔ 진입 스킵 — 지정가 대비 불리 이동 {adv:+.2f} > 임계 {thr} "
+                _cap = pol.get("resize_cap_price")
+                _r0 = pol.get("R")
+                if _r0 is None and stop is not None:
+                    _r0 = abs(lp - float(stop))
+                if _cap is not None and _r0 and adv <= float(_cap):
+                    # 수량 축소비 = 원거리/(원거리+불리이동) → 실거리 × 축소수량 = 원래 1R$
+                    import math as _m
+                    _shrink = float(_r0) / (float(_r0) + adv)
+                    _sz2 = _m.floor(size * _shrink * 1000) / 1000.0   # 거래소 최소단위(0.001) 내림
+                    if _sz2 > 0:
+                        self.log(f"   ⚖ 비중 축소 진입 — 불리 {adv:+.2f}({adv / float(_r0):.2f}R) → "
+                                 f"수량 ×{_shrink:.3f} ({size:g}→{_sz2:g}) · 리스크 1R 유지, 시장가")
+                        return b.place_entry(symbol=sym, side=direction, size=_sz2,
+                                             stop_loss_price=stop,
+                                             custom_tag=(f"{tag}-R" if tag else None),
+                                             dry_run=False)
+                self.log(f"   ⛔ 진입 스킵 — 지정가 대비 불리 이동 {adv:+.2f} > "
+                         f"{'캡 ' + str(_cap) if _cap is not None else '임계 ' + str(thr)} "
                          f"(손익비 보호, 이 신호는 버림)")
                 self.root.after(0, lambda a=sym, v=adv: messagebox.showwarning(
                     "진입 스킵" if self.lang == "ko" else "Entry skipped",
