@@ -489,12 +489,14 @@ def _pin_ok(pin):
 
 # Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
 # 이익만 0부터 적립) → '방패'는 잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 확인).
-# payouts = 이 계좌의 지금까지 출금 횟수(0~5, 대표 2026-07-27 밤 — 960조합 풀그리드 신챔피언):
-#   펀디드 1R = 전 구간 $300 고정(버퍼/안정 구분 소멸 — 얇게 끝까지)
-#   Fast-Payout(대표 2026-07-27 심야): 자격($150+ 익절 5일·직전 출금 후 순익+)이 차는 순간
-#   잔고의 절반을 즉시 출금(회당 $6,000 한도). 모으기 금지 — Live 전환은 리스크팀 재량·예고
-#   없음(Topstep 서면)이라 잔고에 머무는 돈=반값 리스크. 남는 절반=자연 방패(별도 방패 규칙 소멸)
-#   회전(합산 5발): 라이브 전환 — 잔여는 소멸이 아니라 Live 시작 잔고로 이월(Topstep 서면 2026-07-27)
+# payouts = 이 계좌의 지금까지 출금 횟수(0~5). 빅실드 정본(대표 2026-08-02 채택):
+#   펀디드 1R = 전 구간 $300 고정. 출금은 두 단계(계정 합산 기준, 전제="합산 3발 전엔 재량
+#   Live 전환 없음"):
+#   ① 방패기(합산 1~3발): 잔고에 방패 $6,000 상시 유지 — $12,000 도달 시마다 $6,000 출금
+#   ② Fast-Payout기(합산 4~5발, 라이브 초대 전): 방패 해제 — 자격($150+ 익절 5일·직전 출금 후
+#      순익+)이 차는 순간 잔고의 절반을 즉시 출금(회당 $6,000 한도)
+#   회전(합산 5발): 라이브 전환 — 새 계정으로 재시작(잔여는 Live 이월이나 보수적으로 0 산입)
+#   앱은 계정 합산을 직접 모르므로 계좌별 출금 횟수(권장 2계좌 기준 <2=방패기)로 근사 안내.
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
                   "r_steady": 300.0, "buffer": 6000.0, "payouts": 0}
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
@@ -2190,20 +2192,22 @@ class App:
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("펀디드 1R은 전 구간 $300 고정, 출금은 Fast-Payout 하나입니다: 출금 "
+                  text=(("펀디드 1R은 전 구간 $300 고정, 출금은 두 단계입니다(빅실드). "
+                         "방패기(계정 합산 1~3발): 방패 $6,000을 계좌에 남기고 잔고 $12,000 도달 "
+                         "시마다 $6,000 출금. Fast-Payout기(합산 4~5발, 라이브 초대 전): 출금 "
                          "자격($150+ 익절일 5일·직전 출금 후 순익 플러스)이 차는 순간 잔고의 "
-                         "절반을 즉시 출금(회당 $6,000 한도). 모으지 않습니다 — Live 전환은 예고 "
-                         "없이 올 수 있고, 남은 잔고는 이월돼도 회수가 느립니다(Topstep 서면). "
-                         "5발이면 이 계정은 라이브 전환 대상 — 새 계정으로 교체합니다. "
+                         "절반을 즉시 출금(회당 $6,000 한도). 합산 5발이면 이 계정은 라이브 전환 "
+                         "대상 — 새 계정으로 교체합니다. "
                          "출금 횟수는 출금 팝업에서 '예'로 자동 +1 되며 여기서 수동 조정도 됩니다.") if ko else
-                        ("Funded 1R is a flat $300 throughout, and there is exactly one payout rule "
-                         "— Fast-Payout: the moment you qualify (five $150+ winning days, net "
-                         "positive since the last payout), withdraw half the balance immediately "
-                         "($6,000/payout cap). No hoarding — the Live call-up can come without "
-                         "warning, and remaining balances carry over but recover slowly (Topstep, "
-                         "in writing). At five payouts the login becomes a Live-transition "
-                         "candidate — rotate to a fresh login. The count auto-increments via the "
-                         "payout popup and can be adjusted here."))
+                        ("Funded 1R is a flat $300 throughout, and payouts run in two phases "
+                         "(big shield). Shield phase (login payouts 1-3): keep a $6,000 shield in "
+                         "the account and withdraw $6,000 each time the balance reaches $12,000. "
+                         "Fast-Payout phase (payouts 4-5, until the Live invite): the moment you "
+                         "qualify (five $150+ winning days, net positive since the last payout), "
+                         "withdraw half the balance immediately ($6,000/payout cap). At five "
+                         "payouts the login becomes a Live-transition candidate — rotate to a "
+                         "fresh login. The count auto-increments via the payout popup and can be "
+                         "adjusted here."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
 
         def _ok():
@@ -3651,8 +3655,11 @@ class App:
                                         else "5/5 — Live-transition candidate, no entry")
                             else:
                                 r = rs
-                                note = (f"펀디드 {_pcv}/5발 · Fast-Payout(자격 즉시 절반)" if ko
-                                        else f"funded {_pcv}/5 · fast-payout (half on qualify)")
+                                _sh = _pcv < 2
+                                note = ((f"펀디드 {_pcv}/5발 · " + ("방패기($12k→$6k 출금)" if _sh
+                                                                    else "Fast-Payout(자격 즉시 절반)")) if ko
+                                        else (f"funded {_pcv}/5 · " + ("shield ($12k→$6k)" if _sh
+                                                                       else "fast-payout (half on qualify)")))
                         else:
                             r = _as_float(_pr.get("r_test"), 1200.0); note = ("테스트기" if ko else "test")
                     elif _pc.get("on"):                            # 자본 비례(잔고×%)
@@ -3798,12 +3805,12 @@ class App:
         self.root.after(0, _ask)
 
     def _prop_one_r(self, pr, cfg, lbl):
-        """프롭 1R 해석 — Fast-Payout 체제(대표 2026-07-27 심야 "최대한 빨리 페이아웃…그걸로 하자").
-        테스트기=r_test($1,200) 고정. 펀디드=전 구간 $300 고정 + 출금 규칙 하나:
-          Fast-Payout: 출금 자격($150+ 익절일 5일·직전 출금 후 순익+)이 차는 순간 잔고의
-          절반을 즉시 출금(회당 $6,000 한도·최소 $250). 모으기 금지 — Live 전환은 리스크팀
-          재량·예고 없음(Topstep 서면)이라 잔고에 머무는 돈=반값 리스크. 남는 절반=자연 방패.
-          앱은 자격 시점을 API로 알 수 없으므로 잔고 $1,500+에서 출금 횟수당 1회 리마인드 팝업.
+        """프롭 1R 해석 — 빅실드 체제(대표 2026-08-02 채택 "세번 출금은 안전 가정").
+        테스트기=r_test($1,200) 고정. 펀디드=전 구간 $300 고정 + 출금 두 단계:
+          방패기(계좌 출금 <2 ≈ 계정 합산 1~3발): 방패 $6,000 유지 — 잔고 $12,000+ 도달 시
+          $6,000 출금 권장 팝업(방패는 계좌에 남김).
+          Fast-Payout기(그 후 ~ 라이브 초대 전): 자격($150+ 익절일 5일·직전 출금 후 순익+)이
+          차는 순간 잔고의 절반 즉시 출금(회당 $6,000 한도) — 잔고 $1,500+에서 리마인드.
           5발 완료: 진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
         ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) → 잔고=쿠션.
         잔고 조회 실패 시 펀디드 1R($300) 그대로(사이징에 잔고 불필요)."""
@@ -3831,27 +3838,43 @@ class App:
             _alerted = getattr(self, "_payout_alerted", None)
             if _alerted is None:
                 _alerted = self._payout_alerted = set()
-            _stage = (f"펀디드 {pcnt}/5발" if _ko else f"funded {pcnt}/5")
-            self.log(f"   ⚙ [{lbl}] 프롭 {_stage} 1R=${rs:g} (Fast-Payout · 잔고 ${bal:,.0f})")
-            # ── Fast-Payout 리마인드: 절반이 뽑을 만해지면(잔고 $1,500+) 이 발 최초 1회 ──
-            if bal >= 1_500.0:
+            _shield = pcnt < 2         # 계좌별 근사: 권장 2계좌 기준 계좌 2발째까지 ≈ 계정 합산 3발
+            _stage = ((f"펀디드 {pcnt}/5발 · " + ("방패기" if _shield else "Fast-Payout기"))
+                      if _ko else (f"funded {pcnt}/5 · " + ("shield" if _shield else "fast-payout")))
+            self.log(f"   ⚙ [{lbl}] 프롭 {_stage} 1R=${rs:g} (잔고 ${bal:,.0f})")
+            _thr = (buf + _PAYOUT_CHUNK) if _shield else 1_500.0
+            if bal >= _thr:
                 if _pk not in _alerted:
                     _alerted.add(_pk)
-                    _half = min(bal * 0.5, _PAYOUT_CHUNK)
-                    _tail = ((" 이번이 5번째 출금이면 이 계정은 라이브 전환 대상이 됩니다 — 남는 "
-                              "잔고는 Live로 이월되지만 회수가 느립니다.") if pcnt == 4 else "") if _ko \
-                            else ((" This would be the 5th payout — the login becomes a "
-                                   "Live-transition candidate; remaining balance carries into Live "
-                                   "but recovers slowly.") if pcnt == 4 else "")
-                    _msg = ((f"[{lbl}] Fast-Payout ({pcnt + 1}번째 출금).\n\n출금 자격($150+ 익절일 "
-                             f"5일 · 직전 출금 후 순익 플러스)이 차 있다면, 지금 잔고 ${bal:,.0f}의 "
-                             f"절반(≈${_half:,.0f}, 회당 최대 ${_PAYOUT_CHUNK:,.0f})을 바로 출금하세요. "
-                             f"모으지 않습니다 — Live 전환은 예고 없이 올 수 있습니다.{_tail}") if _ko else
-                            (f"[{lbl}] Fast-Payout (payout #{pcnt + 1}).\n\nIf you currently qualify "
-                             f"(five $150+ winning days, net positive since the last payout), withdraw "
-                             f"half of the ${bal:,.0f} balance now (≈${_half:,.0f}, cap "
-                             f"${_PAYOUT_CHUNK:,.0f}). No hoarding — the Live call-up can come without "
-                             f"warning.{_tail}"))
+                    if _shield:
+                        _msg = ((f"[{lbl}] 방패기 출금 ({pcnt + 1}번째).\n\n잔고가 ${bal:,.0f}로 "
+                                 f"문턱(방패 ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f})에 도달했습니다. 출금 "
+                                 f"자격($150+ 익절일 5일 · 직전 출금 후 순익 플러스)이 차 있다면 "
+                                 f"${_PAYOUT_CHUNK:,.0f}을 출금하고 방패 ${buf:,.0f}은 계좌에 남기세요. "
+                                 f"계정 합산 3발까지는 이 방패가 최악의 연속 손실을 흡수합니다.") if _ko else
+                                (f"[{lbl}] Shield-phase payout (#{pcnt + 1}).\n\nBalance ${bal:,.0f} "
+                                 f"reached the threshold (shield ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f}). "
+                                 f"If you qualify (five $150+ winning days, net positive since the last "
+                                 f"payout), withdraw ${_PAYOUT_CHUNK:,.0f} and keep the ${buf:,.0f} "
+                                 f"shield in the account. Through the login's first three payouts this "
+                                 f"shield absorbs the worst losing streaks."))
+                    else:
+                        _half = min(bal * 0.5, _PAYOUT_CHUNK)
+                        _tail = ((" 이번이 5번째 출금이면 이 계정은 라이브 전환 대상이 됩니다 — 남는 "
+                                  "잔고는 Live로 이월되지만 회수가 느립니다.") if pcnt == 4 else "") if _ko \
+                                else ((" This would be the 5th payout — the login becomes a "
+                                       "Live-transition candidate; remaining balance carries into Live "
+                                       "but recovers slowly.") if pcnt == 4 else "")
+                        _msg = ((f"[{lbl}] Fast-Payout ({pcnt + 1}번째 출금 · 라이브 초대 전까지).\n\n"
+                                 f"계정 합산 4발째부터는 방패 없이, 출금 자격($150+ 익절일 5일 · 직전 "
+                                 f"출금 후 순익 플러스)이 차는 순간 잔고 ${bal:,.0f}의 절반"
+                                 f"(≈${_half:,.0f}, 회당 최대 ${_PAYOUT_CHUNK:,.0f})을 바로 출금하세요. "
+                                 f"모으지 않습니다.{_tail}") if _ko else
+                                (f"[{lbl}] Fast-Payout (payout #{pcnt + 1} · until the Live invite).\n\n"
+                                 f"From the login's fourth payout the shield comes off: if you qualify "
+                                 f"(five $150+ winning days, net positive since the last payout), withdraw "
+                                 f"half of the ${bal:,.0f} balance now (≈${_half:,.0f}, cap "
+                                 f"${_PAYOUT_CHUNK:,.0f}). No hoarding.{_tail}"))
                     self._payout_popup(cfg, lbl, "출금 리마인드" if _ko else "Payout reminder", _msg)
             else:
                 _alerted.discard(_pk)                    # 문턱 아래(출금 직후 등) → 다음 도달 때 재알림
