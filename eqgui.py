@@ -498,7 +498,8 @@ def _pin_ok(pin):
 #   회전(합산 5발): 라이브 전환 — 새 계정으로 재시작(잔여는 Live 이월이나 보수적으로 0 산입)
 #   앱은 계정 합산을 직접 모르므로 계좌별 출금 횟수(권장 2계좌 기준 <2=방패기)로 근사 안내.
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
-                  "r_steady": 300.0, "buffer": 6000.0, "payouts": 0}
+                  "r_steady": 300.0, "buffer": 6000.0, "payouts": 0,
+                  "last_bal": None}   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
@@ -3791,6 +3792,24 @@ class App:
         self.log(f"   💰 [{lbl}] 출금 기록 +1 → {new_cnt}/5발"
                  + (" — 이 계좌는 졸업(종료)입니다. 새 챌린지 계좌로 교체하세요." if new_cnt >= 5 else ""))
 
+    def _set_prop_lastbal(self, broker, aid, bal):
+        """출금 감지용 직전 잔고 기록 — 같은 (브로커, 계좌ID) 전 자산 + 무장 스냅샷 동기.
+        메인 스레드에서 호출(root.after 경유)."""
+        aid = (aid or "").strip()
+        hit = False
+        for a in _ASSETS:
+            if self._broker_of(a) != broker:
+                continue
+            for ac in self._accts_of(a):
+                if (ac.get("id") or "").strip() == aid:
+                    ac.setdefault("prop", dict(_PROP_DEFAULTS))["last_bal"] = float(bal)
+                    hit = True
+        for _c in getattr(self, "_sig_accts", {}).values():
+            if _c.get("broker") == broker and (_c.get("acct") or "").strip() == aid:
+                (_c.get("prop") or {})["last_bal"] = float(bal)
+        if hit:
+            self._save_cfg()
+
     def _payout_popup(self, cfg, lbl, title, msg):
         """출금 권장 팝업(권장 톤) + '예'면 출금 횟수 +1 기록. 워커 스레드에서 호출."""
         _ko = self.lang == "ko"
@@ -3838,6 +3857,22 @@ class App:
             _alerted = getattr(self, "_payout_alerted", None)
             if _alerted is None:
                 _alerted = self._payout_alerted = set()
+            # ── 출금 자동 감지(대표 2026-08-02): API엔 payout 이벤트가 없어 잔고 휴리스틱 —
+            # 직전 관측 대비 DLL 최대 일손실($3,000)을 넘는 감소는 거래로 설명 불가 ≈ 출금.
+            # (연속 발주일 기준. 앱을 며칠 껐다 켰으면 오탐 가능 — 팝업이 확인을 묻는 톤인 이유)
+            _lb = pr.get("last_bal")
+            try:
+                _lb = float(_lb) if _lb is not None else None
+            except (TypeError, ValueError):
+                _lb = None
+            if _lb is not None and _lb - bal >= 3_500.0:
+                _dm = ((f"[{lbl}] 출금이 감지된 것 같습니다 — 잔고 ${_lb:,.0f} → ${bal:,.0f} "
+                        f"(−${_lb - bal:,.0f}, 하루 거래 손실로는 설명되지 않는 폭입니다).") if _ko else
+                       (f"[{lbl}] A payout seems to have occurred — balance ${_lb:,.0f} → "
+                        f"${bal:,.0f} (−${_lb - bal:,.0f}, larger than any single-day trading loss)."))
+                self._payout_popup(cfg, lbl, "출금 감지" if _ko else "Payout detected", _dm)
+            self.root.after(0, lambda _b=bal: self._set_prop_lastbal(
+                cfg.get("broker"), cfg.get("acct"), _b))
             _shield = pcnt < 2         # 계좌별 근사: 권장 2계좌 기준 계좌 2발째까지 ≈ 계정 합산 3발
             _stage = ((f"펀디드 {pcnt}/5발 · " + ("방패기" if _shield else "Fast-Payout기"))
                       if _ko else (f"funded {pcnt}/5 · " + ("shield" if _shield else "fast-payout")))
