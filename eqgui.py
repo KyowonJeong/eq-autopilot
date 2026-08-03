@@ -2004,11 +2004,9 @@ class App:
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
                     # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴.
-                    # 선물(NQ·GC)은 즉시 시장가(대표 2026-07-27 "청산은 비트 빼고 시장가").
-                    # _LIMIT_EXIT_FUT가 비어 있어 아래 elif는 현재 불발 — flatten_all이 곧 청산.
-                    if live and j["broker"] in ("bybit", "bitget") and j["asset"] == "BTC":
-                        self._exec_close_limit(b, "BTCUSDT")
-                    elif live and j["broker"] == "projectx" and j["asset"] in _LIMIT_EXIT_FUT:
+                    # 2026-08-03 전면 시장가(대표): BTC 청산 지정가 도전도 폐지 — flatten_all이
+                    # 곧장 시장가 청산. (_exec_close_limit는 롤백용 보존, 호출만 끔)
+                    if live and j["broker"] == "projectx" and j["asset"] in _LIMIT_EXIT_FUT:
                         self._exec_close_limit_fut(b, j["asset"])
                     res = b.flatten_all(dry_run=not live)   # 잔여 확인 겸 최종 청산(플랫이면 no-op)
                     if not res.planned:
