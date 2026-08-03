@@ -4053,8 +4053,41 @@ class App:
                     if isinstance(sig.get("exec_policy"), dict) else None)
             _ctag = f"EQ-AP-{int(_dtl.datetime.now().timestamp() * 1000)}"
             if _pol and _pol.get("mode") == "limit_then_market" and _pol.get("limit_price") is not None:
+                # 구 지정가 경로 - 2026-08-03 전면 시장가 전환 후 구 신호 호환용으로만 보존
                 res = self._exec_entry_limit(b, sym, direction, size, stop, dict(_pol), live, _broker, _ctag)
             else:
+                # ── 시장가 진입 (대표 2026-08-03 전면 전환) ──────────────────────────
+                # 실거리 사이징: 현재가-손절 거리로 수량을 '축소만' 재계산 → 리스크 항상 ≤1R.
+                # (유리하게 내려온 경우 확대는 안 함 - 손절 부근 과대 수량·청산 위험 방지)
+                # 극단 캡: 참조가 대비 0.75R 넘게 불리하면 스킵(8/2급 광펌핑 방어).
+                _ref = sig.get("entry_ref")
+                if live and stop is not None and _ref is not None:
+                    try:
+                        _cur = b.current_market_price(sym)
+                    except Exception:
+                        _cur = None
+                    if _cur is not None:
+                        _d_ref = abs(float(_ref) - float(stop))
+                        _d_act = abs(float(_cur) - float(stop))
+                        _adv = ((_cur - float(_ref)) if str(direction).upper() == "LONG"
+                                else (float(_ref) - _cur))
+                        if _d_ref > 0 and _adv > 0.75 * _d_ref:
+                            self.log(f"   ⛔ [{lbl}] 진입 스킵 — 참조가 대비 불리 {_adv:+.2f}"
+                                     f"({_adv / _d_ref:.2f}R) > 캡 0.75R (광펌핑 방어)")
+                            self.root.after(0, lambda a=sym, v=_adv: messagebox.showwarning(
+                                "진입 스킵" if self.lang == "ko" else "Entry skipped",
+                                (f"{a}: 가격이 참조가 대비 {v:+.2f} 불리하게 이동 — 0.75R 캡 "
+                                 f"초과로 이번 진입을 건너뜁니다." if self.lang == "ko" else
+                                 f"{a}: price moved {v:+.2f} adversely vs reference — beyond "
+                                 f"the 0.75R cap, entry skipped.")))
+                            return
+                        if _d_act > _d_ref > 0:
+                            import math as _m
+                            _sz2 = _m.floor(size * (_d_ref / _d_act) * 1000) / 1000.0
+                            if 0 < _sz2 < size:
+                                self.log(f"   ⚖ [{lbl}] 실거리 사이징 — 거리 {_d_ref:.2f}→{_d_act:.2f} "
+                                         f"→ 수량 {size:g}→{_sz2:g} (리스크 1R 유지)")
+                                size = _sz2
                 if live:
                     self._auto_leverage(b, sym, size)
                 res = b.place_entry(symbol=sym, side=direction, size=size,
