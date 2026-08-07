@@ -115,6 +115,9 @@ TR_LOOKBACK_DAYS = 90                              # 푸시당 체결 조회 범
 TR_CHUNK = 40                                      # 청크당 trade 수(URL 길이 안전)
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
+HB_GRACE_MIN = 60      # 네트워크 순단 유예(분) - 서버(홈피) 재시작·과부하가 자동매매 권한을
+#                        끊지 않게(대표 2026-08-07: 8/5 홈피 반복 재시작이 15분 유예 소진→
+#                        전원 fail-closed 사고). 명시 거부(locked/expired)는 유예 없이 즉시 잠금.
 # 자산별 세션 청산 시각(거래봉 마감, 서버 archive_resolver._WINDOW와 동일 상수) — 자동청산은
 # 사용자가 시각을 고르는 게 아니라 시스템 세션 마감에 자동으로 맞춘다(3자산·BTC 2세션).
 #   NQ 10-14 ET → 14:00 ET · GC 02-06 ET → 06:00 ET · BTC 22-02/02-06 UTC → 02:00·06:00 UTC
@@ -1259,17 +1262,55 @@ class App:
         # 탭 전환이 돌던 루프를 죽인다(대표 2026-07-11 "자산 옮기면 다 리셋" 버그).
         perm_use = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
+        _tripped = []
         if getattr(self, "_sig_on", False) and not perm_auto:
             self._sig_on = False
             self._sig_accts.clear()
             self._set_sig_ind(False)
             self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
+            _tripped.append("자동 진입")
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self._auto_accts.clear()
             self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
+            _tripped.append("자동 청산")
+        # fail-closed로 무장 해제되면 조용히 방치되지 않게 큰 알림 + 재무장까지 반복 리마인드
+        # (대표 2026-08-07: 8/5 사고가 2일간 조용했던 근본 원인). 명시 거부가 아닌 순단
+        # 유예 소진도 여기로 들어온다 - 사용자는 '왜 진입 안 됐지'를 놓치면 안 된다.
+        if _tripped:
+            self._disarmed_reason = " · ".join(_tripped)
+            self._notify_disarmed(first=True)
         self._update_gate_label()
+
+    def _notify_disarmed(self, first=False):
+        """자동매매 무장 해제 경보 - 데스크톱 알림 + 재무장까지 15분마다 반복(대표 2026-08-07).
+        권한이 회복돼(_sig_on/_auto_on 재개 or 게이트 정상) 있으면 반복 종료."""
+        g = getattr(self, "_gate", {}) or {}
+        _still = not (g.get("ok") and g.get("enabled")
+                      and (g.get("caps", {}) or {}).get("autoentry"))
+        if not _still:
+            self._disarmed_reason = None
+            return                                  # 권한 회복 → 리마인드 종료
+        reason = getattr(self, "_disarmed_reason", None) or "자동매매"
+        msg = f"EdgeQuant: {reason}이(가) 중지됨 (fail-closed). 앱에서 다시 켜주세요(Go Live)."
+        try:                                        # macOS 데스크톱 알림(로그·배너와 별개로 튐)
+            import subprocess, sys as _sys
+            if _sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                                  f'display notification "{msg}" with title "EdgeQuant 경보" sound name "Basso"'])
+        except Exception:
+            pass
+        if first:
+            try:
+                from tkinter import messagebox as _mb
+                self.root.after(100, lambda: _mb.showwarning("EdgeQuant 경보", msg))
+            except Exception:
+                pass
+        try:                                        # 15분마다 재알림(재무장 전까지)
+            self.root.after(15 * 60 * 1000, lambda: self._notify_disarmed(first=False))
+        except Exception:
+            pass
 
     def _update_gate_label(self):
         g = self._gate
@@ -1362,12 +1403,12 @@ class App:
             # 거부(locked/expired/decrypt)한 경우는 유예 없이 즉시 fail-closed(위에서 처리). ──
             if gate.get("ok"):
                 self._gate_good, self._gate_good_ts = dict(gate), _t.time()
-            elif _net_fail and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < 15 * 60:
+            elif _net_fail and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < HB_GRACE_MIN * 60:
                 _age = int((_t.time() - self._gate_good_ts) // 60)
                 gate = {**self._gate_good,
-                        "reason": f"네트워크 순단 — 최근 권한 유지(유예 {_age}/15분)"}
-                self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {15 - _age}분 유예 중 "
-                         f"(서버가 명시 거부하면 즉시 잠금)")
+                        "reason": f"네트워크 순단 — 최근 권한 유지(유예 {_age}/{HB_GRACE_MIN}분)"}
+                self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
+                         f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
             self._gate = gate
             self.root.after(0, self._apply_gating)
         threading.Thread(target=w, daemon=True).start()
