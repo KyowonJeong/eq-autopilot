@@ -2615,6 +2615,14 @@ class App:
                     self.log(f"   ℹ {_broker_label(bk)} {_ln}")
             except Exception:
                 pass
+            # 키 사전 경고(만료 D-day·권한)를 연결 테스트에서도 즉시 노출(대표 2026-08-09) —
+            # 진입 직전 사전점검(_precheck_run)만 기다리지 않고 설정 시점에 미리 안다.
+            try:
+                if hasattr(b, "key_info"):
+                    for _w in (b.key_info() or []):
+                        self.log(f"   ⚠ {_broker_label(bk)} {_w}")
+            except Exception:
+                pass
             return None
         except Exception as e:
             return str(e)[:200]

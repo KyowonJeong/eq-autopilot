@@ -503,7 +503,7 @@ class BybitBroker(BrokerAdapter):
             dd = int(d.get("deadlineDay") if d.get("deadlineDay") is not None else -1)
         except (TypeError, ValueError):
             dd = -1
-        if 0 <= dd <= 7:
+        if 0 <= dd <= 14:                      # D-14부터 경고(대표 2026-08-09 '알람 가능한가')
             out.append(f"키 만료 D-{dd} — IP 미등록 키는 3개월 만료. 재발급 또는 IP 등록 필요")
         return out
 
