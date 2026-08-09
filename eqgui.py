@@ -358,23 +358,26 @@ T = {
     "input_needed": {"ko": "입력 필요", "en": "Input needed"},
     "pick_acct": {"ko": "진입하려면 '사용 계좌'에서 단일 계좌를 지정하세요 (전체 불가).",
                   "en": "Entry requires a single account in 'Account' (not all)."},
-    "sec_tr": {"ko": "공개 트랙레코드 (Autopilot)", "en": "Public track record (Autopilot)"},
-    "tr_public": {"ko": "공개 동의", "en": "Make public"},
+    "sec_tr": {"ko": "트랙레코드 기록 (Autopilot)", "en": "Track record (Autopilot)"},
+    # 앱은 '기록'에만 동의받는다(대표 2026-08-08 "공개동의하지 말구 기록 동의로 바꾸고").
+    # 공개 여부는 홈피 대시보드에서 회원이 직접 켜고 끈다 - 앱에서 결정할 일이 아니다.
+    "tr_public": {"ko": "기록 동의", "en": "Record my results"},
     "tr_on_ind": {"ko": "  ● 자동 동기화 ON  ", "en": "  ● Auto-sync ON  "},
     "tr_off_ind": {"ko": "  ○ 자동 동기화 꺼짐  ", "en": "  ○ Auto-sync off  "},
-    "tr_page": {"ko": "공개 페이지", "en": "My page"},
+    "tr_page": {"ko": "내 페이지", "en": "My page"},
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
     "tr_note": {"ko": "※ 실거래 트랙레코드를 자동 생성합니다. EdgeQuant가 실행한 거래만 집계하며, "
                       "같은 계좌에서 직접 하신 거래는 제외됩니다. 앱은 해당 체결만 로컬에서 R 단위로 "
-                      "변환한 후, 공개용 요약 데이터만 서버에 전송합니다. API 키, 계좌번호, 잔고 등 "
-                      "민감 정보는 전송되지 않습니다. 생성된 트랙레코드는 자동 업데이트되며, "
-                      "공개 페이지 링크를 통해 손쉽게 공개할 수 있습니다.",
+                      "변환한 후 요약만 서버에 전송합니다. API 키, 계좌번호, 잔고 등 민감 정보는 "
+                      "전송되지 않습니다. 여기서 동의하는 것은 '기록'까지이며, 이 결과를 멤버십 "
+                      "페이지에 공개할지는 홈페이지 대시보드에서 언제든 켜고 끌 수 있습니다.",
                 "en": "※ Builds your real-trading track record automatically. Only trades executed by "
                       "EdgeQuant are counted — trades you place yourself on the same account are "
                       "excluded. The app converts those fills to R units locally and sends only the "
-                      "public summary to the server — sensitive data such as API keys, account numbers "
-                      "and balances are never transmitted. The track record updates automatically and "
-                      "can be shared easily via its public page link."},
+                      "summary to the server — sensitive data such as API keys, account numbers "
+                      "and balances are never transmitted. This consent covers recording only; "
+                      "whether to publish it on the membership page is a toggle you control "
+                      "anytime in your dashboard."},
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
     "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
@@ -2060,6 +2063,10 @@ class App:
                             self.log(f"   ⚠ {e}")
                         if not res.errors:
                             self.log("   ✅ flat")
+                            # 청산 통보(#53) - 수량 0. 서버는 수량을 지우지 않고 open=False로만
+                            # 바꿔 실현 손익을 다음 진입 전까지 금액으로 보여준다(대표 2026-08-08
+                            # "청산시 피엔엘도 담 거래 전까지 보여줘").
+                            self._send_fill(j["asset"], closed=True)
                         else:
                             # 🚨 청산 후에도 포지션이 남았거나 실패 — 로그만으론 못 본다(2026-07-27
                             # Follower 계좌 청산 거부 실사고). 팝업으로 즉시 수동 개입 요청.
@@ -3431,6 +3438,81 @@ class App:
 
     _APP_VER = "2026.07.27"
 
+    # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
+    # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
+    # 실시간으로. 수량 하나면 금액이 나온다:
+    #     미실현$ = (현재가 − 진입가) × 수량 × 틱가치
+    # 보내는 것: {자산, 수량, 계좌 수, 무장 여부}. 계좌번호·잔고·사이징·체결가는 안 보낸다.
+    # 앱은 상시 떠들지 않는다(대표 "그 담 한 일분간만, 오분 최대") - 진입이 끝난 시점에 1회,
+    # 실패하면 5분 창 안에서만 재시도. 그 뒤 미실현은 서버가 현재가로 계속 계산한다.
+    # ⚠️ 발주 경로에는 손대지 않는다 - 이 호출은 전부 별도 스레드이고, 실패해도 조용하다.
+    _FILL_RETRY_WINDOW_S = 300      # 5분 창 - 그 뒤로는 포기(서버는 현재가로 계속 계산)
+
+    def _note_fill(self, asset, micro=0.0, coin=0.0):
+        """진입 leg 하나가 체결될 때마다 자산별로 누적. 멀티 계좌·멀티 leg를 합산해서
+        보낸다(대표 "그건 합산해서 보여주기") - 계좌별로 보내면 서버가 계좌 단위 정보를
+        들고 있게 되고 카드도 길어진다."""
+        try:
+            import threading as _th
+            if not hasattr(self, "_fill_lock"):
+                self._fill_lock = _th.Lock()
+                self._fill_acc = {}
+            with self._fill_lock:
+                _d = self._fill_acc.setdefault(str(asset), {"micro": 0.0, "coin": 0.0, "n": 0})
+                _d["micro"] += float(micro or 0)
+                _d["coin"] += float(coin or 0)
+                _d["n"] += 1
+        except Exception:
+            pass
+
+    def _send_fill(self, asset, closed=False):
+        """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림)."""
+        import threading as _th
+        import time as _t
+
+        def w():
+            try:
+                import requests
+                try:
+                    import autopilot_crypto
+                    tid = autopilot_crypto.path_id(self._token or "")
+                except Exception:
+                    return                      # 토큰 없으면 보낼 곳이 없다
+                if not tid:
+                    return
+                if closed:
+                    body = {"tok_id": tid, "inst": str(asset), "qty_micro": 0, "qty_btc": 0}
+                else:
+                    if not hasattr(self, "_fill_lock"):
+                        return              # 이 자산에서 체결된 게 없다
+                    with self._fill_lock:
+                        _d = (self._fill_acc or {}).pop(str(asset), None)
+                    if not _d:
+                        return
+                    body = {"tok_id": tid, "inst": str(asset),
+                            "accounts": int(_d.get("n") or 0)}
+                    if str(asset) == "BTC":
+                        body["qty_btc"] = round(float(_d.get("coin") or 0), 6)
+                    else:
+                        body["qty_micro"] = round(float(_d.get("micro") or 0), 2)
+                    if not (body.get("qty_btc") or body.get("qty_micro")):
+                        return                  # 체결 0 - 보낼 게 없다
+                # 무장 = 자동청산 루프가 실제로 돌고 있는가(_auto_on). 2026-08-05 이틀간 조용히
+                # 무장해제됐던 사고를 대시보드가 빨갛게 잡아주도록 같이 보낸다.
+                body["armed"] = bool(getattr(self, "_auto_on", False))
+                _t0 = _t.time()
+                while _t.time() - _t0 < self._FILL_RETRY_WINDOW_S:
+                    try:
+                        r = requests.post(PUSH_BASE + "eqfill", timeout=8, json=body)
+                        if r.ok and str(r.text).startswith("fl:ok"):
+                            return
+                    except Exception:
+                        pass
+                    _t.sleep(20)                # 5분 창 안에서만 - 그 뒤엔 조용히 포기
+            except Exception:
+                pass
+        _th.Thread(target=w, daemon=True).start()
+
     def _report_error(self, ctx, err):
         """예외 자동 리포트(대표 2026-07-27 "필수") — 서버 /eqerr로 익명 전송해 회원 머신의
         버그를 운영자가 본다("대표의 발견력을 회원 수만큼 스케일"). 전송 내용: 앱버전·OS·
@@ -3583,6 +3665,9 @@ class App:
                     self.log(f"   DRY-RUN {_sym} stop:  {res.get('would_place_stop')}")
                 _ok += 1; continue
             self.log(f"   ✅ {_sym} 진입 완료 ×{_qty}")
+            # 대시보드 보고용 누적(#53) - 미니/마이크로가 섞이므로 마이크로 환산 계약으로
+            # 통일한다(미니 1 = 마이크로 10). 심볼 앞 M이 마이크로.
+            self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
             _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
                 _sp = res.get("stop_price")
@@ -4154,6 +4239,7 @@ class App:
                     _tot = "?"
                 self.log(f"   ⏱ [{lbl}] 체결 확인 {_fill.strftime('%H:%M:%S')} · 발송 후 {_tot}")
                 self._entered_at = _mark_entered(asset)
+                self._note_fill(asset, coin=float(size or 0))   # 대시보드 보고용(#53)
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
@@ -4276,6 +4362,8 @@ class App:
                     _th.start(); _ths.append(_th)
                 for _th in _ths:
                     _th.join(timeout=45)
+                # 계좌 전부 끝난 뒤 합산해 1회 보고(#53) - 별도 스레드라 루프를 잡지 않는다.
+                self._send_fill(_asset)
             _t.sleep(SIG_POLL_SECS)
 
 
