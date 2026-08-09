@@ -3663,7 +3663,13 @@ class App:
             pass
 
     def _send_fill(self, asset, closed=False):
-        """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림)."""
+        """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
+        Autopilot(autoentry) 전용(대표 2026-08-09 '오토파일럿한테만 앱에서 서버로') —
+        대시보드 앱 상태를 보는 등급도 Autopilot뿐이라 그 외 등급은 아예 안 보낸다.
+        서버(/eqfill)도 같은 게이트로 이중 방어(fl:ignored)."""
+        _caps = (self._gate or {}).get("caps", {})
+        if not ((self._gate or {}).get("ok") and _caps.get("autoentry")):
+            return
         import threading as _th
         import time as _t
 
@@ -3701,7 +3707,8 @@ class App:
                 while _t.time() - _t0 < self._FILL_RETRY_WINDOW_S:
                     try:
                         r = requests.post(PUSH_BASE + "eqfill", timeout=8, json=body)
-                        if r.ok and str(r.text).startswith("fl:ok"):
+                        # fl:ignored = 서버가 등급상 안 받음(Autopilot 전용) — 재시도 무의미
+                        if r.ok and str(r.text).startswith(("fl:ok", "fl:ignored")):
                             return
                     except Exception:
                         pass
