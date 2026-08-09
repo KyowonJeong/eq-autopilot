@@ -1180,8 +1180,8 @@ class App:
         # 계좌 정보 저장 버튼(대표 2026-08-09 "저장하기 버튼 있음 좋겠어") — 키·설정을 즉시
         # 영속(+Keychain)하고 현재 브로커 연결 테스트까지. 탭 전환 저장에만 의존하지 않게.
         _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
-        ttk.Button(_svrow, text=("계좌 정보 저장 + 연결 테스트" if self.lang == "ko"
-                                 else "Save & test connection"),
+        ttk.Button(_svrow, text=("계좌 정보 저장 + 연결 테스트 + 1R 확인" if self.lang == "ko"
+                                 else "Save + test + check 1R"),
                    command=self._save_creds_and_test).pack(side="left")
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
@@ -2525,8 +2525,9 @@ class App:
         self._refresh_live_panel()
 
     def _save_creds_and_test(self):
-        """[계좌 정보 저장 + 연결 테스트] (대표 2026-08-09) — 현재 탭 키(f1/f2/f3)·계좌 설정을
-        즉시 영속하고, 현재 선택된 브로커로 연결 테스트. 결과는 로그+팝업."""
+        """[계좌 정보 저장 + 연결 테스트 + 1R 확인] (대표 2026-08-09 '한 번에') — 현재 탭
+        키(f1/f2/f3)·계좌 설정 즉시 영속 → 현재 브로커 연결 테스트 → 통과 시 이 자산 전
+        계좌 잔고·1R 미리보기까지 이어서. 실패는 에러 팝업, 성공 확인 = 잔고·1R 팝업."""
         self._save_current_asset()
         asset, bk = self._asset, self._broker_name
         self.log(f"\n💾 {asset} · {_broker_label(bk)} " + ("설정 저장 완료 — 연결 테스트 중…"
@@ -2548,9 +2549,10 @@ class App:
                 else:
                     self._connected = True
                     self.log(f"✅ {asset} · {_broker_label(bk)} 연결 OK — 저장·검증 완료")
-                    messagebox.showinfo(self.t("btn_conn"),
-                                        (f"{_broker_label(bk)} 저장·연결 확인 완료." if self.lang == "ko"
-                                         else f"{_broker_label(bk)} saved & verified."))
+                    # 성공 확인 = 잔고·1R 팝업(별도 확인 팝업 대신) — 이 자산 전 계좌 조회
+                    self._run_1r_preview([asset], (f"{asset} · 저장·연결 OK — 잔고 & 1R"
+                                                   if self.lang == "ko"
+                                                   else f"{asset} · saved & connected — balance & 1R"))
                 self._apply_gating()
                 self._refresh_live_panel()
             self.root.after(0, done)
