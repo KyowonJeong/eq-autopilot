@@ -1107,8 +1107,8 @@ class App:
             self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
             self.b_lock.pack(side="left", padx=(4, 0))
             ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
-            self.show = tk.IntVar()
-            ttk.Checkbutton(r2, text=self.t("show"), variable=self.show, command=self._toggle).pack(side="left", padx=5)
+            # '보기' 체크박스 폐지(대표 2026-08-09) — 키는 열람 불가·교체만 가능(write-only).
+            # 덕분에 PIN 재설정 시 키를 지킬 필요가 없어졌다(_pin_forgot 코드 인증 참조).
         # f3 (추가 필드) — 있는 브로커만
         if spec.get("f3"):
             r3e = ttk.Frame(frm); r3e.pack(fill="x", pady=3)
@@ -1560,7 +1560,6 @@ class App:
     def _unlock(self):
         if self._unlocked:                                   # → re-lock
             self._unlocked = False
-            self.show.set(0)
             self.key.config(state="readonly", show="•")
             self.b_lock.config(text=self.t("unlock"))
             return
@@ -1598,22 +1597,96 @@ class App:
             if not pin or not _pin_ok(pin):
                 self._pin_forgot(); return
         self._f1_unlocked = True
-        self.user.config(state="normal", show="")
+        # show는 "•" 유지 — 잠금해제 = 교체 가능일 뿐, 열람은 불가(write-only, 대표 2026-08-09)
+        self.user.config(state="normal")
         self.b_lock_f1.config(text=self.t("lock"))
 
     def _pin_forgot(self):
-        """PIN 오입력 시 재설정 제안 (대표 2026-07-27 'PIN 재설정 기능이 없더라').
-        보안 원칙: PIN 재설정 = 보호 대상(키체인의 브로커 비밀키)도 함께 삭제 — 잊은 PIN이
-        키 열람 우회로가 되지 않게. 설정에 등록된 모든 브로커 f1의 비밀 + PIN 해시를 지운다.
-        키는 각 브로커 설정에서 다시 붙여넣으면 된다(계좌·1R 등 나머지 설정은 그대로)."""
+        """PIN 재설정 = 가입 채널 코드 인증 (대표 2026-08-09 '멤버 텔레그램이나 디스코드로
+        네자리 숫자'). 구 설계(키 전부 삭제)는 폐지 — 브로커 비밀키는 발급 시 한 번만
+        보여주는 곳이 많아 재발급 강제가 가혹하다. 키 열람 기능이 없어졌으므로(교체만 가능)
+        PIN만 리셋해도 키는 새지 않는다. 서버(/eqpin)가 멤버십 토큰 주인의 텔레그램/디스코드
+        DM으로 4자리 코드를 보내고, 매칭되면 PIN 해시만 삭제·재설정. 키는 전부 유지.
+        서버 불통·토큰 미입력 시 최후수단 = 구 삭제 방식(_pin_wipe_reset)."""
+        import requests
+        _ko = self.lang == "ko"
+        tok = (self._token or "").strip()
+        if not messagebox.askyesno(
+                "PIN",
+                (self.t("pin_wrong") + "\n\nPIN을 잊으셨나요? 본인 확인 후 재설정할 수 있습니다.\n\n"
+                 "가입하신 텔레그램/디스코드 DM으로 4자리 확인 코드를 보내드립니다. "
+                 "재설정해도 저장된 API 키는 그대로 유지됩니다. 계속할까요?") if _ko else
+                (self.t("pin_wrong") + "\n\nForgot your PIN? You can reset it after verification.\n\n"
+                 "We will send a 4-digit code to the Telegram/Discord account you joined with. "
+                 "Your stored API keys are kept. Continue?")):
+            return
+        via = None
+        if tok:
+            try:
+                r = requests.post(PUSH_BASE + "eqpin", timeout=10,
+                                  json={"action": "req", "token": tok})
+                t = (r.text or "").strip()
+                if t.startswith("pr:sent:"):
+                    via = t.split(":", 2)[2]
+                elif t == "pr:err:cooldown":
+                    via = "cooldown"                 # 직전 코드가 아직 유효 — 입력 단계로
+            except Exception:
+                pass
+        if via is None:
+            if messagebox.askyesno("PIN", (
+                    "확인 코드를 보낼 수 없습니다 (서버 연결 실패 또는 멤버십 토큰 미입력).\n\n"
+                    "최후수단으로 저장된 API 키를 모두 삭제하는 방식의 재설정을 진행할까요?") if _ko else (
+                    "Could not send a verification code (server unreachable or no membership "
+                    "token).\n\nProceed with the last-resort reset that deletes all stored API "
+                    "keys?")):
+                self._pin_wipe_reset()
+            return
+        if via == "admin":
+            messagebox.showinfo("PIN", ("가입 채널 정보가 없는 토큰이라 코드를 설계자에게 "
+                                        "보냈습니다. 전달받은 4자리 코드를 입력하세요.") if _ko else
+                                       ("This token has no joined channel on file, so the code "
+                                        "was sent to the architect. Enter the 4-digit code you "
+                                        "receive."))
+        for _ in range(3):
+            code = simpledialog.askstring(
+                "PIN", ("DM으로 받은 4자리 확인 코드를 입력하세요:" if _ko else
+                        "Enter the 4-digit code from your DM:"), parent=self.root)
+            if not code:
+                return
+            try:
+                r = requests.post(PUSH_BASE + "eqpin", timeout=10,
+                                  json={"action": "verify", "token": tok, "code": code.strip()})
+                t = (r.text or "").strip()
+            except Exception:
+                t = "pr:err:network"
+            if t == "pr:ok":
+                _kc_del("__eqpin__")
+                self._unlocked = False
+                self._f1_unlocked = False
+                _np = simpledialog.askstring("PIN", self.t("pin_new"), show="*", parent=self.root)
+                if _np:
+                    _pin_set(_np)
+                self.log("🔐 " + ("PIN 재설정 완료 — 저장된 API 키는 그대로 유지됩니다." if _ko
+                                  else "PIN reset — your stored API keys are kept."))
+                return
+            if t == "pr:err:bad_code":
+                messagebox.showwarning("PIN", "코드가 틀립니다." if _ko else "Wrong code.")
+                continue
+            messagebox.showwarning("PIN", ("코드가 만료됐거나 시도 횟수를 넘겼습니다. "
+                                           "처음부터 다시 시도하세요.") if _ko else
+                                          ("Code expired or too many attempts. "
+                                           "Start over."))
+            return
+
+    def _pin_wipe_reset(self):
+        """최후수단 PIN 재설정(구 방식, 2026-07-27) — 서버 코드 인증이 불가능할 때만.
+        보호 대상(키체인의 브로커 비밀키)을 함께 삭제해 잊은 PIN이 우회로가 되지 않게 한다."""
         _ko = self.lang == "ko"
         if not messagebox.askyesno(
                 "PIN",
-                (self.t("pin_wrong") + "\n\nPIN을 잊으셨나요? 재설정할 수 있습니다.\n\n"
-                 "⚠ 재설정하면 이 앱에 저장된 모든 API 비밀키가 삭제되며, 각 브로커 설정에서 "
+                ("⚠ 재설정하면 이 앱에 저장된 모든 API 비밀키가 삭제되며, 각 브로커 설정에서 "
                  "다시 붙여넣어야 합니다(계좌 목록·1R 등 다른 설정은 유지). 계속할까요?") if _ko else
-                (self.t("pin_wrong") + "\n\nForgot your PIN? You can reset it.\n\n"
-                 "⚠ Resetting deletes every API secret stored by this app — you will need to "
+                ("⚠ Resetting deletes every API secret stored by this app — you will need to "
                  "paste each broker key again (accounts, 1R and other settings are kept). "
                  "Continue?")):
             return
@@ -1656,12 +1729,6 @@ class App:
             self.key.insert(0, self.root.clipboard_get().strip())
         except Exception:
             pass
-
-    def _toggle(self):
-        if not self._unlocked:
-            self.show.set(0)
-            messagebox.showinfo("PIN", self.t("locked_msg")); return
-        self.key.config(show="" if self.show.get() else "•")
 
     def log(self, m):
         _log_to_file(m)          # 파일에도 영속(타임스탬프 부여) — 대표 2026-07-15
@@ -3436,7 +3503,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.07.27"
+    _APP_VER = "2026.08.09"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
