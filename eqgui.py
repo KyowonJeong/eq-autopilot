@@ -1177,6 +1177,12 @@ class App:
             _addr = ttk.Frame(frm); _addr.pack(fill="x", pady=(3, 2))
             ttk.Button(_addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left")
+        # 계좌 정보 저장 버튼(대표 2026-08-09 "저장하기 버튼 있음 좋겠어") — 키·설정을 즉시
+        # 영속(+Keychain)하고 현재 브로커 연결 테스트까지. 탭 전환 저장에만 의존하지 않게.
+        _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
+        ttk.Button(_svrow, text=("계좌 정보 저장 + 연결 테스트" if self.lang == "ko"
+                                 else "Save & test connection"),
+                   command=self._save_creds_and_test).pack(side="left")
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -2192,21 +2198,30 @@ class App:
     # ── 라이브 패널 상태 표시(대표 2026-07-24 자산별 계좌) ─────────────
     def _asset_row_state(self, asset):
         """(요약문, 점 색) — 자산 실행 설정 완결성·연결·무장 상태를 한 줄로.
-        완결성 = 크레덴셜 f1 · 켜진 계좌 최소 1개 · (acct 브로커면)계좌ID · 1R>0."""
-        bk = self._broker_of(asset)
-        f1 = (self._creds_of(asset).get("f1") or "").strip()
-        _sp = _BROKER_SPEC.get(bk, {})
+        완결성 = 크레덴셜 f1 · 켜진 계좌 최소 1개 · (acct 브로커면)계좌ID · 1R>0.
+        계좌별 브로커(대표 2026-08-09): 라벨·키·연결 판정을 켜진 계좌들의 브로커 전체로."""
         active = self._active_accts(asset)
+        # 켜진 계좌들의 브로커(중복 제거, 순서 유지) — 없으면 자산 기본 브로커
+        bks = []
+        for ac in active:
+            _b = self._acct_broker(asset, ac)
+            if _b not in bks:
+                bks.append(_b)
+        if not bks:
+            bks = [self._broker_of(asset)]
         missing = []
-        if not f1:
-            missing.append("키" if self.lang == "ko" else "key")
+        for _b in bks:
+            if not (self._creds_of(asset, _b).get("f1") or "").strip():
+                missing.append((f"{_broker_label(_b)} 키" if self.lang == "ko"
+                                else f"{_broker_label(_b)} key"))
         if not active:
             missing.append("켜진 계좌" if self.lang == "ko" else "account on")
         else:
             if any(_as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on")
                    and not (ac.get("pct") or {}).get("on") for ac in active):
                 missing.append("1R")
-            if _sp.get("acct") and any(not (ac.get("id") or "").strip() for ac in active):
+            if any(_BROKER_SPEC.get(self._acct_broker(asset, ac), {}).get("acct")
+                   and not (ac.get("id") or "").strip() for ac in active):
                 missing.append("계좌ID" if self.lang == "ko" else "acct id")
         if missing:
             return (("✗ 미설정: " if self.lang == "ko" else "✗ missing: ")
@@ -2222,8 +2237,10 @@ class App:
             _jobs = self._auto_accts[auto_keys[0]]
             live = bool(_jobs[0].get("live")) if _jobs else False
         _n = len(active)
-        base = f"{_broker_label(bk)} · " + (f"{_n}계좌" if self.lang == "ko" else f"{_n} acct")
-        if not self._conn_by_broker.get(bk):
+        base = ("+".join(_broker_label(_b) for _b in bks) + " · "
+                + (f"{_n}계좌" if self.lang == "ko" else f"{_n} acct"))
+        _untested = [_b for _b in bks if not self._conn_by_broker.get(_b)]
+        if _untested:
             return base + (" · 연결 테스트 필요" if self.lang == "ko" else " · test connection"), "#9ca3af"
         if armed:
             base += " · " + (("가동 중(실거래)" if live else "가동 중(모의)") if self.lang == "ko"
@@ -2507,25 +2524,63 @@ class App:
             self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
         self._refresh_live_panel()
 
-    def _panel_conn_test(self, asset):
-        """라이브 패널 자산 줄의 연결 테스트 — 그 자산 브로커 크레덴셜로 무음 점검."""
+    def _save_creds_and_test(self):
+        """[계좌 정보 저장 + 연결 테스트] (대표 2026-08-09) — 현재 탭 키(f1/f2/f3)·계좌 설정을
+        즉시 영속하고, 현재 선택된 브로커로 연결 테스트. 결과는 로그+팝업."""
         self._save_current_asset()
-        bk = self._broker_of(asset)
-        if not (self._creds_of(asset).get("f1") or "").strip():
-            messagebox.showwarning(self.t("btn_conn"), f"{asset} · {_broker_label(bk)}: "
-                                   + ("키 미설정" if self.lang == "ko" else "key not set"))
+        asset, bk = self._asset, self._broker_name
+        self.log(f"\n💾 {asset} · {_broker_label(bk)} " + ("설정 저장 완료 — 연결 테스트 중…"
+                 if self.lang == "ko" else "saved — testing connection…"))
+        if not (self._creds_of(asset, bk).get("f1") or "").strip():
+            messagebox.showinfo(self.t("btn_conn"),
+                                (f"{_broker_label(bk)} 키가 비어 있습니다 — 저장만 했습니다."
+                                 if self.lang == "ko" else
+                                 f"{_broker_label(bk)} key is empty — saved settings only."))
             return
-        self.log(f"\n── {asset} · {_broker_label(bk)} 연결 테스트 ──")
 
         def w():
-            err = self._conn_check(asset)
+            err = self._conn_check(asset, bk)
+
             def done():
                 if err:
                     self.log(f"❌ {asset} · {_broker_label(bk)}: {err}")
+                    messagebox.showerror(self.t("btn_conn"), f"{_broker_label(bk)}: {err}")
                 else:
-                    self.log(f"✅ {asset} · {_broker_label(bk)} 연결 OK")
+                    self._connected = True
+                    self.log(f"✅ {asset} · {_broker_label(bk)} 연결 OK — 저장·검증 완료")
+                    messagebox.showinfo(self.t("btn_conn"),
+                                        (f"{_broker_label(bk)} 저장·연결 확인 완료." if self.lang == "ko"
+                                         else f"{_broker_label(bk)} saved & verified."))
+                self._apply_gating()
                 self._refresh_live_panel()
             self.root.after(0, done)
+        threading.Thread(target=w, daemon=True).start()
+
+    def _panel_conn_test(self, asset):
+        """라이브 패널 자산 줄의 연결 테스트 — 켜진 계좌들의 브로커 전부 무음 점검
+        (계좌별 브로커, 대표 2026-08-09: Bitget만 테스트되고 Bybit는 빠지던 것 수리)."""
+        self._save_current_asset()
+        bks = []
+        for ac in self._active_accts(asset):
+            _b = self._acct_broker(asset, ac)
+            if _b not in bks:
+                bks.append(_b)
+        if not bks:
+            bks = [self._broker_of(asset)]
+        _missing = [b for b in bks if not (self._creds_of(asset, b).get("f1") or "").strip()]
+        if _missing:
+            messagebox.showwarning(self.t("btn_conn"), f"{asset}: "
+                                   + ", ".join(_broker_label(b) for b in _missing) + " "
+                                   + ("키 미설정" if self.lang == "ko" else "key not set"))
+            return
+
+        def w():
+            for bk in bks:
+                self.log(f"\n── {asset} · {_broker_label(bk)} 연결 테스트 ──")
+                err = self._conn_check(asset, bk)
+                self.log(f"❌ {asset} · {_broker_label(bk)}: {err}" if err
+                         else f"✅ {asset} · {_broker_label(bk)} 연결 OK")
+            self.root.after(0, self._refresh_live_panel)
         threading.Thread(target=w, daemon=True).start()
 
     def _conn_check(self, asset, broker=None):

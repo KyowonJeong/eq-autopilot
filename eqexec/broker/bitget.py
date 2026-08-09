@@ -53,7 +53,16 @@ class BitgetBroker(BrokerAdapter):
             r = requests.get(url, headers=headers, timeout=_TIMEOUT)
         else:
             r = requests.post(url, data=payload, headers=headers, timeout=_TIMEOUT)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # HTTP 에러에도 Bitget은 본문에 원인 코드를 준다(예: 40012 passphrase 불일치,
+            # 40018 IP 차단) — raise_for_status가 이걸 숨겨 진단 불가였음(대표 2026-08-09 400).
+            try:
+                _e = r.json() or {}
+            except Exception:
+                _e = {}
+            raise RuntimeError(
+                f"Bitget {path} HTTP {r.status_code}: code={_e.get('code')} "
+                f"{_e.get('msg') or (r.text or '')[:160]}")
         d = r.json()
         # Bitget은 성공 시 항상 code="00000". str(None)=="None"을 허용 목록에 두면 code 없는
         # 변형 응답을 성공으로 오판(주문 미발주인데 '완료') → "None" 제거, 명시적 성공코드만 통과.
