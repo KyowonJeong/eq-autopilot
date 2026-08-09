@@ -336,6 +336,78 @@ class BitgetBroker(BrokerAdapter):
         except Exception:
             return None
 
+    def set_stop(self, symbol, stop_price):
+        """포지션 보호 손절가 이동(X2+TR 트레일용, 대표 2026-08-09 Bitget 병렬 발주).
+        Bitget은 Bybit(trading-stop 덮어쓰기)와 달리 포지션 손절이 플랜 주문(pos_loss)이라
+        ①대기 중 손절 플랜을 찾아 modify ②없으면 pos_loss 신규 등록. 실패 시 {"error":...}
+        반환 — 호출측(_btc_move_stop_be)이 경고만 남기고 기존 손절 유지(무방비 구간 없음)."""
+        sym = self._symbol(symbol)
+        _px = str(round(float(stop_price), 2))
+        try:
+            pend = self._req("GET", "/api/v2/mix/order/orders-plan-pending",
+                             {"productType": self.product, "symbol": sym,
+                              "planType": "profit_loss"}) or {}
+            rows = pend.get("entrustedList") or pend.get("list") or \
+                (pend if isinstance(pend, list) else [])
+            _sl = [r for r in rows
+                   if str(r.get("planType", "")).lower() in ("pos_loss", "loss_plan")
+                   and str(r.get("symbol", "")).upper() == sym]
+        except Exception as e:
+            return {"error": f"plan query: {e}"}
+        if _sl:
+            try:
+                self._req("POST", "/api/v2/mix/order/modify-tpsl-order",
+                          body={"orderId": str(_sl[0].get("orderId")), "marginCoin": "USDT",
+                                "productType": self.product, "symbol": sym,
+                                "triggerPrice": _px,
+                                "triggerType": _sl[0].get("triggerType") or "mark_price",
+                                "executePrice": "0"})          # 0 = 트리거 시 시장가
+                return {"error": None}
+            except Exception as e:
+                return {"error": f"modify: {e}"}
+        # 대기 손절 플랜 없음(진입 preset이 소진됐거나 미첨부) → 포지션 손절 신규 등록
+        try:
+            _side = None
+            for p in self.list_open_positions():
+                if p.symbol == sym:
+                    _side = "long" if p.net_qty > 0 else "short"
+                    break
+            if _side is None:
+                return {"error": "no open position"}
+            self._req("POST", "/api/v2/mix/order/place-tpsl-order",
+                      body={"marginCoin": "USDT", "productType": self.product, "symbol": sym,
+                            "planType": "pos_loss", "triggerPrice": _px,
+                            "triggerType": "mark_price", "executePrice": "0",
+                            "holdSide": _side})
+            return {"error": None}
+        except Exception as e:
+            return {"error": f"place: {e}"}
+
+    def block_4h(self, symbol, end_utc):
+        """우리 4H 블록(22-02, 02-06, …)의 (시가, 종가). end_utc = 블록 마감 UTC datetime.
+        Bybit와 동일 규약: 거래소 네이티브 4H 그리드(00-04)가 우리 그리드(+2h)와 어긋나므로
+        1H 4개를 직접 조립한다. 반환 (open, close) | None(판정 불가 → 호출측 보수적 홀드)."""
+        from datetime import timedelta
+        start = end_utc - timedelta(hours=4)
+        try:
+            d = self._req("GET", "/api/v2/mix/market/candles",
+                          {"symbol": self._symbol(symbol), "productType": self.product,
+                           "granularity": "1H",
+                           "startTime": int(start.timestamp() * 1000),
+                           "endTime": int(end_utc.timestamp() * 1000) - 1,
+                           "limit": 10})
+            lst = d if isinstance(d, list) else (d.get("list") or [])
+            # Bitget candle: [ts, open, high, low, close, baseVol, usdtVol] — 정렬 방향은
+            # 방어적으로 ts 기준 재정렬(오름차순) 후 블록 범위 필터.
+            rows = sorted(lst, key=lambda r: int(r[0]))
+            rows = [r for r in rows
+                    if start.timestamp() * 1000 <= int(r[0]) < end_utc.timestamp() * 1000]
+            if len(rows) < 4:              # 봉 누락 = 판정 불가 → 호출측이 홀드(보수적)
+                return None
+            return float(rows[0][1]), float(rows[-1][4])
+        except Exception:
+            return None
+
     def closed_fills(self, start_ms: int) -> list[dict]:
         """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
         GET /api/v2/mix/position/history-position → [{tid, ts_ms, symbol, pnl, direction}].

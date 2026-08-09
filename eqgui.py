@@ -510,7 +510,8 @@ _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모�
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
 
-def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False):
+def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
+              broker=""):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
@@ -528,8 +529,11 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         pc["on"] = bool(pct.get("on"))
         pc["pct"] = _as_float(pct.get("pct"), _PCT_DEFAULTS["pct"])
         pc["floor"] = _as_float(pct.get("floor"), _PCT_DEFAULTS["floor"])
+    # broker: 계좌별 브로커(대표 2026-08-09 "계좌 추가에서 브로커 선택" — BTC Bybit+Bitget
+    # 동시 발주). ""=자산 기본 브로커 사용(_acct_broker가 해석) — 구 설정 무변경 호환.
     return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
-            "label": str(label or ""), "prop": p, "pct": pc, "manual": bool(manual)}
+            "label": str(label or ""), "prop": p, "pct": pc, "manual": bool(manual),
+            "broker": str(broker or "")}
 
 
 def _as_float(v, default=0.0):
@@ -568,7 +572,7 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"), x.get("pct"), x.get("manual", False))
+                                  x.get("prop"), x.get("pct"), x.get("manual", False), bk)
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -579,7 +583,8 @@ def _load():
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                      x.get("prop"), x.get("pct"), x.get("manual", False))
+                                      x.get("prop"), x.get("pct"), x.get("manual", False),
+                                      x.get("broker", ""))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -1158,10 +1163,20 @@ class App:
                                command=lambda a=_src: self._copy_acct_setup(a)
                                ).pack(side="left", padx=(4, 0))
         else:
-            # 크립토(Bybit/Bitget) — 계좌ID 개념 없음. 단일 계좌(id="")의 1R만 노출.
-            ttk.Label(frm, text=("거래 규모 (1R)" if self.lang == "ko" else "Sizing (1R)"),
+            # 크립토(Bybit/Bitget) — 계좌ID 개념 없음(API키=계좌). 계좌 리스트 개방(대표
+            # 2026-08-09 "계좌 추가 이런 식으로 모든 자산"): 행마다 브로커 선택 + 1R + on/off
+            # → 같은 자산을 Bybit·Bitget 동시 발주(각자 1R). 키는 위 브로커 콤보로 전환해
+            # 브로커별로 등록해 두면 계좌 행이 자기 브로커 키를 쓴다.
+            ttk.Label(frm, text=("등록 계좌 — 거래소별 1R·실행 여부 (동시 발주 가능)"
+                                 if self.lang == "ko"
+                                 else "Registered accounts — per-exchange 1R & on/off"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
-            self._acct_edit_row(frm, 0, _accts[0], spec, deletable=False, show_on=False)
+            for _i, _ac in enumerate(_accts):
+                self._acct_edit_row(frm, _i, _ac, spec,
+                                    deletable=len(_accts) > 1, show_on=len(_accts) > 1)
+            _addr = ttk.Frame(frm); _addr.pack(fill="x", pady=(3, 2))
+            ttk.Button(_addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
+                       command=self._add_acct).pack(side="left")
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -1457,6 +1472,12 @@ class App:
         bk = broker or self._acfg[asset]["broker"]
         return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
 
+    def _acct_broker(self, asset, acct):
+        """계좌의 실행 브로커(대표 2026-08-09 계좌별 브로커 — BTC Bybit+Bitget 동시 발주).
+        계좌에 broker가 없거나 이 자산에서 못 쓰는 값이면 자산 기본 브로커(구 동작)."""
+        bk = (acct.get("broker") or "").strip()
+        return bk if bk in _ASSET_BROKERS.get(asset, []) else self._broker_of(asset)
+
     def _accts_of(self, asset):
         """자산의 계좌 리스트(없으면 빈 슬롯 1개 보장)."""
         accts = self._acfg[asset].setdefault("accounts", [])
@@ -1494,6 +1515,14 @@ class App:
             _v = _as_float(w["one_r"].get(), 0.0)
             if _v > 0:
                 accts[idx]["one_r"] = _v
+            try:                                       # 계좌별 브로커(대표 2026-08-09)
+                if w.get("broker") is not None:
+                    _lbl2bk = {_broker_label(b): b for b in _ASSET_BROKERS.get(self._asset, [])}
+                    _bv = _lbl2bk.get(str(w["broker"].get()).strip())
+                    if _bv:
+                        accts[idx]["broker"] = _bv
+            except Exception:
+                pass
             try:
                 accts[idx]["manual"] = bool(w["manual"].get())
             except Exception:
@@ -1863,6 +1892,15 @@ class App:
         asset = self._asset
         # 현재 화면의 계좌 위젯값(라벨·1R·on) 먼저 보존 — 재빌드로 유실 방지
         self._collect_acct_widgets()
+        # 크립토(계좌ID 없음): 새 행을 바로 추가 — 브로커는 현재 탭 브로커로 시작, 행의
+        # 콤보에서 바꾼다(대표 2026-08-09 Bybit+Bitget 동시 발주).
+        if not _BROKER_SPEC.get(self._broker_of(asset), {}).get("acct"):
+            _bk0 = self._broker_name
+            self._accts_of(asset).append(
+                _new_acct(600.0, "", True, _broker_label(_bk0), broker=_bk0))
+            self._save_cfg()
+            self._build()
+            return
         try:
             val = str(self.acct_pick.get()).strip()
         except Exception:
@@ -2371,10 +2409,22 @@ class App:
                             command=self._save_acct_widgets).pack(side="left")
         else:
             on = tk.IntVar(value=1)          # 크립토 단일 계좌 = 항상 on(토글 없음)
+        # 계좌별 브로커 선택(대표 2026-08-09 "계좌 추가에서 브로커 선택하게") — 이 자산에
+        # 브로커가 2개 이상일 때만 노출. 발주·청산·연결테스트 전부 이 값을 따른다.
+        _brs = _ASSET_BROKERS.get(self._asset, [])
+        if len(_brs) > 1:
+            bk_cb = ttk.Combobox(row, values=[_broker_label(b) for b in _brs],
+                                 state="readonly", width=8)
+            bk_cb.set(_broker_label(self._acct_broker(self._asset, acct)))
+            bk_cb.pack(side="left", padx=(0, 4))
+            bk_cb.bind("<<ComboboxSelected>>", lambda e: self._save_acct_widgets())
+        else:
+            bk_cb = None
         aid = (acct.get("id") or "").strip()
         lbl_e = ttk.Entry(row, width=12)
         lbl_e.insert(0, acct.get("label")
-                     or (aid[-4:] if aid else _broker_label(self._broker_name)))
+                     or (aid[-4:] if aid
+                         else _broker_label(self._acct_broker(self._asset, acct))))
         lbl_e.pack(side="left", padx=(0, 4))
         lbl_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
         ttk.Label(row, text="1R $").pack(side="left")
@@ -2382,7 +2432,7 @@ class App:
         r_e.insert(0, f"{_as_float(acct.get('one_r'), 600.0):g}")
         r_e.pack(side="left", padx=(0, 4))
         r_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
-        self._acct_widgets[idx] = {"on": on, "label": lbl_e, "one_r": r_e}
+        self._acct_widgets[idx] = {"on": on, "label": lbl_e, "one_r": r_e, "broker": bk_cb}
         pr = acct.get("prop") or {}
         _pb_txt = self._prop_btn_text(pr)
         pb = ttk.Button(row, text=_pb_txt, width=11,
@@ -2478,12 +2528,12 @@ class App:
             self.root.after(0, done)
         threading.Thread(target=w, daemon=True).start()
 
-    def _conn_check(self, asset):
-        """자산의 브로커 크레덴셜로 무음 연결 테스트 + (projectx) 등록 계좌ID 유효성 검사(스레드
-        컨텍스트). 성공 시 _conn_by_broker[bk]=True(연결=크레덴셜=브로커 단위). 반환: None(성공)
-        | 오류 문자열."""
-        bk = self._broker_of(asset)
-        cr = self._creds_of(asset)
+    def _conn_check(self, asset, broker=None):
+        """자산의 (지정 또는 기본) 브로커 크레덴셜로 무음 연결 테스트 + (projectx) 등록 계좌ID
+        유효성 검사(스레드 컨텍스트). 성공 시 _conn_by_broker[bk]=True(연결=크레덴셜=브로커
+        단위). broker 지정 = 계좌별 브로커 테스트(대표 2026-08-09). 반환: None(성공) | 오류."""
+        bk = broker or self._broker_of(asset)
+        cr = self._creds_of(asset, bk)
         f1 = (cr.get("f1") or "").strip()
         try:
             b = _build_broker(bk, f1, _kc_load(f1) or "", cr.get("f3", ""), [])
@@ -2493,6 +2543,8 @@ class App:
                 if asset == self._asset:      # 현재 탭 자산이면 '계좌 추가' 콤보도 채움
                     self.root.after(0, lambda n=names: self._fill_scope(n))
                 for ac in self._active_accts(asset):
+                    if self._acct_broker(asset, ac) != bk:
+                        continue              # 다른 브로커 계좌 행은 이 테스트 대상 아님
                     aid = (ac.get("id") or "").strip()
                     if not aid:
                         return ("등록 계좌 중 계좌ID 미지정 — 자산 설정에서 계좌를 추가하세요"
@@ -2514,8 +2566,8 @@ class App:
         """자산 asset의 계좌 idx 하나 무장 — 자동청산(그 자산의 _ASSET_EXITS) + (권한 시) 신호대기.
         cred = 자산 브로커 크레덴셜 + 그 계좌 acct_id/one_r (대표 2026-07-24 자산별 계좌)."""
         acct = self._accts_of(asset)[idx]
-        bk = self._broker_of(asset)
-        cr = self._creds_of(asset)
+        bk = self._acct_broker(asset, acct)          # 계좌별 브로커(대표 2026-08-09)
+        cr = self._creds_of(asset, bk)
         f1 = (cr.get("f1") or "").strip()
         aid = (acct.get("id") or "").strip()
         cred = {"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
@@ -2571,25 +2623,28 @@ class App:
         # 프리플라이트: 각 자산의 브로커 크레덴셜 + 켜진 계좌(계좌ID·1R) 완결성 (전체 중단 원칙)
         bad = []
         for a in incl:
-            bk = self._broker_of(a)
-            if not (self._creds_of(a).get("f1") or "").strip():
-                bad.append(f"{a}: " + ("키 미설정" if self.lang == "ko" else "key missing"))
-                continue
-            if not self._broker_allowed(bk):
-                bad.append(f"{a} ({_broker_label(bk)}): " + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
-                                                             else "broker disabled (server)"))
-                continue
             _act = self._active_accts(a)
             if not _act:
                 bad.append(f"{a}: " + ("켜진 계좌 없음" if self.lang == "ko" else "no account on"))
                 continue
-            _need_id = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
+            # 계좌별 브로커(대표 2026-08-09) — 키·허용·계좌ID를 계좌 단위로 검사
             for ac in _act:
-                _nm = ac.get("label") or "?"
+                bk = self._acct_broker(a, ac)
+                _nm = ac.get("label") or _broker_label(bk)
+                if not (self._creds_of(a, bk).get("f1") or "").strip():
+                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                               + ("키 미설정" if self.lang == "ko" else "key missing"))
+                    continue
+                if not self._broker_allowed(bk):
+                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                               + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
+                                  else "broker disabled (server)"))
+                    continue
                 if (_as_float(ac.get("one_r")) <= 0 and not (ac.get("prop") or {}).get("on")
                         and not (ac.get("pct") or {}).get("on")):
                     bad.append(f"{a} {_nm}: 1R")
-                if _need_id and not (ac.get("id") or "").strip():
+                if (_BROKER_SPEC.get(bk, {}).get("acct")
+                        and not (ac.get("id") or "").strip()):
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
         if bad:
             messagebox.showwarning(self.t("sec_live"), "\n".join(bad)); return
@@ -2610,9 +2665,8 @@ class App:
 
         def w():
             fails = []
-            tested = {}                       # 브로커별 연결 테스트 1회(같은 브로커 중복 방지)
+            tested = {}                # (브로커,f1)별 연결 테스트 1회(같은 크레덴셜 중복 방지)
             for a in incl:
-                bk = self._broker_of(a)
                 # 수동 전용 자산(활성 계좌가 전부 수동 모드)은 발주를 안 하므로 브로커 연결 불필요.
                 # 연결 테스트를 건너뛰어 '연결 실패로 전체 중단'되지 않게 한다(대표 2026-07-27).
                 _act = [ac for ac in self._accts_of(a) if ac.get("on")]
@@ -2621,18 +2675,29 @@ class App:
                                              if self.lang == "ko" else
                                              "manual mode (signal tickets only) — skipping connection test"))
                     continue
-                if bk in tested:
-                    err = tested[bk]
-                    self.log(f"── {a} · {_broker_label(bk)} — "
-                             + ("연결 확인됨(공유)" if not err else f"연결 실패(공유): {err}"))
-                else:
-                    self.log(f"── {a} · {_broker_label(bk)} 연결 테스트 ──")
-                    err = self._conn_check(a)
-                    tested[bk] = err
-                    self.log(f"✅ {a} · {_broker_label(bk)} 연결 OK" if not err
-                             else f"❌ {a} · {_broker_label(bk)}: {err}")
-                if err:
-                    fails.append(f"{a}: {err}")
+                # 계좌별 브로커 전부 테스트(대표 2026-08-09 BTC Bybit+Bitget 동시 발주)
+                _bks = []
+                for ac in _act:
+                    if ac.get("manual"):
+                        continue
+                    _b = self._acct_broker(a, ac)
+                    if _b not in _bks:
+                        _bks.append(_b)
+                for bk in _bks:
+                    _f1 = (self._creds_of(a, bk).get("f1") or "").strip()
+                    _tk = (bk, _f1)
+                    if _tk in tested:
+                        err = tested[_tk]
+                        self.log(f"── {a} · {_broker_label(bk)} — "
+                                 + ("연결 확인됨(공유)" if not err else f"연결 실패(공유): {err}"))
+                    else:
+                        self.log(f"── {a} · {_broker_label(bk)} 연결 테스트 ──")
+                        err = self._conn_check(a, bk)
+                        tested[_tk] = err
+                        self.log(f"✅ {a} · {_broker_label(bk)} 연결 OK" if not err
+                                 else f"❌ {a} · {_broker_label(bk)}: {err}")
+                    if err:
+                        fails.append(f"{a} ({_broker_label(bk)}): {err}")
 
             def done():
                 self.b_live_start.config(state="normal")
@@ -3832,23 +3897,25 @@ class App:
         def w():
             blocks = []
             for asset in assets:
-                bk = self._broker_of(asset)
-                cr = self._creds_of(asset)
-                f1 = (cr.get("f1") or "").strip()
-                if not f1:
-                    blocks.append(f"● {asset}: " + ("브로커 키 미설정" if ko else "no credentials"))
-                    continue
                 accts = [a for a in self._accts_of(asset) if a.get("on", True)]
                 if not accts:
                     blocks.append(f"● {asset}: " + ("켜진 계좌 없음" if ko else "no active accounts"))
                     continue
-                f2 = _kc_load(f1) or ""
-                f3 = cr.get("f3", "")
-                is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
                 rows = [f"● {asset}"]
                 for ac in accts:
+                    # 계좌별 브로커(대표 2026-08-09) — 잔고도 그 계좌의 브로커·키로 조회
+                    bk = self._acct_broker(asset, ac)
+                    cr = self._creds_of(asset, bk)
+                    f1 = (cr.get("f1") or "").strip()
                     aid = (ac.get("id") or "").strip()
                     lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
+                    if not f1:
+                        rows.append("   " + (f"{lbl}: 키 미설정({_broker_label(bk)})" if ko
+                                             else f"{lbl}: no credentials ({_broker_label(bk)})"))
+                        continue
+                    f2 = _kc_load(f1) or ""
+                    f3 = cr.get("f3", "")
+                    is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
                     bal, err = self._fetch_balance_diag(bk, f1, f2, f3, aid, is_fut)
                     if err:
                         self.log(f"   ⚠ [{asset}·{lbl}] 잔고 조회 실패 — {err}")
@@ -3922,19 +3989,28 @@ class App:
             seen = set()
             n_closed = 0
             for a in _ASSETS:
-                bk = self._broker_of(a)
-                cr = self._creds_of(a)
-                f1 = (cr.get("f1") or "").strip()
-                if not f1:
-                    continue
-                f2 = _kc_load(f1) or ""
-                f3 = cr.get("f3", "")
-                if _BROKER_SPEC.get(bk, {}).get("acct"):
-                    aids = [(ac.get("id") or "").strip() for ac in self._accts_of(a)
-                            if (ac.get("id") or "").strip()]
-                else:
-                    aids = [""]
-                for aid in aids:
+                # 계좌별 브로커(대표 2026-08-09) — 계좌 행마다 (브로커, 계좌ID) 수집.
+                # 패닉 버튼이므로 on/off 무관 전 계좌 대상(구 동작 유지).
+                _pairs = []
+                for ac in self._accts_of(a):
+                    _b = self._acct_broker(a, ac)
+                    if _BROKER_SPEC.get(_b, {}).get("acct"):
+                        _aid = (ac.get("id") or "").strip()
+                        if _aid:
+                            _pairs.append((_b, _aid))
+                    else:
+                        _pairs.append((_b, ""))
+                # 크레덴셜만 있고 계좌 행이 없는 브로커도 쓸어담기(안전 — 옛 동작 포함)
+                for _b in _ASSET_BROKERS.get(a, []):
+                    if not _BROKER_SPEC.get(_b, {}).get("acct") and (_b, "") not in _pairs:
+                        _pairs.append((_b, ""))
+                for bk, aid in _pairs:
+                    cr = self._creds_of(a, bk)
+                    f1 = (cr.get("f1") or "").strip()
+                    if not f1:
+                        continue
+                    f2 = _kc_load(f1) or ""
+                    f3 = cr.get("f3", "")
                     key = (bk, f1, aid)
                     if key in seen:
                         continue
