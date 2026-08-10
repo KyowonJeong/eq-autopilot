@@ -134,6 +134,12 @@ class NT8Broker(BrokerAdapter):
 
     name = "nt8"
 
+    # 포트별 공유 브리지(2026-08-10): GUI는 연결 테스트·무장·청산마다 어댑터 인스턴스를
+    # 새로 만든다 - 인스턴스마다 서버를 열면 두 번째부터 'Address already in use'로 죽는다.
+    # 서버·상태를 포트 단위 싱글턴으로 공유하고, 인스턴스는 핸들만 잡는다.
+    _BRIDGES: dict = {}                      # {port: (_BridgeState, server, token)}
+    _BRIDGES_LOCK = threading.Lock()
+
     def __init__(self, cfg):
         # cfg: NT8Cfg(port, token, accounts, symbol_map, journal_path)
         self.cfg = cfg
@@ -141,36 +147,55 @@ class NT8Broker(BrokerAdapter):
         self.token = getattr(cfg, "token", "") or ""
         self.accounts = list(getattr(cfg, "accounts", []) or [])
         self.symbol_map = dict(getattr(cfg, "symbol_map", {}) or {})
-        journal = (getattr(cfg, "journal_path", "") or
-                   os.path.join(os.path.expanduser("~"), ".eqexec", "nt8_journal.jsonl"))
-        self._state = _BridgeState(journal)
-        self._server: ThreadingHTTPServer | None = None
+        self._journal = (getattr(cfg, "journal_path", "") or
+                         os.path.join(os.path.expanduser("~"), ".eqexec", "nt8_journal.jsonl"))
+        self._state: _BridgeState | None = None
 
     # ── 수명 ──
     def authenticate(self) -> None:
-        """브리지 서버 기동(이미 떠 있으면 no-op). NT8 접속 대기는 healthcheck가 담당."""
-        if self._server is not None:
+        """브리지 서버 확보(포트 싱글턴 - 이미 떠 있으면 공유). NT8 접속 판정은 healthcheck."""
+        if self._state is not None:
             return
         if not self.token:
             raise RuntimeError("nt8.token required — 앱과 애드온이 공유하는 브리지 토큰")
-        handler = _make_handler(self._state, self.token)
-        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
-        t = threading.Thread(target=self._server.serve_forever,
-                             name="eq-nt8-bridge", daemon=True)
-        t.start()
+        with NT8Broker._BRIDGES_LOCK:
+            ent = NT8Broker._BRIDGES.get(self.port)
+            if ent is not None:
+                state, _srv, tok = ent
+                if tok != self.token:
+                    raise RuntimeError(f"nt8 bridge token mismatch on port {self.port}")
+                self._state = state
+                return
+            state = _BridgeState(self._journal)
+            handler = _make_handler(state, self.token)
+            server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
+            t = threading.Thread(target=server.serve_forever,
+                                 name="eq-nt8-bridge", daemon=True)
+            t.start()
+            NT8Broker._BRIDGES[self.port] = (state, server, self.token)
+            self._state = state
         log.info("nt8 bridge listening on 127.0.0.1:%d", self.port)
 
     def shutdown(self):
-        if self._server is not None:
-            self._server.shutdown()
-            self._server = None
+        pass                                  # 공유 서버는 앱 수명과 함께 감(개별 종료 없음)
 
     def healthcheck(self) -> bool:
-        age = time.time() - self._state.last_state_ts
-        return self._state.last_state_ts > 0 and age <= _HEARTBEAT_MAX_S
+        """애드온 하트비트 판정. 미접속이면 **예외**(조용한 False = GUI 가짜 초록불 방지).
+        브리지 서버가 방금 떴을 수 있어 애드온 첫 push(1초 주기)를 최대 4초 기다린다."""
+        self.authenticate()
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            age = time.time() - self._state.last_state_ts
+            if self._state.last_state_ts > 0 and age <= _HEARTBEAT_MAX_S:
+                return True
+            time.sleep(0.2)
+        raise RuntimeError(
+            "NT8 애드온 미접속 - NinjaTrader가 켜져 있고 EQAutopilotBridge 애드온이 컴파일"
+            "(F5)돼 있는지, 애드온의 Token·Port가 앱 설정과 같은지 확인하세요")
 
     # ── 조회(애드온이 push한 스냅샷 기반) ──
     def _snapshot(self) -> dict:
+        self.authenticate()
         with self._state.lock:
             return dict(self._state.last_state)
 
@@ -207,6 +232,7 @@ class NT8Broker(BrokerAdapter):
         return self.symbol_map.get(c, c)
 
     def _enqueue_and_wait(self, cmd: dict) -> dict:
+        self.authenticate()
         tid = cmd["tid"]
         with self._state.lock:
             if tid in self._state.seen_tids:

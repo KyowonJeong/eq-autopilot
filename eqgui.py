@@ -212,8 +212,8 @@ _BROKERS = ["projectx", "tradovate", "ibkr", "bybit", "bitget"]
 #   ⚠️ BTC를 CME MBTC 선물로 안 함 — MBTC는 주말 휴장인데 BTC 엣지가 주말(일요일)에 몰려 있어
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
 _ASSETS = ["NQ", "GC", "BTC"]
-_ASSET_BROKERS = {"NQ": ["projectx", "tradovate", "ibkr"],
-                  "GC": ["projectx", "tradovate", "ibkr"],
+_ASSET_BROKERS = {"NQ": ["projectx", "nt8", "tradovate", "ibkr"],
+                  "GC": ["projectx", "nt8", "tradovate", "ibkr"],
                   "BTC": ["bybit", "bitget"]}
 _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
@@ -235,6 +235,12 @@ _BROKER_SPEC = {
     "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
                     "f3": "Passphrase", "acct": False, "futures": False, "preview": True,
                     "f1_secret": True},
+    # Lucid = NT8 브리지(대표 2026-08-10, #38). API가 없어 NinjaTrader 애드온 경유 -
+    #   f1 = 앱-애드온 공유 토큰(비밀), f3 = 브리지 포트. 계좌 = NT8 계정 이름 그대로.
+    #   Windows 전용(앱과 NT8 같은 머신). preview = 데모 실증 전.
+    "nt8":         {"label": "Lucid (NT8)", "f1": "Bridge Token (앱-애드온 공유)", "f2": None,
+                    "f3": "Bridge Port (기본 8377)", "acct": True, "futures": True,
+                    "preview": True, "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
     #   (API 키 페어 콜론 연결 — 셋째 토막 'demo'면 데모 서버). preview=데모 실검증 전.
     "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "Password",
@@ -266,6 +272,14 @@ def _build_broker(broker, f1, f2, f3, accounts):
         from eqexec.broker.bitget import BitgetBroker
         from eqexec.config import BitgetCfg
         return BitgetBroker(BitgetCfg(api_key=f1, api_secret=f2, passphrase=f3))
+    if broker == "nt8":
+        from eqexec.broker.nt8 import NT8Broker
+        from eqexec.config import NT8Cfg
+        try:
+            _prt = int(str(f3 or "").strip() or 8377)
+        except (TypeError, ValueError):
+            _prt = 8377
+        return NT8Broker(NT8Cfg(port=_prt, token=(f1 or "").strip(), accounts=acc))
     if broker == "tradovate":
         from eqexec.broker.tradovate import TradovateBroker
         from eqexec.config import TradovateCfg

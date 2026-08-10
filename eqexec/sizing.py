@@ -34,7 +34,7 @@ MINI_RATIO = 10
 # 크립토 최소 수량/랏 스텝(BTC). 거래소별 실제 최소치는 심볼 규격에서 확인해 조정.
 CRYPTO_LOT_STEP = 0.001
 
-_FUTURES_BROKERS = ("projectx", "ibkr")   # projectx == Topstep
+_FUTURES_BROKERS = ("projectx", "ibkr", "nt8")   # projectx == Topstep, nt8 == Lucid 브리지
 _CRYPTO_BROKERS = ("bybit", "bitget")
 _FUT_SYMBOL = {"NQ": "MNQ", "GC": "MGC"}   # BTC 선물 없음(MBTC 제거) — BTC는 크립토 전용
 
