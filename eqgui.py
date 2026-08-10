@@ -3936,7 +3936,8 @@ class App:
                 _tot = "?"
             self.log(f"   ⏱ 진입 완료({_ok}/{len(resolved)} leg) · 발송 후 {_tot}")
 
-    _HB_BROKER_KEY = {"projectx": "topstep", "ibkr": "ibkr", "bybit": "bybit", "bitget": "bitget"}
+    _HB_BROKER_KEY = {"projectx": "topstep", "nt8": "lucid", "tradovate": "tradovate",
+                      "ibkr": "ibkr", "bybit": "bybit", "bitget": "bitget"}
 
     def _broker_allowed(self, broker: str) -> bool:
         """서버(admin) '브로커별 지원' 토글 반영 — 하트비트 brokers에서 꺼진 브로커는 자동화 제외.
