@@ -338,6 +338,7 @@ T = {
     "user": {"ko": "TopstepX user email", "en": "TopstepX user email"},
     "key": {"ko": "ProjectX API Key", "en": "ProjectX API Key"},
     "show": {"ko": "보기", "en": "Show"},
+    "copy_btn": {"ko": "복사", "en": "Copy"},
     "paste": {"ko": "붙여넣기", "en": "Paste"},
     "unlock": {"ko": "🔓 잠금해제", "en": "🔓 Unlock"},
     "lock": {"ko": "🔒 잠금", "en": "🔒 Lock"},
@@ -1117,6 +1118,9 @@ class App:
         # Bybit/Bitget은 f1이 긴 API Key라 수동 타이핑이 고역 — 붙여넣기 버튼(대표 2026-07-12)
         ttk.Button(r1, text=self.t("paste"), width=8,
                    command=self._paste_f1).pack(side="left", padx=(4, 0))
+        # 복사 버튼(대표 2026-08-10 "잠금 해제하면 카피") - 기기 이전용. 비밀 f1은 PIN 게이트
+        ttk.Button(r1, text=self.t("copy_btn"), width=6,
+                   command=self._copy_f1).pack(side="left", padx=(4, 0))
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
@@ -1126,6 +1130,8 @@ class App:
             self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
             self.b_lock.pack(side="left", padx=(4, 0))
             ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
+            ttk.Button(r2, text=self.t("copy_btn"), width=6,
+                       command=self._copy_key).pack(side="left", padx=(4, 0))
             # '보기' 체크박스 폐지(대표 2026-08-09) — 키는 열람 불가·교체만 가능(write-only).
             # 덕분에 PIN 재설정 시 키를 지킬 필요가 없어졌다(_pin_forgot 코드 인증 참조).
         # f3 (추가 필드) — 있는 브로커만
@@ -2507,6 +2513,33 @@ class App:
                 pass
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
         self._refresh_live_panel()
+
+    def _copy_f1(self):
+        """API Key(f1) 복사 - 기기 이전용(대표 2026-08-10). 비밀 취급 브로커는 잠금 해제 후에만.
+        write-only 원칙의 예외지만 PIN 게이트 뒤라 소유자 본인 동작이다."""
+        _sp = _BROKER_SPEC.get(self._broker_name, {})
+        if _sp.get("f1_secret") and not self._f1_unlocked:
+            messagebox.showinfo("PIN", self.t("locked_msg")); return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.user.get())
+            self.log("📋 " + ("API Key를 클립보드에 복사했습니다." if self.lang == "ko"
+                              else "API Key copied to clipboard."))
+        except Exception:
+            pass
+
+    def _copy_key(self):
+        """비밀키(f2) 복사 - 잠금 해제 후에만."""
+        if not self._unlocked:
+            messagebox.showinfo("PIN", self.t("locked_msg")); return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.key.get())
+            self.log("📋 " + ("비밀키를 클립보드에 복사했습니다 - 붙여넣은 뒤 클립보드를 "
+                              "비우는 것을 잊지 마세요." if self.lang == "ko" else
+                              "Secret copied - clear your clipboard after pasting."))
+        except Exception:
+            pass
 
     def _toggle_cfg(self):
         """자산별 브로커 설정 접기/펼치기(대표 2026-07-13)."""
