@@ -4593,7 +4593,9 @@ class App:
                 _recv = _dtl.datetime.now(); _pub = sig.get("published_at")
                 try:
                     _sent = _dtl.datetime.fromtimestamp(float(_pub)) if _pub else None
-                    _lat = f"{_recv.timestamp() - float(_pub):.1f}s"
+                    # 지연 기준 = 봉마감(barclose_ts, 유저 체감) - 구 서버 피드엔 없어 published_at 폴백
+                    _base = sig.get("barclose_ts") or _pub
+                    _lat = f"{_recv.timestamp() - float(_base):.1f}s" + (" (마감 기준)" if sig.get("barclose_ts") else "")
                 except (TypeError, ValueError):
                     _sent, _lat = None, "?"
                 # 🚫 재진입 금지(계좌·세션별 하루 1회) → 발주 대상 계좌 선별
