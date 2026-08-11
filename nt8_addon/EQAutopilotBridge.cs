@@ -13,18 +13,23 @@
 // 설치: 문서\NinjaTrader 8\bin\Custom\AddOns\ 에 복사 → NinjaScript Editor에서 컴파일(F5).
 // 설정: 아래 Port/Token을 앱 설정과 동일하게. 자세한 것은 README.md.
 //
-// ⚠️ 스캐폴드 상태(2026-07-30): 계정 API 호출부(Submit/Flatten)는 NT8 8.1 기준으로
+// 의존성 제로(2026-08-11): Newtonsoft 참조가 NT8 표준 설치에 없어 컴파일이 깨지던 것
+// (대표 실기기 CS0246)을 계기로, 아래 MiniJson(자체 파서·직렬화)으로 교체했다.
+// References 추가 없이 F5 한 번으로 컴파일되는 것이 회원 배포의 전제다.
+//
+// ⚠️ 스캐폴드 상태: 계정 API 호출부(CreateOrder/Submit/Flatten)는 NT8 8.1 기준으로
 // 작성했으며, 실계정 연결 후 데모에서 검증할 것. VERIFY 표시 참조.
 // =========================
 #region Using declarations
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Threading;
-using Newtonsoft.Json.Linq;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
 #endregion
@@ -91,34 +96,36 @@ namespace NinjaTrader.NinjaScript.AddOns
         // ── ① 상태 push: 계정·포지션·잔고 + 하트비트 ──
         private async Task PushStateAsync()
         {
-            var accounts = new JArray();
-            var positions = new JArray();
+            var accounts = new List<object>();
+            var positions = new List<object>();
             lock (Account.All)
             {
                 foreach (Account a in Account.All)
                 {
                     if (a.ConnectionStatus != ConnectionStatus.Connected) continue;
-                    accounts.Add(new JObject {
-                        ["name"] = a.Name,
-                        ["cash_value"] = a.Get(AccountItem.CashValue, Currency.UsDollar),
-                        ["realized_pnl"] = a.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
+                    accounts.Add(new Dictionary<string, object> {
+                        { "name", a.Name },
+                        { "cash_value", a.Get(AccountItem.CashValue, Currency.UsDollar) },
+                        { "realized_pnl", a.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) },
                     });
                     foreach (var p in a.Positions)
                     {
                         int q = p.MarketPosition == MarketPosition.Long ? p.Quantity
                               : p.MarketPosition == MarketPosition.Short ? -p.Quantity : 0;
                         if (q == 0) continue;
-                        positions.Add(new JObject {
-                            ["account"] = a.Name,
-                            ["instrument"] = p.Instrument.FullName,   // "MNQ 09-26"
-                            ["net_qty"] = q,
-                            ["avg_price"] = p.AveragePrice,
+                        positions.Add(new Dictionary<string, object> {
+                            { "account", a.Name },
+                            { "instrument", p.Instrument.FullName },   // "MNQ 09-26"
+                            { "net_qty", q },
+                            { "avg_price", p.AveragePrice },
                         });
                     }
                 }
             }
-            var body = new JObject { ["accounts"] = accounts, ["positions"] = positions,
-                                     ["ts"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds() };
+            var body = new Dictionary<string, object> {
+                { "accounts", accounts }, { "positions", positions },
+                { "ts", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
+            };
             await PostAsync("/v1/state", body);
         }
 
@@ -126,28 +133,37 @@ namespace NinjaTrader.NinjaScript.AddOns
         private async Task DrainCommandsAsync()
         {
             var resp = await http.GetStringAsync(BaseUrl + "/v1/pending");
-            var cmds = (JArray)(JObject.Parse(resp)["commands"] ?? new JArray());
-            foreach (JObject c in cmds)
+            var root = MiniJson.Parse(resp) as Dictionary<string, object>;
+            var cmds = (root != null ? root.Get("commands") : null) as List<object>
+                       ?? new List<object>();
+            foreach (var co in cmds)
             {
-                string tid = (string)c["tid"];
+                var c = co as Dictionary<string, object>;
+                if (c == null) continue;
+                string tid = c.Str("tid");
                 if (string.IsNullOrEmpty(tid) || doneTids.Contains(tid)) continue;
                 doneTids.Add(tid);
-                JObject ack = new JObject { ["tid"] = tid, ["ok"] = false };
+                Dictionary<string, object> ack;
                 try
                 {
-                    switch ((string)c["op"])
+                    switch (c.Str("op"))
                     {
                         case "entry":   ack = ExecEntry(c);   break;
                         case "stop":    ack = ExecStop(c);    break;
                         case "close":   ack = ExecClose(c);   break;
                         case "flatten": ack = ExecFlatten(c); break;
-                        default: ack["error"] = "unknown op"; break;
+                        default: ack = Ack(false); ack["error"] = "unknown op"; break;
                     }
                 }
-                catch (Exception ex) { ack["error"] = ex.Message; }
+                catch (Exception ex) { ack = Ack(false); ack["error"] = ex.Message; }
                 ack["tid"] = tid;
                 await PostAsync("/v1/ack", ack);
             }
+        }
+
+        private static Dictionary<string, object> Ack(bool ok)
+        {
+            return new Dictionary<string, object> { { "ok", ok } };
         }
 
         private static Account FindAccount(string name)
@@ -164,35 +180,36 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // entry: 시장가(정본=봉마감 최속) + stop_loss_price 있으면 브래킷.
         // 스탑 제출 실패 시 진입분 즉시 플래튼 — 알몸 포지션 불가 원칙.
-        private JObject ExecEntry(JObject c)
+        private Dictionary<string, object> ExecEntry(Dictionary<string, object> c)
         {
-            var acct = FindAccount((string)c["account"]);
-            if (acct == null) throw new Exception("account not connected: " + c["account"]);
-            var instr = FindInstrument((string)c["instrument"]);
-            if (instr == null) throw new Exception("instrument not found: " + c["instrument"]);
-            int qty = (int)c["qty"];
-            bool buy = (string)c["side"] == "buy";
+            var acct = FindAccount(c.Str("account"));
+            if (acct == null) throw new Exception("account not connected: " + c.Str("account"));
+            var instr = FindInstrument(c.Str("instrument"));
+            if (instr == null) throw new Exception("instrument not found: " + c.Str("instrument"));
+            int qty = c.Int("qty");
+            bool buy = c.Str("side") == "buy";
             var action = buy ? OrderAction.Buy : OrderAction.SellShort;
-            bool isLimit = (string)c["order_type"] == "limit" && c["limit_price"] != null;
+            bool isLimit = c.Str("order_type") == "limit" && c.Get("limit_price") != null;
 
             // 진입 주문 — VERIFY: NT 8.1 CreateOrder 시그니처(oco/strategy 인자)
             Order entry = acct.CreateOrder(instr, action,
                 isLimit ? OrderType.Limit : OrderType.Market,
                 OrderEntry.Automated, TimeInForce.Day, qty,
-                isLimit ? (double)c["limit_price"] : 0, 0,
-                "", "EQ-" + c["tid"], Core.Globals.MaxDate, null);
+                isLimit ? c.Dbl("limit_price") : 0, 0,
+                "", "EQ-" + c.Str("tid"), Core.Globals.MaxDate, null);
             acct.Submit(new[] { entry });
 
-            var ack = new JObject { ["ok"] = true, ["order_id"] = entry.OrderId };
-            if (c["stop_loss_price"] != null && c["stop_loss_price"].Type != JTokenType.Null)
+            var ack = Ack(true);
+            ack["order_id"] = entry.OrderId;
+            if (c.Get("stop_loss_price") != null)
             {
                 try
                 {
                     var stopAction = buy ? OrderAction.Sell : OrderAction.BuyToCover;
                     Order stop = acct.CreateOrder(instr, stopAction, OrderType.StopMarket,
                         OrderEntry.Automated, TimeInForce.Gtc, qty,
-                        0, (double)c["stop_loss_price"],
-                        "", "EQS-" + c["tid"], Core.Globals.MaxDate, null);
+                        0, c.Dbl("stop_loss_price"),
+                        "", "EQS-" + c.Str("tid"), Core.Globals.MaxDate, null);
                     acct.Submit(new[] { stop });
                     ack["stop_order_id"] = stop.OrderId;
                 }
@@ -205,33 +222,38 @@ namespace NinjaTrader.NinjaScript.AddOns
             return ack;
         }
 
-        private JObject ExecStop(JObject c)
+        private Dictionary<string, object> ExecStop(Dictionary<string, object> c)
         {
-            var acct = FindAccount((string)c["account"]);
-            var instr = FindInstrument((string)c["instrument"]);
+            var acct = FindAccount(c.Str("account"));
+            var instr = FindInstrument(c.Str("instrument"));
             if (acct == null || instr == null) throw new Exception("account/instrument missing");
-            bool sell = (string)c["side"] == "sell";
+            bool sell = c.Str("side") == "sell";
             Order stop = acct.CreateOrder(instr,
                 sell ? OrderAction.Sell : OrderAction.BuyToCover, OrderType.StopMarket,
-                OrderEntry.Automated, TimeInForce.Gtc, (int)c["qty"],
-                0, (double)c["stop_price"], "", "EQS-" + c["tid"],
+                OrderEntry.Automated, TimeInForce.Gtc, c.Int("qty"),
+                0, c.Dbl("stop_price"), "", "EQS-" + c.Str("tid"),
                 Core.Globals.MaxDate, null);
             acct.Submit(new[] { stop });
-            return new JObject { ["ok"] = true, ["order_id"] = stop.OrderId };
+            var ack = Ack(true);
+            ack["order_id"] = stop.OrderId;
+            return ack;
         }
 
-        private JObject ExecClose(JObject c)
+        private Dictionary<string, object> ExecClose(Dictionary<string, object> c)
         {
-            var acct = FindAccount((string)c["account"]);
-            var instr = FindInstrument((string)c["instrument"]);
+            var acct = FindAccount(c.Str("account"));
+            var instr = FindInstrument(c.Str("instrument"));
             if (acct == null || instr == null) throw new Exception("account/instrument missing");
             acct.Flatten(new[] { instr });                 // 해당 종목만 정리(주문 취소 포함)
-            return new JObject { ["ok"] = true };
+            return Ack(true);
         }
 
-        private JObject ExecFlatten(JObject c)
+        private Dictionary<string, object> ExecFlatten(Dictionary<string, object> c)
         {
-            var wanted = (c["accounts"] as JArray)?.Select(t => (string)t).ToHashSet();
+            HashSet<string> wanted = null;
+            var arr = c.Get("accounts") as List<object>;
+            if (arr != null)
+                wanted = new HashSet<string>(arr.Select(t => t as string).Where(t => t != null));
             lock (Account.All)
             {
                 foreach (Account a in Account.All)
@@ -243,14 +265,222 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (instrs.Length > 0) a.Flatten(instrs);
                 }
             }
-            return new JObject { ["ok"] = true };
+            return Ack(true);
         }
 
-        private static async Task PostAsync(string path, JObject body)
+        private static async Task PostAsync(string path, Dictionary<string, object> body)
         {
-            var content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
+            var content = new StringContent(MiniJson.Serialize(body), Encoding.UTF8,
+                                            "application/json");
             var r = await http.PostAsync(BaseUrl + path, content);
             r.EnsureSuccessStatusCode();
+        }
+    }
+
+    // ── 사전 접근 헬퍼 ──
+    internal static class DictExt
+    {
+        public static object Get(this Dictionary<string, object> d, string k)
+        {
+            object v;
+            return d != null && d.TryGetValue(k, out v) ? v : null;
+        }
+        public static string Str(this Dictionary<string, object> d, string k)
+        {
+            var v = d.Get(k);
+            return v == null ? null : v.ToString();
+        }
+        public static int Int(this Dictionary<string, object> d, string k)
+        {
+            return (int)Convert.ToDouble(d.Get(k) ?? 0, CultureInfo.InvariantCulture);
+        }
+        public static double Dbl(this Dictionary<string, object> d, string k)
+        {
+            return Convert.ToDouble(d.Get(k) ?? 0, CultureInfo.InvariantCulture);
+        }
+    }
+
+    // ── MiniJson — 의존성 제로 JSON (파서 + 직렬화) ─────────────────────────────
+    // 브리지 프로토콜에 필요한 만큼만: object/array/string/number/bool/null.
+    // 값 타입: Dictionary<string,object> / List<object> / string / double / bool / null.
+    internal static class MiniJson
+    {
+        public static object Parse(string s)
+        {
+            int i = 0;
+            var v = ParseValue(s, ref i);
+            return v;
+        }
+
+        private static object ParseValue(string s, ref int i)
+        {
+            SkipWs(s, ref i);
+            if (i >= s.Length) throw new Exception("json: eof");
+            char ch = s[i];
+            if (ch == '{') return ParseObj(s, ref i);
+            if (ch == '[') return ParseArr(s, ref i);
+            if (ch == '"') return ParseStr(s, ref i);
+            if (ch == 't') { Expect(s, ref i, "true"); return true; }
+            if (ch == 'f') { Expect(s, ref i, "false"); return false; }
+            if (ch == 'n') { Expect(s, ref i, "null"); return null; }
+            return ParseNum(s, ref i);
+        }
+
+        private static Dictionary<string, object> ParseObj(string s, ref int i)
+        {
+            var d = new Dictionary<string, object>();
+            i++;                                          // '{'
+            SkipWs(s, ref i);
+            if (s[i] == '}') { i++; return d; }
+            while (true)
+            {
+                SkipWs(s, ref i);
+                string k = ParseStr(s, ref i);
+                SkipWs(s, ref i);
+                if (s[i] != ':') throw new Exception("json: ':' expected");
+                i++;
+                d[k] = ParseValue(s, ref i);
+                SkipWs(s, ref i);
+                if (s[i] == ',') { i++; continue; }
+                if (s[i] == '}') { i++; return d; }
+                throw new Exception("json: ',' or '}' expected");
+            }
+        }
+
+        private static List<object> ParseArr(string s, ref int i)
+        {
+            var a = new List<object>();
+            i++;                                          // '['
+            SkipWs(s, ref i);
+            if (s[i] == ']') { i++; return a; }
+            while (true)
+            {
+                a.Add(ParseValue(s, ref i));
+                SkipWs(s, ref i);
+                if (s[i] == ',') { i++; continue; }
+                if (s[i] == ']') { i++; return a; }
+                throw new Exception("json: ',' or ']' expected");
+            }
+        }
+
+        private static string ParseStr(string s, ref int i)
+        {
+            if (s[i] != '"') throw new Exception("json: '\"' expected");
+            var sb = new StringBuilder();
+            i++;
+            while (true)
+            {
+                char ch = s[i++];
+                if (ch == '"') return sb.ToString();
+                if (ch == '\\')
+                {
+                    char e = s[i++];
+                    switch (e)
+                    {
+                        case '"': sb.Append('"'); break;
+                        case '\\': sb.Append('\\'); break;
+                        case '/': sb.Append('/'); break;
+                        case 'b': sb.Append('\b'); break;
+                        case 'f': sb.Append('\f'); break;
+                        case 'n': sb.Append('\n'); break;
+                        case 'r': sb.Append('\r'); break;
+                        case 't': sb.Append('\t'); break;
+                        case 'u':
+                            sb.Append((char)Convert.ToInt32(s.Substring(i, 4), 16));
+                            i += 4; break;
+                        default: throw new Exception("json: bad escape");
+                    }
+                }
+                else sb.Append(ch);
+            }
+        }
+
+        private static double ParseNum(string s, ref int i)
+        {
+            int start = i;
+            while (i < s.Length && (char.IsDigit(s[i]) || s[i] == '-' || s[i] == '+'
+                                    || s[i] == '.' || s[i] == 'e' || s[i] == 'E'))
+                i++;
+            return double.Parse(s.Substring(start, i - start), CultureInfo.InvariantCulture);
+        }
+
+        private static void SkipWs(string s, ref int i)
+        {
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+        }
+
+        private static void Expect(string s, ref int i, string word)
+        {
+            if (string.CompareOrdinal(s, i, word, 0, word.Length) != 0)
+                throw new Exception("json: '" + word + "' expected");
+            i += word.Length;
+        }
+
+        public static string Serialize(object v)
+        {
+            var sb = new StringBuilder();
+            Write(sb, v);
+            return sb.ToString();
+        }
+
+        private static void Write(StringBuilder sb, object v)
+        {
+            if (v == null) { sb.Append("null"); return; }
+            if (v is bool) { sb.Append((bool)v ? "true" : "false"); return; }
+            if (v is string) { WriteStr(sb, (string)v); return; }
+            if (v is Dictionary<string, object>)
+            {
+                sb.Append('{');
+                bool first = true;
+                foreach (var kv in (Dictionary<string, object>)v)
+                {
+                    if (!first) sb.Append(',');
+                    first = false;
+                    WriteStr(sb, kv.Key);
+                    sb.Append(':');
+                    Write(sb, kv.Value);
+                }
+                sb.Append('}');
+                return;
+            }
+            if (v is IEnumerable && !(v is string))
+            {
+                sb.Append('[');
+                bool first = true;
+                foreach (var it in (IEnumerable)v)
+                {
+                    if (!first) sb.Append(',');
+                    first = false;
+                    Write(sb, it);
+                }
+                sb.Append(']');
+                return;
+            }
+            // 숫자(int/long/double/decimal 등)
+            sb.Append(Convert.ToString(v, CultureInfo.InvariantCulture));
+        }
+
+        private static void WriteStr(StringBuilder sb, string s)
+        {
+            sb.Append('"');
+            foreach (char ch in s)
+            {
+                switch (ch)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (ch < ' ') sb.Append("\\u").Append(((int)ch).ToString("x4"));
+                        else sb.Append(ch);
+                        break;
+                }
+            }
+            sb.Append('"');
         }
     }
 }
