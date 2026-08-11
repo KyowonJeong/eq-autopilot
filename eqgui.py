@@ -1006,16 +1006,7 @@ class App:
         # (테스터 리포트 2026-07-12). 창을 줄여도 스크롤로 전부 접근 가능.
         host = ttk.Frame(self.root); host.pack(fill="both", expand=True)
         self._scroll_host = host
-        # 스크롤 복원은 시간차 3연발 - 레이아웃이 자라는 동안의 1회성 복원은 0으로
-        # 클램프된다(대표 2026-08-11 "여전히 그러는디"). 60/250/600ms 시점에 재적용.
-        if _keep_y:
-            def _restore_scroll(y=_keep_y):
-                try:
-                    self._scroll_cv.yview_moveto(y)
-                except Exception:
-                    pass
-            for _ms in (60, 250, 600):
-                self.root.after(_ms, _restore_scroll)
+        self._keep_y = _keep_y                    # _build 끝에서 동기 복원(그리기 전)
         _cv = tk.Canvas(host, highlightthickness=0, borderwidth=0)
         self._scroll_cv = _cv                     # 스크롤 위치 복원용(2026-08-11)
         _sb = ttk.Scrollbar(host, orient="vertical", command=_cv.yview)
@@ -1432,6 +1423,22 @@ class App:
                          else "connected ✓ (test passed, no retest needed)") if _ok else
                         ("연결 테스트 필요" if self.lang == "ko" else "connection test required")))
         self._async_load_key(self._acur().get("f1", ""))
+        # 스크롤 동기 복원(대표 2026-08-11 "꼭 위로 갔다 내려와야 하나") - 첫 페인트 전에
+        # 레이아웃을 확정(update_idletasks)하고 위치를 맞춰 점프 프레임을 없앤다.
+        # after(80) 한 발은 지연 로드로 높이가 미세하게 자랄 때의 안전빵.
+        if getattr(self, "_keep_y", None):
+            def _restore_scroll(y=self._keep_y):
+                try:
+                    self._scroll_cv.yview_moveto(y)
+                except Exception:
+                    pass
+            try:
+                self.root.update_idletasks()
+                _restore_scroll()
+            except Exception:
+                pass
+            self.root.after(80, _restore_scroll)
+            self._keep_y = None
 
     def _set_actions_enabled(self, on):
         """_busy()용. 작업 중(on=False)엔 전부 잠그고, 끝나면 게이팅 상태로 복원."""
