@@ -1233,6 +1233,59 @@ class App:
             self.f3.insert(0, c.get("f3", ""))
             ttk.Button(r3e, text=self.t("paste"), width=8,
                        command=lambda: self._paste_into(self.f3)).pack(side="left", padx=(4, 0))
+        # 저장·테스트 버튼 폐지(대표 2026-08-11 "버튼 최소화, 유저 경험 최고로" - 자동 저장
+        # 확정): 입력이 멈추면 자동 저장(+Keychain), 키가 완성되면 자동 연결 확인까지.
+        # 사람이 할 일은 입력뿐 - 스텝 0.
+        _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
+        ttk.Label(_svrow, text=("입력하면 자동으로 저장·연결 확인됩니다 (자산마다 한 번, 재시작해도 유지)"
+                                if self.lang == "ko" else
+                                "Everything saves & verifies automatically as you type (once per asset)"),
+                  foreground="#9ca3af").pack(side="left")
+        self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
+        self._saved_lbl.pack(side="left", padx=(10, 0))
+        for _w in (getattr(self, "user", None), getattr(self, "key", None),
+                   getattr(self, "f3", None)):
+            if _w is not None:
+                _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
+        # 가용 계좌(대표 2026-08-11 확정): 브로커 설정의 일부다 - Topstep은 연결되면 자동으로
+        # 차고, Lucid처럼 API 목록이 없는 브로커는 여기서 수동 등록해야 ② 드롭다운에 뜬다.
+        if spec.get("acct"):
+            _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
+            _av = self._avail_of(self._asset, self._broker_name)
+            _avtxt = ", ".join(_av) if _av else ("아직 없음" if self.lang == "ko" else "none yet")
+            self._avail_lbl = ttk.Label(
+                _avrow, text=(("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
+                              + _avtxt),
+                foreground="#555", wraplength=700, justify="left")
+            self._avail_lbl.pack(side="left")
+            if self._broker_name == "projectx":
+                ttk.Label(_avrow, text=("(연결하면 자동으로 불러옵니다)" if self.lang == "ko"
+                                        else "(loaded automatically on connect)"),
+                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
+            else:
+                _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
+                self._avail_entry = ttk.Entry(_mrow, width=24)
+                self._avail_entry.pack(side="left")
+                ttk.Button(_mrow, text=("가용 계좌 등록" if self.lang == "ko" else "Register account"),
+                           command=self._register_avail).pack(side="left", padx=(4, 0))
+                ttk.Label(_mrow, text=("계좌 이름 그대로 (Lucid는 NT8 Accounts 탭 이름)"
+                                       if self.lang == "ko" else
+                                       "exact account name (Lucid: as in NT8 Accounts tab)"),
+                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
+        if spec.get("acct"):
+            # ① 브로커 설정 복사(대표 2026-08-11 "브로커 설정 복사, 계좌 설정 복사 둘 다")
+            _bsrcs = [a for a in _ASSETS if a != self._asset
+                      and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
+            if _bsrcs:
+                _bcp = ttk.Frame(frm); _bcp.pack(fill="x", pady=(2, 0))
+                ttk.Label(_bcp, text=("브로커 설정 복사 ←" if self.lang == "ko"
+                                      else "Copy broker setup ←"),
+                          foreground="#888").pack(side="left")
+                for _srcb in _bsrcs:
+                    ttk.Button(_bcp, text=_srcb, width=5,
+                               command=lambda a=_srcb: self._copy_broker_setup(a)
+                               ).pack(side="left", padx=(4, 0))
+
         # ── 계좌 관리(대표 2026-07-24 자산별 계좌) — 이 자산(self._asset)의 등록 계좌 리스트.
         #   계좌마다 [실행 on][라벨][1R $][삭제] — 값은 FocusOut/토글 시 이 자산 accounts에 즉시
         #   저장(_save_acct_widgets). 여러 펀디드/챌린지 계좌를 각자 1R로 동시에 굴린다.
@@ -1243,7 +1296,7 @@ class App:
         self._acct_widgets = {}                     # {idx: {on,label,one_r}} — 현재 자산 계좌 위젯
         _accts = self._accts_of(self._asset)
         if spec.get("acct"):
-            ttk.Label(frm, text=("등록 계좌 — 계좌별 1R·실행 여부 (라이브 패널에서 자산 단위로 시작)"
+            ttk.Label(frm, text=("② 사용 계좌 — 드롭다운에서 골라 추가 (계좌별 1R·실행 여부)"
                                  if self.lang == "ko"
                                  else "② Accounts — pick from the dropdown, one at a time"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(10, 1))
@@ -1300,62 +1353,8 @@ class App:
                                    font=("Helvetica", 11, "bold"))
         self._next_lbl.pack(anchor="w", pady=(8, 0))
         self._refresh_next_action()
-        # 저장·테스트 버튼 폐지(대표 2026-08-11 "버튼 최소화, 유저 경험 최고로" - 자동 저장
-        # 확정): 입력이 멈추면 자동 저장(+Keychain), 키가 완성되면 자동 연결 확인까지.
-        # 사람이 할 일은 입력뿐 - 스텝 0.
-        _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
-        ttk.Label(_svrow, text=("입력하면 자동으로 저장·연결 확인됩니다 (자산마다 한 번, 재시작해도 유지)"
-                                if self.lang == "ko" else
-                                "Everything saves & verifies automatically as you type (once per asset)"),
-                  foreground="#9ca3af").pack(side="left")
-        self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
-        self._saved_lbl.pack(side="left", padx=(10, 0))
-        for _w in (getattr(self, "user", None), getattr(self, "key", None),
-                   getattr(self, "f3", None)):
-            if _w is not None:
-                _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
-        # 가용 계좌(대표 2026-08-11 확정): 브로커 설정의 일부다 - Topstep은 연결되면 자동으로
-        # 차고, Lucid처럼 API 목록이 없는 브로커는 여기서 수동 등록해야 ② 드롭다운에 뜬다.
-        if spec.get("acct"):
-            _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
-            _av = self._avail_of(self._asset, self._broker_name)
-            _avtxt = ", ".join(_av) if _av else ("아직 없음" if self.lang == "ko" else "none yet")
-            ttk.Label(_avrow, text=(("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
-                                    + _avtxt),
-                      foreground="#555", wraplength=700, justify="left").pack(side="left")
-            if self._broker_name == "projectx":
-                ttk.Label(_avrow, text=("(연결하면 자동으로 불러옵니다)" if self.lang == "ko"
-                                        else "(loaded automatically on connect)"),
-                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
-            else:
-                _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
-                self._avail_entry = ttk.Entry(_mrow, width=24)
-                self._avail_entry.pack(side="left")
-                ttk.Button(_mrow, text=("가용 계좌 등록" if self.lang == "ko" else "Register account"),
-                           command=self._register_avail).pack(side="left", padx=(4, 0))
-                ttk.Label(_mrow, text=("계좌 이름 그대로 (Lucid는 NT8 Accounts 탭 이름)"
-                                       if self.lang == "ko" else
-                                       "exact account name (Lucid: as in NT8 Accounts tab)"),
-                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
-        if spec.get("acct"):
-            # ① 브로커 설정 복사(대표 2026-08-11 "브로커 설정 복사, 계좌 설정 복사 둘 다")
-            _bsrcs = [a for a in _ASSETS if a != self._asset
-                      and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
-            if _bsrcs:
-                _bcp = ttk.Frame(frm); _bcp.pack(fill="x", pady=(2, 0))
-                ttk.Label(_bcp, text=("브로커 설정 복사 ←" if self.lang == "ko"
-                                      else "Copy broker setup ←"),
-                          foreground="#888").pack(side="left")
-                for _srcb in _bsrcs:
-                    ttk.Button(_bcp, text=_srcb, width=5,
-                               command=lambda a=_srcb: self._copy_broker_setup(a)
-                               ).pack(side="left", padx=(4, 0))
-        # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
-        ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
-                              else "Preview 1R — all accounts"),
-                   command=lambda a=self._asset: self._preview_one_r(a)
-                   ).pack(anchor="w", pady=(4, 1))
-        ttk.Label(frm, text=self.t("conn_first"), foreground="#888").pack(anchor="w")
+        # '이 자산 전 계좌 1R 확인' 버튼 폐지(대표 2026-08-11 버튼 제로) - 1R은 라이브
+        # 패널 자산 줄에 상시 표시. 낡은 "연결 테스트 먼저" 안내도 자동 검증이라 제거.
         frm = _outer_frm                          # 접이식 본문 끝 — 이후(로그)는 바깥에
 
         # 자동 청산·자동 진입 섹션은 라이브 패널로 통합(대표 2026-07-13) — 개별 정지도 패널 줄에서.
@@ -2111,6 +2110,15 @@ class App:
             self.acct_pick["values"] = _vals
             if _vals and not self.acct_pick.get().strip():
                 self.acct_pick.set(_vals[0])
+        except Exception:
+            pass
+        # ① 가용 계좌 줄도 갱신(빌드 시점엔 '아직 없음'이었다가 로드 완료 즉시 반영)
+        try:
+            _av = self._avail_of(self._asset, self._broker_name)
+            if _av and hasattr(self, "_avail_lbl"):
+                self._avail_lbl.config(
+                    text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
+                    + ", ".join(_av))
         except Exception:
             pass
 
