@@ -522,6 +522,18 @@ _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300
                   "r_steady": 300.0, "buffer": 6000.0, "payouts": 0,
                   "last_bal": None}   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
+# ── 브로커별 프롭 정본 프리셋(대표 2026-08-11 "브로커 자동 감지해서 페이즈별 사이징") ──
+#   projectx(Topstep) = 빅실드 정본 1200/300/방패6000 (2026-08-02 채택)
+#   nt8(Lucid)        = 속도 스윕 정본: 평가 $300 / 펀디드 $150, 방패 없음(락스텝·1발 전환)
+#                       라이브 락 후는 프롭 모드가 아니라 '잔고 %' 모드 2% 권장(e3d03c3)
+_PROP_PRESETS = {
+    "projectx": {"r_test": 1200.0, "r_buffer": 300.0, "r_steady": 300.0, "buffer": 6000.0},
+    "nt8":      {"r_test": 300.0,  "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0},
+}
+
+
+def _prop_preset(broker):
+    return _PROP_PRESETS.get(str(broker or "").lower())
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
 
@@ -2357,6 +2369,19 @@ class App:
         except Exception:
             return
         pr = dict(_PROP_DEFAULTS); pr.update(acct.get("prop") or {})
+        # 브로커 자동 감지 프리셋(대표 2026-08-11): 값이 기본값 그대로인 계좌만 그 브로커의
+        # 정본으로 스왑(커스텀 값은 불변). Lucid는 평가300/펀디드150·방패0, 라이브=잔고2% 권장.
+        try:
+            _bk = (acct.get("broker") or self._acfg[self._asset]["broker"] or "").lower()
+            _ps = _prop_preset(_bk)
+            if _ps and all(float(pr.get(k, 0)) == _PROP_DEFAULTS[k] for k in
+                           ("r_test", "r_buffer", "r_steady", "buffer")):
+                pr.update(_ps)
+                if _bk == "nt8":
+                    self.log("프롭 프리셋: Lucid 정본 적용(평가 $300 / 펀디드 $150, 방패 없음 - "
+                             "라이브 락 후엔 '잔고 %' 모드 2%를 권장)")
+        except Exception:
+            pass
         win = tk.Toplevel(self.root)
         win.title(("프롭 자동 사이징 — " + (acct.get("label") or "")) if ko
                   else ("Prop auto-sizing — " + (acct.get("label") or "")))
