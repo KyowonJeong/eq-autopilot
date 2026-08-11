@@ -1259,6 +1259,21 @@ class App:
             self.acct_add_bk.pack(side="left", padx=(0, 4))
             self.acct_pick = ttk.Combobox(addr, values=[], state="normal")
             self.acct_pick.pack(side="left", fill="x", expand=True)
+            # 드롭다운 = 고른 브로커의 가용 계좌(대표 2026-08-11 "가용 계좌 중 선택하게").
+            # 브로커를 바꾸면 그 브로커의 가용 목록으로 갱신된다.
+
+            def _sync_pick(_e=None):
+                _lbl = str(self.acct_add_bk.get()).strip()
+                _bk = next((b for b in _addbrs if _broker_label(b) == _lbl), self._broker_name)
+                _av = list(self._avail_of(self._asset, _bk))
+                try:
+                    self.acct_pick["values"] = _av
+                    if _av and not self.acct_pick.get().strip():
+                        self.acct_pick.set(_av[0])
+                except Exception:
+                    pass
+            self.acct_add_bk.bind("<<ComboboxSelected>>", _sync_pick)
+            _sync_pick()
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left", padx=(4, 0))
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
@@ -1314,6 +1329,29 @@ class App:
                    getattr(self, "f3", None)):
             if _w is not None:
                 _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
+        # 가용 계좌(대표 2026-08-11 확정): 브로커 설정의 일부다 - Topstep은 연결되면 자동으로
+        # 차고, Lucid처럼 API 목록이 없는 브로커는 여기서 수동 등록해야 ② 드롭다운에 뜬다.
+        if spec.get("acct"):
+            _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
+            _av = self._avail_of(self._asset, self._broker_name)
+            _avtxt = ", ".join(_av) if _av else ("아직 없음" if self.lang == "ko" else "none yet")
+            ttk.Label(_avrow, text=(("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
+                                    + _avtxt),
+                      foreground="#555", wraplength=700, justify="left").pack(side="left")
+            if self._broker_name == "projectx":
+                ttk.Label(_avrow, text=("(연결하면 자동으로 불러옵니다)" if self.lang == "ko"
+                                        else "(loaded automatically on connect)"),
+                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
+            else:
+                _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
+                self._avail_entry = ttk.Entry(_mrow, width=24)
+                self._avail_entry.pack(side="left")
+                ttk.Button(_mrow, text=("가용 계좌 등록" if self.lang == "ko" else "Register account"),
+                           command=self._register_avail).pack(side="left", padx=(4, 0))
+                ttk.Label(_mrow, text=("계좌 이름 그대로 (Lucid는 NT8 Accounts 탭 이름)"
+                                       if self.lang == "ko" else
+                                       "exact account name (Lucid: as in NT8 Accounts tab)"),
+                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -1616,6 +1654,26 @@ class App:
         """자산 탭의 (현재 또는 지정) 브로커 크레덴셜 {f1,f3}. 계좌는 자산별이라 크레덴셜도 자산 내."""
         bk = broker or self._acfg[asset]["broker"]
         return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
+
+    def _register_avail(self):
+        """① 가용 계좌 수동 등록(대표 2026-08-11) - API 목록이 없는 브로커(Lucid 등)용.
+        등록하면 ② 사용 계좌 드롭다운에 뜬다. 중복은 무시."""
+        try:
+            _v = str(self._avail_entry.get()).strip()
+        except Exception:
+            _v = ""
+        if not _v:
+            return
+        _av = self._avail_of(self._asset, self._broker_name)
+        if _v not in _av:
+            _av.append(_v)
+            self._save_cfg()
+        self._build()                        # 가용 줄·② 드롭다운 즉시 반영
+
+    def _avail_of(self, asset, broker=None):
+        """이 (자산, 브로커)의 가용 계좌 목록(대표 2026-08-11 확정 설계) - ①브로커 설정에서
+        등록/자동 로드되고, ②사용 계좌는 여기서 고르기만 한다. creds 블롭에 함께 저장."""
+        return self._creds_of(asset, broker).setdefault("avail", [])
 
     def _acct_broker(self, asset, acct):
         """계좌의 실행 브로커(대표 2026-08-09 계좌별 브로커 — BTC Bybit+Bitget 동시 발주).
@@ -2067,6 +2125,16 @@ class App:
             try:
                 b = _build_broker("projectx", f1, _kc_load(f1) or "", cr.get("f3", ""), [])
                 names = [str(a.get("name")) for a in b._accounts()]
+                # 가용 계좌로 영속(대표 2026-08-11): 다음 실행부터는 API 재조회 전에도
+                # ② 드롭다운이 차 있고, ①의 가용 계좌 줄에도 보인다.
+                try:
+                    _av = cr.setdefault("avail", [])
+                    for _nm in names:
+                        if _nm not in _av:
+                            _av.append(_nm)
+                    self._save_cfg()
+                except Exception:
+                    pass
             except Exception:
                 names = None
             if names:
