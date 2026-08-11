@@ -986,6 +986,14 @@ class App:
 
     def _build(self):
         d = _load()
+        # 재빌드 후에도 보던 자리 유지(대표 2026-08-11 "자산 버튼 옮기면 위로 리셋돼
+        # 정신 없어") - 파괴 전에 스크롤 위치를 잡아둔다.
+        _keep_y = None
+        try:
+            if getattr(self, "_scroll_cv", None) is not None:
+                _keep_y = self._scroll_cv.yview()[0]
+        except Exception:
+            pass
         if getattr(self, "_scroll_host", None) is not None:
             self._scroll_host.destroy()
         elif self.frm is not None:
@@ -998,7 +1006,9 @@ class App:
         # (테스터 리포트 2026-07-12). 창을 줄여도 스크롤로 전부 접근 가능.
         host = ttk.Frame(self.root); host.pack(fill="both", expand=True)
         self._scroll_host = host
+        self._restore_y = _keep_y                 # scrollregion 정착 콜백이 소비
         _cv = tk.Canvas(host, highlightthickness=0, borderwidth=0)
+        self._scroll_cv = _cv                     # 스크롤 위치 복원용(2026-08-11)
         _sb = ttk.Scrollbar(host, orient="vertical", command=_cv.yview)
         _cv.configure(yscrollcommand=_sb.set)
         _sb.pack(side="right", fill="y")
@@ -1013,6 +1023,14 @@ class App:
                 if _cv.itemcget(_win, "height") != str(_need):
                     _cv.itemconfigure(_win, height=_need)
                 _cv.configure(scrollregion=_cv.bbox("all"))
+                # 첫 정착 시 이전 스크롤 위치 복원(재빌드 리셋 방지)
+                nonlocal_keep = getattr(self, "_restore_y", None)
+                if nonlocal_keep is not None:
+                    try:
+                        _cv.yview_moveto(nonlocal_keep)
+                    except Exception:
+                        pass
+                    self._restore_y = None
             except Exception:
                 pass
         frm.bind("<Configure>", _fit_canvas)
