@@ -1890,9 +1890,10 @@ class App:
         _th.Thread(target=w, daemon=True).start()
 
     def _copy_acct_setup(self, src_asset):
-        """다른 선물 자산(src)의 계좌 구성(계좌 목록·1R·프롭/자본% 모드)을 현재 자산으로 복사.
-        NQ·GC는 같은 프롭 계좌로 운용하므로 설정을 한 번에 맞춘다(대표 2026-07-26 #20).
-        브로커·크레덴셜은 자산별 독립이라 건드리지 않는다 — 계좌 구성만 복사."""
+        """다른 선물 자산(src)의 설정 전체를 현재 자산으로 복사 - 브로커 선택·크레덴셜
+        (브리지 토큰·포트 포함)·계좌 목록·1R·모드까지 싸그리(대표 2026-08-11 "다 싸그리").
+        NQ·GC는 같은 프롭 계좌·같은 브로커로 운용하므로 한 번에 맞추는 게 실사용이다.
+        (구버전은 계좌 목록만 복사해 브로커·토큰이 빠졌다 - Lucid 셋업 실측에서 발각)"""
         import copy as _copy
         dst = self._asset
         src_accts = self._accts_of(src_asset)
@@ -1902,16 +1903,19 @@ class App:
                                  else f"No accounts to copy from {src_asset}.")); return
         if not messagebox.askyesno(
                 ("계좌 설정 복사" if self.lang == "ko" else "Copy account setup"),
-                (f"{src_asset}의 계좌 구성을 {dst}(으)로 덮어쓸까요? (브로커·키는 유지)"
+                (f"{src_asset}의 설정 전체(브로커, 키, 계좌 구성)를 {dst}(으)로 덮어쓸까요?"
                  if self.lang == "ko" else
-                 f"Overwrite {dst}'s account setup with {src_asset}'s? (broker/keys kept)")):
+                 f"Overwrite {dst}'s entire setup (broker, keys, accounts) with {src_asset}'s?")):
             return
         self._collect_acct_widgets()
+        _src = self._acfg[src_asset]
+        self._acfg[dst]["broker"] = _src.get("broker")
+        self._acfg[dst]["creds"] = _copy.deepcopy(_src.get("creds", {}))
         self._acfg[dst]["accounts"] = [_copy.deepcopy(a) for a in src_accts]
         self._save_cfg()
         self._build()
-        self.log(f"📋 {src_asset} → {dst} 계좌 설정 복사 완료 "
-                 f"({len(src_accts)}개 계좌)")
+        self.log(f"📋 {src_asset} → {dst} 설정 전체 복사 완료 "
+                 f"(브로커 {_src.get('broker')}, {len(src_accts)}개 계좌)")
 
     def _add_acct(self):
         """자산 탭 설정에서 계좌 추가 — acct_pick의 선택/입력값을 이 자산의 계좌ID로 등록(중복 방지)."""
