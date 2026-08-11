@@ -865,6 +865,8 @@ class App:
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
         self._broker_name = self._acfg[self._asset]["broker"]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
+        # 이 앱이 연 포지션 흔적(청산 버튼 노출 근거) - 재시작에도 유지(2026-08-11)
+        self._open_assets = set(self._profile.get("open_assets") or [])
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         self._token = _d0.get("token", "")
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
@@ -1044,13 +1046,14 @@ class App:
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
         # 스타일: 네이티브 ttk 유지(대표 2026-08-11 "흉한 버튼" - tk 빨강 조합이 맥에서
         # 시뻘건 덩어리로 렌더링). 위험 신호는 넓은 간격 격리 + 확인 대화가 담당한다.
-        _flat_btn = ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko"
-                                         else "Close ALL positions"),
-                               command=self._close_all_positions)
-        _flat_btn.pack(side="left", padx=(24, 0))
-        # 서버 신호 없이 전 자산 전 계좌 잔고·1R을 한 번에 확인(대표 2026-07-26).
-        ttk.Button(lc, text=("전 자산 1R 조회" if self.lang == "ko" else "Preview 1R (all)"),
-                   command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
+        self._flat_btn = ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko"
+                                              else "Close ALL positions"),
+                                    command=self._close_all_positions)
+        # 상황 버튼(대표 2026-08-11 버튼 제로): 평소엔 숨김 - 가동 중이거나 이 앱이 연
+        # 포지션이 남아있을 때만 나타난다(정지=포지션 유지라 정지 후에도 흔적 있으면 노출).
+        self._flat_visible = False
+        # [전 자산 1R 조회] 버튼 폐지(대표 2026-08-11 버튼 제로) - 1R은 자산 줄에 상시
+        # 표시(_asset_row_state), 필요하면 저장 시 자동 검증 로그에도 남는다.
         ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
                   justify="left").pack(anchor="w", pady=(2, 0))
         self._refresh_live_panel()
@@ -1221,15 +1224,20 @@ class App:
                                    font=("Helvetica", 11, "bold"))
         self._next_lbl.pack(anchor="w", pady=(8, 0))
         self._refresh_next_action()
-        # 계좌 정보 저장 버튼(대표 2026-08-09 "저장하기 버튼 있음 좋겠어") — 키·설정을 즉시
-        # 영속(+Keychain)하고 현재 브로커 연결 테스트까지. 탭 전환 저장에만 의존하지 않게.
+        # 저장·테스트 버튼 폐지(대표 2026-08-11 "버튼 최소화, 유저 경험 최고로" - 자동 저장
+        # 확정): 입력이 멈추면 자동 저장(+Keychain), 키가 완성되면 자동 연결 확인까지.
+        # 사람이 할 일은 입력뿐 - 스텝 0.
         _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
-        # "(이 자산만)" 명시(대표 2026-08-11 "모든 자산이야 이 자산만이야?" - 라벨이 모호했다).
-        ttk.Button(_svrow, text=("이 자산 계좌 저장 + 연결 테스트 + 1R 확인" if self.lang == "ko"
-                                 else "Save this asset + test + check 1R"),
-                   command=self._save_creds_and_test).pack(side="left")
+        ttk.Label(_svrow, text=("입력하면 자동으로 저장·연결 확인됩니다 (자산마다 한 번, 재시작해도 유지)"
+                                if self.lang == "ko" else
+                                "Everything saves & verifies automatically as you type (once per asset)"),
+                  foreground="#9ca3af").pack(side="left")
         self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
         self._saved_lbl.pack(side="left", padx=(10, 0))
+        for _w in (getattr(self, "user", None), getattr(self, "key", None),
+                   getattr(self, "f3", None)):
+            if _w is not None:
+                _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -1589,7 +1597,7 @@ class App:
             elif not accts:
                 t = "다음: [계좌 추가]로 계좌 이름을 등록하세요" if ko else "Next: add your account with [Add]"
             elif a not in getattr(self, "_test_ok", set()):
-                t = "다음: [이 자산 계좌 저장 + 연결 테스트]를 누르세요 (한 번이면 됩니다)" if ko else "Next: press [Save this asset + test] (one time is enough)"
+                t = "다음: 키·계좌를 입력하세요 - 저장·연결 확인은 자동입니다" if ko else "Next: enter key & account - saving & verification are automatic"
             elif armed:
                 t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Armed - runs automatically on the next signal"
             elif int((self._profile or {}).get("demo_runs") or 0) == 0:
@@ -1854,6 +1862,7 @@ class App:
         try:
             entry.delete(0, "end")
             entry.insert(0, self.root.clipboard_get().strip())
+            self._schedule_autosave()        # 붙여넣기도 자동 저장·검증(2026-08-11 버튼 제로)
         except Exception:
             pass
 
@@ -1863,6 +1872,7 @@ class App:
         try:
             self.key.delete(0, "end")
             self.key.insert(0, self.root.clipboard_get().strip())
+            self._schedule_autosave()        # 붙여넣기도 자동 저장·검증
         except Exception:
             pass
 
@@ -2364,8 +2374,16 @@ class App:
             _jobs = self._auto_accts[auto_keys[0]]
             live = bool(_jobs[0].get("live")) if _jobs else False
         _n = len(active)
+        # 1R 상시 표시(대표 2026-08-11 정보 승격 - 조회 버튼 폐지의 대체): 고정 1R 합.
+        # 프롭/자본비례 계좌는 가동 시 자동 산출이라 "자동"으로 표기.
+        _auto_sz = any((ac.get("prop") or {}).get("on") or (ac.get("pct") or {}).get("on")
+                       for ac in active)
+        _r_sum = sum(_as_float(ac.get("one_r"), 0.0) for ac in active
+                     if not ((ac.get("prop") or {}).get("on") or (ac.get("pct") or {}).get("on")))
+        _r_txt = (" · 1R " + ("자동" if self.lang == "ko" else "auto")) if _auto_sz else (
+            f" · 1R ${_r_sum:g}" if _r_sum > 0 else "")
         base = ("+".join(_broker_label(_b) for _b in bks) + " · "
-                + (f"{_n}계좌" if self.lang == "ko" else f"{_n} acct"))
+                + (f"{_n}계좌" if self.lang == "ko" else f"{_n} acct") + _r_txt)
         _untested = [_b for _b in bks if not self._conn_by_broker.get(_b)]
         if _untested:
             return base + (" · 연결 테스트 필요" if self.lang == "ko" else " · test connection"), "#9ca3af"
@@ -2551,6 +2569,16 @@ class App:
         ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=9, column=2)
 
     def _refresh_live_panel(self):
+        # 청산 버튼 노출 판정 - 무장 중 or 이 앱이 연 포지션 흔적(_open_assets)
+        try:
+            _show = bool(getattr(self, "_sig_accts", {}) or getattr(self, "_auto_accts", {})
+                         or getattr(self, "_open_assets", set()))
+            if _show and not self._flat_visible:
+                self._flat_btn.pack(side="left", padx=(24, 0)); self._flat_visible = True
+            elif not _show and self._flat_visible:
+                self._flat_btn.pack_forget(); self._flat_visible = False
+        except Exception:
+            pass
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
                 txt, col = self._asset_row_state(asset)
@@ -2693,6 +2721,51 @@ class App:
             self._set_auto_ind(bool(self._auto_accts), sorted({k[0] for k in self._auto_accts}))
             self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
         self._refresh_live_panel()
+
+    def _schedule_autosave(self):
+        """입력 디바운스 자동 저장(대표 2026-08-11 버튼 제로 확정). 1.2초 잠잠하면 발화."""
+        try:
+            if getattr(self, "_autosave_after", None):
+                self.root.after_cancel(self._autosave_after)
+            self._autosave_after = self.root.after(1200, self._autosave_fire)
+        except Exception:
+            pass
+
+    def _autosave_fire(self):
+        """자동 저장 + (키 완성 시) 무음 연결 확인. 실패는 로그만 - 팝업으로 방해하지 않는다."""
+        self._autosave_after = None
+        try:
+            self._save_current_asset()               # 영속 + ✓저장됨 라벨
+        except Exception:
+            return
+        asset, bk = self._asset, self._broker_name
+        f1 = (self._creds_of(asset, bk).get("f1") or "").strip()
+        if not f1:
+            return
+        # 같은 크레덴셜 재테스트 방지 - 지문이 바뀌었을 때만 무음 확인
+        fp = (asset, bk, f1, len(self.key.get()) if hasattr(self, "key") else 0)
+        if getattr(self, "_autotest_fp", None) == fp:
+            return
+        self._autotest_fp = fp
+
+        def w():
+            err = self._conn_check(asset, bk)
+
+            def done():
+                if err:
+                    self.log(f"❌ {asset} · {_broker_label(bk)}: {err}")
+                else:
+                    self._connected = True
+                    self._conn_by_broker[bk] = True
+                    if not hasattr(self, "_test_ok"):
+                        self._test_ok = set()
+                    self._test_ok.add(asset)
+                    self.log(f"✅ {asset} · {_broker_label(bk)} 연결 확인 - 자동 저장·검증 완료")
+                self._refresh_next_action()
+                self._apply_gating()
+                self._refresh_live_panel()
+            self.root.after(0, done)
+        threading.Thread(target=w, daemon=True).start()
 
     def _save_creds_and_test(self):
         """[계좌 정보 저장 + 연결 테스트 + 1R 확인] (대표 2026-08-09 '한 번에') — 현재 탭
@@ -3870,6 +3943,18 @@ class App:
                 _d = self._fill_acc.setdefault(str(asset), {"micro": 0.0, "coin": 0.0, "n": 0})
                 _d["micro"] += float(micro or 0)
                 _d["coin"] += float(coin or 0)
+            if not hasattr(self, "_open_assets"):
+                self._open_assets = set()
+            self._open_assets.add(str(asset))        # 청산 버튼 노출 근거(2026-08-11)
+            try:
+                self._profile["open_assets"] = sorted(self._open_assets)
+                self._save_cfg()                     # 재시작에도 흔적 유지
+            except Exception:
+                pass
+            try:
+                self.root.after(0, self._refresh_live_panel)
+            except Exception:
+                pass
                 _d["n"] += 1
         except Exception:
             pass
@@ -3951,9 +4036,18 @@ class App:
 
     def _send_fill(self, asset, closed=False):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
+        (2026-08-11) closed면 열린 포지션 흔적 해제 - 청산 버튼 자동 숨김.
         Autopilot(autoentry) 전용(대표 2026-08-09 '오토파일럿한테만 앱에서 서버로') —
         대시보드 앱 상태를 보는 등급도 Autopilot뿐이라 그 외 등급은 아예 안 보낸다.
         서버(/eqfill)도 같은 게이트로 이중 방어(fl:ignored)."""
+        if closed:
+            try:
+                getattr(self, "_open_assets", set()).discard(str(asset))
+                self._profile["open_assets"] = sorted(getattr(self, "_open_assets", set()))
+                self._save_cfg()
+                self.root.after(0, self._refresh_live_panel)
+            except Exception:
+                pass
         _caps = (self._gate or {}).get("caps", {})
         if not ((self._gate or {}).get("ok") and _caps.get("autoentry")):
             return
