@@ -1250,6 +1250,13 @@ class App:
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
             addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
+            # 추가 줄에서 브로커까지 고른다(대표 2026-08-11) - Topstep+Lucid 혼합 운용이
+            # 한 줄에서 끝난다. 기본값 = ①의 현재 브로커.
+            _addbrs = _ASSET_BROKERS.get(self._asset, [])
+            self.acct_add_bk = ttk.Combobox(addr, values=[_broker_label(b) for b in _addbrs],
+                                            state="readonly", width=14)
+            self.acct_add_bk.set(_broker_label(self._broker_name))
+            self.acct_add_bk.pack(side="left", padx=(0, 4))
             self.acct_pick = ttk.Combobox(addr, values=[], state="normal")
             self.acct_pick.pack(side="left", fill="x", expand=True)
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
@@ -2137,12 +2144,23 @@ class App:
             messagebox.showinfo(self.t("btn_accts"),
                                 "이미 등록된 계좌입니다." if self.lang == "ko"
                                 else "Already registered."); return
+        # 추가 줄에서 고른 브로커(대표 2026-08-11) - 없으면 현재 탭 브로커
+        _bk_add = self._broker_name
+        try:
+            _lbl = str(self.acct_add_bk.get()).strip()
+            for _b in _ASSET_BROKERS.get(asset, []):
+                if _broker_label(_b) == _lbl:
+                    _bk_add = _b
+                    break
+        except Exception:
+            pass
         # 첫 계좌가 빈 슬롯(id 미지정)이면 그걸 채우고, 아니면 새 계좌로 추가
         if len(accts) == 1 and not (accts[0].get("id") or "").strip():
             accts[0]["id"] = aid
             accts[0]["label"] = accts[0].get("label") or aid[-4:]
+            accts[0]["broker"] = _bk_add
         else:
-            accts.append(_new_acct(600.0, aid, True, aid[-4:]))
+            accts.append(_new_acct(600.0, aid, True, aid[-4:], broker=_bk_add))
         self._save_cfg()
         # 자동 연결 테스트(#19): creds 판정은 재빌드 '전'(위젯 값 살아있을 때), 실행은 재빌드
         # '후' 지연(위젯 재생성 완료 뒤). 순서가 뒤집히면 연결 테스트가 빈 크레덴셜로 실패하거나
