@@ -1215,6 +1215,12 @@ class App:
             _addr = ttk.Frame(frm); _addr.pack(fill="x", pady=(3, 2))
             ttk.Button(_addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left")
+        # 다음 행동 안내(2026-08-11 UX #65: "언제 연결 버튼 눌러야 하는지 모르겠다") -
+        # 상태에서 계산한 딱 한 문장이 다음 버튼을 가리킨다.
+        self._next_lbl = ttk.Label(frm, text="", foreground="#1d4ed8",
+                                   font=("Helvetica", 11, "bold"))
+        self._next_lbl.pack(anchor="w", pady=(8, 0))
+        self._refresh_next_action()
         # 계좌 정보 저장 버튼(대표 2026-08-09 "저장하기 버튼 있음 좋겠어") — 키·설정을 즉시
         # 영속(+Keychain)하고 현재 브로커 연결 테스트까지. 탭 전환 저장에만 의존하지 않게.
         _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
@@ -1560,6 +1566,35 @@ class App:
                        + _dtf.datetime.now().strftime("%H:%M:%S"),
                        foreground="#15803d")
             self.root.after(1500, lambda: lbl.config(foreground="#6b7280"))
+        except Exception:
+            pass
+
+    def _refresh_next_action(self):
+        """현재 자산 탭의 상태 → '다음 행동' 한 문장. 토큰→키→계좌→저장/테스트→모의→가동."""
+        try:
+            lbl = getattr(self, "_next_lbl", None)
+            if lbl is None:
+                return
+            ko = self.lang == "ko"
+            a = self._asset
+            armed = any(k[0] == a for k in (set(self._sig_accts) | set(self._auto_accts)))
+            cr = self._creds_of(a)
+            accts = [x for x in self._accts_of(a) if (x.get("id") or "").strip()]
+            if not (self._token or "").strip():
+                t = "다음: 맨 위에 멤버십 토큰을 붙여넣으세요" if ko else "Next: paste your membership token at the top"
+            elif not (cr.get("f1") or "").strip():
+                t = "다음: 브로커를 고르고 API 키(또는 브리지 토큰)를 입력하세요" if ko else "Next: pick a broker and enter its API key / bridge token"
+            elif not accts:
+                t = "다음: [계좌 추가]로 계좌 이름을 등록하세요" if ko else "Next: add your account with [Add]"
+            elif a not in getattr(self, "_test_ok", set()):
+                t = "다음: [계좌 정보 저장 + 연결 테스트]를 누르세요" if ko else "Next: press [Save + test + check 1R]"
+            elif armed:
+                t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Armed - runs automatically on the next signal"
+            elif int((self._profile or {}).get("demo_runs") or 0) == 0:
+                t = "다음: [▶ 모의 시작]으로 첫 사이클을 데모로 확인하세요" if ko else "Next: press [▶ Start Demo] for your first cycle"
+            else:
+                t = "준비 완료 - [▶ 모의 시작] 또는 [▶ 라이브 시작]" if ko else "Ready - [▶ Start Demo] or [▶ Go Live]"
+            lbl.config(text="👉 " + t)
         except Exception:
             pass
 
@@ -2682,6 +2717,13 @@ class App:
                 else:
                     self._connected = True
                     self.log(f"✅ {asset} · {_broker_label(bk)} 연결 OK — 저장·검증 완료")
+                    try:
+                        if not hasattr(self, "_test_ok"):
+                            self._test_ok = set()
+                        self._test_ok.add(asset)
+                        self.root.after(0, self._refresh_next_action)
+                    except Exception:
+                        pass
                     # 성공 확인 = 잔고·1R 팝업(별도 확인 팝업 대신) — 이 자산 전 계좌 조회
                     self._run_1r_preview([asset], (f"{asset} · 저장·연결 OK — 잔고 & 1R"
                                                    if self.lang == "ko"
