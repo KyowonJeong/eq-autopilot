@@ -3680,7 +3680,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.09"
+    _APP_VER = "2026.08.11"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -3708,6 +3708,81 @@ class App:
                 _d["n"] += 1
         except Exception:
             pass
+
+    def _send_gap(self, asset, sig, b, sym_match):
+        """체결 갭 실측 보고(/eqgap, 대표 2026-08-11): 봉마감 기준가(entry_ref) 대비 실제
+        평균 체결가. 자산당 신호 1건에 1회(첫 성공 계좌 기준 - 같은 순간 시장가라 계좌 간
+        차이는 무시 가능). 포지션 평균단가가 브로커에 잡힐 때까지 최대 60초 폴링.
+        발주 경로 무간섭 - 별도 스레드, 실패해도 조용히."""
+        _caps = (self._gate or {}).get("caps", {})
+        if not ((self._gate or {}).get("ok") and _caps.get("autoentry")):
+            return
+        try:
+            _key = (str(asset), str((sig or {}).get("id")))
+            if not hasattr(self, "_gap_sent"):
+                self._gap_sent = set()
+            if _key in self._gap_sent:
+                return
+            self._gap_sent.add(_key)
+        except Exception:
+            return
+        import threading as _th
+        import time as _t
+        _ref = (sig or {}).get("entry_ref")
+        _dir = (sig or {}).get("direction")
+        _sid = (sig or {}).get("id")
+        _sent_ts = _t.time()
+
+        def w():
+            try:
+                import requests
+                try:
+                    import autopilot_crypto
+                    tid = autopilot_crypto.path_id(self._token or "")
+                except Exception:
+                    return
+                if not (tid and _ref and _dir):
+                    return
+                fill = None
+                _t0 = _t.time()
+                while _t.time() - _t0 < 60 and fill is None:
+                    try:
+                        for _p in (b.list_open_positions() or []):
+                            if str(sym_match) not in str(_p.symbol):
+                                continue
+                            _raw = getattr(_p, "raw", {}) or {}
+                            for _k2 in ("avgPrice", "averagePrice", "entryPrice",
+                                        "avgEntryPrice", "buyAvgPrice"):
+                                try:
+                                    _v = float(_raw.get(_k2) or 0)
+                                except Exception:
+                                    _v = 0
+                                if _v > 0:
+                                    fill = _v
+                                    break
+                            if fill:
+                                break
+                    except Exception:
+                        pass
+                    if fill is None:
+                        _t.sleep(5)
+                if not fill:
+                    return
+                body = {"tok_id": tid, "id": str(_sid or ""), "inst": str(asset),
+                        "direction": str(_dir).upper(), "entry_ref": float(_ref),
+                        "fill_price": float(fill), "sent_ts": _sent_ts,
+                        "fill_ts": _t.time()}
+                for _try in range(3):
+                    try:
+                        r = requests.post(PUSH_BASE + "eqgap", timeout=8, json=body)
+                        if r.ok and str(r.text).startswith("gap:"):
+                            return
+                    except Exception:
+                        pass
+                    _t.sleep(15)
+            except Exception:
+                pass
+        _th.Thread(target=w, daemon=True).start()
 
     def _send_fill(self, asset, closed=False):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
@@ -3919,6 +3994,7 @@ class App:
             # 대시보드 보고용 누적(#53) - 미니/마이크로가 섞이므로 마이크로 환산 계약으로
             # 통일한다(미니 1 = 마이크로 10). 심볼 앞 M이 마이크로.
             self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
+            self._send_gap(asset, sig, b, _con)          # 체결 갭 실측(자산당 1회, 2026-08-11)
             _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
                 _sp = res.get("stop_price")
@@ -4503,6 +4579,7 @@ class App:
                 self.log(f"   ⏱ [{lbl}] 체결 확인 {_fill.strftime('%H:%M:%S')} · 발송 후 {_tot}")
                 self._entered_at = _mark_entered(asset)
                 self._note_fill(asset, coin=float(size or 0))   # 대시보드 보고용(#53)
+                self._send_gap(asset, sig, b, sym)               # 체결 갭 실측(2026-08-11)
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
