@@ -4817,6 +4817,16 @@ def _bind_clipboard(root):
 
 def main():
     root = tk.Tk()
+    # 창·작업표시줄 아이콘(대표 2026-08-11 "이상한 모양 나와") - exe 아이콘(spec)과 별개로
+    # 런타임 Tk 아이콘을 명시해야 기본 깃털이 안 뜬다. 윈도=ico, 맥/기타=png 폴백.
+    try:
+        import sys as _sys
+        if _sys.platform.startswith("win"):
+            root.iconbitmap(_resource("eqicon.ico"))
+        else:
+            root.iconphoto(True, tk.PhotoImage(file=_resource("eqlogo.png")))
+    except Exception:
+        pass
     try:
         ttk.Style().theme_use("aqua")
     except Exception:
