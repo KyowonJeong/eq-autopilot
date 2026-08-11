@@ -1042,12 +1042,12 @@ class App:
         self.b_live_stop.pack(side="left", padx=(6, 0))
         # 모든 자산·계좌 포지션 즉시 시장가 청산 — 패닉 버튼(대표 2026-07-27). 무장 해제(전체
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
-        _flat_btn = tk.Button(lc, text=("🟥 모든 포지션 청산" if self.lang == "ko"
-                                        else "🟥 Close ALL positions"),
-                              command=self._close_all_positions,
-                              fg="#b91c1c", relief="solid", bd=1,
-                              highlightbackground="#b91c1c", padx=8)
-        _flat_btn.pack(side="left", padx=(14, 0))
+        # 스타일: 네이티브 ttk 유지(대표 2026-08-11 "흉한 버튼" - tk 빨강 조합이 맥에서
+        # 시뻘건 덩어리로 렌더링). 위험 신호는 넓은 간격 격리 + 확인 대화가 담당한다.
+        _flat_btn = ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko"
+                                         else "Close ALL positions"),
+                               command=self._close_all_positions)
+        _flat_btn.pack(side="left", padx=(24, 0))
         # 서버 신호 없이 전 자산 전 계좌 잔고·1R을 한 번에 확인(대표 2026-07-26).
         ttk.Button(lc, text=("전 자산 1R 조회" if self.lang == "ko" else "Preview 1R (all)"),
                    command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
