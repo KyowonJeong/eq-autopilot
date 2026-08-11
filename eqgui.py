@@ -1171,6 +1171,11 @@ class App:
                       fg=("#178a3a" if _a == self._asset else "#333"),   # 선택=초록(흰색 안 보임, 대표 2026-07-11)
                       padx=14, pady=4).pack(side="left", padx=(0, 4))
         spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
+        # ①/② 섹션 분리(대표 2026-08-11 "브로커 설정이랑 계좌 추가랑 따로"): 브로커 연결은
+        # 브로커당 한 번, 계좌는 그 아래서 여러 개 - 개념이 달라 화면도 가른다.
+        ttk.Label(frm, text=("① 브로커 연결 (한 번만)" if self.lang == "ko"
+                             else "① Broker connection (one-time)"),
+                  foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(8, 1))
         # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
         rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
         ttk.Label(rb, text=self.t("broker"), width=18).pack(side="left")
@@ -1240,8 +1245,8 @@ class App:
         if spec.get("acct"):
             ttk.Label(frm, text=("등록 계좌 — 계좌별 1R·실행 여부 (라이브 패널에서 자산 단위로 시작)"
                                  if self.lang == "ko"
-                                 else "Registered accounts — per-account 1R & on/off"),
-                      foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
+                                 else "② Accounts — pick from the dropdown, one at a time"),
+                      foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(10, 1))
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
             addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
@@ -1272,9 +1277,9 @@ class App:
             # 2026-08-09 "계좌 추가 이런 식으로 모든 자산"): 행마다 브로커 선택 + 1R + on/off
             # → 같은 자산을 Bybit·Bitget 동시 발주(각자 1R). 키는 위 브로커 콤보로 전환해
             # 브로커별로 등록해 두면 계좌 행이 자기 브로커 키를 쓴다.
-            ttk.Label(frm, text=("등록 계좌 — 거래소별 1R·실행 여부 (동시 발주 가능)"
+            ttk.Label(frm, text=("② 계좌 — 거래소별 1R·실행 여부 (동시 발주 가능)"
                                  if self.lang == "ko"
-                                 else "Registered accounts — per-exchange 1R & on/off"),
+                                 else "② Accounts — per-exchange 1R & on/off"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec,
@@ -2815,6 +2820,11 @@ class App:
                         self._test_ok = set()
                     self._test_ok.add(asset)
                     self.log(f"✅ {asset} · {_broker_label(bk)} 연결 확인 - 자동 저장·검증 완료")
+                    if bk == "projectx":             # 연결되면 계좌 드롭다운 자동 채움(②로 직행)
+                        try:
+                            self._autoload_topstep_scope(asset)
+                        except Exception:
+                            pass
                 self._refresh_next_action()
                 self._apply_gating()
                 self._refresh_live_panel()
