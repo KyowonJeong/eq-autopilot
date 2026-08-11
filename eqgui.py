@@ -1224,8 +1224,9 @@ class App:
         # 계좌 정보 저장 버튼(대표 2026-08-09 "저장하기 버튼 있음 좋겠어") — 키·설정을 즉시
         # 영속(+Keychain)하고 현재 브로커 연결 테스트까지. 탭 전환 저장에만 의존하지 않게.
         _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
-        ttk.Button(_svrow, text=("계좌 정보 저장 + 연결 테스트 + 1R 확인" if self.lang == "ko"
-                                 else "Save + test + check 1R"),
+        # "(이 자산만)" 명시(대표 2026-08-11 "모든 자산이야 이 자산만이야?" - 라벨이 모호했다).
+        ttk.Button(_svrow, text=("이 자산 계좌 저장 + 연결 테스트 + 1R 확인" if self.lang == "ko"
+                                 else "Save this asset + test + check 1R"),
                    command=self._save_creds_and_test).pack(side="left")
         self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
         self._saved_lbl.pack(side="left", padx=(10, 0))
@@ -1563,7 +1564,8 @@ class App:
             if lbl is None:
                 return
             lbl.config(text=("✓ 저장됨 " if self.lang == "ko" else "✓ saved ")
-                       + _dtf.datetime.now().strftime("%H:%M:%S"),
+                       + _dtf.datetime.now().strftime("%H:%M:%S")
+                       + (" - 재시작해도 유지됩니다" if self.lang == "ko" else " - kept across restarts"),
                        foreground="#15803d")
             self.root.after(1500, lambda: lbl.config(foreground="#6b7280"))
         except Exception:
@@ -1587,7 +1589,7 @@ class App:
             elif not accts:
                 t = "다음: [계좌 추가]로 계좌 이름을 등록하세요" if ko else "Next: add your account with [Add]"
             elif a not in getattr(self, "_test_ok", set()):
-                t = "다음: [계좌 정보 저장 + 연결 테스트]를 누르세요" if ko else "Next: press [Save + test + check 1R]"
+                t = "다음: [이 자산 계좌 저장 + 연결 테스트]를 누르세요 (한 번이면 됩니다)" if ko else "Next: press [Save this asset + test] (one time is enough)"
             elif armed:
                 t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Armed - runs automatically on the next signal"
             elif int((self._profile or {}).get("demo_runs") or 0) == 0:
