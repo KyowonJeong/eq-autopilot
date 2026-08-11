@@ -603,7 +603,7 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"), x.get("pct"), x.get("manual", False), bk)
+                                  x.get("prop"), x.get("pct"), False, bk)
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -617,7 +617,7 @@ def _load():
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                      x.get("prop"), x.get("pct"), x.get("manual", False),
+                                      x.get("prop"), x.get("pct"), False,
                                       x.get("broker", ""))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
@@ -1299,20 +1299,12 @@ class App:
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
             addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
-            # 독립 드롭다운(대표 2026-08-11 "브로커 설정이랑 계좌 등록이 독립된 드롭다운"):
-            # ②는 브로커 콤보 없이 계좌 드롭다운 하나 - 이 자산 전 브로커의 가용 계좌가
-            # "브로커 · 계좌" 꼴로 다 모여 있고, 고르면 브로커는 자동 판별된다.
-            self.acct_pick = ttk.Combobox(addr, values=self._acct_pick_values(self._asset),
-                                          state="normal")
-            _pv = list(self.acct_pick["values"] or [])
-            if _pv:
-                self.acct_pick.set(_pv[0])
-            self.acct_pick.pack(side="left", fill="x", expand=True)
-            ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
-                       command=self._add_acct).pack(side="left", padx=(4, 0))
+            # 행 중심 등록(대표 2026-08-11 "추가 누르면 빈 칸 등장, 행에서 브로커 고르고
+            # 가용 목록에서 선택"): 하단 통합 드롭다운 폐지 - [계좌 추가]가 빈 행을 만든다.
+            ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add account"), width=10,
+                       command=self._add_acct).pack(side="left")
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
-            # Topstep 계좌 목록을 백그라운드로 자동 로드 → '계좌 추가' 콤보를 미리 채운다
-            # (대표 2026-07-26: 연결테스트를 따로 안 눌러도 목록이 바로 떠서 계좌를 한 번에 추가).
+            # Topstep 가용 계좌 자동 로드는 유지 - 행의 계좌 콤보가 이 목록을 쓴다.
             if self._broker_of(self._asset) == "projectx":
                 self._autoload_topstep_scope(self._asset)
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
@@ -1664,16 +1656,6 @@ class App:
         bk = broker or self._acfg[asset]["broker"]
         return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
 
-    def _acct_pick_values(self, asset):
-        """② 계좌 드롭다운 값: 이 자산 전 브로커의 가용 계좌를 "브로커 · 계좌"로 통합
-        (대표 2026-08-11 독립 드롭다운). 이미 등록된 사용 계좌는 뺀다 - 남은 것만 고르게."""
-        _used = {(x.get("id") or "").strip() for x in self._accts_of(asset)}
-        out = []
-        for _bk in _ASSET_BROKERS.get(asset, []):
-            for _nm in self._avail_of(asset, _bk):
-                if _nm and _nm not in _used:
-                    out.append(f"{_broker_label(_bk)} · {_nm}")
-        return out
 
     def _register_avail(self):
         """① 가용 계좌 수동 등록(대표 2026-08-11) - API 목록이 없는 브로커(Lucid 등)용.
@@ -1793,7 +1775,14 @@ class App:
             except Exception:
                 pass
             try:
-                accts[idx]["manual"] = bool(w["manual"].get())
+                _icb = w.get("acct_id")
+                if _icb is not None:
+                    _v = str(_icb.get()).strip()
+                    # "…끝자리"/"계좌 선택" 표시값은 무시 - 가용 목록 선택이나 직접 입력만 저장
+                    if _v and not _v.startswith("…") and _v not in ("계좌 선택", "pick"):
+                        accts[idx]["id"] = _v
+                        if not (accts[idx].get("label") or "").strip():
+                            accts[idx]["label"] = _v[-4:]
             except Exception:
                 pass
 
@@ -2113,24 +2102,17 @@ class App:
         return True
 
     def _fill_scope(self, names):
-        # 불러온 계좌 목록 → ② 통합 드롭다운 재구성(대표 2026-08-11 독립 드롭다운:
-        # 원시 names가 아니라 "브로커 · 계좌" 통합 목록으로 그린다)
-        if not hasattr(self, "acct_pick"):
-            return
-        try:
-            _vals = self._acct_pick_values(self._asset)
-            self.acct_pick["values"] = _vals
-            if _vals and not self.acct_pick.get().strip():
-                self.acct_pick.set(_vals[0])
-        except Exception:
-            pass
-        # ① 가용 계좌 줄도 갱신(빌드 시점엔 '아직 없음'이었다가 로드 완료 즉시 반영)
+        """Topstep 계좌 목록 로드 완료 → ① 가용 라벨 + 행 계좌 콤보 값 즉시 갱신."""
         try:
             _av = self._avail_of(self._asset, self._broker_name)
             if _av and hasattr(self, "_avail_lbl"):
                 self._avail_lbl.config(
                     text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
                     + ", ".join(_av))
+            for _w in getattr(self, "_acct_widgets", {}).values():
+                _icb = _w.get("acct_id")
+                if _icb is not None:
+                    _icb["values"] = list(_av)
         except Exception:
             pass
 
@@ -2235,67 +2217,20 @@ class App:
         self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개)")
 
     def _add_acct(self):
-        """자산 탭 설정에서 계좌 추가 — acct_pick의 선택/입력값을 이 자산의 계좌ID로 등록(중복 방지)."""
+        """[계좌 추가] = 빈 행 추가(대표 2026-08-11 행 중심 등록). 브로커·계좌·1R은 행에서
+        고른다 - 행의 계좌 콤보가 그 행 브로커의 가용 목록을 보여준다."""
         asset = self._asset
-        # 현재 화면의 계좌 위젯값(라벨·1R·on) 먼저 보존 — 재빌드로 유실 방지
-        self._collect_acct_widgets()
-        # 크립토(계좌ID 없음): 새 행을 바로 추가 — 브로커는 현재 탭 브로커로 시작, 행의
-        # 콤보에서 바꾼다(대표 2026-08-09 Bybit+Bitget 동시 발주).
-        if not _BROKER_SPEC.get(self._broker_of(asset), {}).get("acct"):
-            _bk0 = self._broker_name
-            self._accts_of(asset).append(
-                _new_acct(600.0, "", True, _broker_label(_bk0), broker=_bk0))
-            self._save_cfg()
-            self._build()
-            return
-        try:
-            val = str(self.acct_pick.get()).strip()
-        except Exception:
-            val = ""
-        aid = val.split("·")[-1].strip() if "·" in val else val
-        if not aid:
-            # Topstep인데 콤보가 아직 비어있으면(계좌 목록 로드 전) 로드를 띄우고 안내
-            # (대표 2026-07-26: 연결테스트 안 눌러도 목록이 뜨게 — 자동 로드 재시도).
-            _empty_combo = not list(self.acct_pick["values"] or [])
-            if self._broker_of(asset) == "projectx" and _empty_combo:
-                self._autoload_topstep_scope(asset)
-                messagebox.showinfo(self.t("btn_accts"),
-                                    "계좌 목록을 불러오는 중입니다 — 잠시 후 목록에서 계좌를 골라 "
-                                    "다시 '계좌 추가'를 누르세요." if self.lang == "ko" else
-                                    "Loading your account list — pick an account and press Add again.")
-                return
-            messagebox.showwarning(self.t("btn_accts"),
-                                   "추가할 계좌를 선택하거나 입력하세요." if self.lang == "ko"
-                                   else "Pick or type an account first."); return
-        accts = self._accts_of(asset)
-        if any((x.get("id") or "").strip() == aid for x in accts):
-            messagebox.showinfo(self.t("btn_accts"),
-                                "이미 등록된 계좌입니다." if self.lang == "ko"
-                                else "Already registered."); return
-        # 드롭다운 값 "브로커 · 계좌"에서 브로커 자동 판별(대표 2026-08-11 독립 드롭다운).
-        # 수동 타이핑(접두 없음)이면 현재 탭 브로커.
-        _bk_add = self._broker_name
-        if "·" in val:
-            _pre = val.split("·")[0].strip()
-            for _b in _ASSET_BROKERS.get(asset, []):
-                if _broker_label(_b) == _pre:
-                    _bk_add = _b
-                    break
-        # 첫 계좌가 빈 슬롯(id 미지정)이면 그걸 채우고, 아니면 새 계좌로 추가
-        if len(accts) == 1 and not (accts[0].get("id") or "").strip():
-            accts[0]["id"] = aid
-            accts[0]["label"] = accts[0].get("label") or aid[-4:]
-            accts[0]["broker"] = _bk_add
-        else:
-            accts.append(_new_acct(600.0, aid, True, aid[-4:], broker=_bk_add))
+        self._collect_acct_widgets()             # 다른 행 미저장 편집 보존
+        _bk0 = self._broker_name
+        _accts = self._accts_of(asset)
+        # 첫 계좌가 완전 빈 슬롯이면 새 행 대신 그걸 쓰게 둔다(중복 빈 행 방지)
+        if not (len(_accts) == 1 and not (_accts[0].get("id") or "").strip()
+                and _BROKER_SPEC.get(self._broker_of(asset), {}).get("acct")):
+            _accts.append(_new_acct(600.0, "", True,
+                                    "" if _BROKER_SPEC.get(_bk0, {}).get("acct")
+                                    else _broker_label(_bk0), broker=_bk0))
         self._save_cfg()
-        # 자동 연결 테스트(#19): creds 판정은 재빌드 '전'(위젯 값 살아있을 때), 실행은 재빌드
-        # '후' 지연(위젯 재생성 완료 뒤). 순서가 뒤집히면 연결 테스트가 빈 크레덴셜로 실패하거나
-        # 재빌드 도중 위젯 접근으로 계좌 목록이 깜빡였음(대표 2026-07-26 리포트).
-        _auto_test = self._creds_ok(silent=True)
         self._build()
-        if _auto_test:
-            self.root.after(350, self.healthcheck)
 
     def _del_acct(self, asset, idx):
         """이 자산의 등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지. 인덱스가 밀리므로
@@ -2809,7 +2744,8 @@ class App:
                                  state="readonly", width=8)
             bk_cb.set(_broker_label(self._acct_broker(self._asset, acct)))
             bk_cb.pack(side="left", padx=(0, 4))
-            bk_cb.bind("<<ComboboxSelected>>", lambda e: self._save_acct_widgets())
+            bk_cb.bind("<<ComboboxSelected>>",
+                       lambda e: (self._save_acct_widgets(), self._build()))
         else:
             bk_cb = None
         aid = (acct.get("id") or "").strip()
@@ -2836,19 +2772,20 @@ class App:
                         command=lambda i=idx: self._pct_dialog(i))
         cb.pack(side="left", padx=(4, 0))
         self._acct_widgets[idx]["pct_btn"] = cb
-        # 수동 모드(대표 2026-07-27): 신호 티켓만 받고 자동 진입 안 함(진입은 사용자가 직접).
-        # API 없는 프롭(예: 평가·Sim Funded 단계)에서 신호를 손으로 실행할 때. 자동 청산은 별개.
-        man = tk.IntVar(value=1 if acct.get("manual") else 0)
-        ttk.Checkbutton(row, text=("수동" if self.lang == "ko" else "Manual"), variable=man,
-                        command=self._save_acct_widgets).pack(side="left", padx=(6, 0))
-        self._acct_widgets[idx]["manual"] = man
+        # 수동 모드 폐지(대표 2026-08-11 "수동 기능 없애" - 그건 Operator의 사용법이지
+        # Autopilot 행의 스위치가 아니다). 로더도 manual=False 강제.
         if pr.get("on") or pc.get("on"):
             r_e.config(state="disabled")               # 자동 사이징 중엔 수동 1R 비활성
-        if aid:
-            ttk.Label(row, text=f"…{aid[-6:]}", foreground="#888").pack(side="left", padx=(4, 0))
-        elif spec.get("acct"):
-            ttk.Label(row, text=("계좌 미지정" if self.lang == "ko" else "no id"),
-                      foreground="#b06f00").pack(side="left", padx=(4, 0))
+        # 계좌 선택 콤보(대표 2026-08-11 "행에서 브로커 고르면 가용 목록"): 값 목록 = 이 행
+        # 브로커의 가용 계좌. 선택하면 전체 ID를 저장하고 표시는 끝자리만(대표 "끝숫자만").
+        _rbk = self._acct_broker(self._asset, acct)
+        if _BROKER_SPEC.get(_rbk, {}).get("acct"):
+            id_cb = ttk.Combobox(row, values=list(self._avail_of(self._asset, _rbk)), width=13)
+            id_cb.set(f"…{aid[-6:]}" if aid else ("계좌 선택" if self.lang == "ko" else "pick"))
+            id_cb.pack(side="left", padx=(4, 0))
+            id_cb.bind("<<ComboboxSelected>>", lambda e: self._save_acct_widgets())
+            id_cb.bind("<FocusOut>", lambda e: self._save_acct_widgets())
+            self._acct_widgets[idx]["acct_id"] = id_cb
         if deletable:
             ttk.Button(row, text=("삭제" if self.lang == "ko" else "Remove"), width=6,
                        command=lambda i=idx: self._del_acct(self._asset, i)).pack(side="right")
