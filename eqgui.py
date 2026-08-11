@@ -695,6 +695,8 @@ def _load():
     out["dry_run"] = bool(d.get("dry_run", True))
     if "cfg_open" in d:
         out["cfg_open"] = bool(d.get("cfg_open"))
+    if "acct_open" in d:
+        out["acct_open"] = bool(d.get("acct_open"))
     _p = d.get("profile") or {}
     out["profile"] = {"public": bool(_p.get("public")), "handle": _p.get("handle", "")}
     return out
@@ -851,7 +853,7 @@ def _mark_pushed() -> None:
         pass
 
 
-def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None):
+def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acct_open=None):
     """자산별 설정(acfg={자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}) + lang/token/전역
     dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음."""
     try:
@@ -866,6 +868,8 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None):
             payload["dry_run"] = bool(dry_run)
         if cfg_open is not None:
             payload["cfg_open"] = bool(cfg_open)
+        if acct_open is not None:
+            payload["acct_open"] = bool(acct_open)
         if profile is not None:
             payload["profile"] = dict(profile)
         with open(CFG_PATH, "w") as f:
@@ -1173,9 +1177,7 @@ class App:
         spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
         # ①/② 섹션 분리(대표 2026-08-11 "브로커 설정이랑 계좌 추가랑 따로"): 브로커 연결은
         # 브로커당 한 번, 계좌는 그 아래서 여러 개 - 개념이 달라 화면도 가른다.
-        ttk.Label(frm, text=("① 브로커 연결 (한 번만)" if self.lang == "ko"
-                             else "① Broker connection (one-time)"),
-                  foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(8, 1))
+        # (①/② 번호 라벨 제거 - 접이식 제목 두 개가 유닛 분리를 이미 말한다, 2026-08-11)
         # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
         rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
         ttk.Label(rb, text=self.t("broker"), width=18).pack(side="left")
@@ -1286,6 +1288,32 @@ class App:
                                command=lambda a=_srcb: self._copy_broker_setup(a)
                                ).pack(side="left", padx=(4, 0))
 
+        # ── 둘째 접이식: 자산별 계좌 설정(대표 2026-08-11 "브로커 설정 드롭다운, 그 아래
+        #    계좌 설정 드롭다운" - 두 유닛을 독립 접이식으로). 자산 탭은 공유(_asset 하나).
+        frm = _outer_frm
+        if not hasattr(self, "_acct_open"):
+            self._acct_open = bool(d.get("acct_open", True))
+        self._acct_hdr = tk.Button(
+            frm, text=("▾ " if self._acct_open else "▸ ")
+            + ("자산별 계좌 설정 (NQ·GC·BTC)" if self.lang == "ko"
+               else "Per-asset account setup (NQ·GC·BTC)"),
+            command=self._toggle_acct, relief="flat", anchor="w",
+            font=("Helvetica", 12, "bold"), padx=0)
+        self._acct_hdr.pack(fill="x", anchor="w", pady=(6, 0))
+        self._acct_body = ttk.Frame(frm)
+        if self._acct_open:
+            self._acct_body.pack(fill="x")
+        frm = self._acct_body
+        # 이 접이식에도 자산 탭(같은 _asset 공유 - 한쪽에서 바꾸면 둘 다 그 자산으로)
+        atab2 = ttk.Frame(frm); atab2.pack(fill="x", pady=(2, 6))
+        for _a in _ASSETS:
+            _lbl2 = _ASSET_LABEL[_a]["ko" if self.lang == "ko" else "en"]
+            tk.Button(atab2, text=_lbl2, command=lambda a=_a: self._on_asset(a),
+                      relief=("sunken" if _a == self._asset else "raised"),
+                      bg=("#eaf7ee" if _a == self._asset else "#e2e8f0"),
+                      fg=("#178a3a" if _a == self._asset else "#333"),
+                      padx=14, pady=4).pack(side="left", padx=(0, 4))
+
         # ── 계좌 관리(대표 2026-07-24 자산별 계좌) — 이 자산(self._asset)의 등록 계좌 리스트.
         #   계좌마다 [실행 on][라벨][1R $][삭제] — 값은 FocusOut/토글 시 이 자산 accounts에 즉시
         #   저장(_save_acct_widgets). 여러 펀디드/챌린지 계좌를 각자 1R로 동시에 굴린다.
@@ -1296,9 +1324,9 @@ class App:
         self._acct_widgets = {}                     # {idx: {on,label,one_r}} — 현재 자산 계좌 위젯
         _accts = self._accts_of(self._asset)
         if spec.get("acct"):
-            ttk.Label(frm, text=("② 사용 계좌 — 드롭다운에서 골라 추가 (계좌별 1R·실행 여부)"
+            ttk.Label(frm, text=("사용 계좌 — 목록에서 골라 추가 (계좌별 1R·실행 여부)"
                                  if self.lang == "ko"
-                                 else "② Accounts — pick from the dropdown, one at a time"),
+                                 else "Accounts — pick from the list (per-account 1R & on/off)"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(10, 1))
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
@@ -2886,6 +2914,19 @@ class App:
                                 else "Per-asset broker setup (NQ·GC·BTC)"))
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
                        cfg_open=self._cfg_open)
+
+    def _toggle_acct(self):
+        """자산별 계좌 설정 접기/펼치기(대표 2026-08-11 독립 접이식)."""
+        self._acct_open = not self._acct_open
+        if self._acct_open:
+            self._acct_body.pack(fill="x", after=self._acct_hdr)
+        else:
+            self._acct_body.pack_forget()
+        self._acct_hdr.config(text=("▾ " if self._acct_open else "▸ ")
+                              + ("자산별 계좌 설정 (NQ·GC·BTC)" if self.lang == "ko"
+                                 else "Per-asset account setup (NQ·GC·BTC)"))
+        self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
+                       acct_open=self._acct_open)
 
     def _panel_stop(self, asset):
         """라이브 패널 자산 줄 정지 — 이 자산의 모든 계좌 가동 해제(자동청산+신호대기 둘 다)."""
