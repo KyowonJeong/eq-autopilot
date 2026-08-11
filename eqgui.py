@@ -396,7 +396,7 @@ T = {
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
     "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
-    "live_stopall": {"ko": "⏹ 전체 정지", "en": "⏹ Stop all"},
+    "live_stopall": {"ko": "⏹ 전체 정지 (포지션 유지)", "en": "⏹ Stop all (positions kept)"},
     "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 신호 확신도에 따라 최대 3R"
                            "(maximum risk)까지 — 계좌 여유는 1R의 3배로 잡으세요.",
                      "en": "1R = typical risk per trade · scales up to 3R (maximum risk) with signal "
@@ -1042,8 +1042,12 @@ class App:
         self.b_live_stop.pack(side="left", padx=(6, 0))
         # 모든 자산·계좌 포지션 즉시 시장가 청산 — 패닉 버튼(대표 2026-07-27). 무장 해제(전체
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
-        ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko" else "Close all positions"),
-                   command=self._close_all_positions).pack(side="left", padx=(6, 0))
+        _flat_btn = tk.Button(lc, text=("🟥 모든 포지션 청산" if self.lang == "ko"
+                                        else "🟥 Close ALL positions"),
+                              command=self._close_all_positions,
+                              fg="#b91c1c", relief="solid", bd=1,
+                              highlightbackground="#b91c1c", padx=8)
+        _flat_btn.pack(side="left", padx=(14, 0))
         # 서버 신호 없이 전 자산 전 계좌 잔고·1R을 한 번에 확인(대표 2026-07-26).
         ttk.Button(lc, text=("전 자산 1R 조회" if self.lang == "ko" else "Preview 1R (all)"),
                    command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
@@ -2756,6 +2760,19 @@ class App:
                                 "이미 가동 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
                                 if self.lang == "ko" else
                                 "Already armed — press 'Stop all' first."); return
+        # 라이브 오발 방지(2026-08-11 UX 감사, 운영 1순위): 실거래 시작은 명시 확인을 거친다.
+        # 모의는 팝업 없음 - 데모 문턱을 높이지 않는다.
+        if not dry:
+            if not messagebox.askyesno(
+                    "라이브 시작" if self.lang == "ko" else "Go Live",
+                    ("지금부터 실제 계좌에 실주문이 나갑니다.\n"
+                     "신호가 오면 자동으로 진입, 손절, 청산합니다.\n\n"
+                     "라이브를 시작할까요? (연결 테스트는 자동으로 수행됩니다)"
+                     if self.lang == "ko" else
+                     "Real orders will be placed on live accounts from now on.\n"
+                     "Entries, stops and exits run automatically on each signal.\n\n"
+                     "Start live? (connection tests run automatically)")):
+                return
         if not self._consent_ok():
             return
         if not self._token:
@@ -2881,8 +2898,19 @@ class App:
         self._auto_on = False
         self._set_auto_ind(False, [])
         self._set_sig_ind(False, [])
-        self.log(f"\n⏹ 전체 정지 — {n}개 계좌 가동 해제." if self.lang == "ko"
-                 else f"\n⏹ Stopped all — {n} account(s) disarmed.")
+        self.log((f"\n⏹ 전체 정지 — {n}개 계좌 가동 해제. ⚠ 열린 포지션은 그대로 유지됩니다 - "
+                  "정리하려면 [모든 포지션 청산]을 누르세요.") if self.lang == "ko"
+                 else (f"\n⏹ Stopped all — {n} account(s) disarmed. ⚠ Open positions stay open - "
+                       "use [Close all positions] to flatten."))
+        try:
+            messagebox.showwarning(
+                "전체 정지" if self.lang == "ko" else "Stopped",
+                ("자동 실행만 멈췄습니다. **열린 포지션과 손절 주문은 그대로 살아 있습니다.**\n"
+                 "포지션까지 정리하려면 [모든 포지션 청산]을 누르세요." if self.lang == "ko" else
+                 "Automation stopped. **Open positions and stop orders remain live.**\n"
+                 "Use [Close all positions] if you want to flatten."))
+        except Exception:
+            pass
         self._refresh_live_panel()
         self._apply_gating()
 
