@@ -14,7 +14,7 @@ a = Analysis(
     ['eqgui.py'],
     pathex=[],
     binaries=[],
-    datas=[('eqlogo.png', '.')] + collect_data_files('tzdata'),
+    datas=[('eqlogo.png', '.'), ('nt8_addon/EQAutopilotBridge.cs', 'nt8_addon'), ('nt8_addon/README.md', 'nt8_addon')] + collect_data_files('tzdata'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
