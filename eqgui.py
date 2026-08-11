@@ -225,60 +225,6 @@ _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
 #   (구 GC 지정가 배선은 _exec_close_limit_fut에 보존 — 재개하려면 {"GC": "MGC"}로 복원.)
 _LIMIT_EXIT_FUT = {}
 
-# 브로커별 설정 스텝(대표 2026-08-11) - 브로커 고른 순간 키 입력란 위에 뜨고,
-# 연결 확인이 끝나면 자동으로 사라진다(다 된 사람에겐 소음). 홈피 상세 가이드의 요약판.
-_BROKER_STEPS = {
-    "projectx": {
-        "ko": "① dashboard.projectx.com 로그인(Topstep 계정)  ② 우상단 프로필 → API Keys → Generate\n"
-              "③ TopstepX 로그인 이메일을 첫 칸에, 발급된 API Key를 둘째 칸에\n"
-              "④ [계좌 추가]에 계좌 이름(PRAC…/TSX…)과 1R 입력 - 저장·연결은 자동",
-        "en": "① Log in at dashboard.projectx.com (Topstep)  ② Profile → API Keys → Generate\n"
-              "③ Enter your TopstepX email and the generated API Key\n"
-              "④ [Add account]: account name (PRAC…/TSX…) and 1R - saving & verify are automatic",
-    },
-    "nt8": {
-        "ko": "① 같은 윈도우 PC에 NinjaTrader 8 설치(Lucid 대시보드에서 다운로드)\n"
-              "② NT8 → Tools → Import → NinjaScript Add-On으로 동봉 브리지(zip) 설치\n"
-              "③ 브리지 토큰을 애드온과 여기 같은 값으로(포트 기본 8377)\n"
-              "④ NT8 연결(초록불) 후 [계좌 추가]에 NT8 계정 이름 그대로 - Control Center에서 이름이 잘리면 홈피 가이드 참고",
-        "en": "① Install NinjaTrader 8 on this Windows PC (download via Lucid dashboard)\n"
-              "② NT8 → Tools → Import → NinjaScript Add-On: install the bundled bridge zip\n"
-              "③ Use the same Bridge Token here and in the add-on (port 8377)\n"
-              "④ Connect NT8 (green), then [Add account] with the exact NT8 account name",
-    },
-    "bybit": {
-        "ko": "① Bybit → 프로필 → API → Create New Key → System-generated\n"
-              "② 권한: Contract-Orders&Positions만 체크(출금 권한 금지)\n"
-              "③ API Key·Secret을 붙여넣기(PIN 잠금 해제 후) - 저장·연결은 자동",
-        "en": "① Bybit → Profile → API → Create New Key → System-generated\n"
-              "② Permissions: Contract - Orders & Positions ONLY (never withdrawal)\n"
-              "③ Paste API Key & Secret (unlock PIN first) - saving & verify are automatic",
-    },
-    "bitget": {
-        "ko": "① Bitget → API 관리 → API Key 생성(Passphrase 직접 설정)\n"
-              "② 권한: 선물 주문·포지션만(출금 금지)\n"
-              "③ Key·Secret·Passphrase 세 칸 입력 - 저장·연결은 자동",
-        "en": "① Bitget → API Management → Create API Key (set your own Passphrase)\n"
-              "② Permissions: futures orders & positions only (no withdrawal)\n"
-              "③ Fill Key, Secret and Passphrase - saving & verify are automatic",
-    },
-    "tradovate": {
-        "ko": "① trader.tradovate.com 로그인 → Settings → API Access에서 키 페어 발급\n"
-              "② Username·Password 입력, 셋째 칸에 cid:sec (데모는 cid:sec:demo)\n"
-              "③ [계좌 추가]에 계좌 이름과 1R - 저장·연결은 자동",
-        "en": "① Log in at trader.tradovate.com → Settings → API Access → create key pair\n"
-              "② Enter Username & Password; third field = cid:sec (demo: cid:sec:demo)\n"
-              "③ [Add account]: account name and 1R - saving & verify are automatic",
-    },
-    "ibkr": {
-        "ko": "① TWS(또는 IB Gateway) 실행 → Configure → API → Settings\n"
-              "② 'Enable ActiveX and Socket Clients' 켜기, 포트 확인(모의 7497/실 7496)\n"
-              "③ 여기 Host는 보통 127.0.0.1, Port만 맞추면 끝 - TWS가 켜져 있어야 연결됩니다",
-        "en": "① Run TWS (or IB Gateway) → Configure → API → Settings\n"
-              "② Enable 'ActiveX and Socket Clients', check port (paper 7497 / live 7496)\n"
-              "③ Host is usually 127.0.0.1; set the port - TWS must stay running",
-    },
-}
 
 _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
@@ -1200,14 +1146,13 @@ class App:
         self.brokerbox.bind("<<ComboboxSelected>>", self._on_broker)
         if spec.get("preview"):
             ttk.Label(rb, text=self.t("broker_preview"), foreground="#b06f00").pack(side="left", padx=(8, 0))
-        # 브로커 스텝 가이드(대표 2026-08-11): 브로커 고른 그 자리에서, 키 입력란 바로 위.
-        # 연결 확인이 끝난 브로커는 표시하지 않는다 - 다 된 사람에게는 소음이라서.
-        _steps = (_BROKER_STEPS.get(self._broker_name) or {}).get(
-            "ko" if self.lang == "ko" else "en")
-        if _steps and not self._conn_by_broker.get(self._broker_name):
-            _gf = ttk.Frame(frm); _gf.pack(fill="x", pady=(4, 2))
-            ttk.Label(_gf, text=_steps, foreground="#8a8f98", justify="left",
-                      wraplength=760).pack(anchor="w", padx=(2, 0))
+        # 설정법 안내는 홈피 정본 한 줄로(대표 2026-08-11 "설명 너무 지저분 - 홈피 어디서
+        # 볼 수 있는지만 딱"). 인앱 멀티라인 스텝은 제거, 연결되면 이 줄도 사라진다.
+        if not self._conn_by_broker.get(self._broker_name):
+            ttk.Label(frm, text=("자세한 설정법: 홈피 → EQ Autopilot → 브로커별 설정법"
+                                 if self.lang == "ko" else
+                                 "Full setup guide: website → EQ Autopilot → Broker Setup"),
+                      foreground="#8a8f98").pack(anchor="w", pady=(2, 2))
         # f1 (브로커별 1번 필드)
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
