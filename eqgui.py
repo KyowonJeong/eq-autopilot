@@ -1264,6 +1264,16 @@ class App:
                 _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
         # 가용 계좌(대표 2026-08-11 확정): 브로커 설정의 일부다 - Topstep은 연결되면 자동으로
         # 차고, Lucid처럼 API 목록이 없는 브로커는 여기서 수동 등록해야 ② 드롭다운에 뜬다.
+        if not spec.get("acct"):
+            # 크립토는 계좌ID 개념이 없다(API 키=계좌) - 가용 계좌 코너가 왜 없는지 앱이
+            # 직접 답한다(대표 2026-08-11 "비트는 가용 계좌 안 써줌?").
+            ttk.Label(frm, text=("가용 계좌: 크립토는 API 키가 곧 계좌입니다 - 별도 등록 없이 "
+                                 "아래 계좌 설정에서 거래소별로 추가하세요."
+                                 if self.lang == "ko" else
+                                 "Available accounts: for crypto the API key IS the account - "
+                                 "just add exchanges in the account section below."),
+                      foreground="#9ca3af", wraplength=700, justify="left"
+                      ).pack(anchor="w", pady=(4, 0))
         if spec.get("acct"):
             _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
             _av = self._avail_of(self._asset, self._broker_name)
