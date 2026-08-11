@@ -1046,12 +1046,12 @@ class App:
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
         # 스타일: 네이티브 ttk 유지(대표 2026-08-11 "흉한 버튼" - tk 빨강 조합이 맥에서
         # 시뻘건 덩어리로 렌더링). 위험 신호는 넓은 간격 격리 + 확인 대화가 담당한다.
+        # 상시 노출(대표 2026-08-11 "즉시 청산 버튼 필요하잖아" - 조건부 숨김 기각):
+        # 패닉 버튼은 비상구라 추적 로직과 무관하게 항상 그 자리에 있어야 한다.
         self._flat_btn = ttk.Button(lc, text=("모든 포지션 청산" if self.lang == "ko"
                                               else "Close ALL positions"),
                                     command=self._close_all_positions)
-        # 상황 버튼(대표 2026-08-11 버튼 제로): 평소엔 숨김 - 가동 중이거나 이 앱이 연
-        # 포지션이 남아있을 때만 나타난다(정지=포지션 유지라 정지 후에도 흔적 있으면 노출).
-        self._flat_visible = False
+        self._flat_btn.pack(side="left", padx=(24, 0))
         # [전 자산 1R 조회] 버튼 폐지(대표 2026-08-11 버튼 제로) - 1R은 자산 줄에 상시
         # 표시(_asset_row_state), 필요하면 저장 시 자동 검증 로그에도 남는다.
         ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
@@ -2569,16 +2569,6 @@ class App:
         ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=9, column=2)
 
     def _refresh_live_panel(self):
-        # 청산 버튼 노출 판정 - 무장 중 or 이 앱이 연 포지션 흔적(_open_assets)
-        try:
-            _show = bool(getattr(self, "_sig_accts", {}) or getattr(self, "_auto_accts", {})
-                         or getattr(self, "_open_assets", set()))
-            if _show and not self._flat_visible:
-                self._flat_btn.pack(side="left", padx=(24, 0)); self._flat_visible = True
-            elif not _show and self._flat_visible:
-                self._flat_btn.pack_forget(); self._flat_visible = False
-        except Exception:
-            pass
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
                 txt, col = self._asset_row_state(asset)
