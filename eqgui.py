@@ -1006,7 +1006,16 @@ class App:
         # (테스터 리포트 2026-07-12). 창을 줄여도 스크롤로 전부 접근 가능.
         host = ttk.Frame(self.root); host.pack(fill="both", expand=True)
         self._scroll_host = host
-        self._restore_y = _keep_y                 # scrollregion 정착 콜백이 소비
+        # 스크롤 복원은 시간차 3연발 - 레이아웃이 자라는 동안의 1회성 복원은 0으로
+        # 클램프된다(대표 2026-08-11 "여전히 그러는디"). 60/250/600ms 시점에 재적용.
+        if _keep_y:
+            def _restore_scroll(y=_keep_y):
+                try:
+                    self._scroll_cv.yview_moveto(y)
+                except Exception:
+                    pass
+            for _ms in (60, 250, 600):
+                self.root.after(_ms, _restore_scroll)
         _cv = tk.Canvas(host, highlightthickness=0, borderwidth=0)
         self._scroll_cv = _cv                     # 스크롤 위치 복원용(2026-08-11)
         _sb = ttk.Scrollbar(host, orient="vertical", command=_cv.yview)
@@ -1023,14 +1032,6 @@ class App:
                 if _cv.itemcget(_win, "height") != str(_need):
                     _cv.itemconfigure(_win, height=_need)
                 _cv.configure(scrollregion=_cv.bbox("all"))
-                # 첫 정착 시 이전 스크롤 위치 복원(재빌드 리셋 방지)
-                nonlocal_keep = getattr(self, "_restore_y", None)
-                if nonlocal_keep is not None:
-                    try:
-                        _cv.yview_moveto(nonlocal_keep)
-                    except Exception:
-                        pass
-                    self._restore_y = None
             except Exception:
                 pass
         frm.bind("<Configure>", _fit_canvas)
