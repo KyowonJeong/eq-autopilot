@@ -519,8 +519,8 @@ def _pin_ok(pin):
 #   회전(합산 5발): 라이브 전환 — 새 계정으로 재시작(잔여는 Live 이월이나 보수적으로 0 산입)
 #   앱은 계정 합산을 직접 모르므로 계좌별 출금 횟수(권장 2계좌 기준 <2=방패기)로 근사 안내.
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
-                  "r_steady": 300.0, "buffer": 6000.0, "payouts": 0,
-                  "last_bal": None}   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
+                  "r_steady": 300.0, "buffer": 6000.0, "payouts": 0, "r_live": 100.0,
+                  "last_bal": None}   # r_live = 라이브 초기 1R(Lucid, +$4,500 락 전. 2026-08-11)   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 # ── 브로커별 프롭 정본 프리셋(대표 2026-08-11 "브로커 자동 감지해서 페이즈별 사이징") ──
 #   projectx(Topstep) = 빅실드 정본 1200/300/방패6000 (2026-08-02 채택)
@@ -528,7 +528,8 @@ _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모�
 #                       라이브 락 후는 프롭 모드가 아니라 '잔고 %' 모드 2% 권장(e3d03c3)
 _PROP_PRESETS = {
     "projectx": {"r_test": 1200.0, "r_buffer": 300.0, "r_steady": 300.0, "buffer": 6000.0},
-    "nt8":      {"r_test": 300.0,  "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0},
+    "nt8":      {"r_test": 300.0,  "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0,
+                 "r_live": 100.0},
 }
 
 
@@ -542,7 +543,8 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
-        p["on"] = bool(p["on"]); p["type"] = "funded" if p["type"] == "funded" else "test"
+        p["on"] = bool(p["on"])
+        p["type"] = p["type"] if p["type"] in ("funded", "live") else "test"
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
@@ -2398,9 +2400,12 @@ class App:
                         variable=ty_v, value="test").grid(row=1, column=1, sticky="w")
         ttk.Radiobutton(frm, text=("펀디드" if ko else "Funded"),
                         variable=ty_v, value="funded").grid(row=1, column=2, sticky="w")
+        ttk.Radiobutton(frm, text=("라이브 초기" if ko else "Live (early)"),
+                        variable=ty_v, value="live").grid(row=1, column=3, sticky="w")
         ents = {}
         _rows = [("r_test", "챌린지 1R $" if ko else "Challenge 1R $"),
                  ("r_steady", "펀디드 1R $" if ko else "Funded 1R $"),
+                 ("r_live", "라이브 초기 1R $" if ko else "Live-early 1R $"),
                  ("payouts", "출금 횟수 (0~5)" if ko else "Payouts so far (0~5)")]
         # r_buffer·buffer 필드는 Fast-Payout 채택으로 미사용 — 저장값은 유지(마이그레이션 호환)
         for i, (k, lab) in enumerate(_rows, start=2):
@@ -4343,6 +4348,12 @@ class App:
           5발 완료: 진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
         ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) → 잔고=쿠션.
         잔고 조회 실패 시 펀디드 1R($300) 그대로(사이징에 잔고 불필요)."""
+        if pr.get("type") == "live":
+            # 라이브 초기(Lucid): $0 시작 최취약 구간 - 가장 얇게. +$4,500 락 확보 후엔
+            # 프롭 모드를 끄고 '잔고 %' 모드 2%(절반 수확·절반 성장)로 전환 권장(정본 e3d03c3).
+            r = _as_float(pr.get("r_live"), 100.0)
+            self.log(f"   ⚙ [{lbl}] 라이브 초기 1R=${r:g} (락 확보 후 잔고 2% 모드 권장)")
+            return r
         if pr.get("type") != "funded":
             r = _as_float(pr.get("r_test"), 1200.0)
             self.log(f"   ⚙ [{lbl}] 프롭 테스트기 1R=${r:g}")
