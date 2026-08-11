@@ -1221,6 +1221,8 @@ class App:
         ttk.Button(_svrow, text=("계좌 정보 저장 + 연결 테스트 + 1R 확인" if self.lang == "ko"
                                  else "Save + test + check 1R"),
                    command=self._save_creds_and_test).pack(side="left")
+        self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
+        self._saved_lbl.pack(side="left", padx=(10, 0))
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -1231,8 +1233,16 @@ class App:
 
         # 자동 청산·자동 진입 섹션은 라이브 패널로 통합(대표 2026-07-13) — 개별 정지도 패널 줄에서.
         ttk.Separator(frm).pack(fill="x", pady=8)
+        _logrow = ttk.Frame(frm)
+        _logrow.pack(fill="x", pady=(6, 0))
+        ttk.Label(_logrow, text=("로그" if self.lang == "ko" else "Log"),
+                  foreground="#6b7280").pack(side="left")
+        ttk.Button(_logrow, text=("로그 복사" if self.lang == "ko" else "Copy log"),
+                   command=self._copy_log).pack(side="right")
+        ttk.Label(_logrow, text=f"v{self._APP_VER}", foreground="#6b7280").pack(
+            side="right", padx=(0, 8))   # 지원 DM에 버전 필수(2026-08-11 UX 감사)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
-        self.out.pack(fill="both", expand=True, pady=(6, 0))
+        self.out.pack(fill="both", expand=True, pady=(0, 0))
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. 계좌 버튼(연결 테스트 겸)은 항상 활성.
         self._action_btns = [self.b_acc, self.b_tr]
@@ -1534,8 +1544,24 @@ class App:
         return [a for a in self._accts_of(asset) if a.get("on")]
 
     def _save_cfg(self, **kw):
-        """_save_full 래퍼 — 현재 앱 상태를 yaml로 영속화."""
+        """_save_full 래퍼 — 현재 앱 상태를 yaml로 영속화 + 저장 확인 표시(2026-08-11 UX:
+        '적용됐는지 안 보인다' - 저장이 일어날 때마다 상태 라벨이 ✓와 시각으로 답한다)."""
         _save_full(self.lang, self._token, self._acfg, self._profile, **kw)
+        self._flash_saved()
+
+    def _flash_saved(self):
+        """설정 영역 상단의 저장 상태 라벨을 '✓ 저장됨 HH:MM:SS'로 갱신, 잠깐 초록 강조."""
+        try:
+            import datetime as _dtf
+            lbl = getattr(self, "_saved_lbl", None)
+            if lbl is None:
+                return
+            lbl.config(text=("✓ 저장됨 " if self.lang == "ko" else "✓ saved ")
+                       + _dtf.datetime.now().strftime("%H:%M:%S"),
+                       foreground="#15803d")
+            self.root.after(1500, lambda: lbl.config(foreground="#6b7280"))
+        except Exception:
+            pass
 
     def _acur(self):
         """현재 자산 탭의 브로커 + 그 자산 브로커 크레덴셜 {broker,f1,f3}."""
@@ -1803,8 +1829,30 @@ class App:
         except Exception:
             pass
 
+    def _copy_log(self):
+        """화면 로그 전체를 클립보드로 - 지원 DM에 붙여넣기(2026-08-11 UX 감사)."""
+        try:
+            txt = self.out.get("1.0", "end").strip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(f"[EQ Autopilot v{self._APP_VER}]\n" + txt[-8000:])
+            self.log("로그를 클립보드에 복사했습니다." if self.lang == "ko"
+                     else "Log copied to clipboard.")
+        except Exception:
+            pass
+
     def log(self, m):
         _log_to_file(m)          # 파일에도 영속(타임스탬프 부여) — 대표 2026-07-15
+        # 화면 로그에도 시각(2026-08-11 UX 감사: 스샷 한 장 지원의 전제). 빈 줄·구분선은 그대로.
+        try:
+            import datetime as _dtl2
+            _m = str(m)
+            if _m.strip() and not _m.startswith(("═", "─", "\n═")):
+                _pfx = _dtl2.datetime.now().strftime("%H:%M:%S ")
+                _m = ("\n" + _pfx + _m.lstrip("\n")) if _m.startswith("\n") else (_pfx + _m)
+            self.q.put(_m)
+            return
+        except Exception:
+            pass
         self.q.put(m)
 
     def _drain(self):
@@ -2761,15 +2809,26 @@ class App:
                                 if self.lang == "ko" else
                                 "Already armed — press 'Stop all' first."); return
         # 라이브 오발 방지(2026-08-11 UX 감사, 운영 1순위): 실거래 시작은 명시 확인을 거친다.
-        # 모의는 팝업 없음 - 데모 문턱을 높이지 않는다.
+        # 모의는 팝업 없음 - 데모 문턱을 높이지 않는다. 모의 이력 0이면 경고 한 줄 추가(soft-gate).
+        if dry:
+            try:
+                self._profile["demo_runs"] = int(self._profile.get("demo_runs") or 0) + 1
+                self._save_cfg()
+            except Exception:
+                pass
         if not dry:
+            _no_demo = not int((self._profile or {}).get("demo_runs") or 0)
+            _warn_demo = (("\n⚠ 아직 모의 실행 이력이 없습니다 - 첫 주는 데모가 기본 순서입니다.\n"
+                           if self.lang == "ko" else
+                           "\n⚠ You have never run demo mode - demo first is the default path.\n")
+                          if _no_demo else "")
             if not messagebox.askyesno(
                     "라이브 시작" if self.lang == "ko" else "Go Live",
-                    ("지금부터 실제 계좌에 실주문이 나갑니다.\n"
+                    ("지금부터 실제 계좌에 실주문이 나갑니다.\n" + _warn_demo +
                      "신호가 오면 자동으로 진입, 손절, 청산합니다.\n\n"
                      "라이브를 시작할까요? (연결 테스트는 자동으로 수행됩니다)"
                      if self.lang == "ko" else
-                     "Real orders will be placed on live accounts from now on.\n"
+                     "Real orders will be placed on live accounts from now on.\n" + _warn_demo +
                      "Entries, stops and exits run automatically on each signal.\n\n"
                      "Start live? (connection tests run automatically)")):
                 return
