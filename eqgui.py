@@ -663,7 +663,10 @@ def _load():
         else:
             s = assets_raw.get(a) or {}
             bk = s.get("broker") if s.get("broker") in brs else brs[0]
-            creds = {b: {"f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
+            # avail(가용 계좌)도 함께 로드 - 화이트리스트에서 빠져 재시작마다 증발했다
+            # (대표 2026-08-11 "설정해도 껐다 켜면"). 수동 등록(Lucid)이 특히 치명적이었다.
+            creds = {b: {"f1": cr.get("f1", ""), "f3": cr.get("f3", ""),
+                         "avail": [str(x) for x in (cr.get("avail") or []) if str(x).strip()]}
                      for b, cr in (s.get("creds") or {}).items() if b in brs}
             include = bool(s.get("include", True))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
@@ -2190,6 +2193,16 @@ class App:
         if cache is None:
             cache = self._scope_cache = {}
         if ck in cache:                       # 이미 받은 목록이면 즉시 채우고 끝(재조회 없음)
+            # 캐시 히트도 이 자산의 가용 계좌에 병합(대표 2026-08-11: NQ가 먼저 받아가면
+            # GC는 이 경로로 빠져 가용 등록이 안 됐다 - 자산별 creds 블롭이라 각자 채워야 함)
+            try:
+                _av = cr.setdefault("avail", [])
+                _new = [n for n in cache[ck] if n not in _av]
+                if _new:
+                    _av.extend(_new)
+                    self._save_cfg()
+            except Exception:
+                pass
             self._fill_scope(cache[ck])
             return
         import threading as _th
