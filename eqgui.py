@@ -1071,8 +1071,11 @@ class App:
                                               else "Close ALL positions"),
                                     command=self._close_all_positions)
         self._flat_btn.pack(side="left", padx=(24, 0))
-        # [전 자산 1R 조회] 버튼 폐지(대표 2026-08-11 버튼 제로) - 1R은 자산 줄에 상시
-        # 표시(_asset_row_state), 필요하면 저장 시 자동 검증 로그에도 남는다.
+        # [전 자산 1R 조회] 복원(대표 2026-08-11 "전계좌 1R 조회는?") - 자산 줄 상시 표시는
+        # 설정값 합이고, 이 버튼은 잔고 실조회라 프롭/자본% 자동 사이징의 실계산 1R($)을
+        # 보여준다. 네트워크 조회 = 상시 표시 불가 = 버튼이 정당한 자리.
+        ttk.Button(lc, text=("전 계좌 1R 조회" if self.lang == "ko" else "Check 1R (all)"),
+                   command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
         ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
                   justify="left").pack(anchor="w", pady=(2, 0))
         self._refresh_live_panel()
