@@ -1250,30 +1250,15 @@ class App:
             for _i, _ac in enumerate(_accts):
                 self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
             addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
-            # 추가 줄에서 브로커까지 고른다(대표 2026-08-11) - Topstep+Lucid 혼합 운용이
-            # 한 줄에서 끝난다. 기본값 = ①의 현재 브로커.
-            _addbrs = _ASSET_BROKERS.get(self._asset, [])
-            self.acct_add_bk = ttk.Combobox(addr, values=[_broker_label(b) for b in _addbrs],
-                                            state="readonly", width=14)
-            self.acct_add_bk.set(_broker_label(self._broker_name))
-            self.acct_add_bk.pack(side="left", padx=(0, 4))
-            self.acct_pick = ttk.Combobox(addr, values=[], state="normal")
+            # 독립 드롭다운(대표 2026-08-11 "브로커 설정이랑 계좌 등록이 독립된 드롭다운"):
+            # ②는 브로커 콤보 없이 계좌 드롭다운 하나 - 이 자산 전 브로커의 가용 계좌가
+            # "브로커 · 계좌" 꼴로 다 모여 있고, 고르면 브로커는 자동 판별된다.
+            self.acct_pick = ttk.Combobox(addr, values=self._acct_pick_values(self._asset),
+                                          state="normal")
+            _pv = list(self.acct_pick["values"] or [])
+            if _pv:
+                self.acct_pick.set(_pv[0])
             self.acct_pick.pack(side="left", fill="x", expand=True)
-            # 드롭다운 = 고른 브로커의 가용 계좌(대표 2026-08-11 "가용 계좌 중 선택하게").
-            # 브로커를 바꾸면 그 브로커의 가용 목록으로 갱신된다.
-
-            def _sync_pick(_e=None):
-                _lbl = str(self.acct_add_bk.get()).strip()
-                _bk = next((b for b in _addbrs if _broker_label(b) == _lbl), self._broker_name)
-                _av = list(self._avail_of(self._asset, _bk))
-                try:
-                    self.acct_pick["values"] = _av
-                    if _av and not self.acct_pick.get().strip():
-                        self.acct_pick.set(_av[0])
-                except Exception:
-                    pass
-            self.acct_add_bk.bind("<<ComboboxSelected>>", _sync_pick)
-            _sync_pick()
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left", padx=(4, 0))
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
@@ -1352,6 +1337,19 @@ class App:
                                        if self.lang == "ko" else
                                        "exact account name (Lucid: as in NT8 Accounts tab)"),
                           foreground="#9ca3af").pack(side="left", padx=(8, 0))
+        if spec.get("acct"):
+            # ① 브로커 설정 복사(대표 2026-08-11 "브로커 설정 복사, 계좌 설정 복사 둘 다")
+            _bsrcs = [a for a in _ASSETS if a != self._asset
+                      and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
+            if _bsrcs:
+                _bcp = ttk.Frame(frm); _bcp.pack(fill="x", pady=(2, 0))
+                ttk.Label(_bcp, text=("브로커 설정 복사 ←" if self.lang == "ko"
+                                      else "Copy broker setup ←"),
+                          foreground="#888").pack(side="left")
+                for _srcb in _bsrcs:
+                    ttk.Button(_bcp, text=_srcb, width=5,
+                               command=lambda a=_srcb: self._copy_broker_setup(a)
+                               ).pack(side="left", padx=(4, 0))
         # 서버 신호 없이 '지금 이 자산 전 계좌의 1R($)'만 잔고 조회로 미리 보여준다(대표 2026-07-26).
         ttk.Button(frm, text=("이 자산 전 계좌 1R 확인" if self.lang == "ko"
                               else "Preview 1R — all accounts"),
@@ -1654,6 +1652,17 @@ class App:
         """자산 탭의 (현재 또는 지정) 브로커 크레덴셜 {f1,f3}. 계좌는 자산별이라 크레덴셜도 자산 내."""
         bk = broker or self._acfg[asset]["broker"]
         return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
+
+    def _acct_pick_values(self, asset):
+        """② 계좌 드롭다운 값: 이 자산 전 브로커의 가용 계좌를 "브로커 · 계좌"로 통합
+        (대표 2026-08-11 독립 드롭다운). 이미 등록된 사용 계좌는 뺀다 - 남은 것만 고르게."""
+        _used = {(x.get("id") or "").strip() for x in self._accts_of(asset)}
+        out = []
+        for _bk in _ASSET_BROKERS.get(asset, []):
+            for _nm in self._avail_of(asset, _bk):
+                if _nm and _nm not in _used:
+                    out.append(f"{_broker_label(_bk)} · {_nm}")
+        return out
 
     def _register_avail(self):
         """① 가용 계좌 수동 등록(대표 2026-08-11) - API 목록이 없는 브로커(Lucid 등)용.
@@ -2093,13 +2102,15 @@ class App:
         return True
 
     def _fill_scope(self, names):
-        # 불러온 계좌 목록 → '계좌 추가' 콤보 채움(대표 2026-07-24 멀티계좌)
+        # 불러온 계좌 목록 → ② 통합 드롭다운 재구성(대표 2026-08-11 독립 드롭다운:
+        # 원시 names가 아니라 "브로커 · 계좌" 통합 목록으로 그린다)
         if not hasattr(self, "acct_pick"):
             return
         try:
-            self.acct_pick["values"] = names
-            if names and not self.acct_pick.get().strip():
-                self.acct_pick.set(names[0])
+            _vals = self._acct_pick_values(self._asset)
+            self.acct_pick["values"] = _vals
+            if _vals and not self.acct_pick.get().strip():
+                self.acct_pick.set(_vals[0])
         except Exception:
             pass
 
@@ -2146,11 +2157,33 @@ class App:
                 self.root.after(0, _apply)
         _th.Thread(target=w, daemon=True).start()
 
+    def _copy_broker_setup(self, src_asset):
+        """① 브로커 설정만 복사(대표 2026-08-11 "다른 유닛을 하나로 묶으면 언제나 혼란"):
+        브로커 선택·크레덴셜(브리지 토큰·포트)·가용 계좌 목록. 사용 계좌(②)는 안 건드린다."""
+        import copy as _copy
+        dst = self._asset
+        _src = self._acfg[src_asset]
+        if not any((v.get("f1") or "").strip() for v in (_src.get("creds") or {}).values()):
+            messagebox.showinfo(("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
+                                (f"{src_asset}에 복사할 브로커 설정이 없습니다." if self.lang == "ko"
+                                 else f"No broker setup to copy from {src_asset}.")); return
+        if not messagebox.askyesno(
+                ("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
+                (f"{src_asset}의 브로커 설정(브로커·키·가용 계좌)을 {dst}(으)로 덮어쓸까요?\n"
+                 "사용 계좌(②)는 그대로 둡니다." if self.lang == "ko" else
+                 f"Overwrite {dst}'s broker setup (broker, keys, available accounts) "
+                 f"with {src_asset}'s? Accounts in ② stay untouched.")):
+            return
+        self._collect_acct_widgets()
+        self._acfg[dst]["broker"] = _src.get("broker")
+        self._acfg[dst]["creds"] = _copy.deepcopy(_src.get("creds", {}))
+        self._save_cfg()
+        self._build()
+        self.log(f"📋 {src_asset} → {dst} 브로커 설정 복사 완료 (브로커 {_src.get('broker')})")
+
     def _copy_acct_setup(self, src_asset):
-        """다른 선물 자산(src)의 설정 전체를 현재 자산으로 복사 - 브로커 선택·크레덴셜
-        (브리지 토큰·포트 포함)·계좌 목록·1R·모드까지 싸그리(대표 2026-08-11 "다 싸그리").
-        NQ·GC는 같은 프롭 계좌·같은 브로커로 운용하므로 한 번에 맞추는 게 실사용이다.
-        (구버전은 계좌 목록만 복사해 브로커·토큰이 빠졌다 - Lucid 셋업 실측에서 발각)"""
+        """② 사용 계좌만 복사: 계좌 목록·1R·모드. 브로커·키(①)는 안 건드린다
+        (대표 2026-08-11 유닛 분리 - 구 "싸그리 복사"를 ①/② 두 버튼으로 갈랐다)."""
         import copy as _copy
         dst = self._asset
         src_accts = self._accts_of(src_asset)
@@ -2160,19 +2193,16 @@ class App:
                                  else f"No accounts to copy from {src_asset}.")); return
         if not messagebox.askyesno(
                 ("계좌 설정 복사" if self.lang == "ko" else "Copy account setup"),
-                (f"{src_asset}의 설정 전체(브로커, 키, 계좌 구성)를 {dst}(으)로 덮어쓸까요?"
-                 if self.lang == "ko" else
-                 f"Overwrite {dst}'s entire setup (broker, keys, accounts) with {src_asset}'s?")):
+                (f"{src_asset}의 사용 계좌(계좌·1R·모드)를 {dst}(으)로 덮어쓸까요?\n"
+                 "브로커·키(①)는 그대로 둡니다." if self.lang == "ko" else
+                 f"Overwrite {dst}'s accounts (ids, 1R, modes) with {src_asset}'s? "
+                 "Broker & keys in ① stay untouched.")):
             return
         self._collect_acct_widgets()
-        _src = self._acfg[src_asset]
-        self._acfg[dst]["broker"] = _src.get("broker")
-        self._acfg[dst]["creds"] = _copy.deepcopy(_src.get("creds", {}))
         self._acfg[dst]["accounts"] = [_copy.deepcopy(a) for a in src_accts]
         self._save_cfg()
         self._build()
-        self.log(f"📋 {src_asset} → {dst} 설정 전체 복사 완료 "
-                 f"(브로커 {_src.get('broker')}, {len(src_accts)}개 계좌)")
+        self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개)")
 
     def _add_acct(self):
         """자산 탭 설정에서 계좌 추가 — acct_pick의 선택/입력값을 이 자산의 계좌ID로 등록(중복 방지)."""
@@ -2212,16 +2242,15 @@ class App:
             messagebox.showinfo(self.t("btn_accts"),
                                 "이미 등록된 계좌입니다." if self.lang == "ko"
                                 else "Already registered."); return
-        # 추가 줄에서 고른 브로커(대표 2026-08-11) - 없으면 현재 탭 브로커
+        # 드롭다운 값 "브로커 · 계좌"에서 브로커 자동 판별(대표 2026-08-11 독립 드롭다운).
+        # 수동 타이핑(접두 없음)이면 현재 탭 브로커.
         _bk_add = self._broker_name
-        try:
-            _lbl = str(self.acct_add_bk.get()).strip()
+        if "·" in val:
+            _pre = val.split("·")[0].strip()
             for _b in _ASSET_BROKERS.get(asset, []):
-                if _broker_label(_b) == _lbl:
+                if _broker_label(_b) == _pre:
                     _bk_add = _b
                     break
-        except Exception:
-            pass
         # 첫 계좌가 빈 슬롯(id 미지정)이면 그걸 채우고, 아니면 새 계좌로 추가
         if len(accts) == 1 and not (accts[0].get("id") or "").strip():
             accts[0]["id"] = aid
