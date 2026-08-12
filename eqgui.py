@@ -1236,19 +1236,12 @@ class App:
                                         else "(loaded automatically on connect)"),
                           foreground="#9ca3af").pack(side="left", padx=(6, 0))
             elif self._broker_name == "nt8":
+                # 수동 등록 폐지(대표 2026-08-12 "수동 등록 지워") - 자동 로드 단일 경로.
+                # 로드 실패 시 팝업이 NT8 기동을 안내한다(_autoload_nt8_avail).
                 ttk.Label(_avrow, text=("(NT8이 켜져 있으면 자동으로 불러옵니다)"
                                         if self.lang == "ko" else
                                         "(loaded automatically while NT8 is running)"),
                           foreground="#9ca3af").pack(side="left", padx=(6, 0))
-                _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
-                self._avail_entry = ttk.Entry(_mrow, width=24)
-                self._avail_entry.pack(side="left")
-                ttk.Button(_mrow, text=("수동 등록" if self.lang == "ko" else "Register manually"),
-                           command=self._register_avail).pack(side="left", padx=(4, 0))
-                ttk.Label(_mrow, text=("NT8이 꺼져 있을 때만 필요 - Accounts 탭 이름 그대로"
-                                       if self.lang == "ko" else
-                                       "only needed while NT8 is off - exact Accounts-tab name"),
-                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
             else:
                 _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
                 self._avail_entry = ttk.Entry(_mrow, width=24)
@@ -2163,8 +2156,23 @@ class App:
                 b = _build_broker("nt8", f1, "", cr.get("f3", ""), [])
                 names = [str(a.get("name")) for a in b._accounts() if a.get("name")]
             except Exception:
-                return                           # NT8 꺼짐/브리지 미기동 - 무음
+                names = []
             if not names:
+                # 가용 계좌가 아예 없는데 로드도 실패 → NT8 기동 안내(대표 2026-08-12
+                # "등록 안 되면 NT8 켜라고 팝업"). 이미 목록이 있으면 조용히 생략.
+                if not (cr.get("avail") or []) and not getattr(self, "_nt8_hint_shown", False):
+                    self._nt8_hint_shown = True      # 세션당 1회 - 탭 전환마다 도배 방지
+                    def _nt8_hint():
+                        messagebox.showinfo(
+                            "Lucid (NT8)",
+                            "Lucid 가용 계좌를 불러오지 못했습니다.\n\n"
+                            "같은 PC에서 NinjaTrader 8을 켜고 로그인(초록불)한 뒤\n"
+                            "이 탭을 다시 열면 자동으로 등록됩니다."
+                            if self.lang == "ko" else
+                            "Could not load Lucid accounts.\n\n"
+                            "Start NinjaTrader 8 on this PC, log in (green), then "
+                            "reopen this tab - accounts register automatically.")
+                    self.root.after(0, _nt8_hint)
                 return
             cache[ck] = names
 
