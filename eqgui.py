@@ -3236,6 +3236,7 @@ class App:
 
         def w():
             fails = []
+            nt8_fail = []
             tested = {}                # (브로커,f1)별 연결 테스트 1회(같은 크레덴셜 중복 방지)
             for a in incl:
                 # 수동 전용 자산(활성 계좌가 전부 수동 모드)은 발주를 안 하므로 브로커 연결 불필요.
@@ -3269,6 +3270,8 @@ class App:
                                  else f"❌ {a} · {_broker_label(bk)}: {err}")
                     if err:
                         fails.append(f"{a} ({_broker_label(bk)}): {err}")
+                        if bk == "nt8":
+                            nt8_fail.append(a)
 
             def done():
                 self.b_live_start.config(state="normal")
@@ -3276,9 +3279,18 @@ class App:
                     self.b_demo_start.config(state="normal")
                 if fails:
                     self.log("⛔ 전체 중단 — 아무 계좌도 가동하지 않았습니다.")
-                    messagebox.showerror(self.t("sec_live"),
-                                         ("연결 실패 — 전체 중단:\n" if self.lang == "ko"
-                                          else "Connection failed — aborted:\n") + "\n".join(fails))
+                    _msg = (("연결 실패 — 전체 중단:\n" if self.lang == "ko"
+                             else "Connection failed — aborted:\n") + "\n".join(fails))
+                    # Lucid 실패 = 십중팔구 NT8 꺼짐(대표 2026-08-12 "닌자 켜졌나 봐라 워닝")
+                    if nt8_fail:
+                        _msg += (("\n\n[Lucid] NinjaTrader 8이 켜져 있고 로그인(초록불)돼 "
+                                  "있는지 확인하세요 - 같은 PC에서 NT8이 꺼져 있으면 "
+                                  "Lucid는 연결되지 않습니다.")
+                                 if self.lang == "ko" else
+                                 ("\n\n[Lucid] Check that NinjaTrader 8 is running and "
+                                  "logged in (green) on this PC - Lucid cannot connect "
+                                  "while NT8 is off."))
+                    messagebox.showerror(self.t("sec_live"), _msg)
                     self._refresh_live_panel(); return
                 narmed = 0
                 for a in incl:
