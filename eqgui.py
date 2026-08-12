@@ -1242,6 +1242,16 @@ class App:
                                         if self.lang == "ko" else
                                         "(loaded automatically while NT8 is running)"),
                           foreground="#9ca3af").pack(side="left", padx=(6, 0))
+                # 안심 문구(대표 2026-08-12): 첫 셋업(NT8·브리지)이 고비지, 계좌 추가는 쉽다.
+                ttk.Label(frm, text=("Lucid 계좌를 더 사셨나요? 처음 NT8 셋업만 한 번이 고비고, "
+                                     "계좌 추가는 쉽습니다 - NT8 재로그인하면 새 계좌가 위 목록에 "
+                                     "자동으로 뜨고, 아래 계좌 설정에서 골라 1R만 정하면 끝이에요."
+                                     if self.lang == "ko" else
+                                     "Bought another Lucid account? The one-time NT8 setup is the "
+                                     "hard part - adding accounts is easy: re-log into NT8, the new "
+                                     "account appears above automatically, pick it below and set 1R.")
+                          , foreground="#8a8f98", wraplength=740, justify="left"
+                          ).pack(anchor="w", pady=(2, 0))
             else:
                 _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
                 self._avail_entry = ttk.Entry(_mrow, width=24)
