@@ -2161,28 +2161,24 @@ class App:
             return
         import threading as _th
 
-        def w():
+        def w(attempt: int = 0):
             try:
                 b = _build_broker("nt8", f1, "", cr.get("f3", ""), [])
                 names = [str(a.get("name")) for a in b._accounts() if a.get("name")]
             except Exception:
                 names = []
             if not names:
-                # 가용 계좌가 아예 없는데 로드도 실패 → NT8 기동 안내(대표 2026-08-12
-                # "등록 안 되면 NT8 켜라고 팝업"). 이미 목록이 있으면 조용히 생략.
-                if not (cr.get("avail") or []) and not getattr(self, "_nt8_hint_shown", False):
-                    self._nt8_hint_shown = True      # 세션당 1회 - 탭 전환마다 도배 방지
-                    def _nt8_hint():
-                        messagebox.showinfo(
-                            "Lucid (NT8)",
-                            "Lucid 가용 계좌를 불러오지 못했습니다.\n\n"
-                            "같은 PC에서 NinjaTrader 8을 켜고 로그인(초록불)한 뒤\n"
-                            "이 탭을 다시 열면 자동으로 등록됩니다."
-                            if self.lang == "ko" else
-                            "Could not load Lucid accounts.\n\n"
-                            "Start NinjaTrader 8 on this PC, log in (green), then "
-                            "reopen this tab - accounts register automatically.")
-                    self.root.after(0, _nt8_hint)
+                # ⚠️기동 직후엔 브리지가 1~2초 늦게 깬다(대표 2026-08-12 "뜨자마자 경고 주는데
+                # 일이초 있다 보니 연결 댐") → 팝업 대신 조용한 재시도 3회. 최종 실패도
+                # 로그 한 줄만 - NT8 기동 경고는 [연결 테스트]와 [라이브 시작]이 그 시점에 준다.
+                if attempt < 3:
+                    self.root.after(2500, lambda: _th.Thread(
+                        target=w, args=(attempt + 1,), daemon=True).start())
+                elif not (cr.get("avail") or []):
+                    self.root.after(0, lambda: self.log(
+                        f"   · {asset} Lucid 가용 계좌 자동 로드 대기 - NT8이 켜지면 자동 등록됩니다"
+                        if self.lang == "ko" else
+                        f"   · {asset} Lucid accounts pending - they register once NT8 is running"))
                 return
             cache[ck] = names
 
