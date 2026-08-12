@@ -14,7 +14,7 @@ a = Analysis(
     ['eqgui.py'],
     pathex=[],
     binaries=[],
-    datas=[('eqlogo.png', '.')] + collect_data_files('tzdata'),
+    datas=[('eqlogo.png', '.'), ('eqlogo256.png', '.')] + collect_data_files('tzdata'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

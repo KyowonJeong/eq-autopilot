@@ -5298,12 +5298,22 @@ def main():
     root = tk.Tk()
     # 창·작업표시줄 아이콘(대표 2026-08-11 "이상한 모양 나와") - exe 아이콘(spec)과 별개로
     # 런타임 Tk 아이콘을 명시해야 기본 깃털이 안 뜬다. 윈도=ico, 맥/기타=png 폴백.
+    # 2단 폴백(대표 2026-08-12 "깃털 또 나와"): ①iconbitmap(default=)로 전 창(팝업 포함)에
+    # 적용 ②실패하든 말든 iconphoto(256px)도 항상 시도 - 어느 한쪽이 죽어도 깃털은 안 뜬다.
+    import sys as _sys
+    if _sys.platform.startswith("win"):
+        try:
+            root.iconbitmap(default=_resource("eqicon.ico"))
+        except Exception:
+            try:
+                root.iconbitmap(_resource("eqicon.ico"))
+            except Exception:
+                pass
     try:
-        import sys as _sys
-        if _sys.platform.startswith("win"):
-            root.iconbitmap(_resource("eqicon.ico"))
-        else:
-            root.iconphoto(True, tk.PhotoImage(file=_resource("eqlogo.png")))
+        _icpng = _resource("eqlogo256.png")
+        if not os.path.exists(_icpng):
+            _icpng = _resource("eqlogo.png")
+        root.iconphoto(True, tk.PhotoImage(file=_icpng))
     except Exception:
         pass
     try:
