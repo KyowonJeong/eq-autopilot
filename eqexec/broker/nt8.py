@@ -218,6 +218,12 @@ class NT8Broker(BrokerAdapter):
                 return int(p.get("net_qty") or 0)
         return 0
 
+    def _accounts(self):
+        """가용 계좌 자동 로드(2026-08-12 대표 "자동 읽기 안 되는 게 별로") - 브리지 tick의
+        Account.All 열거를 ProjectX 인터페이스 모양으로. NT8이 켜져 있어야 응답한다."""
+        return [{"name": a.get("name"), "id": a.get("name")}
+                for a in self._snapshot().get("accounts", []) if a.get("name")]
+
     def account_balance(self, acct):
         for a in self._snapshot().get("accounts", []):
             if str(a.get("name")) == str(acct):

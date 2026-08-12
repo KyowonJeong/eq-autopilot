@@ -1235,15 +1235,28 @@ class App:
                 ttk.Label(_avrow, text=("(연결하면 자동으로 불러옵니다)" if self.lang == "ko"
                                         else "(loaded automatically on connect)"),
                           foreground="#9ca3af").pack(side="left", padx=(6, 0))
+            elif self._broker_name == "nt8":
+                ttk.Label(_avrow, text=("(NT8이 켜져 있으면 자동으로 불러옵니다)"
+                                        if self.lang == "ko" else
+                                        "(loaded automatically while NT8 is running)"),
+                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
+                _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
+                self._avail_entry = ttk.Entry(_mrow, width=24)
+                self._avail_entry.pack(side="left")
+                ttk.Button(_mrow, text=("수동 등록" if self.lang == "ko" else "Register manually"),
+                           command=self._register_avail).pack(side="left", padx=(4, 0))
+                ttk.Label(_mrow, text=("NT8이 꺼져 있을 때만 필요 - Accounts 탭 이름 그대로"
+                                       if self.lang == "ko" else
+                                       "only needed while NT8 is off - exact Accounts-tab name"),
+                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
             else:
                 _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
                 self._avail_entry = ttk.Entry(_mrow, width=24)
                 self._avail_entry.pack(side="left")
                 ttk.Button(_mrow, text=("가용 계좌 등록" if self.lang == "ko" else "Register account"),
                            command=self._register_avail).pack(side="left", padx=(4, 0))
-                ttk.Label(_mrow, text=("계좌 이름 그대로 (Lucid는 NT8 Accounts 탭 이름)"
-                                       if self.lang == "ko" else
-                                       "exact account name (Lucid: as in NT8 Accounts tab)"),
+                ttk.Label(_mrow, text=("계좌 이름 그대로" if self.lang == "ko"
+                                       else "exact account name"),
                           foreground="#9ca3af").pack(side="left", padx=(8, 0))
         if spec.get("acct"):
             # ① 브로커 설정 복사(대표 2026-08-11 "브로커 설정 복사, 계좌 설정 복사 둘 다")
@@ -1307,9 +1320,12 @@ class App:
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add account"), width=10,
                        command=self._add_acct).pack(side="left")
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
-            # Topstep 가용 계좌 자동 로드는 유지 - 행의 계좌 콤보가 이 목록을 쓴다.
+            # 가용 계좌 자동 로드 - 행의 계좌 콤보가 이 목록을 쓴다.
+            # Topstep=API, Lucid=브리지 tick(2026-08-12부터 자동 - NT8 켜져 있을 때).
             if self._broker_of(self._asset) == "projectx":
                 self._autoload_topstep_scope(self._asset)
+            if "nt8" in _ASSET_BROKERS.get(self._asset, []):
+                self._autoload_nt8_avail(self._asset)
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
             # 선물 자산 간 계좌 설정 복사(대표 2026-07-26 #20) — NQ·GC는 같은 프롭 계좌로 운용
             _srcs = [a for a in _ASSETS if a != self._asset
@@ -2119,6 +2135,50 @@ class App:
         except Exception:
             pass
 
+    def _autoload_nt8_avail(self, asset):
+        """Lucid(NT8) 가용 계좌 자동 로드(대표 2026-08-12) - 브리지 tick의 Account.All을
+        받아 이 자산 가용 목록에 병합. NT8이 꺼져 있으면 타임아웃 후 조용히 생략(수동 등록
+        경로는 그대로 살아있음). (포트,토큰)별 캐시로 탭 전환마다 재조회하지 않는다."""
+        cr = self._creds_of(asset, "nt8")
+        f1 = (cr.get("f1") or "").strip()
+        if not f1:
+            return
+        ck = ("nt8", cr.get("f3", ""), f1[:8])
+        cache = getattr(self, "_scope_cache", None)
+        if cache is None:
+            cache = self._scope_cache = {}
+        if ck in cache:
+            names = cache[ck]
+            _av = cr.setdefault("avail", [])
+            _new = [n for n in names if n not in _av]
+            if _new:
+                _av.extend(_new)
+                self._save_cfg()
+            self._fill_scope(names)
+            return
+        import threading as _th
+
+        def w():
+            try:
+                b = _build_broker("nt8", f1, "", cr.get("f3", ""), [])
+                names = [str(a.get("name")) for a in b._accounts() if a.get("name")]
+            except Exception:
+                return                           # NT8 꺼짐/브리지 미기동 - 무음
+            if not names:
+                return
+            cache[ck] = names
+
+            def done():
+                _av = cr.setdefault("avail", [])
+                _new = [n for n in names if n not in _av]
+                if _new:
+                    _av.extend(_new)
+                    self._save_cfg()
+                    self.log(f"🧾 {asset} · Lucid 가용 계좌 자동 등록: " + ", ".join(_new))
+                self._fill_scope(names)
+            self.root.after(0, done)
+        _th.Thread(target=w, daemon=True).start()
+
     def _autoload_topstep_scope(self, asset):
         """Topstep(projectx) 자산 탭 진입 시 브로커 계좌 목록을 백그라운드로 받아 '계좌 추가'
         콤보를 미리 채운다(대표 2026-07-26 버그: 예전엔 '연결 테스트'를 눌러야만 _fill_scope가
@@ -2918,11 +2978,13 @@ class App:
                         self._test_ok = set()
                     self._test_ok.add(asset)
                     self.log(f"✅ {asset} · {_broker_label(bk)} 연결 확인 - 자동 저장·검증 완료")
-                    if bk == "projectx":             # 연결되면 계좌 드롭다운 자동 채움(②로 직행)
-                        try:
+                    try:
+                        if bk == "projectx":         # 연결되면 가용 계좌 자동 채움(②로 직행)
                             self._autoload_topstep_scope(asset)
-                        except Exception:
-                            pass
+                        elif bk == "nt8":
+                            self._autoload_nt8_avail(asset)
+                    except Exception:
+                        pass
                 self._refresh_next_action()
                 self._apply_gating()
                 self._refresh_live_panel()
