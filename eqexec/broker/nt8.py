@@ -231,11 +231,62 @@ class NT8Broker(BrokerAdapter):
         return None
 
     # ── 명령 ──
+    @staticmethod
+    def _front_month(sym: str, today=None):
+        """NT8 인스트루먼트 만기 자동 계산 - symbol_map 미설정 시 폴백(2026-08-12 신설).
+        지수(NQ/MNQ/ES/MES): 분기물(3/6/9/12), 만기월 3째 금요일 8일 전 롤.
+        금(GC/MGC): 유동월(2/4/6/8/12 - 10월은 유동성 없어 제외), 인도 전월 27일 롤.
+        규칙이 어긋나는 예외 상황은 앱 설정 symbol_map 한 줄로 덮는다(맵이 항상 우선)."""
+        import datetime as _dt
+        d = today or _dt.date.today()
+        base = str(sym).upper()
+
+        def _third_friday(y, m):
+            first = _dt.date(y, m, 1)
+            return first + _dt.timedelta(days=(4 - first.weekday()) % 7 + 14)
+
+        if base in ("NQ", "MNQ", "ENQ", "ES", "MES"):
+            y, m = d.year, d.month
+            for _ in range(8):
+                if m in (3, 6, 9, 12):
+                    if d <= _third_friday(y, m) - _dt.timedelta(days=8):
+                        return f"{sym} {m:02d}-{y % 100:02d}"
+                m += 1
+                if m > 12:
+                    m, y = 1, y + 1
+            return None
+        if base in ("GC", "MGC", "GCE"):
+            y, m = d.year, d.month
+            for _ in range(14):
+                if m in (2, 4, 6, 8, 12):
+                    py_, pm = (y, m - 1) if m > 1 else (y - 1, 12)
+                    if d <= _dt.date(py_, pm, 27):
+                        return f"{sym} {m:02d}-{y % 100:02d}"
+                m += 1
+                if m > 12:
+                    m, y = 1, y + 1
+            return None
+        return None
+
     def _nt_symbol(self, contract) -> str:
         """EQ 계약 표기 → NT8 인스트루먼트 문자열(예: 'MNQ' → 'MNQ 09-26').
-        롤오버는 symbol_map 갱신으로 처리(설정 파일 한 줄)."""
+        우선순위: ①symbol_map(설정 오버라이드) ②이미 완전 표기면 그대로 ③만기 자동 계산."""
         c = str(contract)
-        return self.symbol_map.get(c, c)
+        if c in self.symbol_map:
+            return self.symbol_map[c]
+        if " " in c:
+            return c                                  # 이미 "MNQ 09-26" 완전 표기
+        return self._front_month(c) or c
+
+    def search_contracts(self, text: str, live: bool = False) -> list[dict]:
+        """ProjectX/Tradovate와 동일 호출 계약. NT8은 계약 조회 API가 없어 정적 해석
+        (symbol_map → 만기 자동 계산)이 곧 '활성 계약'이다. id에 NT 완전 표기("MNQ 09-26")를
+        넣어야 place_entry(_nt_symbol 항등 통과)·잔여 포지션 대조(p.symbol == id)가 맞물린다.
+        ☠️2026-08-12 첫 라이브 NQ 진입이 이 메서드 부재로 실패(대표 실전 발각) - 연결
+        테스트는 인터페이스 구멍을 못 잡는다. 신규 선물 브로커는 place_entry/search_contracts/
+        place_protective_stop/close_contract/account_balance 전부 있어야 발주가 돈다."""
+        nt = self._nt_symbol(str(text))
+        return [{"id": nt, "name": nt, "activeContract": True}]
 
     def _enqueue_and_wait(self, cmd: dict) -> dict:
         self.authenticate()

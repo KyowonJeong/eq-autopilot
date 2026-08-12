@@ -3780,6 +3780,15 @@ class App:
             b = _build_broker(cfg.get("broker"), cfg.get("f1", ""), cfg.get("f2", ""),
                               cfg.get("f3", ""), [cfg.get("acct")] if cfg.get("acct") else [])
             b.healthcheck()
+            # 계약 해석까지 사전 검증(2026-08-12 첫 Lucid 라이브: search_contracts 부재가
+            # 사전 점검을 통과하고 진입 순간에야 터짐 - 발주 직전 경로를 여기서 미리 밟는다).
+            if hasattr(b, "search_contracts"):
+                _pf_sym = {"NQ": "MNQ", "GC": "MGC"}.get(str(asset))
+                if _pf_sym:
+                    _pf_cs = b.search_contracts(_pf_sym)
+                    if not _pf_cs or not _pf_cs[0].get("id"):
+                        raise RuntimeError(f"활성 계약 해석 실패({_pf_sym}) - 진입이 막힙니다")
+                    self.log(f"   · 계약 해석 OK: {_pf_sym} → {_pf_cs[0]['id']}")
             warns = []
             if hasattr(b, "key_info"):
                 try:
