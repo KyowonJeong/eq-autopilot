@@ -2628,8 +2628,10 @@ class App:
         return "1R 계산기" if self.lang == "ko" else "1R calculator"
 
     def _pct_dialog(self, idx):
-        """계좌별 자본 비례 사이징(대표 2026-07-26 #18): 1R = 잔고 × pct%, 최소 floor.
-        발주 순간 잔고 조회(선물=account_balance / 크립토=available_usdt). 프롭 모드와 배타."""
+        """1R 계산 도우미(2026-08-13 전면 개편). 자본금과 비율을 **회원이 직접 입력**하면
+        1R을 산술로 보여주고, [1R로 적용]을 누르면 그 값이 계좌 행의 1R 칸에 채워진다.
+        잔고 조회 없음·자동 반영 없음 — 결정 주체는 언제나 회원(⚖️ 사이징 개인화 제거의 일부).
+        구 '자본 비례 모드'(켬/끔 + 발주 시 잔고 조회)는 폐지됐고 pct.on은 항상 False로 저장."""
         ko = self.lang == "ko"
         try:
             acct = self._accts_of(self._asset)[idx]
@@ -2643,54 +2645,68 @@ class App:
             return
         pc = dict(_PCT_DEFAULTS); pc.update(acct.get("pct") or {})
         win = tk.Toplevel(self.root)
-        win.title(("1R 계산기 — " + (acct.get("label") or "")) if ko
-                  else ("1R calculator — " + (acct.get("label") or "")))
+        win.title(("1R 계산 도우미 — " + (acct.get("label") or "")) if ko
+                  else ("1R helper — " + (acct.get("label") or "")))
         win.resizable(False, False); win.grab_set()
-        frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
-        on_v = tk.IntVar(value=1 if pc.get("on") else 0)
-        ttk.Checkbutton(frm, variable=on_v,
-                        text=("이 계좌를 계산기 대상으로 표시" if ko else
-                              "Mark this account for the calculator")
-                        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Label(frm, text=("자본 대비 비율 %" if ko else "Percent of capital %")).grid(row=1, column=0, sticky="w")
+        frm = ttk.Frame(win, padding=14); frm.pack(fill="both", expand=True)
+        ttk.Label(frm, wraplength=380, justify="left",
+                  text=("계좌 자본금과 비율을 넣으면 1R 금액을 계산해 드립니다.\n"
+                        "마음에 들면 [1R로 적용]을 눌러 주세요 — 그 값이 발주에 쓰입니다."
+                        if ko else
+                        "Enter your account capital and a percent to compute a 1R amount.\n"
+                        "If it looks right, press [Use as 1R] — that value is what orders use.")
+                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(frm, text=("계좌 자본금 $" if ko else "Account capital $")).grid(row=1, column=0, sticky="w")
+        ce = ttk.Entry(frm, width=12); ce.grid(row=1, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(frm, text=("비율 %" if ko else "Percent %")).grid(row=2, column=0, sticky="w", pady=(6, 0))
         pe = ttk.Entry(frm, width=8); pe.insert(0, f"{_as_float(pc.get('pct'), 0.4):g}")
-        pe.grid(row=1, column=1, sticky="w")
-        ttk.Label(frm, text=("최소 1R $ (수수료 방어)" if ko else "Min 1R $ (fee floor)")).grid(row=2, column=0, sticky="w")
-        fe = ttk.Entry(frm, width=8); fe.insert(0, f"{_as_float(pc.get('floor'), 200.0):g}")
-        fe.grid(row=2, column=1, sticky="w")
-        ttk.Label(frm, foreground="#888", wraplength=360, justify="left",
-                  text=(("이 값은 계산기 입력일 뿐입니다. **발주에 쓰이는 1R은 계좌 행에 직접 "
-                         "입력하신 금액**이며, 앱은 주문을 낼 때 잔고를 조회해 금액을 정하지 "
-                         "않습니다. 참고로 자본의 0.4%를 1R로 두면 13년 최악 낙폭(약 42R)이 "
-                         "자본의 약 17%에 해당합니다 — 일반적인 산술이며 권유가 아닙니다. "
-                         "얼마를 걸지는 본인이 판단해 1R 칸에 적어 주십시오.") if ko else
-                        ("This is calculator input only. **The 1R used for orders is the amount you "
-                         "typed into the account row**; the app does not read your balance to decide "
-                         "an amount at order time. For reference, setting 1R to 0.4% of capital puts "
-                         "the 13-year worst drawdown (~42R) at about 17% of capital — that is "
-                         "arithmetic, not a recommendation. Decide the amount yourself and enter it "
-                         "in the 1R field."))
-                  ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 8))
+        pe.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+        res_v = tk.StringVar(value=("→ 자본금을 입력하세요" if ko else "→ enter capital"))
+        ttk.Label(frm, textvariable=res_v, font=("", 13, "bold")).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                  text=("참고: 자본의 0.4%를 1R로 두면 13년 최악 낙폭(약 42R)이 자본의 약 17%에 "
+                        "해당합니다. 단순 산술이며 권유가 아닙니다 — 얼마를 걸지는 본인이 "
+                        "결정하십시오. 앱은 잔고를 조회해 금액을 정하지 않습니다." if ko else
+                        "Reference: at 0.4% of capital per 1R, the 13-year worst drawdown (~42R) "
+                        "equals about 17% of capital. Plain arithmetic, not a recommendation — "
+                        "you decide the amount. The app never reads your balance to set it.")
+                  ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 10))
 
-        def _ok():
-            newc = {"on": bool(on_v.get()), "pct": _as_float(pe.get(), 0.4),
-                    "floor": _as_float(fe.get(), 200.0)}
-            if newc["on"] and (newc["pct"] <= 0 or newc["pct"] > 100):
-                messagebox.showwarning("EQ", "비율은 0~100 사이여야 합니다." if ko
-                                       else "Percent must be between 0 and 100."); return
-            acct["pct"] = newc
+        def _calc(*_):
+            try:
+                cap = float((ce.get() or "").replace(",", ""))
+                pct = float(pe.get())
+                if cap <= 0 or pct <= 0 or pct > 100:
+                    raise ValueError
+                r = cap * pct / 100.0
+                res_v.set((f"1R = ${r:,.0f}  (${cap:,.0f} × {pct:g}%)") if ko
+                          else (f"1R = ${r:,.0f}  (${cap:,.0f} × {pct:g}%)"))
+                return r
+            except (TypeError, ValueError):
+                res_v.set("→ 자본금·비율을 확인하세요" if ko else "→ check capital / percent")
+                return None
+        ce.bind("<KeyRelease>", _calc); pe.bind("<KeyRelease>", _calc)
+
+        def _apply():
+            r = _calc()
+            if r is None:
+                return
+            # 회원이 버튼으로 확정한 값만 1R 칸에 채운다 - 자동 반영 없음.
+            acct["one_r"] = round(r, 2)
+            acct["pct"] = {"on": False, "pct": _as_float(pe.get(), 0.4),
+                           "floor": _as_float(pc.get("floor"), 200.0)}   # 비율만 기억(모드 아님)
             try:
                 w = self._acct_widgets.get(idx) or {}
-                if w.get("pct_btn"):
-                    w["pct_btn"].config(text=self._pct_btn_text(newc))
                 if w.get("one_r"):
-                    w["one_r"].config(state=("disabled" if newc["on"] else "normal"))
+                    w["one_r"].config(state="normal")
+                    w["one_r"].delete(0, "end"); w["one_r"].insert(0, f"{acct['one_r']:g}")
             except Exception:
                 pass
             self._save_acct_widgets(); win.destroy()
 
-        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=4, column=1)
-        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=4, column=2)
+        ttk.Button(frm, text=("1R로 적용" if ko else "Use as 1R"), command=_apply).grid(row=5, column=1, sticky="e")
+        ttk.Button(frm, text=("닫기" if ko else "Close"), command=win.destroy).grid(row=5, column=2, padx=(6, 0))
 
     def _prop_btn_text(self, pr):
         if not (pr or {}).get("on"):
