@@ -2671,11 +2671,11 @@ class App:
         ttk.Label(frm, textvariable=res_v, font=("", 13, "bold")).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=("참고: 자본의 0.4%를 1R로 두면 13년 최악 낙폭(약 42R)이 자본의 약 17%에 "
+                  text=("참고: 자본의 0.4%를 1R로 두면 13년 최악 낙폭(약 53R)이 자본의 약 21%에 "
                         "해당합니다. 단순 산술이며 권유가 아닙니다 — 얼마를 걸지는 본인이 "
                         "결정하십시오. 앱은 잔고를 조회해 금액을 정하지 않습니다." if ko else
-                        "Reference: at 0.4% of capital per 1R, the 13-year worst drawdown (~42R) "
-                        "equals about 17% of capital. Plain arithmetic, not a recommendation — "
+                        "Reference: at 0.4% of capital per 1R, the 13-year worst drawdown (~53R) "
+                        "equals about 21% of capital. Plain arithmetic, not a recommendation — "
                         "you decide the amount. The app never reads your balance to set it.")
                   ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 10))
 
