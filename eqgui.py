@@ -2601,11 +2601,11 @@ class App:
             live = bool(_jobs[0].get("live")) if _jobs else False
         _n = len(active)
         # 1R 상시 표시(대표 2026-08-11 정보 승격 - 조회 버튼 폐지의 대체): 고정 1R 합.
-        # 프롭/자본비례 계좌는 가동 시 자동 산출이라 "자동"으로 표기.
-        _auto_sz = any((ac.get("prop") or {}).get("on") or (ac.get("pct") or {}).get("on")
-                       for ac in active)
+        # 프롭 계좌만 "단계값"(회원이 단계별로 입력한 상수)을 쓴다. 자본% 계좌는 2026-08-13부터
+        # 회원이 1R 칸에 적은 금액을 그대로 쓰므로 합계에 포함한다 - "자동"이라 적으면 거짓말이 된다.
+        _auto_sz = any((ac.get("prop") or {}).get("on") for ac in active)
         _r_sum = sum(_as_float(ac.get("one_r"), 0.0) for ac in active
-                     if not ((ac.get("prop") or {}).get("on") or (ac.get("pct") or {}).get("on")))
+                     if not (ac.get("prop") or {}).get("on"))
         _r_txt = (" · 1R " + ("자동" if self.lang == "ko" else "auto")) if _auto_sz else (
             f" · 1R ${_r_sum:g}" if _r_sum > 0 else "")
         base = ("+".join(_broker_label(_b) for _b in bks) + " · "
@@ -2620,10 +2620,12 @@ class App:
         return base + (" · 준비됨" if self.lang == "ko" else " · ready"), "#9ca3af"
 
     def _pct_btn_text(self, pc):
+        # 버튼은 이제 '계산기'다(2026-08-13). 켜져 있어도 발주 1R을 바꾸지 않는다 —
+        # 표기가 사이징을 대신해 주는 것처럼 읽히면 안 된다.
         if (pc or {}).get("on"):
-            return (f"자본 {_as_float(pc.get('pct'), 0.4):g}%" if self.lang == "ko"
-                    else f"{_as_float(pc.get('pct'), 0.4):g}% eq")
-        return "자본%: 끔" if self.lang == "ko" else "% sizing: off"
+            return (f"계산기 {_as_float(pc.get('pct'), 0.4):g}%" if self.lang == "ko"
+                    else f"calc {_as_float(pc.get('pct'), 0.4):g}%")
+        return "1R 계산기" if self.lang == "ko" else "1R calculator"
 
     def _pct_dialog(self, idx):
         """계좌별 자본 비례 사이징(대표 2026-07-26 #18): 1R = 잔고 × pct%, 최소 floor.
@@ -2634,36 +2636,40 @@ class App:
         except Exception:
             return
         if (acct.get("prop") or {}).get("on"):
-            messagebox.showinfo("EQ", ("프롭 자동 사이징이 켜져 있어 자본 비례를 함께 쓸 수 없습니다. "
-                                       "프롭을 끄고 다시 시도하세요." if ko else
-                                       "Prop auto-sizing is on; disable it first to use % sizing."))
+            messagebox.showinfo("EQ", ("프롭 계좌는 단계별로 입력하신 1R을 씁니다. 계산기를 쓰려면 "
+                                       "프롭 모드를 끄고 1R을 직접 입력하세요." if ko else
+                                       "Prop accounts use the per-stage 1R you entered. To use the "
+                                       "calculator, turn prop mode off and enter 1R directly."))
             return
         pc = dict(_PCT_DEFAULTS); pc.update(acct.get("pct") or {})
         win = tk.Toplevel(self.root)
-        win.title(("자본 비례 사이징 — " + (acct.get("label") or "")) if ko
-                  else ("Capital-proportional sizing — " + (acct.get("label") or "")))
+        win.title(("1R 계산기 — " + (acct.get("label") or "")) if ko
+                  else ("1R calculator — " + (acct.get("label") or "")))
         win.resizable(False, False); win.grab_set()
         frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
         on_v = tk.IntVar(value=1 if pc.get("on") else 0)
         ttk.Checkbutton(frm, variable=on_v,
-                        text=("자본 비례 사이징 사용(잔고의 %로 1R 자동)" if ko else
-                              "Enable capital-proportional sizing (1R = % of balance)")
+                        text=("이 계좌를 계산기 대상으로 표시" if ko else
+                              "Mark this account for the calculator")
                         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Label(frm, text=("잔고 대비 비율 %" if ko else "Percent of balance %")).grid(row=1, column=0, sticky="w")
+        ttk.Label(frm, text=("자본 대비 비율 %" if ko else "Percent of capital %")).grid(row=1, column=0, sticky="w")
         pe = ttk.Entry(frm, width=8); pe.insert(0, f"{_as_float(pc.get('pct'), 0.4):g}")
         pe.grid(row=1, column=1, sticky="w")
         ttk.Label(frm, text=("최소 1R $ (수수료 방어)" if ko else "Min 1R $ (fee floor)")).grid(row=2, column=0, sticky="w")
         fe = ttk.Entry(frm, width=8); fe.insert(0, f"{_as_float(pc.get('floor'), 200.0):g}")
         fe.grid(row=2, column=1, sticky="w")
         ttk.Label(frm, foreground="#888", wraplength=360, justify="left",
-                  text=(("발주 순간 계좌 잔고를 조회해 1R = 잔고 × 비율로 계산합니다(선물·크립토 모두). "
-                         "권장 0.4%는 13년 최악 낙폭(약 42R)에서도 자본의 ~17%에 그치는 안전 비율입니다. "
-                         "잔고 조회가 안 되면 24시간 내 마지막 성공값을 쓰고, 그것도 없으면 그 계좌는 "
-                         "이번 진입을 건너뜁니다.") if ko else
-                        ("At order time the account balance is read and 1R = balance × percent "
-                         "(futures and crypto alike). The suggested 0.4% keeps even the 13-year "
-                         "worst drawdown (~42R) to ~17% of capital. If the balance can't be read, "
-                         "the last value within 24h is used; if none, that account skips the entry."))
+                  text=(("이 값은 계산기 입력일 뿐입니다. **발주에 쓰이는 1R은 계좌 행에 직접 "
+                         "입력하신 금액**이며, 앱은 주문을 낼 때 잔고를 조회해 금액을 정하지 "
+                         "않습니다. 참고로 자본의 0.4%를 1R로 두면 13년 최악 낙폭(약 42R)이 "
+                         "자본의 약 17%에 해당합니다 — 일반적인 산술이며 권유가 아닙니다. "
+                         "얼마를 걸지는 본인이 판단해 1R 칸에 적어 주십시오.") if ko else
+                        ("This is calculator input only. **The 1R used for orders is the amount you "
+                         "typed into the account row**; the app does not read your balance to decide "
+                         "an amount at order time. For reference, setting 1R to 0.4% of capital puts "
+                         "the 13-year worst drawdown (~42R) at about 17% of capital — that is "
+                         "arithmetic, not a recommendation. Decide the amount yourself and enter it "
+                         "in the 1R field."))
                   ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 8))
 
         def _ok():
@@ -4893,35 +4899,43 @@ class App:
             if bal >= _thr:
                 if _pk not in _alerted:
                     _alerted.add(_pk)
+                    # ⚖️ 2026-08-13: 회원 **잔고로 개인 출금 금액을 계산해 지시하던 문안을 폐지**한다
+                    # (구: "잔고 $X의 절반 ≈$Y를 바로 출금하세요"). 재산 상황을 반영해 처분을
+                    # 권하는 형태라 개별 투자자문에 가장 가까운 지점이었다. 이제 팝업은
+                    # ①회원이 설정한 문턱에 도달했다는 사실 ②그 설정값이 무엇인지 ③판단은 본인 몫
+                    # 만 알린다 - 금액 계산·지시 없음. 프롭사 자격 요건은 프롭사 규칙의 인용이다.
+                    _decide = ("\n\n출금 여부와 금액은 본인이 판단해 결정하십시오. EdgeQuant는 "
+                               "회원이 설정한 알림만 전달하며 자금 처분을 권유하지 않습니다."
+                               if _ko else
+                               "\n\nWhether and how much to withdraw is your decision. EdgeQuant only "
+                               "delivers the reminder you configured and does not advise on "
+                               "disposing of funds.")
                     if _shield:
-                        _msg = ((f"[{lbl}] 방패기 출금 ({pcnt + 1}번째).\n\n잔고가 ${bal:,.0f}로 "
-                                 f"문턱(방패 ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f})에 도달했습니다. 출금 "
-                                 f"자격($150+ 익절일 5일 · 직전 출금 후 순익 플러스)이 차 있다면 "
-                                 f"${_PAYOUT_CHUNK:,.0f}을 출금하고 방패 ${buf:,.0f}은 계좌에 남기세요. "
-                                 f"계정 합산 3발까지는 이 방패가 최악의 연속 손실을 흡수합니다.") if _ko else
-                                (f"[{lbl}] Shield-phase payout (#{pcnt + 1}).\n\nBalance ${bal:,.0f} "
-                                 f"reached the threshold (shield ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f}). "
-                                 f"If you qualify (five $150+ winning days, net positive since the last "
-                                 f"payout), withdraw ${_PAYOUT_CHUNK:,.0f} and keep the ${buf:,.0f} "
-                                 f"shield in the account. Through the login's first three payouts this "
-                                 f"shield absorbs the worst losing streaks."))
+                        _msg = ((f"[{lbl}] 방패기 알림 ({pcnt + 1}번째 출금 구간).\n\n설정하신 문턱"
+                                 f"(방패 ${buf:,.0f} + ${_PAYOUT_CHUNK:,.0f})에 도달했습니다. "
+                                 f"프롭사 출금 자격 요건은 '$150+ 익절일 5일 · 직전 출금 후 순익 "
+                                 f"플러스'입니다(해당 회사 규칙).") if _ko else
+                                (f"[{lbl}] Shield-phase notice (payout window #{pcnt + 1}).\n\n"
+                                 f"The threshold you configured (shield ${buf:,.0f} + "
+                                 f"${_PAYOUT_CHUNK:,.0f}) has been reached. The firm's stated payout "
+                                 f"criteria are five $150+ winning days and net positive since the "
+                                 f"last payout (their rule)."))
                     else:
-                        _half = min(bal * 0.5, _PAYOUT_CHUNK)
-                        _tail = ((" 이번이 5번째 출금이면 이 계정은 라이브 전환 대상이 됩니다 — 남는 "
+                        _tail = ((" 계정 합산 5번째 출금이면 이 계정은 라이브 전환 대상이 됩니다 — 남는 "
                                   "잔고는 Live로 이월되지만 회수가 느립니다.") if pcnt == 4 else "") if _ko \
-                                else ((" This would be the 5th payout — the login becomes a "
-                                       "Live-transition candidate; remaining balance carries into Live "
-                                       "but recovers slowly.") if pcnt == 4 else "")
-                        _msg = ((f"[{lbl}] Fast-Payout ({pcnt + 1}번째 출금 · 라이브 초대 전까지).\n\n"
-                                 f"계정 합산 4발째부터는 방패 없이, 출금 자격($150+ 익절일 5일 · 직전 "
-                                 f"출금 후 순익 플러스)이 차는 순간 잔고 ${bal:,.0f}의 절반"
-                                 f"(≈${_half:,.0f}, 회당 최대 ${_PAYOUT_CHUNK:,.0f})을 바로 출금하세요. "
-                                 f"모으지 않습니다.{_tail}") if _ko else
-                                (f"[{lbl}] Fast-Payout (payout #{pcnt + 1} · until the Live invite).\n\n"
-                                 f"From the login's fourth payout the shield comes off: if you qualify "
-                                 f"(five $150+ winning days, net positive since the last payout), withdraw "
-                                 f"half of the ${bal:,.0f} balance now (≈${_half:,.0f}, cap "
-                                 f"${_PAYOUT_CHUNK:,.0f}). No hoarding.{_tail}"))
+                                else ((" A 5th payout makes the login a Live-transition candidate; "
+                                       "remaining balance carries into Live but recovers slowly.")
+                                      if pcnt == 4 else "")
+                        _msg = ((f"[{lbl}] Fast-Payout 구간 알림 ({pcnt + 1}번째 출금 구간).\n\n"
+                                 f"설정하신 문턱에 도달했습니다. 계정 합산 4발째부터는 방패를 두지 않는 "
+                                 f"설정이며, 프롭사 출금 자격 요건은 '$150+ 익절일 5일 · 직전 출금 후 "
+                                 f"순익 플러스'입니다(해당 회사 규칙).{_tail}") if _ko else
+                                (f"[{lbl}] Fast-Payout notice (payout window #{pcnt + 1}).\n\n"
+                                 f"The threshold you configured has been reached. From the login's "
+                                 f"fourth payout your settings keep no shield. The firm's stated payout "
+                                 f"criteria are five $150+ winning days and net positive since the last "
+                                 f"payout (their rule).{_tail}"))
+                    _msg += _decide
                     self._payout_popup(cfg, lbl, "출금 리마인드" if _ko else "Payout reminder", _msg)
             else:
                 _alerted.discard(_pk)                    # 문턱 아래(출금 직후 등) → 다음 도달 때 재알림
