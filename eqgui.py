@@ -2658,6 +2658,8 @@ class App:
                   ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
         ttk.Label(frm, text=("계좌 자본금 $" if ko else "Account capital $")).grid(row=1, column=0, sticky="w")
         ce = ttk.Entry(frm, width=12); ce.grid(row=1, column=1, sticky="w", padx=(6, 0))
+        _bal_v = tk.StringVar(value=("잔고 조회 중…" if ko else "reading balance…"))
+        ttk.Label(frm, textvariable=_bal_v, foreground="#888").grid(row=1, column=2, sticky="w", padx=(8, 0))
         ttk.Label(frm, text=("비율 %" if ko else "Percent %")).grid(row=2, column=0, sticky="w", pady=(6, 0))
         pe = ttk.Entry(frm, width=8); pe.insert(0, f"{_as_float(pc.get('pct'), 0.4):g}")
         pe.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
@@ -2687,6 +2689,40 @@ class App:
                 res_v.set("→ 자본금·비율을 확인하세요" if ko else "→ check capital / percent")
                 return None
         ce.bind("<KeyRelease>", _calc); pe.bind("<KeyRelease>", _calc)
+
+        # ── 자본금 프리필(대표 2026-08-13 "자본금쯤은 읽어와서 자동으로 채워줌 안 되나"):
+        # 회원이 계산기를 **연 순간에만** 잔고를 조회해 자본금 칸을 미리 채운다. 값은 수정
+        # 가능하고, [1R로 적용]을 눌러야만 발주에 닿는다 - 제안값+회원 확정 구조라 발주 시점
+        # 자동 산출(폐지됨)과 법적으로 다르다(질문지 A0-c의 '제안값 표시' 방식). ──
+        def _prefill():
+            try:
+                bk = self._acct_broker(self._asset, acct)
+                cr = self._creds_of(self._asset, bk)
+                f1 = (cr.get("f1") or "").strip()
+                if not f1:
+                    raise RuntimeError("no creds")
+                f2 = _kc_load(f1) or ""
+                f3 = cr.get("f3", "")
+                is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
+                bal, err = self._fetch_balance_diag(bk, f1, f2, f3,
+                                                    (acct.get("id") or "").strip(), is_fut)
+                if bal is None:
+                    raise RuntimeError(err or "no balance")
+                def _fill(b=float(bal)):
+                    if not win.winfo_exists():
+                        return
+                    _bal_v.set((f"현재 잔고 ${b:,.0f} - 수정 가능" if ko
+                                else f"balance ${b:,.0f} - editable"))
+                    if not ce.get().strip():
+                        ce.insert(0, f"{b:,.0f}")
+                        _calc()
+                self.root.after(0, _fill)
+            except Exception:
+                self.root.after(0, lambda: (_bal_v.set("잔고 조회 실패 - 직접 입력" if ko
+                                                       else "balance unavailable - type it")
+                                            if win.winfo_exists() else None))
+        import threading as _th2
+        _th2.Thread(target=_prefill, daemon=True).start()
 
         def _apply():
             r = _calc()
