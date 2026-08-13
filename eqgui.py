@@ -407,13 +407,15 @@ T = {
                         "신호의 방향·손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리. "
                         "세션 마감 자동 청산을 원하지 않으면 마감 전에 [⏹ 전체 정지]를 누르세요 — 포지션은 "
                         "그대로 유지되고 앱은 어떤 주문도 내지 않습니다(앱을 꺼도 같습니다. 브로커에 "
-                        "걸어둔 손절 주문은 계좌에 남습니다).",
+                        "걸어둔 손절 주문은 계좌에 남습니다). 그 순간부터 그 포지션의 청산은 본인 "
+                        "몫입니다 — 다시 시작해도 지나간 세션의 청산을 소급 실행하지 않습니다.",
                   "en": "Starts every checked asset at once after connection tests (one failure = nothing "
                         "starts). Auto-enters with the signal's direction & stop, auto-closes at session "
                         "end. Positions are managed independently per symbol. If you do not want the "
                         "session-end auto-close, press [⏹ Stop all] before the close — positions are "
                         "kept and the app places no orders (quitting the app works too; broker-side "
-                        "stop orders remain on your account)."},
+                        "stop orders remain on your account). From that moment closing that position "
+                        "is on you — restarting does not retroactively run a missed session close."},
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (auto)"},
