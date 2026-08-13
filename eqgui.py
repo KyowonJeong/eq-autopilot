@@ -2825,13 +2825,13 @@ class App:
             _bn = ("Topstep" if _bk == "projectx" else "Lucid" if _bk == "nt8" else _bk)
             ttk.Button(frm, text=(f"시뮬 기준값 채우기 ({_bn})" if ko
                                   else f"Fill simulation defaults ({_bn})"),
-                       command=_fill_preset).grid(row=9, column=0, columnspan=2,
-                                                  sticky="w", pady=(0, 8))
-            ttk.Label(frm, foreground="#888",
+                       command=_fill_preset).grid(row=9, column=0, columnspan=4,
+                                                  sticky="w", pady=(0, 2))
+            ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
                       text=("홈페이지 시뮬레이션과 같은 값입니다. 눌러도 저장 전엔 반영되지 않습니다."
                             if ko else
                             "Same values as the website simulation. Nothing applies until you save.")
-                      ).grid(row=9, column=2, columnspan=2, sticky="w", pady=(0, 8))
+                      ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         def _ok():
             newp = {"on": bool(on_v.get()), "type": ty_v.get()}
@@ -2858,8 +2858,8 @@ class App:
             self._save_acct_widgets()
             win.destroy()
 
-        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=9, column=1)
-        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=9, column=2)
+        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=11, column=1, pady=(4, 0))
+        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=11, column=2, pady=(4, 0))
 
     def _refresh_live_panel(self):
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
