@@ -2851,8 +2851,11 @@ class App:
         self._acct_widgets[idx]["pct_btn"] = cb
         # 수동 모드 폐지(대표 2026-08-11 "수동 기능 없애" - 그건 Operator의 사용법이지
         # Autopilot 행의 스위치가 아니다). 로더도 manual=False 강제.
-        if pr.get("on") or pc.get("on"):
-            r_e.config(state="disabled")               # 자동 사이징 중엔 수동 1R 비활성
+        # 1R 입력칸은 프롭 모드에서만 잠근다(프롭은 단계별 상수를 쓰므로). 자본% 모드는
+        # 2026-08-13 잔고 연동 폐지로 **회원이 확정한 이 값**이 곧 발주 1R이 됐다 —
+        # 잠가두면 회원이 못 고치는 낡은 상수로 발주된다(그 수리에서 딸려온 결함).
+        if pr.get("on"):
+            r_e.config(state="disabled")
         # 계좌 선택 콤보(대표 2026-08-11 "행에서 브로커 고르면 가용 목록"): 값 목록 = 이 행
         # 브로커의 가용 계좌. 선택하면 전체 ID를 저장하고 표시는 끝자리만(대표 "끝숫자만").
         _rbk = self._acct_broker(self._asset, acct)
