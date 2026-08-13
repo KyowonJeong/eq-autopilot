@@ -404,10 +404,14 @@ T = {
                      "en": "1R = typical risk per trade · scales up to 3R (maximum risk) with signal "
                            "confidence — budget 3× your 1R."},
     "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
-                        "신호의 방향·손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리.",
+                        "신호의 방향·손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리. "
+                        "세션 마감 자동 청산을 원하지 않으면 마감 전에 앱을 끄면 됩니다 — 꺼져 있는 동안 "
+                        "앱은 어떤 주문도 내지 않습니다(단, 브로커에 걸어둔 손절 주문은 계좌에 남습니다).",
                   "en": "Starts every checked asset at once after connection tests (one failure = nothing "
                         "starts). Auto-enters with the signal's direction & stop, auto-closes at session "
-                        "end. Positions are managed independently per symbol."},
+                        "end. Positions are managed independently per symbol. If you do not want the "
+                        "session-end auto-close, simply quit the app before the close — while it is off "
+                        "the app places no orders (broker-side stop orders remain on your account)."},
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (auto)"},
