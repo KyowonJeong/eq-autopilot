@@ -2806,22 +2806,12 @@ class App:
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("펀디드 1R은 전 구간 $300 고정, 출금은 두 단계입니다(빅실드). "
-                         "방패기(계정 합산 1~3발): 방패 $6,000을 계좌에 남기고 잔고 $12,000 도달 "
-                         "시마다 $6,000 출금. Fast-Payout기(합산 4~5발, 라이브 초대 전): 출금 "
-                         "자격($150+ 익절일 5일·직전 출금 후 순익 플러스)이 차는 순간 잔고의 "
-                         "절반을 즉시 출금(회당 $6,000 한도). 합산 5발이면 이 계정은 라이브 전환 "
-                         "대상 — 새 계정으로 교체합니다. "
-                         "출금 횟수는 출금 팝업에서 '예'로 자동 +1 되며 여기서 수동 조정도 됩니다.") if ko else
-                        ("Funded 1R is a flat $300 throughout, and payouts run in two phases "
-                         "(big shield). Shield phase (login payouts 1-3): keep a $6,000 shield in "
-                         "the account and withdraw $6,000 each time the balance reaches $12,000. "
-                         "Fast-Payout phase (payouts 4-5, until the Live invite): the moment you "
-                         "qualify (five $150+ winning days, net positive since the last payout), "
-                         "withdraw half the balance immediately ($6,000/payout cap). At five "
-                         "payouts the login becomes a Live-transition candidate — rotate to a "
-                         "fresh login. The count auto-increments via the payout popup and can be "
-                         "adjusted here."))
+                  text=(("출금 문턱에 닿으면 앱이 알려주고, 출금 횟수는 팝업에서 '예'를 누르면 "
+                         "+1 됩니다(여기서 수동 조정도 가능).\n운용 방식 전체 설명: "
+                         "홈페이지 → 자본 운용 → 프롭 운용 원칙") if ko else
+                        ("The app notifies you at payout thresholds; the count increments when "
+                         "you press Yes in the popup (adjustable here too).\nFull playbook: "
+                         "website → Capital → Prop playbook."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
 
         def _ok():
