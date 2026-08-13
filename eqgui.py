@@ -3046,10 +3046,14 @@ class App:
                         self.root.after(0, self._refresh_next_action)
                     except Exception:
                         pass
-                    # 성공 확인 = 잔고·1R 팝업(별도 확인 팝업 대신) — 이 자산 전 계좌 조회
-                    self._run_1r_preview([asset], (f"{asset} · 저장·연결 OK — 잔고 & 1R"
-                                                   if self.lang == "ko"
-                                                   else f"{asset} · saved & connected — balance & 1R"))
+                    # 잔고 조회는 **회원이 요청할 때만**(2026-08-13). 저장·연결만 했는데 잔고를
+                    # 자동으로 끌어와 보여주면, 묻지도 않은 재산 조회를 앱이 먼저 하는 셈이다.
+                    # 잔고·1R 확인은 자산 탭의 [잔고 & 1R] 버튼으로 회원이 직접 누른다.
+                    self.root.after(0, lambda a=asset: messagebox.showinfo(
+                        "EQ", (f"{a} · 저장·연결 OK.\n\n계좌 잔고와 1R을 확인하려면 "
+                               f"[잔고 & 1R] 버튼을 눌러 주세요." if self.lang == "ko"
+                               else f"{a} · saved & connected.\n\nUse the [Balance & 1R] button "
+                                    f"to check balance and 1R.")))
                 self._apply_gating()
                 self._refresh_live_panel()
             self.root.after(0, done)
@@ -4556,35 +4560,9 @@ class App:
         모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
-    def _acct_balance(self, cfg):
-        """계좌 잔고($) 통합 조회 — 선물(account_balance) / 크립토(available_usdt).
-        성공 시 (self._bal_cache에 캐시). 24h 내 마지막 성공값 폴백. 실패·무값 시 None."""
-        import time as _t
-        b = _build_broker(cfg["broker"], cfg["f1"], cfg["f2"], cfg["f3"],
-                          [cfg["acct"]] if cfg.get("acct") else [])
-        bal = None
-        try:
-            if hasattr(b, "account_balance"):
-                bal = b.account_balance(cfg.get("acct"))
-            elif hasattr(b, "available_usdt"):
-                bal = b.available_usdt()
-        except Exception:
-            bal = None
-        ck = (cfg["broker"], cfg.get("acct") or cfg.get("f1"))
-        cache = getattr(self, "_bal_cache", None)
-        if cache is None:
-            cache = self._bal_cache = {}
-        if bal is not None and bal > 0:
-            cache[ck] = (float(bal), _t.time())
-            return float(bal)
-        hit = cache.get(ck)
-        if hit and (_t.time() - hit[1]) <= 86400:
-            return hit[0]                               # 24h 내 마지막 성공값 폴백
-        return None
-
     def _fetch_balance_diag(self, bk, f1, f2, f3, aid, is_fut):
         """잔고 직접 조회 + 실패 원인 표면화. 반환 (bal|None, err|None).
-        _acct_balance의 bal>0 게이트·캐시를 우회 — 0/저잔고도 그대로. 크립토 None이면
+        (구 _acct_balance 캐시는 자본% 폐지와 함께 제거) 0·저잔고도 그대로 반환. 크립토 None이면
         authenticate로 인증 실패인지 필드 없음인지 구분해 로그로 드러낸다(대표 2026-07-26)."""
         try:
             b = _build_broker(bk, f1, f2, f3, [aid] if aid else [])
@@ -4756,23 +4734,6 @@ class App:
                                 else f"Close-all done — {n_closed} positions flattened"))
         import threading as _th
         _th.Thread(target=w, daemon=True).start()
-
-    def _pct_one_r(self, pc, cfg, lbl):
-        """⚠️ **발주 경로에서 호출 금지**(2026-08-13). 잔고 × pct% 산술 — 이제 오직 회원이
-        설정 화면에서 '계산' 버튼을 눌렀을 때의 **제안값 표시·미리보기 전용**이다. 회원이 그
-        값을 보고 확인해 고정 1R로 저장하면, 발주는 그 회원 확정 상수만 읽는다.
-        이유: 잔고(재산 상황)를 입력으로 위험 금액을 정하는 자동화는 개별 투자자문
-        (KR 자본시장법 개별성 / DE Anlageberatung)에 닿는다. 산술 도구는 남기되 결정은
-        회원이 한다 - 이 분리가 이 함수의 존재 이유다.
-        ※ 선물 '계약수 0.75 미만 진입금지'는 sizing.compute_size에서 처리."""
-        bal = self._acct_balance(cfg)
-        if bal is None:
-            return None
-        pct = _as_float(pc.get("pct"), 0.4)
-        floor = _as_float(pc.get("floor"), 200.0)
-        r = max(bal * pct / 100.0, floor)
-        self.log(f"   ⚙ [{lbl}] 자본 비례 1R=${r:,.0f} (잔고 ${bal:,.0f} × {pct:g}%, 최소 ${floor:g})")
-        return r
 
     def _bump_payout(self, broker, aid, lbl):
         """출금 완료 기록(+1) — 같은 (브로커, 계좌ID)를 쓰는 전 자산의 계좌(NQ·GC 공유) +
