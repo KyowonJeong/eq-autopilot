@@ -5044,7 +5044,15 @@ class App:
         size = _sz["size"]; sym = _sz["symbol"]
         _legs = _sz.get("legs") or [(sym, size)]
         if size <= 0:
-            self.log(f"   ⏭ [{lbl}] 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.")
+            # 왜 쉬는지 한눈에(대표 2026-08-13): 최소 1계약 리스크가 설정 1R의 몇 배인지 명시.
+            try:
+                _c1 = float(_sz.get("risk_per_contract") or 0)
+                _ratio = (_c1 / _eff_r) if _eff_r > 0 else 0
+                self.log(f"   ⏭ [{lbl}] 진입 안 함 — 오늘 손절거리 {_sz['risk_pts']}pt라 최소 "
+                         f"1계약 리스크가 ${_c1:,.0f} = 설정 1R(${_eff_r:g})의 {_ratio:.1f}배. "
+                         f"과대 사이징 방지 게이트(0.75계약 미만)가 막았습니다.")
+            except Exception:
+                self.log(f"   ⏭ [{lbl}] 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.")
             return
         self.log(f"   [{lbl}] {asset} {direction} x{size} ({sym}) · 손절 {stop} · "
                  f"1R=${one_r:g}×{mult:.2f}=${_eff_r:g}(거리 {_sz['risk_pts']}) · "
