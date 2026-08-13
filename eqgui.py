@@ -2762,19 +2762,12 @@ class App:
         except Exception:
             return
         pr = dict(_PROP_DEFAULTS); pr.update(acct.get("prop") or {})
-        # 브로커 자동 감지 프리셋(대표 2026-08-11): 값이 기본값 그대로인 계좌만 그 브로커의
-        # 정본으로 스왑(커스텀 값은 불변). Lucid는 평가300/펀디드150·방패0, 라이브=잔고2% 권장.
+        # 프리셋은 몰래 스왑하지 않는다(2026-08-13, 대표 "시뮬 결과 액수 사용 버튼 어때 -
+        # 그건 자기가 누르는 거니깐"). 아래 [시뮬 기준값 채우기] 버튼이 유일한 적용 경로.
         try:
             _bk = (acct.get("broker") or self._acfg[self._asset]["broker"] or "").lower()
-            _ps = _prop_preset(_bk)
-            if _ps and all(float(pr.get(k, 0)) == _PROP_DEFAULTS[k] for k in
-                           ("r_test", "r_buffer", "r_steady", "buffer")):
-                pr.update(_ps)
-                if _bk == "nt8":
-                    self.log("프롭 프리셋: Lucid 정본 적용(평가 $300 / 펀디드 $150, 방패 없음 - "
-                             "라이브 락 후엔 '잔고 %' 모드 2%를 권장)")
         except Exception:
-            pass
+            _bk = ""
         win = tk.Toplevel(self.root)
         win.title(("프롭 자동 사이징 — " + (acct.get("label") or "")) if ko
                   else ("Prop auto-sizing — " + (acct.get("label") or "")))
@@ -2814,6 +2807,32 @@ class App:
                          "website → Capital → Prop playbook."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
 
+        # ── [시뮬 기준값 채우기] — 홈피 시뮬레이션이 쓰는 브로커별 정본 상수를 회원이
+        #    버튼으로 불러온다(전 회원 동일 공개 상수 + 회원 클릭 = 개인화 아님). ──
+        _ps = _prop_preset(_bk)
+        _ps_hidden = {}                       # 다이얼로그에 없는 필드(buffer 등)는 저장 시 반영
+
+        def _fill_preset():
+            if not _ps:
+                return
+            for k, e in ents.items():
+                if k in _ps:
+                    e.delete(0, "end"); e.insert(0, f"{_ps[k]:g}")
+            for k in ("r_buffer", "buffer"):
+                if k in _ps:
+                    _ps_hidden[k] = _ps[k]
+        if _ps:
+            _bn = ("Topstep" if _bk == "projectx" else "Lucid" if _bk == "nt8" else _bk)
+            ttk.Button(frm, text=(f"시뮬 기준값 채우기 ({_bn})" if ko
+                                  else f"Fill simulation defaults ({_bn})"),
+                       command=_fill_preset).grid(row=9, column=0, columnspan=2,
+                                                  sticky="w", pady=(0, 8))
+            ttk.Label(frm, foreground="#888",
+                      text=("홈페이지 시뮬레이션과 같은 값입니다. 눌러도 저장 전엔 반영되지 않습니다."
+                            if ko else
+                            "Same values as the website simulation. Nothing applies until you save.")
+                      ).grid(row=9, column=2, columnspan=2, sticky="w", pady=(0, 8))
+
         def _ok():
             newp = {"on": bool(on_v.get()), "type": ty_v.get()}
             for k in ents:
@@ -2822,7 +2841,7 @@ class App:
             # 다이얼로그에서 뺀 레거시 필드(r_buffer·buffer)는 기존 저장값 유지 — 여기서
             # 참조하다 KeyError로 저장이 조용히 죽던 사고 수리(대표 2026-07-28 "저장 안 됨").
             for k in ("r_buffer", "buffer"):
-                newp[k] = _as_float(pr.get(k), _PROP_DEFAULTS[k])
+                newp[k] = _as_float(_ps_hidden.get(k, pr.get(k)), _PROP_DEFAULTS[k])
             if newp["on"] and any(newp[k] <= 0 for k in ("r_test", "r_steady")):
                 messagebox.showwarning("EQ", "1R 값은 0보다 커야 합니다." if ko
                                        else "1R values must be > 0.")
