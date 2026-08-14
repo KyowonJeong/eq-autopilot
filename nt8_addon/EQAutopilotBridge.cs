@@ -122,8 +122,44 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                 }
             }
+            // ── 체결 이력(2026-08-14): 공개 트랙레코드가 브로커 체결에서 생성되는데 NT8만
+            //    조회 경로가 없어 루시드 거래가 기록에서 통째로 빠졌다. 상태 push에 얹는다
+            //    (별도 엔드포인트 불필요 - 이미 주기적으로 도는 경로).
+            //    NinjaTrader는 Account.Executions에 세션 체결을 들고 있다. 앱이 90일 창으로
+            //    합산하므로 여기서는 있는 그대로 넘기고, 중복은 앱·서버 tid 멱등이 흡수한다.
+            var executions = new List<object>();
+            try
+            {
+                lock (Account.All)
+                {
+                    foreach (Account a in Account.All)
+                    {
+                        if (a.ConnectionStatus != ConnectionStatus.Connected) continue;
+                        foreach (Execution ex in a.Executions)
+                        {
+                            if (ex == null || ex.Instrument == null) continue;
+                            executions.Add(new Dictionary<string, object> {
+                                { "account", a.Name },
+                                { "exec_id", ex.ExecutionId },
+                                { "instrument", ex.Instrument.FullName },
+                                { "side", ex.MarketPosition == MarketPosition.Long ? "BUY" : "SELL" },
+                                { "qty", ex.Quantity },
+                                { "price", ex.Price },
+                                { "time", ex.Time.ToUniversalTime()
+                                            .ToString("yyyy-MM-ddTHH:mm:ssZ") },
+                                { "commission", ex.Commission },
+                                { "pnl", ex.Position != null ? ex.Position.GetUnrealizedProfitLoss(
+                                            PerformanceUnit.Currency, ex.Price) : 0.0 },
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception) { /* 체결 조회 실패는 상태 push 전체를 막지 않는다 */ }
+
             var body = new Dictionary<string, object> {
                 { "accounts", accounts }, { "positions", positions },
+                { "executions", executions },
                 { "ts", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
             };
             await PostAsync("/v1/state", body);

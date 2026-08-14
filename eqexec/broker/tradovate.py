@@ -123,6 +123,51 @@ class TradovateBroker(BrokerAdapter):
                 return a
         return None
 
+    def closed_fills(self, start_ms: int) -> list[dict]:
+        """실현손익 체결 목록(트랙레코드 푸시용). ProjectX·NT8 어댑터와 같은 계약.
+
+        Tradovate는 /fill/list(체결)와 /order/list(주문)를 주지만 반턴별 실현손익은
+        **cashBalance 로그**가 아니라 fillPair(진입·청산 짝)에 있다. 여기서는
+        /fillPair/list로 짝지어진 것만 취해 청산 시각·손익을 만든다.
+
+        ⚠️ 실키 미검증(#36) - 계좌 개설 후 첫 동기화에서 형식 대조 필요. 실패 시 예외를
+        올리면 호출측이 '체결 조회 실패'로 로그하고 그 브로커만 건너뛴다(다른 브로커 무영향).
+        """
+        from datetime import datetime, timezone
+        out = []
+        for a in self._accounts():
+            try:
+                pairs = self._get("/fillPair/list") or []
+            except Exception:
+                continue
+            for fp in pairs:
+                try:
+                    if int(fp.get("accountId") or 0) != int(a.get("id") or -1):
+                        continue
+                    pnl = fp.get("realizedPnl")
+                    if pnl is None:
+                        continue                       # 아직 안 닫힌 짝
+                    ts = str(fp.get("timestamp") or fp.get("bought") or "")
+                    ts_ms = int(datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                .astimezone(timezone.utc).timestamp() * 1000)
+                    if ts_ms < int(start_ms):
+                        continue
+                    _qty = int(fp.get("qty") or 0)
+                    out.append({
+                        "tid": str(fp.get("id") or ""),
+                        "ts_ms": ts_ms,
+                        "symbol": self._contract_symbol(fp.get("contractId")),
+                        "pnl": float(pnl),
+                        # active side가 buy면 롱을 청산한 것이 아니라 롱을 연 짝이다 →
+                        # fillPair는 진입 방향을 그대로 준다(buy=LONG).
+                        "direction": "LONG" if _qty > 0 else "SHORT",
+                        "acct": str(a.get("id") or ""),
+                        "acct_name": str(a.get("name") or ""),
+                    })
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def account_balance(self, acct):
         """계좌 현금 잔고 — POST /cashBalance/getcashbalancesnapshot {accountId}.
         VERIFY: 응답 필드(totalCashValue) 데모 확인. 실패 시 None(호출측 폴백 규약)."""

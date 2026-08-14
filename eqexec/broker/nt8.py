@@ -348,6 +348,48 @@ class NT8Broker(BrokerAdapter):
                "account": str(account_id), "instrument": sym}
         return self._enqueue_and_wait(cmd)
 
+    def closed_fills(self, start_ms: int) -> list[dict]:
+        """실현손익 체결 목록(트랙레코드 푸시용). ProjectX 어댑터와 같은 계약.
+
+        애드온이 상태 push(/v1/state)에 실어 보낸 executions를 쓴다 - NT8은 조회형 API가
+        없어 별도 엔드포인트 대신 이미 도는 경로에 얹었다(2026-08-14). 종전에는 이 메서드가
+        아예 없어 트랙레코드에서 **루시드 거래가 통째로 빠졌다**(호출측이 AttributeError를
+        받고 '체결 이력 미지원'으로 건너뜀).
+
+        NT8 Execution은 반턴(half-turn) 단위라 진입/청산이 따로 온다. 청산 반턴만 남기려면
+        pnl이 실린 것만 취한다 - 애드온이 진입 반턴에는 0을 싣는다.
+        """
+        st = (self._state.last_state if self._state else {}) or {}
+        rows = st.get("executions") or []
+        out = []
+        for e in rows:
+            try:
+                if not isinstance(e, dict):
+                    continue
+                pnl = float(e.get("pnl") or 0.0)
+                if pnl == 0.0:                       # 진입 반턴 - 실현손익 없음
+                    continue
+                ts = str(e.get("time") or "")
+                from datetime import datetime, timezone
+                ts_ms = int(datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            .replace(tzinfo=timezone.utc).timestamp() * 1000)
+                if ts_ms < int(start_ms):
+                    continue
+                # 청산 side의 반대가 보유했던 방향(sell로 닫았으면 LONG이었다).
+                _side = str(e.get("side") or "").upper()
+                out.append({
+                    "tid": str(e.get("exec_id") or ""),
+                    "ts_ms": ts_ms,
+                    "symbol": str(e.get("instrument") or ""),      # 예: "MGC 12-26"
+                    "pnl": pnl - float(e.get("commission") or 0.0),
+                    "direction": "LONG" if _side == "SELL" else "SHORT",
+                    "acct": str(e.get("account") or ""),
+                    "acct_name": str(e.get("account") or ""),
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
         planned = self.list_open_positions()
         res = FlattenResult(dry_run=dry_run, planned=planned)
