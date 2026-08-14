@@ -431,10 +431,10 @@ T = {
     "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     "live_stopall": {"ko": "⏹ 전체 정지 (포지션 유지)", "en": "⏹ Stop all (positions kept)"},
-    "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 신호 확신도에 따라 최대 3R"
+    "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 시장 국면의 기대값에 따라 최대 3R"
                            "(maximum risk)까지 — 계좌 여유는 1R의 3배로 잡으세요.",
-                     "en": "1R = typical risk per trade · scales up to 3R (maximum risk) with signal "
-                           "confidence — budget 3× your 1R."},
+                     "en": "1R = typical risk per trade · scales up to 3R (maximum risk) with the "
+                           "expectancy of the market regime — budget 3× your 1R."},
     "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
                         "신호의 방향·손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리. "
                         "세션 마감 자동 청산을 원하지 않으면 마감 전에 [⏹ 전체 정지]를 누르세요 — 포지션은 "
@@ -464,7 +464,7 @@ T = {
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sig_note": {"ko": "※ 신호의 방향·손절가로 자동 진입하고, 계약 수는 위 1R($ 리스크)로 앱이 자동 계산합니다 "
-                       "(신호에 계약 수 없음). ⚠️ EdgeQuant는 신호 확신도에 따라 포지션을 키워 "
+                       "(신호에 계약 수 없음). ⚠️ EdgeQuant는 시장 국면의 기대값에 따라 포지션을 키워 "
                        "거래당 최대 3R까지 리스크를 감수합니다 — 계좌 여유는 1R의 3배 기준으로 잡으세요. "
                        "자산은 신호의 종목으로 자동 판별(NQ→MNQ·GC→MGC·BTC→BTCUSDT.P). "
                        "'사용 계좌'만 고르면 됩니다. 포지션은 종목별로 독립 관리됩니다 — 같은 종목은 기존 "
@@ -472,7 +472,7 @@ T = {
                        "종목은 서로 영향을 주지 않으므로 NQ와 GC도 같은 계좌에서 동시에 독립 운용할 수 있습니다.",
                  "en": "※ Enters automatically using the signal's direction and stop; the contract count is computed "
                        "by the app from your 1R above (the signal carries no contract count). ⚠️ EdgeQuant scales "
-                       "position size with signal confidence — up to 3R risk per trade; budget your account for "
+                       "position size with the expectancy of the market regime — up to 3R risk per trade; budget your account for "
                        "3× your 1R. The instrument is detected from the signal (NQ→MNQ · GC→MGC · BTC→BTCUSDT.P). "
                        "Just pick the account. Positions are managed independently per symbol — the same "
                        "symbol re-enters only after the previous position is confirmed fully closed (no doubling), "
