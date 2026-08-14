@@ -64,6 +64,38 @@ APP_DIR = _app_dir()
 os.makedirs(APP_DIR, exist_ok=True)
 CFG_PATH = os.path.join(APP_DIR, "config.yaml")
 
+
+def _machine_id() -> str:
+    """이 설치본의 기기 식별자(설치별 난수 12자). 없으면 만들어 파일에 남긴다.
+
+    왜 필요한가(대표 2026-08-14): 한 회원이 여러 머신에서 돌리면(맥=Topstep·크립토 /
+    윈도우=NT8·Lucid) 서버가 자산당 칸을 하나만 두고 있어 **나중 보고가 앞 보고를
+    덮었다** — GC 실제 7계약(TS 5 + Lucid 2)이 5로 기록된 실사고. 보고에 이 값을 실어
+    서버가 기기별로 나눠 담고 합산하게 한다.
+
+    하드웨어 지문(MAC·시리얼)이 아니라 **난수**다. 기기를 특정할 수 없고 설정 폴더를
+    지우면 새로 생긴다 — 합산에 필요한 최소한만 담는다.
+    """
+    _p = os.path.join(APP_DIR, ".machine_id")
+    try:
+        with open(_p) as f:
+            v = "".join(ch for ch in f.read().strip() if ch.isalnum())[:16]
+        if v:
+            return v
+    except Exception:
+        pass
+    import uuid
+    v = uuid.uuid4().hex[:12]
+    try:
+        with open(_p, "w") as f:
+            f.write(v)
+    except Exception:
+        pass
+    return v
+
+
+MACHINE_ID = _machine_id()
+
 # ── 앱 로그 파일 영속화(대표 2026-07-15): 화면 로그를 일자별 파일에도 기록(타임스탬프 부여).
 #    앱을 닫아도 수신·체결 지연 기록이 남아 사후 감사 가능. 30일 지난 파일은 시작 시 정리. ──
 LOG_DIR = os.path.join(APP_DIR, "logs")
@@ -4189,7 +4221,11 @@ class App:
                 # 회원마다 다른(서버 미지) baseline으로 나눠 역산·상호비교를 막는다(대표 2026-07-26).
                 # 크기 안 바꾼 회원은 scale=1.0 유지, 자본 키운 회원만 배수가 커진다.
                 _bsum = sum(v.get("base", {}).values()) or _rsum
-                trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else ""), "date": d,
+                # tid에 기기를 넣는다(2026-08-14): 종전 'agg-날짜-자산'은 머신 구분이 없어,
+                # 한 회원이 두 머신에서 같은 날 같은 자산을 거래하면 서버 병합 키가 겹쳐
+                # 나중 푸시가 앞 푸시를 덮었다(맥=Topstep / 윈도우=Lucid 구성에서 실제 발생).
+                trades.append({"tid": f"agg-{d}-{a}" + (f"-{s}" if s else "") + f"-{MACHINE_ID}",
+                               "date": d,
                                "instrument": a, "direction": v["direction"],
                                # r = 손익비 = 그날 손익 ÷ 그날 실제 1R 합(사이징 무관, 절대 비교 가능).
                                # cash_rel = r과 동일 계산이나 공개 페이지는 이를 '누적한 뒤' 곡선의
@@ -4414,7 +4450,7 @@ class App:
                         _d = (self._fill_acc or {}).pop(str(asset), None)
                     if not _d:
                         return
-                    body = {"tok_id": tid, "inst": str(asset),
+                    body = {"tok_id": tid, "inst": str(asset), "mid": MACHINE_ID,
                             "accounts": int(_d.get("n") or 0)}
                     if str(asset) == "BTC":
                         body["qty_btc"] = round(float(_d.get("coin") or 0), 6)
