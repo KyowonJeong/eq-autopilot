@@ -2622,7 +2622,12 @@ class App:
         "덜 됐다"고 말해, 한 자산으로 시작한 회원에게 계속 미완성 신호를 준다(대표 2026-08-15).
         완결성 = 크레덴셜 f1 · 켜진 계좌 최소 1개 · (acct 브로커면)계좌ID · 1R>0.
         계좌별 브로커(대표 2026-08-09): 라벨·키·연결 판정을 켜진 계좌들의 브로커 전체로."""
-        if not self._acfg.get(asset, {}).get("include", True):
+        # ⚠ 무장 판정이 먼저다. 체크를 풀어도 이미 무장된 자산은 그 세션이 끝날 때까지 계속
+        # 돈다(_on_asset_toggle은 include만 바꾸고 해제하지 않는다). armed를 안 보고 숨기면
+        # **실주문이 나가는 자산이 화면에서 사라진다** — 미관을 안전과 맞바꾸는 것이다.
+        _armed_now = any(k[0] == asset for k in getattr(self, "_sig_accts", {})) or \
+                     any(k[0] == asset for k in getattr(self, "_auto_accts", {}))
+        if not self._acfg.get(asset, {}).get("include", True) and not _armed_now:
             return (("— 사용 안 함 (언제든 추가할 수 있습니다)" if self.lang == "ko"
                      else "— not in use (add it any time)"), "#6b7280")
         active = self._active_accts(asset)
