@@ -692,8 +692,13 @@ def _load():
         out["cfg_open"] = bool(d.get("cfg_open"))
     if "acct_open" in d:
         out["acct_open"] = bool(d.get("acct_open"))
-    _p = d.get("profile") or {}
-    out["profile"] = {"public": bool(_p.get("public")), "handle": _p.get("handle", "")}
+    # profile은 저장은 통째로 하는데(_save_cfg) 로드에서 public/handle만 남겨 나머지를 버리고
+    # 있었다 — demo_runs가 재시작마다 증발해 "모의 이력 없음" 경고가 매번 떴다.
+    # 알 수 없는 키를 보존한다(2026-08-15). 월 1회 실행 확인 시각(consent_at)도 여기 산다.
+    _p = dict(d.get("profile") or {})
+    _p["public"] = bool(_p.get("public"))
+    _p["handle"] = _p.get("handle", "")
+    out["profile"] = _p
     return out
 
 
@@ -3303,6 +3308,74 @@ class App:
         self._set_auto_ind(bool(self._auto_accts), sorted({k[0] for k in self._auto_accts}))
         self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
 
+    # ── 월 1회 실행 확인(대표 2026-08-15) ────────────────────────────────
+    # 자동 실행은 켜두면 회원이 잊어도 계속 돈다. 그게 이 도구의 장점이자 위험이라
+    # 30일마다 "계속할지"를 다시 묻는다. 무응답은 **새 진입만** 막고 자동청산은 계속한다
+    # (fail-closed 전체정지 사고 2026-07-14의 교훈 - 안전한 방향으로만 실패시킨다).
+    CONSENT_DAYS = 30
+
+    def _consent_left(self):
+        """다음 확인까지 남은 일수. 확인 이력이 없으면 0(=지금 물어야 함)."""
+        import time as _t
+        ts = (self._profile or {}).get("consent_at")
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            return 0.0
+        return self.CONSENT_DAYS - (_t.time() - ts) / 86400.0
+
+    def _consent_summary(self):
+        """지난 30일 요약 — 이 앱이 이 계좌에서 무엇을 했는지. 없으면 빈 문자열."""
+        # 로컬 원장(.eqtrades.json)에는 **진입 기록만** 있고 실현 R은 없다(브로커 조회가 별도).
+        # 다이얼로그에서 네트워크를 타면 느리고 실패하므로, 즉시 확실한 것만 보여준다.
+        import time as _t
+        try:
+            since_ms = (_t.time() - self.CONSENT_DAYS * 86400) * 1000
+            rows = [r for r in _ledger_load() if (r.get("ts_ms") or 0) >= since_ms]
+        except Exception:
+            rows = []
+        per = {}
+        for r in rows:
+            a = str(r.get("asset") or "?")
+            per[a] = per.get(a, 0) + 1
+        incl = [a for a in _ASSETS if self._acfg.get(a, {}).get("include", True)]
+        brk = " · ".join(f"{a} {c}" for a, c in sorted(per.items())) or ("없음" if self.lang == "ko" else "none")
+        if self.lang == "ko":
+            return (f"지난 30일 동안 이 앱이 대표 계좌에서 낸 진입\n\n"
+                    f"    합계      {len(rows)}건\n"
+                    f"    자산별    {brk}\n"
+                    f"    실행 대상  {', '.join(incl) or '없음'}\n")
+        return (f"Entries this app placed in your account over the last 30 days:\n\n"
+                f"    total     {len(rows)}\n"
+                f"    by market {brk}\n"
+                f"    enabled   {', '.join(incl) or 'none'}\n")
+
+    def _consent_ask(self):
+        """만료됐으면 묻는다. 계속=True(시각 갱신) / 중단·닫기=False."""
+        import time as _t
+        if self._consent_left() > 0:
+            return True
+        body = (self._consent_summary() +
+                ("\n이대로 계속 실행할까요?\n\n"
+                 "자동 실행은 켜두면 잊어도 계속 돕니다. 한 달 사이 계좌도 생각도 달라질 수 있어서,\n"
+                 "30일마다 여전히 원하시는지 확인합니다.\n\n"
+                 "* [아니오]를 누르거나 답하지 않으면 새 진입만 멈춥니다.\n"
+                 "  이미 열려 있는 포지션의 자동청산은 계속됩니다."
+                 if self.lang == "ko" else
+                 "\nKeep running as is?\n\n"
+                 "Automated execution keeps going even when you forget it is on. Accounts and\n"
+                 "intentions change over a month, so we ask every 30 days whether you still want this.\n\n"
+                 "* Choosing No, or not answering, stops new entries only.\n"
+                 "  Auto-close on positions already open continues."))
+        ok = messagebox.askyesno(("실행 계속 확인" if self.lang == "ko" else "Confirm continued execution"),
+                                 body, default="no")
+        if ok:
+            self._profile = {**(self._profile or {}), "consent_at": _t.time()}
+            self._save_cfg()
+            self.log("   ✅ 실행 확인 갱신 — 30일 뒤 다시 여쭙습니다."
+                     if self.lang == "ko" else "   ✅ Consent renewed - we will ask again in 30 days.")
+        return bool(ok)
+
     def _master_start(self, dry: bool = True):
         """[라이브 시작]/[모의 시작] — 실행 체크된 자산을 연결 테스트(자산 브로커, 같은 브로커는
         중복 테스트 방지), 전부 통과 시에만 각 자산의 켜진 계좌를 일괄 무장(하나라도 실패 시
@@ -3312,6 +3385,10 @@ class App:
                                    "서버가 모의 모드를 강제 중입니다 — 지금은 모의 시작만 가능합니다."
                                    if self.lang == "ko" else
                                    "Server is forcing dry-run; only demo start is available."); return
+        if not dry and not self._consent_ask():      # 월 1회 확인 - 실거래에만
+            self.log("   ⏸ 실행 확인이 없어 라이브 시작을 중단했습니다."
+                     if self.lang == "ko" else "   ⏸ Live start cancelled - no confirmation.")
+            return
         self.live_dry.set(1 if dry else 0)
         if self._sig_accts or self._auto_accts:
             messagebox.showinfo(self.t("sec_live"),
@@ -5307,6 +5384,19 @@ class App:
                            if key[0] == _asset]
                 if not targets:
                     self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산 자동진입 미설정(켜진 계좌 없음), 건너뜀.")
+                    _t.sleep(SIG_POLL_SECS); continue
+                # 월 1회 실행 확인이 무장 중에 만료되면 **새 진입만** 멈춘다.
+                # 자동청산(_auto_loop)은 별도 루프라 계속 돈다 — 열린 포지션은 방치하지 않는다.
+                # 모의는 확인을 받지 않으므로 보류 대상이 아니다(실거래에만 적용).
+                _live_now = not bool(self.live_dry.get()) if hasattr(self, "live_dry") else False
+                if _live_now and self._consent_left() <= 0:
+                    self.log(f"\n⏸ 신호 [{sid}] {_asset} — 30일 실행 확인이 만료되어 새 진입을 보류했습니다.\n"
+                             f"   앱에서 [라이브 시작]을 다시 누르면 확인 후 재개됩니다. "
+                             f"이미 열린 포지션의 자동청산은 계속됩니다."
+                             if self.lang == "ko" else
+                             f"\n⏸ Signal [{sid}] {_asset} — 30-day confirmation expired; new entry held.\n"
+                             f"   Press [Go Live] again to confirm and resume. "
+                             f"Auto-close on open positions continues.")
                     _t.sleep(SIG_POLL_SECS); continue
                 # 신선도/발행일 게이트 (시그널 단위 1회, 계좌 무관)
                 import datetime as _dtd
