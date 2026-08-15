@@ -654,7 +654,13 @@ def _load():
             creds = {b: {"f1": cr.get("f1", ""), "f3": cr.get("f3", ""),
                          "avail": [str(x) for x in (cr.get("avail") or []) if str(x).strip()]}
                      for b, cr in (s.get("creds") or {}).items() if b in brs}
-            include = bool(s.get("include", True))
+            # 새 설치만 기본 미선택 — "자산 하나로 시작" 온보딩(대표 2026-08-15).
+            # 판정은 아래 flat 마이그레이션 가드와 **같은 조건**이어야 한다: assets/broker-centric/
+            # flat(f1) 어느 형태로든 설정이 있으면 기존 회원이므로 종전대로 True.
+            # (assets_raw만 보면 구형 flat 설정 회원이 통째로 꺼져 매매가 멈춘다 - 회귀 테스트에서 발각.)
+            _fresh = (not assets_raw and not _broker_centric
+                      and not (d.get("f1") or "").strip())
+            include = bool(s.get("include", not _fresh))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
                                       x.get("prop"), x.get("pct"), False,
@@ -1071,7 +1077,18 @@ class App:
         # 자산별 실행 행 — [자산] 상태 [연결테스트] [정지] ●
         self._live_include = {}
         self._live_rows = {}       # {asset: (status_lbl, dot)}
+        # 하나도 안 고른 상태(새 설치)에서만 뜨는 안내 — "셋 다 해야 한다"는 인상을 막는다.
+        # 자산 수와 등급(Preview/Operator/Autopilot)은 별개 축이다(대표 2026-08-15).
+        self._pick_box = ttk.Frame(frm)          # 자리 고정용 - 라벨만 넣고 뺀다(순서 안 틀어짐)
+        self._pick_box.pack(fill="x")
+        self._pick_hint = tk.Label(
+            self._pick_box, anchor="w", justify="left", wraplength=760, foreground="#6b7280",
+            text=("시작할 자산을 선택하세요. 하나만 골라도 됩니다 - 나머지는 언제든 추가할 수 있습니다."
+                  if self.lang == "ko" else
+                  "Pick the markets to start with. One is enough - you can add the rest any time."))
+        self._pick_hint.pack(anchor="w", pady=(2, 2))
         lv = ttk.Frame(frm); lv.pack(fill="x", pady=(3, 0))
+        self._sync_pick_hint()
         for _a in _ASSETS:
             row = ttk.Frame(lv); row.pack(fill="x", pady=1)
             var = tk.IntVar(value=1 if self._acfg[_a].get("include", True) else 0)
@@ -2601,8 +2618,13 @@ class App:
     # ── 라이브 패널 상태 표시(대표 2026-07-24 자산별 계좌) ─────────────
     def _asset_row_state(self, asset):
         """(요약문, 점 색) — 자산 실행 설정 완결성·연결·무장 상태를 한 줄로.
+        미선택 자산은 '사용 안 함'으로 낸다 — 안 고른 것을 ✗ 미설정으로 찍으면 화면이
+        "덜 됐다"고 말해, 한 자산으로 시작한 회원에게 계속 미완성 신호를 준다(대표 2026-08-15).
         완결성 = 크레덴셜 f1 · 켜진 계좌 최소 1개 · (acct 브로커면)계좌ID · 1R>0.
         계좌별 브로커(대표 2026-08-09): 라벨·키·연결 판정을 켜진 계좌들의 브로커 전체로."""
+        if not self._acfg.get(asset, {}).get("include", True):
+            return (("— 사용 안 함 (언제든 추가할 수 있습니다)" if self.lang == "ko"
+                     else "— not in use (add it any time)"), "#6b7280")
         active = self._active_accts(asset)
         # 켜진 계좌들의 브로커(중복 제거, 순서 유지) — 없으면 자산 기본 브로커
         bks = []
@@ -2901,7 +2923,21 @@ class App:
         ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=11, column=1, pady=(4, 0))
         ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=11, column=2, pady=(4, 0))
 
+    def _sync_pick_hint(self):
+        """자산을 하나도 안 고른 상태에서만 선택 안내를 보인다."""
+        _h = getattr(self, "_pick_hint", None)
+        if _h is None:
+            return
+        try:
+            if any(self._acfg.get(a, {}).get("include", True) for a in _ASSETS):
+                _h.pack_forget()
+            elif not _h.winfo_ismapped():
+                _h.pack(anchor="w", pady=(2, 2))
+        except Exception:
+            pass
+
     def _refresh_live_panel(self):
+        self._sync_pick_hint()
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
                 txt, col = self._asset_row_state(asset)
