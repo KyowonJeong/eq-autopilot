@@ -5208,7 +5208,15 @@ class App:
         if size <= 0:
             # 왜 쉬는지 한눈에(대표 2026-08-13): 최소 1계약 리스크가 설정 1R의 몇 배인지 명시.
             try:
-                _c1 = float(_sz.get("risk_per_contract") or 0)
+                # compute_size는 risk_per_contract를 반환하지 않는다(size/symbol/kind/unit/
+                # risk_pts/legs 뿐) — 그대로 읽어 항상 $0 · 0.0배로 찍히고 있었다.
+                # 대표가 2026-08-13에 "왜 쉬는지 한눈에" 넣으신 안내인데 숫자가 전부 0이었다.
+                # 있는 값(risk_pts × 계약 포인트가치)으로 직접 계산한다.
+                from eqexec import sizing as _szmod
+                _pv = float(_szmod.FUTURES_POINT_VALUE.get(_sz.get("symbol")) or 0)
+                _c1 = float(_sz.get("risk_pts") or 0) * _pv
+                if _c1 <= 0:
+                    raise ValueError("point value unknown")
                 _ratio = (_c1 / _eff_r) if _eff_r > 0 else 0
                 self.log(f"   ⏭ [{lbl}] 진입 안 함 — 오늘 손절거리 {_sz['risk_pts']}pt라 최소 "
                          f"1계약 리스크가 ${_c1:,.0f} = 설정 1R(${_eff_r:g})의 {_ratio:.1f}배. "
