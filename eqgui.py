@@ -396,6 +396,18 @@ T = {
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
+    "consent_detail": {
+        "ko": ("· 크립토 진입 시 잔고가 부족하면 앱이 거래소 계좌의 레버리지 설정을 올립니다"
+               "(주문이 아니라 계좌 설정 변경입니다. 내리지는 않습니다).\n"
+               "· 선물 손절가에 0~6틱을 넓히는 방향으로만 얹습니다. 실제 리스크가 설정 1R을"
+               " 손절거리의 0.5% 이내로 넘습니다.\n"
+               "· 진입은 건별 승인 없이 나갑니다. 한 번 무장하면 그 세션 동안 신호마다 자동 발주됩니다."),
+        "en": ("· On crypto entries, if the balance is short the app raises the leverage setting on your "
+               "exchange account (a settings change, not an order; it is never lowered).\n"
+               "· Futures stop prices get a 0-6 tick offset, widening only. Realised risk exceeds your 1R "
+               "by up to about 0.5% of the stop distance.\n"
+               "· Entries are placed without per-trade approval. Once armed, every signal in that session "
+               "is ordered automatically.")},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
               "en": "Ready. Enter your key → 'Test connection' → the rest unlocks once it passes."},
     "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산·자동 진입 기능이 활성화됩니다.",
@@ -1079,6 +1091,11 @@ class App:
             self.consent = tk.IntVar()
         ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
                         command=self._update_tr_status).pack(anchor="w", pady=(2, 2))
+        # 앱이 회원 확인 없이 하는 일 중 **계좌에 쓰기가 일어나는 것**을 체크박스 바로 아래
+        # 고지한다(2026-08-15 사실기술서 감사). 지금까지 어디에도 안 적혀 있었다.
+        # 둘 다 의도된 설계이고 끄는 스위치가 없으므로, 최소한 알고 켜야 한다.
+        ttk.Label(frm, text=self.t("consent_detail"), foreground="#6b7280",
+                  wraplength=760, justify="left").pack(anchor="w", pady=(0, 4))
         # 자산별 실행 행 — [자산] 상태 [연결테스트] [정지] ●
         self._live_include = {}
         self._live_rows = {}       # {asset: (status_lbl, dot)}
