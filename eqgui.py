@@ -1057,7 +1057,10 @@ class App:
             ttk.Label(top, image=self._logo).pack(side="left", padx=(0, 8))
         except Exception:
             self._logo = None
-        ttk.Label(top, text=f"EQ Autopilot — {_broker_label(self._broker_name)}",
+        # 제목은 고정(대표 2026-08-17 "루시드만 되는 거야?") - 시작 시점 첫 자산의 브로커를
+        # 붙이던 단일 브로커 시절 유물이 멀티 브로커 앱을 루시드 전용처럼 보이게 했다.
+        # 현재 브로커는 자산 행("Lucid (NT8) · 1계좌 …")이 이미 보여준다.
+        ttk.Label(top, text="EQ Autopilot",
                   font=("Helvetica", 16, "bold")).pack(side="left")
         ttk.Label(top, text=self.t("lang")).pack(side="right", padx=(0, 4))
         self.langbox = ttk.Combobox(top, values=["한국어", "English"], width=9, state="readonly")
@@ -4437,7 +4440,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.17b"
+    _APP_VER = "2026.08.17c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
