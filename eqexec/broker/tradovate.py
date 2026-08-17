@@ -80,9 +80,30 @@ class TradovateBroker(BrokerAdapter):
             raise RuntimeError(f"Tradovate auth returned no accessToken: {data}")
         self._token, self._token_at = tok, time.time()
 
+    def _renew(self) -> bool:
+        """기존 토큰 연장(GET /auth/renewAccessToken, Bearer). 성공 시 True.
+        공식 문서(2026-08-17 대조): accesstokenrequest는 호출마다 **새 세션**을 열고
+        동시 세션은 2개 제한 - 셋째가 생기면 가장 오래된 세션이 강제 종료된다. 대표가
+        Tradovate Trader에 로그인한 채 앱이 재인증을 반복하면 서로를 걷어차는 구조라,
+        문서 권고대로 만료 전에는 갱신을 먼저 시도하고 실패할 때만 재인증한다."""
+        if not self._token:
+            return False
+        try:
+            r = requests.get(f"{self.base}/auth/renewAccessToken",
+                             headers=self._headers(), timeout=_TIMEOUT)
+            r.raise_for_status()
+            tok = (r.json() or {}).get("accessToken")
+            if tok:
+                self._token, self._token_at = tok, time.time()
+                return True
+        except Exception:
+            pass
+        return False
+
     def _ensure_token(self) -> None:
         if self._token is None or (time.time() - self._token_at) > (_TOKEN_TTL - _RENEW_MARGIN):
-            self.authenticate()
+            if not self._renew():
+                self.authenticate()
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
