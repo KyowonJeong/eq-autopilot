@@ -3059,8 +3059,10 @@ class App:
         self._refresh_live_panel()
 
     def _copy_f1(self):
-        """API Key(f1) 복사 - 기기 이전용(대표 2026-08-10). 비밀 취급 브로커는 잠금 해제 후에만.
-        write-only 원칙의 예외지만 PIN 게이트 뒤라 소유자 본인 동작이다."""
+        """f1 복사 - 기기 이전용(대표 2026-08-10). f1은 브로커마다 다르다(ProjectX=이메일,
+        크립토=API Key, IBKR=호스트) - 'API Key'로 뭉뚱그리면 ProjectX에서 거짓 안내(D6 실사).
+        비밀 취급 브로커는 잠금 해제 후에만. write-only 원칙의 예외지만 PIN 게이트 뒤라
+        소유자 본인 동작이다."""
         _sp = _BROKER_SPEC.get(self._broker_name, {})
         if _sp.get("f1_secret") and not self._f1_unlocked:
             messagebox.showinfo("PIN", self.t("locked_msg")); return
@@ -3596,7 +3598,8 @@ class App:
         """잔고-맞춤 레버리지 자동 조정 (대표 2026-07-20 — 110007 잔고부족 진입실패 재발 방지).
         진입 직전 가용잔고를 앱이 직접 조회해, 이 수량이 들어가도록 레버리지를 상향한다
         (하향 안 함 · 실위험은 손절=1R 고정이라 위험 증가 아님). 실패해도 진입은 계속 시도.
-        브로커가 ensure_leverage를 지원할 때만(현재 Bybit) 동작 — Bitget은 추후."""
+        브로커가 ensure_leverage를 지원할 때만 동작 — Bybit·Bitget 둘 다 구현돼 있다
+        (bitget.py:127, hasattr 게이트 통과; 'Bitget은 추후'는 옛말 - D6 실사 정정)."""
         if not hasattr(b, "ensure_leverage"):
             return
         try:
