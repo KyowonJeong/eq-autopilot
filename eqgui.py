@@ -3576,6 +3576,7 @@ class App:
         self._auto_accts.clear()
         self._sig_on = False
         self._auto_on = False
+        self._alive_ping(armed=False, force=True)   # 정상 종료 신고 - 다운 경보 대상 제외
         self._set_auto_ind(False, [])
         self._set_sig_ind(False, [])
         self.log((f"\n⏹ 전체 정지 — {n}개 계좌 가동 해제. ⚠ 열린 포지션은 그대로 유지됩니다 - "
@@ -4800,6 +4801,26 @@ class App:
             return True
         return bool(gb.get(self._HB_BROKER_KEY.get(broker, broker), False))
 
+    def _alive_ping(self, armed: bool = True, force: bool = False):
+        """생존 핑(/eqalive, 대표 2026-08-17 '앱 다운 알림은 해') - 무장 중 4분마다.
+        서버는 15분 무소식(핑 3회 결번)이면 회원에게 '앱이 죽었다'를 DM한다.
+        [전체 정지]만 armed=False로 경보 대상에서 빠진다 - **무장 중 창을 닫으면 경보가
+        맞다**(자동화가 실제로 멈추니까, 크래시·정전과 회원 입장에선 같은 상태).
+        발송 경로에 부하를 주지 않게 백그라운드 스레드 + 실패 무해(다음 핑이 복구)."""
+        import time as _t
+        if not force and _t.time() - getattr(self, "_alive_at", 0.0) < 240:
+            return
+        self._alive_at = _t.time()
+
+        def _bg():
+            try:
+                requests.post(PUSH_BASE + "eqalive", timeout=8,
+                              json={"t": self._token, "armed": bool(armed),
+                                    "v": self._APP_VER})
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _live_now(self, live_flag: bool) -> bool:
         """발주 '순간'의 실거래 여부 = 시작 시 선택 AND 현재 게이트의 강제 모의 아님.
         어드민이 강제 dry run을 켜면(하트비트 ≤5분 반영) 이미 돌던 루프도 다음 발주부터
@@ -5377,6 +5398,7 @@ class App:
         last_id = None
         entered_day = {}       # {(key, dedup_key): 발행날짜}. 계좌·세션별 하루 1회 재진입 금지
         while self._sig_on:
+            self._alive_ping(armed=True)          # 생존 핑(4분 스로틀) - 다운 알림의 심박
             try:
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
                 sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
