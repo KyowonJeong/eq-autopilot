@@ -3358,7 +3358,8 @@ class App:
         incl = [a for a in _ASSETS if self._acfg.get(a, {}).get("include", True)]
         brk = " · ".join(f"{a} {c}" for a, c in sorted(per.items())) or ("없음" if self.lang == "ko" else "none")
         if self.lang == "ko":
-            return (f"지난 30일 동안 이 앱이 대표 계좌에서 낸 진입\n\n"
+            # 회원이 읽는 화면이다 - 호칭은 중립으로(대표 2026-08-17 "앱에 대표라는 말 쓰면 어쩌냐").
+            return (f"지난 30일 동안 이 앱이 이 계좌에서 낸 진입\n\n"
                     f"    합계      {len(rows)}건\n"
                     f"    자산별    {brk}\n"
                     f"    실행 대상  {', '.join(incl) or '없음'}\n")

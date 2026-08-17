@@ -216,6 +216,35 @@ class BitgetBroker(BrokerAdapter):
         q = round(float(size), 3)
         return f"{q:.3f}".rstrip("0").rstrip(".") or "0"
 
+    _PSTEP: dict = {}                     # 심볼 → (step, decimals) 캐시 (프로세스 수명)
+
+    def _pstep(self, sym: str) -> tuple:
+        """심볼의 가격 스텝. Bitget 계약 스펙(pricePlace·priceEndStep)에서 읽는다.
+        BTCUSDT = place 1, endStep 1 → 0.1. 조회 실패 시 BTC 0.1 / 그 외 0.01 폴백."""
+        v = BitgetBroker._PSTEP.get(sym)
+        if v:
+            return v
+        try:
+            d = self._req("GET", "/api/v2/mix/market/contracts",
+                          {"productType": self.product, "symbol": sym})
+            row = (d[0] if isinstance(d, list) and d else d) or {}
+            place = int(row.get("pricePlace") or 1)
+            end = float(row.get("priceEndStep") or 1)
+            v = (end / (10 ** place), place)
+        except Exception:
+            v = (0.1, 1) if sym.startswith("BTC") else (0.01, 2)
+        BitgetBroker._PSTEP[sym] = v
+        return v
+
+    def _snap_px(self, sym: str, px) -> str:
+        """가격을 계약 틱에 스냅해 문자열로. 2026-08-17 첫 실측 사고(45115 'multiple of
+        0.1'): 신호 손절은 Bybit 좌표 + 크로스 캘리브레이션(소수 2자리)이라 Bitget 틱
+        (0.1)에 안 맞아 진입 자체가 거절됐다. ProjectX 금 틱스냅(1a51d42)과 같은 원칙 —
+        정렬은 브로커층 책임. 반올림 오차는 최대 반 틱(BTC $0.05)로 무시 가능."""
+        step, place = self._pstep(sym)
+        q = round(round(float(px) / step) * step, place)
+        return f"{q:.{place}f}"
+
     def place_entry(self, *, symbol, side, size, stop_loss_price=None, custom_tag=None,
                     dry_run: bool = True, **_ignored) -> dict:
         """USDT-FUTURES 마켓 진입 (+ presetStopLossPrice 손절 첨부). 크립토엔 account/contract 없음 —
@@ -236,10 +265,10 @@ class BitgetBroker(BrokerAdapter):
         if custom_tag:
             body["clientOid"] = str(custom_tag)[:64]
         if stop_loss_price:
-            body["presetStopLossPrice"] = str(stop_loss_price)
+            body["presetStopLossPrice"] = self._snap_px(sym, stop_loss_price)   # 틱스냅(45115)
         if dry_run:
             return {"would_place": body,
-                    "would_place_stop": (str(stop_loss_price) if stop_loss_price else None)}
+                    "would_place_stop": body.get("presetStopLossPrice")}
         try:
             res = self._req("POST", "/api/v2/mix/order/place-order", body=body)
         except Exception as e:
@@ -270,11 +299,11 @@ class BitgetBroker(BrokerAdapter):
         qty = self._fmt_qty(size)
         body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
                 "marginCoin": "USDT", "side": bside, "orderType": "limit",
-                "price": f"{float(price):g}", "size": qty, "force": "post_only"}
+                "price": self._snap_px(sym, price), "size": qty, "force": "post_only"}
         if custom_tag:
             body["clientOid"] = str(custom_tag)[:64]
         if stop_loss_price:
-            body["presetStopLossPrice"] = str(stop_loss_price)
+            body["presetStopLossPrice"] = self._snap_px(sym, stop_loss_price)
         if dry_run:
             return {"would_place": body}
         try:
@@ -300,7 +329,7 @@ class BitgetBroker(BrokerAdapter):
         body = {"symbol": sym, "productType": self.product, "marginMode": "crossed",
                 "marginCoin": "USDT",
                 "side": "sell" if pos.net_qty > 0 else "buy",
-                "orderType": "limit", "price": f"{float(price):g}",
+                "orderType": "limit", "price": self._snap_px(sym, price),
                 "size": self._fmt_qty(abs(pos.net_qty)), "force": "post_only",
                 "reduceOnly": "YES"}
         if dry_run:
@@ -351,7 +380,7 @@ class BitgetBroker(BrokerAdapter):
         ①대기 중 손절 플랜을 찾아 modify ②없으면 pos_loss 신규 등록. 실패 시 {"error":...}
         반환 — 호출측(_btc_move_stop_be)이 경고만 남기고 기존 손절 유지(무방비 구간 없음)."""
         sym = self._symbol(symbol)
-        _px = str(round(float(stop_price), 2))
+        _px = self._snap_px(sym, stop_price)   # 틱스냅 — round(,2)는 45115 거절(2026-08-17)
         try:
             pend = self._req("GET", "/api/v2/mix/order/orders-plan-pending",
                              {"productType": self.product, "symbol": sym,
