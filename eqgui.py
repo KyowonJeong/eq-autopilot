@@ -277,7 +277,9 @@ _BROKER_SPEC = {
                     "preview": True, "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
     #   (API 키 페어 콜론 연결 — 셋째 토막 'demo'면 데모 서버). preview=데모 실검증 전.
-    "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "Password",
+    # f2 라벨 주의(2026-08-17 실사): "Password"로만 쓰면 마스터 로그인 비밀번호를 넣게 유도한다.
+    # Tradovate 키 발급 시 "Protect with a dedicated password"로 정한 전용 비밀번호가 맞다.
+    "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "API dedicated password",
                     "f3": "API cid:sec[:demo]", "acct": True, "futures": True,
                     "preview": True},
 }
