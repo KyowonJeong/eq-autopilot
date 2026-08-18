@@ -2208,9 +2208,18 @@ class App:
         return True
 
     def _fill_scope(self, names):
-        """Topstep 계좌 목록 로드 완료 → ① 가용 라벨 + 행 계좌 콤보 값 즉시 갱신."""
+        """Topstep 계좌 목록 로드 완료 → ① 가용 라벨 + 행 계좌 콤보 값 즉시 갱신.
+        2026-08-18(대표 펀디드 통과 실사고): 받은 목록을 가용 계좌에 **병합·영속**부터 한다.
+        예전엔 여기서 낡은 avail만 다시 읽어, 연결 테스트가 새 계좌를 브로커에서 받아와도
+        (로그엔 찍히는데) 드롭다운·가용 라벨엔 평가 통과로 생긴 새 계좌가 안 나타났다."""
         try:
             _av = self._avail_of(self._asset, self._broker_name)
+            _new = [str(n) for n in (names or []) if str(n).strip() and str(n) not in _av]
+            if _new:
+                _av.extend(_new)
+                self._save_cfg()
+                self.log(("🧾 가용 계좌 자동 등록: " if self.lang == "ko"
+                          else "🧾 Accounts auto-registered: ") + ", ".join(_new))
             if _av and hasattr(self, "_avail_lbl"):
                 self._avail_lbl.config(
                     text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
@@ -3269,6 +3278,13 @@ class App:
             b.healthcheck()
             if bk == "projectx":
                 names = [str(x.get("name")) for x in b._accounts()]
+                # 세션 캐시 교체(2026-08-18): 연결 테스트의 신선 목록이 정본 - 안 그러면
+                # 탭 재진입 때 _autoload가 낡은 캐시로 콤보를 도로 덮는다.
+                try:
+                    getattr(self, "_scope_cache", None) is not None or setattr(self, "_scope_cache", {})
+                    self._scope_cache[("projectx", f1)] = names
+                except Exception:
+                    pass
                 if asset == self._asset:      # 현재 탭 자산이면 '계좌 추가' 콤보도 채움
                     self.root.after(0, lambda n=names: self._fill_scope(n))
                 for ac in self._active_accts(asset):
@@ -4440,7 +4456,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.17d"
+    _APP_VER = "2026.08.18a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
