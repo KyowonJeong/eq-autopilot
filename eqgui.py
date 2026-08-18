@@ -696,6 +696,16 @@ def _load():
                 acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
                 accounts = [_new_acct(one_r, acct_id, True,
                                       acct_id[-4:] if acct_id else _broker_label(bk))]
+        # 저장돼 버린 중복 계좌 행 청소(2026-08-18): 같은 id의 뒤 행은 통째로 버린다.
+        _dseen, _duniq = set(), []
+        for _x in accounts:
+            _dk = str(_x.get("id") or "").strip().lower()
+            if _dk and _dk in _dseen:
+                continue
+            if _dk:
+                _dseen.add(_dk)
+            _duniq.append(_x)
+        accounts = _duniq
         if not accounts:
             accounts = [_new_acct(600.0, "", True, _broker_label(bk))]
         creds.setdefault(bk, {"f1": "", "f3": ""})
@@ -1902,6 +1912,38 @@ class App:
                             accts[idx]["label"] = _v[-4:]
             except Exception:
                 pass
+        # 같은 계좌 중복 등록 가드(대표 2026-08-18 "같은 계좌가 계속 추가됨" - Lucid 실사고):
+        # 한 자산 안에서 같은 계좌ID 행이 둘이면 진입이 그 계좌에 **두 번** 나간다.
+        # 첫 행만 남기고 뒤 행의 id를 비운다(행은 남겨 다른 계좌를 고르게) + 경고 1회.
+        try:
+            _seen_ids = set()
+            _cleared = False
+            for _i2, _ac2 in enumerate(accts):
+                _idv = str(_ac2.get("id") or "").strip().lower()
+                if not _idv:
+                    continue
+                if _idv in _seen_ids:
+                    _ac2["id"] = ""
+                    _cleared = True
+                    _icb2 = (getattr(self, "_acct_widgets", {}).get(_i2) or {}).get("acct_id")
+                    if _icb2 is not None:
+                        try:
+                            _icb2.set("계좌 선택" if self.lang == "ko" else "pick")
+                        except Exception:
+                            pass
+                else:
+                    _seen_ids.add(_idv)
+            if _cleared:
+                messagebox.showwarning(
+                    "EQ Autopilot",
+                    ("이미 등록된 계좌입니다 - 같은 계좌는 자산당 한 번만 등록할 수 있습니다"
+                     "(중복이면 주문이 두 번 나갑니다). 중복 행의 계좌 선택을 비웠습니다."
+                     if self.lang == "ko" else
+                     "That account is already registered - each account can be used only "
+                     "once per asset (a duplicate would double the orders). The duplicate "
+                     "row's selection was cleared."))
+        except Exception:
+            pass
 
     def _save_current_asset(self):
         """현재 탭 크레덴셜(f1,f3) → 이 자산 브로커 창고, 비밀(f2) → Keychain, 실행자산·계좌위젯
@@ -4799,7 +4841,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18e"
+    _APP_VER = "2026.08.18f"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
