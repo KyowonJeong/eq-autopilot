@@ -1652,8 +1652,13 @@ class App:
             txt, col = self.t("gate_master_off"), "#b00020"
         else:
             caps = g.get("caps", {})
+            # 공개 표시명(대표 2026-08-18 랜딩 스샷에서 내부명 'royal' 발각): 내부 등급명은
+            # 서버·코드 정본 그대로 두고 **화면에만** 공개명을 쓴다(admin은 admin 그대로).
+            _TIER_PUB = {"royal": "Autopilot", "member": "Operator",
+                         "guest": "Preview", "public": "Preview"}
+            _tname = g.get("tier", "—")
             txt = self.t("gate_ok").format(
-                tier=g.get("tier", "—"), u="✓" if caps.get("use") else "✗",
+                tier=_TIER_PUB.get(_tname, _tname), u="✓" if caps.get("use") else "✗",
                 a="✓" if caps.get("autoentry") else "✗",
                 dry=self.t("gate_dry") if g.get("force_dry_run") else "")
             col = "#1a7f37"
@@ -4841,7 +4846,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18f"
+    _APP_VER = "2026.08.18g"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
