@@ -2863,7 +2863,8 @@ class App:
             acct = self._accts_of(self._asset)[idx]
         except Exception:
             return
-        pr = dict(_PROP_DEFAULTS); pr.update(acct.get("prop") or {})
+        _saved = acct.get("prop") or {}
+        pr = dict(_PROP_DEFAULTS); pr.update(_saved)
         # 프리셋은 몰래 스왑하지 않는다(2026-08-13, 대표 "시뮬 결과 액수 사용 버튼 어때 -
         # 그건 자기가 누르는 거니깐"). 아래 [시뮬 기준값 채우기] 버튼이 유일한 적용 경로.
         try:
@@ -2898,7 +2899,11 @@ class App:
         for i, (k, lab) in enumerate(_rows, start=2):
             ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
             e = ttk.Entry(frm, width=10)
-            e.insert(0, f"{_as_float(pr.get(k), _PROP_DEFAULTS[k]):g}")
+            # 새 계좌(저장 이력 없음)는 1R 필드 0으로 비워 시작(대표 2026-08-18) - 앱이
+            # 임의 기본값을 앉히지 않는다. 값 적용 경로는 직접 입력 또는 [시뮬 기준값 채우기]뿐.
+            _v0 = (0.0 if (not _saved and k in ("r_test", "r_steady", "r_live"))
+                   else _as_float(pr.get(k), _PROP_DEFAULTS[k]))
+            e.insert(0, f"{_v0:g}")
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
@@ -4794,7 +4799,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18d"
+    _APP_VER = "2026.08.18e"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
