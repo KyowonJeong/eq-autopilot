@@ -2207,27 +2207,41 @@ class App:
             messagebox.showwarning(self.t("need_consent"), self.t("need_consent")); return False
         return True
 
-    def _fill_scope(self, names):
-        """Topstep 계좌 목록 로드 완료 → ① 가용 라벨 + 행 계좌 콤보 값 즉시 갱신.
-        2026-08-18(대표 펀디드 통과 실사고): 받은 목록을 가용 계좌에 **병합·영속**부터 한다.
-        예전엔 여기서 낡은 avail만 다시 읽어, 연결 테스트가 새 계좌를 브로커에서 받아와도
-        (로그엔 찍히는데) 드롭다운·가용 라벨엔 평가 통과로 생긴 새 계좌가 안 나타났다."""
+    def _fill_scope(self, names, asset=None, broker=None):
+        """브로커의 신선한 계좌 목록 → 가용 계좌 **미러링(교체)** + UI 갱신.
+        2026-08-18b(대표 "예전 계좌가 안 지워져"): append-only였던 avail을 브로커 목록
+        정본으로 교체한다 - 닫힌 평가 계좌가 드롭다운에 영원히 남던 것 정리. 등록된
+        사용 계좌 행은 안 건드린다(행 관리는 회원 몫). 빈 목록이면 아무것도 안 지운다
+        (일시 연결 문제 오살 방지). asset/broker 명시 = 백그라운드 로더가 탭 전환 뒤
+        도착해도 자기 자산 avail만 만진다(예전엔 현재 탭 avail을 오염시킬 수 있었다)."""
         try:
-            _av = self._avail_of(self._asset, self._broker_name)
-            _new = [str(n) for n in (names or []) if str(n).strip() and str(n) not in _av]
-            if _new:
-                _av.extend(_new)
-                self._save_cfg()
-                self.log(("🧾 가용 계좌 자동 등록: " if self.lang == "ko"
-                          else "🧾 Accounts auto-registered: ") + ", ".join(_new))
-            if _av and hasattr(self, "_avail_lbl"):
-                self._avail_lbl.config(
-                    text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
-                    + ", ".join(_av))
-            for _w in getattr(self, "_acct_widgets", {}).values():
-                _icb = _w.get("acct_id")
-                if _icb is not None:
-                    _icb["values"] = list(_av)
+            _a, _b = asset or self._asset, broker or self._broker_name
+            fresh = list(dict.fromkeys(str(n) for n in (names or []) if str(n).strip()))
+            if fresh:
+                cr = self._creds_of(_a, _b)
+                _av = cr.setdefault("avail", [])
+                _add = [n for n in fresh if n not in _av]
+                _gone = [n for n in _av if n not in fresh]
+                if _add or _gone:
+                    _av[:] = fresh
+                    self._save_cfg()
+                    if _add:
+                        self.log(("🧾 가용 계좌 등록: " if self.lang == "ko"
+                                  else "🧾 Accounts added: ") + ", ".join(_add))
+                    if _gone:
+                        self.log(("🧾 가용 계좌 정리(브로커에 더 없음): " if self.lang == "ko"
+                                  else "🧾 Accounts removed (no longer at broker): ")
+                                 + ", ".join(_gone))
+            if _a == self._asset and _b == self._broker_name:   # UI는 그 탭이 떠 있을 때만
+                _av = self._avail_of(self._asset, self._broker_name)
+                if _av and hasattr(self, "_avail_lbl"):
+                    self._avail_lbl.config(
+                        text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
+                        + ", ".join(_av))
+                for _w in getattr(self, "_acct_widgets", {}).values():
+                    _icb = _w.get("acct_id")
+                    if _icb is not None:
+                        _icb["values"] = list(_av)
         except Exception:
             pass
 
@@ -2276,13 +2290,7 @@ class App:
             cache[ck] = names
 
             def done():
-                _av = cr.setdefault("avail", [])
-                _new = [n for n in names if n not in _av]
-                if _new:
-                    _av.extend(_new)
-                    self._save_cfg()
-                    self.log(f"🧾 {asset} · Lucid 가용 계좌 자동 등록: " + ", ".join(_new))
-                self._fill_scope(names)
+                self._fill_scope(names, asset=asset, broker="nt8")
             self.root.after(0, done)
         _th.Thread(target=w, daemon=True).start()
 
@@ -2300,17 +2308,9 @@ class App:
         if cache is None:
             cache = self._scope_cache = {}
         if ck in cache:                       # 이미 받은 목록이면 즉시 채우고 끝(재조회 없음)
-            # 캐시 히트도 이 자산의 가용 계좌에 병합(대표 2026-08-11: NQ가 먼저 받아가면
-            # GC는 이 경로로 빠져 가용 등록이 안 됐다 - 자산별 creds 블롭이라 각자 채워야 함)
-            try:
-                _av = cr.setdefault("avail", [])
-                _new = [n for n in cache[ck] if n not in _av]
-                if _new:
-                    _av.extend(_new)
-                    self._save_cfg()
-            except Exception:
-                pass
-            self._fill_scope(cache[ck])
+            # 캐시 히트도 이 자산의 avail에 반영(대표 2026-08-11: 자산별 creds 블롭이라
+            # 각자 채워야 함) - 미러링은 _fill_scope가 한다.
+            self._fill_scope(cache[ck], asset=asset, broker="projectx")
             return
         import threading as _th
 
@@ -2318,25 +2318,13 @@ class App:
             try:
                 b = _build_broker("projectx", f1, _kc_load(f1) or "", cr.get("f3", ""), [])
                 names = [str(a.get("name")) for a in b._accounts()]
-                # 가용 계좌로 영속(대표 2026-08-11): 다음 실행부터는 API 재조회 전에도
-                # ② 드롭다운이 차 있고, ①의 가용 계좌 줄에도 보인다.
-                try:
-                    _av = cr.setdefault("avail", [])
-                    for _nm in names:
-                        if _nm not in _av:
-                            _av.append(_nm)
-                    self._save_cfg()
-                except Exception:
-                    pass
             except Exception:
                 names = None
             if names:
                 cache[ck] = names
-
-                def _apply():
-                    if self._asset == asset:  # 아직 그 탭이면 콤보 채움(탭 전환 후 오채움 방지)
-                        self._fill_scope(names)
-                self.root.after(0, _apply)
+                # 영속·미러링·UI 갱신 전부 _fill_scope(자산·브로커 명시라 탭 전환 무해).
+                self.root.after(0, lambda: self._fill_scope(names, asset=asset,
+                                                            broker="projectx"))
         _th.Thread(target=w, daemon=True).start()
 
     def _copy_broker_setup(self, src_asset):
@@ -3285,8 +3273,8 @@ class App:
                     self._scope_cache[("projectx", f1)] = names
                 except Exception:
                     pass
-                if asset == self._asset:      # 현재 탭 자산이면 '계좌 추가' 콤보도 채움
-                    self.root.after(0, lambda n=names: self._fill_scope(n))
+                self.root.after(0, lambda n=names: self._fill_scope(
+                    n, asset=asset, broker="projectx"))
                 for ac in self._active_accts(asset):
                     if self._acct_broker(asset, ac) != bk:
                         continue              # 다른 브로커 계좌 행은 이 테스트 대상 아님
@@ -4456,7 +4444,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18a"
+    _APP_VER = "2026.08.18b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
