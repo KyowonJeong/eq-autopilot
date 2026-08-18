@@ -574,8 +574,18 @@ def _pin_ok(pin):
 #      순익+)이 차는 순간 잔고의 절반을 즉시 출금(회당 $6,000 한도)
 #   회전(합산 5발): 라이브 전환 — 새 계정으로 재시작(잔여는 Live 이월이나 보수적으로 0 산입)
 #   앱은 계정 합산을 직접 모르므로 계좌별 출금 횟수(권장 2계좌 기준 <2=방패기)로 근사 안내.
+# 평가 통과 익절(대표 2026-08-18): 테스트(챌린지) 계좌에서 **통과 기준 잔고**를 회원이 직접
+# 입력해 두면, 앱이 (현재 잔고 + 미실현 이익)이 그 값에 닿는 순간 그 계좌의 포지션을 시장가로
+# 정리한다. 잔고를 기준으로 삼는 이유(대표 질문 "목표 계좌액이야 남은 액이야"): '남은 이익'을
+# 넣게 하면 잔고가 늘 때마다 회원이 숫자를 고쳐야 하고 안 고치면 엉뚱한 데서 닫힌다. 목표
+# 잔고는 통과까지 한 번만 넣으면 되고, 남은 거리는 앱이 매번 다시 계산한다.
+# 회원이 숫자를 정하고 앱은 집행만 한다 - 우리가 목표를 판단하거나 권하지 않는다.
+# 버퍼: 수수료·체결오차로 목표에 미달하는 일이 없게 여유를 얹는다.
+_TP_BUFFER_USD = 20.0
+_PV_BY_ROOT = {"MNQ": 2.0, "NQ": 20.0, "ENQ": 20.0, "MGC": 10.0, "GC": 100.0, "GCE": 100.0}
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
                   "r_steady": 300.0, "buffer": 6000.0, "payouts": 0, "r_live": 100.0,
+                  "pass_tp": 0.0,
                   "last_bal": None}   # r_live = 라이브 초기 1R(Lucid, +$4,500 락 전. 2026-08-11)   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 # ── 브로커별 프롭 정본 프리셋(대표 2026-08-11 "브로커 자동 감지해서 페이즈별 사이징") ──
@@ -954,6 +964,7 @@ class App:
         threading.Thread(target=self._build_watch, daemon=True).start()   # 빌드 교체 감지(#31)
         self._precheck_done = {}                                    # {(asset, entry_iso): True}
         root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
+        root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -2881,7 +2892,8 @@ class App:
         _rows = [("r_test", "챌린지 1R $" if ko else "Challenge 1R $"),
                  ("r_steady", "펀디드 1R $" if ko else "Funded 1R $"),
                  ("r_live", "라이브 초기 1R $" if ko else "Live-early 1R $"),
-                 ("payouts", "출금 횟수 (0~5)" if ko else "Payouts so far (0~5)")]
+                 ("payouts", "출금 횟수 (0~5)" if ko else "Payouts so far (0~5)"),
+                 ("pass_tp", "통과 목표 잔고 $ (0=끔)" if ko else "Pass target balance $ (0=off)")]
         # r_buffer·buffer 필드는 Fast-Payout 채택으로 미사용 — 저장값은 유지(마이그레이션 호환)
         for i, (k, lab) in enumerate(_rows, start=2):
             ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
@@ -2896,7 +2908,23 @@ class App:
                         ("The app notifies you at payout thresholds; the count increments when "
                          "you press Yes in the popup (adjustable here too).\nFull playbook: "
                          "website → Capital → Prop playbook."))
-                  ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 8))
+                  ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                  text=(("통과 목표 잔고: 테스트기 + Topstep(ProjectX) 계좌에서만 작동합니다. "
+                         "프롭 화면에 보이는 "
+                         "통과 기준 잔고를 그대로 넣으십시오. (현재 잔고 + 미실현 이익)이 그 값"
+                         f"(+${_TP_BUFFER_USD:g} 여유)에 닿는 순간 이 계좌의 포지션을 시장가로 "
+                         "정리합니다. 남은 거리는 앱이 매번 계산하니 잔고가 늘어도 고칠 필요가 "
+                         "없습니다. 금액은 본인이 정하고, 규정 확인도 본인 몫입니다. 0=꺼짐(기본).")
+                        if ko else
+                        ("Pass target balance: test accounts on Topstep (ProjectX) only. "
+                         "Enter the balance your firm "
+                         "requires to clear the evaluation. When (current balance + open profit) "
+                         f"reaches it (+${_TP_BUFFER_USD:g} headroom), the app market-closes this "
+                         "account's positions. The remaining distance is recomputed each time, so "
+                         "you never need to update it as the balance grows. You set the number and "
+                         "you check your firm's rules. 0 disables it (default)."))
+                  ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         # ── [시뮬 기준값 채우기] — 홈피 시뮬레이션이 쓰는 브로커별 정본 상수를 회원이
         #    버튼으로 불러온다(전 회원 동일 공개 상수 + 회원 클릭 = 개인화 아님). ──
@@ -2929,6 +2957,7 @@ class App:
             for k in ents:
                 newp[k] = _as_float(ents[k].get(), _PROP_DEFAULTS[k])
             newp["payouts"] = max(0, min(5, int(_as_float(ents["payouts"].get(), 0))))
+            newp["pass_tp"] = max(0.0, _as_float(ents["pass_tp"].get(), 0.0))
             # 다이얼로그에서 뺀 레거시 필드(r_buffer·buffer)는 기존 저장값 유지 — 여기서
             # 참조하다 KeyError로 저장이 조용히 죽던 사고 수리(대표 2026-07-28 "저장 안 됨").
             for k in ("r_buffer", "buffer"):
@@ -2938,6 +2967,18 @@ class App:
                                        else "1R values must be > 0.")
                 return
             acct["prop"] = newp
+            try:      # pass_tp 변경 시 이번 가동의 발동·안내 래치 리셋 → 감시 재개(2026-08-18 감사 ⑥)
+                _aidl = str(acct.get("id") or "").lower()
+                for _st in ("_passtp_done", "_passtp_note", "_passtp_failwarn"):
+                    _d = getattr(self, _st, None)
+                    if isinstance(_d, dict):
+                        for _k in [k for k in _d if isinstance(k, tuple) and len(k) > 1 and k[1] == _aidl]:
+                            _d.pop(_k, None)
+                    elif isinstance(_d, set):
+                        for _k in [k for k in _d if isinstance(k, tuple) and len(k) > 1 and k[1] == _aidl]:
+                            _d.discard(_k)
+            except Exception:
+                pass
             try:
                 w = self._acct_widgets.get(idx) or {}
                 if w.get("prop_btn"):
@@ -4005,6 +4046,267 @@ class App:
     # ── 진입 전 API 사전 점검 (대표 2026-07-13) ──────────────────────────────
     # 무장된 자산마다 다음 진입 70분 전~진입 사이에 1회, 그 자산 브로커 API를 실제 인증해 본다.
     # 실패=팝업+로그(키·IP·네트워크 문제를 진입 전에 발견), Bybit는 키 만료 임박·권한도 경고.
+    # ── 평가 통과 익절 감시(대표 2026-08-18) ─────────────────────────────────
+    # 회원이 테스트기 계좌에 "통과 목표 잔고 $"를 넣어 두면, (현재 잔고 + 미실현 이익)이
+    # 그 값(+비용 비례 버퍼)에 닿는 순간 **그 계좌의 포지션만** 시장가로 정리한다.
+    #   · 우리는 금액을 판단하지 않는다 - 회원이 입력한 값을 집행만 한다.
+    #   · 브로커 지정가를 안 쓰는 이유: 익절 체결 뒤 남은 보호손절이 반대 포지션을 열 수
+    #     있다(고아 주문). 앱이 닫고 플랫 확인 후 잔여 주문까지 취소하는 편이 안전하다.
+    #   · 무장(_sig_on) + 라이브 + **Topstep(ProjectX) 전용**. 킬스위치 EQ_PASSTP_OFF=1.
+    # 2026-08-18 적대검증(3렌즈) 반영 - 설계 불변식:
+    #   ① confirm-after-act: 청산 발주 후 재조회로 플랫을 **확인한 뒤에만** 주문 취소·done·
+    #      성공 팝업. 미확인이면 done 없이 60초 뒤 재시도(flatten_all의 STILL OPEN 패턴).
+    #   ② projectx만: NT8은 평단 키가 다르고(avg_price) 시세·주문취소 API가 없으며,
+    #      Tradovate는 REST 시세가 없다 - 무음 불능으로 회원을 속이느니 지원을 좁힌다.
+    #   ③ 버퍼=청산측 실비용 비례(계약수×쿠션, 최소 $20) - 고정 $20은 GC 다계약에서 미달.
+    #   ④ single-flight + 발사 직전 스냅샷 재확인(그 사이 청산/신규 진입이면 보류).
+    #   ⑤ 발동 시 그 실계좌의 무장 행 전부 해제(이번 가동 한정) - 통과 직후 재진입 방지.
+    #   ⑥ pass_tp 저장 변경 시 발동 래치 리셋(감시 재개).
+    #   ⑦ ProjectX position.type 실측 전 방어: 1·2 외 값이면 판단 보류(부호 오판 방지).
+    def _passtp_tick(self):
+        try:
+            if (str(os.environ.get("EQ_PASSTP_OFF", "")).strip() != "1"
+                    and getattr(self, "_sig_on", False)
+                    and not getattr(self, "_passtp_busy", False)):
+                self._passtp_busy = True
+                threading.Thread(target=self._passtp_scan_wrap, daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(60 * 1000, self._passtp_tick)
+            except Exception:
+                pass
+
+    def _passtp_scan_wrap(self):
+        try:
+            self._passtp_scan()
+        except Exception:
+            pass
+        finally:
+            self._passtp_busy = False
+
+    def _passtp_targets(self):
+        """감시 대상 [(asset, idx, cfg, 목표$)] - 테스트기 + pass_tp>0 + 라이브 무장 계좌.
+        Topstep(ProjectX) 전용·수동 모드 제외. 미지원 브로커에 값이 있으면 1회 경고 로그."""
+        out = []
+        warned = getattr(self, "_passtp_warned", None)
+        if warned is None:
+            warned = self._passtp_warned = set()
+        for (asset, idx), cfg in list(getattr(self, "_sig_accts", {}).items()):
+            if not cfg.get("live") or cfg.get("manual"):
+                continue
+            if not _BROKER_SPEC.get(cfg.get("broker"), {}).get("futures"):
+                continue                       # 프롭 평가 계좌 = 선물 브로커
+            try:
+                acct = self._accts_of(asset)[idx]
+            except Exception:
+                continue
+            pr = dict(_PROP_DEFAULTS); pr.update(acct.get("prop") or {})
+            tp = _as_float(pr.get("pass_tp"), 0.0)
+            if pr.get("type") != "test" or tp <= 0:
+                continue
+            if cfg.get("broker") != "projectx":
+                wk = (cfg.get("broker"), str(cfg.get("acct") or "").lower())
+                if wk not in warned:
+                    warned.add(wk)
+                    self.log(f"   ⚠ [{cfg.get('label') or wk[1]}] 통과 익절은 현재 "
+                             f"Topstep(ProjectX)만 지원합니다 - "
+                             f"{_broker_label(cfg.get('broker'))} 계좌에선 작동하지 않습니다")
+                continue
+            out.append((asset, idx, cfg, tp))
+        return out
+
+    @staticmethod
+    def _passtp_pv(contract_id):
+        """계약ID → 포인트 가치($). 미인식이면 None(그 포지션은 계산에서 제외)."""
+        s = str(contract_id or "").upper()
+        parts = s.split(".")
+        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+        if root in _PV_BY_ROOT:
+            return _PV_BY_ROOT[root]
+        for tok, pv in _PV_BY_ROOT.items():    # 형식이 달라도 티커 토큰 폴백
+            if tok in s:
+                return pv
+        return None
+
+    @staticmethod
+    def _passtp_buffer(poss):
+        """청산측 실비용 비례 버퍼: 계약당 쿠션(시장가 슬리피지+청산측 커미션 근사,
+        마이크로 $3 · 미니/풀 $30) 합산, 최소 _TP_BUFFER_USD. 근거=GC 시장가 슬리피지
+        실측 주석(projectx.py, 건당 $64/23계약)."""
+        cush = 0.0
+        for p in poss:
+            s = str(p.symbol).upper()
+            parts = s.split(".")
+            root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+            per = 3.0 if root.startswith("M") else 30.0
+            cush += abs(int(p.net_qty)) * per
+        return max(_TP_BUFFER_USD, cush)
+
+    def _passtp_broker(self, cfg):
+        """타깃별 브로커 인스턴스 캐시 - 매분 재로그인 방지(토큰 갱신은 어댑터 몫)."""
+        c = getattr(self, "_passtp_bk", None)
+        if c is None:
+            c = self._passtp_bk = {}
+        k = (cfg.get("broker"), cfg.get("f1", ""))
+        b = c.get(k)
+        if b is None:
+            b = c[k] = _build_broker(cfg.get("broker"), cfg.get("f1", ""),
+                                     cfg.get("f2", ""), cfg.get("f3", ""), [])
+        return b
+
+    @staticmethod
+    def _passtp_filter(poss, aid_cfg):
+        """설정 계좌(이름/ID)로 포지션 필터 - casefold(어댑터 계좌 매칭과 동일 규칙)."""
+        want = str(aid_cfg or "").lower()
+        return [p for p in poss
+                if not want or want in (str(p.account_name).lower(),
+                                        str(p.account_id).lower())]
+
+    def _passtp_scan(self):
+        import time as _timemod
+        done = getattr(self, "_passtp_done", None)
+        if done is None:
+            done = self._passtp_done = {}
+        for asset, idx, cfg, tp in self._passtp_targets():
+            aid_cfg = str(cfg.get("acct") or "")
+            key = (cfg.get("broker"), aid_cfg.lower())
+            if done.get(key):
+                continue                        # 이 계좌는 이번 가동에서 이미 정리함
+            try:
+                b = self._passtp_broker(cfg)
+                poss = self._passtp_filter(b.list_open_positions(), aid_cfg)
+                if not poss:
+                    continue
+                # ProjectX position.type 실측 전 방어(⑦): 1·2 외 값이면 부호를 못 믿는다.
+                if any((p.raw or {}).get("type") not in (1, 2) for p in poss):
+                    continue
+                total, seen = 0.0, 0
+                for p in poss:
+                    pv = self._passtp_pv(p.symbol)
+                    avg = _as_float((p.raw or {}).get("averagePrice"), 0.0)
+                    if not pv or avg <= 0:
+                        continue                # 값이 불확실하면 이 포지션은 판단에서 뺀다
+                    mark = b.current_market_price(p.symbol)
+                    if mark is None:
+                        continue
+                    total += (float(mark) - avg) * int(p.net_qty) * pv
+                    seen += 1
+                if seen == 0 or seen != len(poss):
+                    continue                    # 하나라도 값을 못 읽으면 이번 회차는 판단 보류
+                if total <= 0:
+                    continue                    # 이익 구간이 아니면 볼 것 없다
+                try:
+                    bal = b.account_balance(aid_cfg)
+                except Exception:
+                    bal = None
+                if bal is None:
+                    continue                    # 잔고를 모르면 판단 보류(오발동 방지)
+                # ⚠ balance가 실현 잔고인지 에쿼티인지 VERIFY 전(라이브=정본) - 에쿼티라면
+                # 미실현이 이중 가산돼 이르게 발동한다. 아래 '실현 잔고 재확인'이 그물이다.
+                buf = self._passtp_buffer(poss)
+                if float(bal) >= tp + buf:
+                    # 이미 실현 잔고만으로 목표 이상 - 확정할 게 없으니 건드리지 않는다.
+                    note = getattr(self, "_passtp_note", None)
+                    if note is None:
+                        note = self._passtp_note = {}
+                    if not note.get(key):
+                        note[key] = True
+                        self.log(f"   · [{cfg.get('label') or aid_cfg}] 잔고 ${float(bal):,.0f}가 "
+                                 f"이미 목표 ${tp:,.0f} 이상 - 통과 익절 대기 없음(설정 확인 권장)")
+                    continue
+                if float(bal) + total < tp + buf:
+                    continue
+                # ── 발사 직전 최종 가드(④): 무장 유지 + 스냅샷 일치 재확인 ──
+                if not getattr(self, "_sig_on", False):
+                    return
+                if (asset, idx) not in getattr(self, "_sig_accts", {}):
+                    continue
+                fresh = self._passtp_filter(b.list_open_positions(), aid_cfg)
+                if ({(p.symbol, int(p.net_qty)) for p in fresh}
+                        != {(p.symbol, int(p.net_qty)) for p in poss}):
+                    continue                    # 그 사이 포지션이 변함(청산/신규) - 보류
+                # ── 목표 도달 → 그 계좌만 정리 ──
+                lbl = cfg.get("label") or aid_cfg
+                self.log(f"\n🎯 [{lbl}] 통과 목표 도달 - 잔고 ${float(bal):,.0f} + 미실현 "
+                         f"${total:,.0f} ≥ 목표 ${tp:,.0f}+버퍼 ${buf:,.0f} → 이 계좌 정리")
+                for p in poss:
+                    try:
+                        b.close_contract((p.raw or {}).get("_accountId") or p.account_id, p.symbol)
+                    except Exception as ce:
+                        self.log(f"   ❌ {p.symbol} 청산 발주 실패: {ce}")
+                # ── confirm-after-act(①): 플랫 확인 후에만 주문 취소·done·팝업 ──
+                flat = False
+                for _ in range(8):
+                    _timemod.sleep(1)
+                    try:
+                        if not self._passtp_filter(b.list_open_positions(), aid_cfg):
+                            flat = True; break
+                    except Exception:
+                        pass
+                if not flat:
+                    self.log(f"   🛑 [{lbl}] 청산 미확인 - 손절·주문은 그대로 두고 60초 뒤 "
+                             f"재시도합니다. 계좌를 직접 확인하십시오.")
+                    fw = getattr(self, "_passtp_failwarn", None)
+                    if fw is None:
+                        fw = self._passtp_failwarn = set()
+                    if key not in fw:
+                        fw.add(key)
+                        self.root.after(0, lambda l=lbl: messagebox.showwarning(
+                            "EQ Autopilot",
+                            (f"[{l}] 통과 익절 청산이 확인되지 않았습니다.\n"
+                             "보호 손절은 그대로 있으며 60초마다 재시도합니다.\n"
+                             "프롭사 화면에서 계좌를 직접 확인하십시오."
+                             if self.lang == "ko" else
+                             f"[{l}] Pass take-profit close not confirmed.\n"
+                             "Protective stops remain in place; retrying every 60s.\n"
+                             "Please check the account at your prop firm.")))
+                    continue                    # done 미기록 → 다음 스캔이 재시도
+                # 플랫 확인됨 - 이제야 그 계좌의 잔여 주문 취소(고아 손절 방지)
+                try:
+                    _aid = (poss[0].raw or {}).get("_accountId") or poss[0].account_id
+                    for o in b._open_orders(_aid):
+                        try:
+                            b._cancel_order(_aid, o.get("id"))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                done[key] = _timemod.time()
+                # 재진입 차단(⑤): 이 실계좌가 무장된 모든 (자산,행)을 이번 가동에서 해제.
+                try:
+                    for k2 in [k2 for k2, c2 in list(self._sig_accts.items())
+                               if c2.get("broker") == "projectx"
+                               and str(c2.get("acct") or "").lower() == aid_cfg.lower()]:
+                        self._sig_accts.pop(k2, None)
+                except Exception:
+                    pass
+                # 실현 잔고 재확인 - 슬리피지·수수료로 목표 미달이면 축하 대신 경고.
+                try:
+                    bal2 = b.account_balance(aid_cfg)
+                except Exception:
+                    bal2 = None
+                _short = bal2 is not None and float(bal2) < tp
+                self.log(f"   ✅ [{lbl}] 정리 완료(플랫 확인) - 신규 자동 진입 중단"
+                         + (f" · ⚠ 실현 잔고 ${float(bal2):,.0f} < 목표 ${tp:,.0f}"
+                            if _short else ""))
+                self.root.after(0, lambda l=lbl, t=total, s=_short, b2=bal2: messagebox.showinfo(
+                    "EQ Autopilot",
+                    ((f"[{l}] 통과 목표 도달 - 미실현 ${t:,.0f}에서 포지션을 정리했습니다.\n"
+                      "이 계좌의 신규 자동 진입은 중단됐습니다(다음 [라이브 시작]까지).\n"
+                      + (f"주의: 실현 잔고(${float(b2):,.0f})가 목표에 다소 못 미칩니다 - "
+                         "프롭사 화면에서 통과 여부를 확인하십시오." if s else
+                         "프롭사 화면에서 통과 여부와 계좌 상태를 확인하십시오."))
+                     if self.lang == "ko" else
+                     (f"[{l}] Pass target reached - closed at ${t:,.0f} open profit.\n"
+                      "New automated entries for this account are paused (until the next Go Live).\n"
+                      + (f"Note: realized balance (${float(b2):,.0f}) landed slightly below target - "
+                         "verify the pass at your prop firm." if s else
+                         "Check your prop firm's dashboard for the account status.")))))
+            except Exception as e:
+                self.log(f"   · 통과 익절 감시 오류({asset}/{aid_cfg}): {e}")
+
     def _precheck_tick(self):
         try:
             from datetime import datetime
@@ -4444,7 +4746,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18b"
+    _APP_VER = "2026.08.18c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
