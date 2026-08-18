@@ -18,7 +18,9 @@ _TOKEN_TTL = 24 * 60 * 60       # ProjectX session token ~24h
 _RENEW_MARGIN = 60 * 60         # re-auth 1h before expiry
 _LONG = 1                       # position.type: 1=long, 2=short (docs don't state it; common ProjectX
                                 # convention). Only affects the displayed net sign — closeContract
-                                # flattens the whole position regardless, so a wrong guess is cosmetic.
+                                # flattens the whole position regardless. ⚠ 2026-08-18: no longer
+                                # cosmetic - eqgui pass-TP uses net_qty sign for open-PnL math.
+                                # VERIFY type mapping (1=long?) live; pass-TP holds off on ∉(1,2).
 _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
 
 # 계약 메타데이터 조회 실패 시 폴백 틱사이즈(우리가 다루는 심볼만).
