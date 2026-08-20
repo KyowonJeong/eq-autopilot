@@ -230,6 +230,20 @@ class NT8Broker(BrokerAdapter):
                 return a.get("cash_value")
         return None
 
+    def account_netliq(self, acct):
+        """NetLiquidation(잔고+미실현) - 통과 익절의 판정 원천(2026-08-20). 구 애드온은
+        이 필드를 안 보내므로 None → 호출부가 '애드온 업데이트 필요'로 안내하고 쉰다."""
+        for a in self._snapshot().get("accounts", []):
+            if str(a.get("name")) == str(acct):
+                return a.get("net_liq")
+        return None
+
+    def account_unrealized(self, acct):
+        for a in self._snapshot().get("accounts", []):
+            if str(a.get("name")) == str(acct):
+                return a.get("unrealized_pnl")
+        return None
+
     # ── 명령 ──
     @staticmethod
     def _front_month(sym: str, today=None):

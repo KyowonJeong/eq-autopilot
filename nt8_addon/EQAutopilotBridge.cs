@@ -107,6 +107,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         { "name", a.Name },
                         { "cash_value", a.Get(AccountItem.CashValue, Currency.UsDollar) },
                         { "realized_pnl", a.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) },
+                        // 통과 익절(2026-08-20): NetLiq = 잔고+미실현 - 앱이 시세·포인트가치
+                        // 없이 (잔고+미실현)≥목표를 판정하는 유일한 원천. 구 앱은 이 필드를
+                        // 모른 채 무시하므로 호환에 영향 없음.
+                        { "net_liq", a.Get(AccountItem.NetLiquidation, Currency.UsDollar) },
+                        { "unrealized_pnl", a.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar) },
                     });
                     foreach (var p in a.Positions)
                     {

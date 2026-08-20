@@ -2962,15 +2962,15 @@ class App:
                          "website → Capital → Prop playbook."))
                   ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("통과 목표 잔고: 테스트기 + Topstep(ProjectX) 계좌에서만 작동합니다. "
-                         "프롭 화면에 보이는 "
+                  text=(("통과 목표 잔고: 테스트기 + Topstep(ProjectX)·Lucid(NT8) 계좌에서 "
+                         "작동합니다(NT8은 새 브리지 애드온 필요). 프롭 화면에 보이는 "
                          "통과 기준 잔고를 그대로 넣으십시오. (현재 잔고 + 미실현 이익)이 그 값"
                          "(+계약수 비례 여유, 최소 $20)에 닿는 순간 이 계좌의 포지션을 시장가로 "
                          "정리합니다. 남은 거리는 앱이 매번 계산하니 잔고가 늘어도 고칠 필요가 "
                          "없습니다. 금액은 본인이 정하고, 규정 확인도 본인 몫입니다. 0=꺼짐(기본).")
                         if ko else
-                        ("Pass target balance: test accounts on Topstep (ProjectX) only. "
-                         "Enter the balance your firm "
+                        ("Pass target balance: test accounts on Topstep (ProjectX) and "
+                         "Lucid (NT8; new bridge add-on required). Enter the balance your firm "
                          "requires to clear the evaluation. When (current balance + open profit) "
                          "reaches it (plus size-scaled headroom, min $20), the app market-closes this "
                          "account's positions. The remaining distance is recomputed each time, so "
@@ -4169,11 +4169,11 @@ class App:
                     self.log(f"   ⚠ [{cfg.get('label') or wk[1]}] 통과 익절은 수동 모드 "
                              f"계좌에선 작동하지 않습니다")
                 continue
-            if cfg.get("broker") != "projectx":
+            if cfg.get("broker") not in ("projectx", "nt8"):
                 if wk not in warned:
                     warned.add(wk)
                     self.log(f"   ⚠ [{cfg.get('label') or wk[1]}] 통과 익절은 현재 "
-                             f"Topstep(ProjectX)만 지원합니다 - "
+                             f"Topstep(ProjectX)·Lucid(NT8)만 지원합니다 - "
                              f"{_broker_label(cfg.get('broker'))} 계좌에선 작동하지 않습니다")
                 continue
             out.append((asset, idx, cfg, tp))
@@ -4201,7 +4201,7 @@ class App:
         for p in poss:
             s = str(p.symbol).upper()
             parts = s.split(".")
-            root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+            root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s.split(" ")[0]
             per = 4.0 if root.startswith("M") else 40.0
             cush += abs(int(p.net_qty)) * per
         return max(_TP_BUFFER_USD, cush)
@@ -4284,7 +4284,9 @@ class App:
                      "Please check the account at your prop firm.")))
             return False
         # ── 플랫 확인됨: 그 계좌 잔여 주문 전체 취소(고아 손절 방지) ──
-        if _aid is not None:
+        # NT8은 close=종목 Flatten이 주문 취소까지 포함하고 _open_orders API가 없다 -
+        # 어댑터가 지원할 때만 수행(2026-08-20 nt8 지원).
+        if _aid is not None and hasattr(b, "_open_orders"):
             try:
                 for o in b._open_orders(_aid):
                     try:
@@ -4301,7 +4303,7 @@ class App:
         # 재진입 차단: 이 실계좌가 무장된 모든 (자산,행)을 이번 가동에서 해제.
         try:
             for k2 in [k2 for k2, c2 in list(self._sig_accts.items())
-                       if c2.get("broker") == "projectx"
+                       if c2.get("broker") == cfg.get("broker")
                        and str(c2.get("acct") or "").strip().lower()
                        == str(aid_cfg).strip().lower()]:
                 self._sig_accts.pop(k2, None)
@@ -4309,7 +4311,9 @@ class App:
             pass
         # 실현 잔고 재확인 - 슬리피지·수수료로 목표 미달이면 축하 대신 경고.
         try:
-            bal2 = b.account_balance(aid_cfg)
+            # NT8은 플랫 후 NetLiq=실현 잔고와 동치라 그것으로 재확인(2026-08-20).
+            bal2 = (b.account_netliq(aid_cfg) if cfg.get("broker") == "nt8"
+                    else b.account_balance(aid_cfg))
         except Exception:
             bal2 = None
         _short = bal2 is not None and float(bal2) < tp
@@ -4350,6 +4354,59 @@ class App:
                     continue
                 poss = self._passtp_filter(b.list_open_positions(), aid_cfg)
                 if not poss:
+                    continue
+                if cfg.get("broker") == "nt8":
+                    # ── Lucid(NT8): 시세·포인트가치 없이 NetLiq(잔고+미실현) 하나로 판정
+                    # (2026-08-20). 구 애드온은 net_liq를 안 보내 None → 1회 안내 후 휴면.
+                    nl = None
+                    try:
+                        nl = b.account_netliq(aid_cfg)
+                    except Exception:
+                        nl = None
+                    if nl is None:
+                        w2 = getattr(self, "_passtp_warned", None)
+                        if w2 is None:
+                            w2 = self._passtp_warned = set()
+                        wk2 = ("nt8-old-addon", key[1])
+                        if wk2 not in w2:
+                            w2.add(wk2)
+                            self.log(f"   ⚠ [{cfg.get('label') or aid_cfg}] 통과 익절: NT8 "
+                                     f"브리지 애드온이 구버전입니다 - 앱 패키지의 새 "
+                                     f"EQAutopilotBridge.cs로 교체(재컴파일)해야 작동합니다")
+                        continue
+                    cash = None
+                    try:
+                        cash = b.account_balance(aid_cfg)
+                    except Exception:
+                        pass
+                    buf = self._passtp_buffer(poss)
+                    if cash is not None and float(cash) >= tp + buf:
+                        note = getattr(self, "_passtp_note", None)
+                        if note is None:
+                            note = self._passtp_note = {}
+                        if not note.get(key):
+                            note[key] = True
+                            self.log(f"   · [{cfg.get('label') or aid_cfg}] 잔고 "
+                                     f"${float(cash):,.0f}가 이미 목표 ${tp:,.0f} 이상 - "
+                                     f"통과 익절 대기 없음(설정 확인 권장)")
+                        continue
+                    if float(nl) < tp + buf:
+                        continue
+                    if not getattr(self, "_sig_on", False):
+                        return
+                    if (asset, idx) not in getattr(self, "_sig_accts", {}):
+                        continue
+                    _upnl = None
+                    try:
+                        _upnl = b.account_unrealized(aid_cfg)
+                    except Exception:
+                        pass
+                    lbl = cfg.get("label") or aid_cfg
+                    self.log(f"\n🎯 [{lbl}] 통과 목표 도달 - NetLiq ${float(nl):,.0f} ≥ "
+                             f"목표 ${tp:,.0f}+버퍼 ${buf:,.0f} → 이 계좌 정리")
+                    fired.add(key)
+                    self._passtp_close_account(b, cfg, aid_cfg, key, tp,
+                                               float(_upnl) if _upnl is not None else 0.0)
                     continue
                 # ProjectX position.type 실측 전 방어: 1·2 외 값이면 부호를 못 믿는다.
                 if any((p.raw or {}).get("type") not in (1, 2) for p in poss):
@@ -4846,7 +4903,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.18g"
+    _APP_VER = "2026.08.20h"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
