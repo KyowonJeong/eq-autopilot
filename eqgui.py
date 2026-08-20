@@ -4240,9 +4240,15 @@ class App:
             except Exception as ce:
                 self.log(f"   ❌ {p.symbol} 청산 발주 실패: {ce}")
         flat, left = False, poss
+        _is_nt8 = cfg.get("broker") == "nt8"
         for _ in range(8):
             _timemod.sleep(1)
             try:
+                # NT8 blip 가드(적대검증 D2): 연결이 끊기면 계정이 push에서 통째로 빠져
+                # 빈 포지션 = '플랫'으로 오독된다. 신선 + 계정 존재일 때만 플랫 인정.
+                if _is_nt8 and hasattr(b, "snapshot_fresh"):
+                    if not (b.snapshot_fresh() and b.account_connected(aid_cfg)):
+                        continue
                 left = self._passtp_filter(b.list_open_positions(), aid_cfg)
                 if not left:
                     flat = True; break
@@ -4358,11 +4364,21 @@ class App:
                 if cfg.get("broker") == "nt8":
                     # ── Lucid(NT8): 시세·포인트가치 없이 NetLiq(잔고+미실현) 하나로 판정
                     # (2026-08-20). 구 애드온은 net_liq를 안 보내 None → 1회 안내 후 휴면.
+                    # 신선도 게이트(적대검증 D1): NT8이 죽으면 push가 고착 - 낡은 값 발사 금지.
+                    if hasattr(b, "snapshot_fresh") and not b.snapshot_fresh():
+                        continue
                     nl = None
                     try:
                         nl = b.account_netliq(aid_cfg)
                     except Exception:
                         nl = None
+                    _cash0 = None
+                    try:
+                        _cash0 = b.account_balance(aid_cfg)
+                    except Exception:
+                        pass
+                    if nl is not None and float(nl) == 0.0 and _cash0 and float(_cash0) > 0:
+                        nl = None              # 피드가 NetLiq 미지원(0 고정) - 무음 휴면 방지(D3)
                     if nl is None:
                         w2 = getattr(self, "_passtp_warned", None)
                         if w2 is None:
@@ -4374,11 +4390,7 @@ class App:
                                      f"브리지 애드온이 구버전입니다 - 앱 패키지의 새 "
                                      f"EQAutopilotBridge.cs로 교체(재컴파일)해야 작동합니다")
                         continue
-                    cash = None
-                    try:
-                        cash = b.account_balance(aid_cfg)
-                    except Exception:
-                        pass
+                    cash = _cash0
                     buf = self._passtp_buffer(poss)
                     if cash is not None and float(cash) >= tp + buf:
                         note = getattr(self, "_passtp_note", None)
@@ -4390,6 +4402,19 @@ class App:
                                      f"${float(cash):,.0f}가 이미 목표 ${tp:,.0f} 이상 - "
                                      f"통과 익절 대기 없음(설정 확인 권장)")
                         continue
+                    _pv = getattr(self, "_passtp_nlprobe", None)
+                    if _pv is None:
+                        _pv = self._passtp_nlprobe = set()
+                    if key not in _pv:
+                        _pv.add(key)
+                        try:
+                            _u0 = b.account_unrealized(aid_cfg)
+                            self.log(f"   · [{cfg.get('label') or aid_cfg}] NT8 NetLiq 실측: "
+                                     f"netliq=${float(nl):,.0f} cash="
+                                     f"${float(cash):,.0f} upnl=${float(_u0 or 0):,.0f} "
+                                     f"(netliq≈cash+upnl이면 정상)")
+                        except Exception:
+                            pass
                     if float(nl) < tp + buf:
                         continue
                     if not getattr(self, "_sig_on", False):

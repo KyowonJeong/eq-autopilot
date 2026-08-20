@@ -101,9 +101,18 @@ def _make_handler(state: _BridgeState, token: str):
             if self.path == "/v1/ping":
                 return self._send(200, {"ok": True, "ts": time.time()})
             if self.path == "/v1/pending":
+                # 명령 TTL 120초(2026-08-20 적대검증 D1): NT8이 죽어 있던 사이 쌓인 명령이
+                # 며칠 뒤 재접속 순간 시장가로 집행되는 지뢰 제거. 결정은 신선할 때만 유효하다.
+                now = time.time()
                 with state.lock:
                     cmds, state.pending = state.pending, []
-                return self._send(200, {"commands": cmds})
+                fresh, stale = [], []
+                for c in cmds:
+                    (fresh if now - float(c.get("_ts") or now) <= 120 else stale).append(c)
+                for c in stale:
+                    state.journal({"op": "ttl-dropped", "tid": c.get("tid"),
+                                   "orig_op": c.get("op"), "age_s": int(now - float(c.get("_ts") or now))})
+                return self._send(200, {"commands": fresh})
             return self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -230,19 +239,36 @@ class NT8Broker(BrokerAdapter):
                 return a.get("cash_value")
         return None
 
+    def _acct_row(self, acct):
+        """계정 스냅샷 행 - casefold 일치(2026-08-20 D4: 필터는 casefold인데 여기만 정확
+        일치라 케이스 다르면 '구 애드온' 오진 경고가 났다)."""
+        want = str(acct or "").strip().lower()
+        for a in self._snapshot().get("accounts", []):
+            if str(a.get("name") or "").strip().lower() == want:
+                return a
+        return None
+
+    def snapshot_fresh(self, max_age: float = 10.0) -> bool:
+        """push 신선도(2026-08-20 D1) - NT8이 죽으면 last_state가 고착되므로, 무인 판정
+        (통과 익절)은 이 게이트를 통과한 스냅샷만 믿는다."""
+        st = self._state
+        return bool(st and st.last_state_ts
+                    and (time.time() - st.last_state_ts) <= max_age)
+
+    def account_connected(self, acct) -> bool:
+        """이 계정이 현재 push에 존재(=NT8 연결됨)하는가(2026-08-20 D2) - 연결 blip 중엔
+        계정이 push에서 통째로 빠져 빈 포지션이 '플랫'으로 오독된다."""
+        return self._acct_row(acct) is not None
+
     def account_netliq(self, acct):
         """NetLiquidation(잔고+미실현) - 통과 익절의 판정 원천(2026-08-20). 구 애드온은
         이 필드를 안 보내므로 None → 호출부가 '애드온 업데이트 필요'로 안내하고 쉰다."""
-        for a in self._snapshot().get("accounts", []):
-            if str(a.get("name")) == str(acct):
-                return a.get("net_liq")
-        return None
+        a = self._acct_row(acct)
+        return a.get("net_liq") if a else None
 
     def account_unrealized(self, acct):
-        for a in self._snapshot().get("accounts", []):
-            if str(a.get("name")) == str(acct):
-                return a.get("unrealized_pnl")
-        return None
+        a = self._acct_row(acct)
+        return a.get("unrealized_pnl") if a else None
 
     # ── 명령 ──
     @staticmethod
@@ -309,6 +335,7 @@ class NT8Broker(BrokerAdapter):
             if tid in self._state.seen_tids:
                 return {"duplicate": True, "tid": tid}   # 멱등: 이미 나간 명령
             self._state.journal(cmd)
+            cmd.setdefault("_ts", time.time())     # TTL 판정용 적재 시각(2026-08-20 D1)
             self._state.pending.append(cmd)
         deadline = time.time() + _ACK_TIMEOUT_S
         while time.time() < deadline:
