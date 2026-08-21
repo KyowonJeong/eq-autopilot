@@ -140,9 +140,42 @@ namespace NinjaTrader.NinjaScript.AddOns
                     foreach (Account a in Account.All)
                     {
                         if (a.ConnectionStatus != ConnectionStatus.Connected) continue;
-                        foreach (Execution ex in a.Executions)
+                        // 실현손익 부기(2026-08-21, 실기기 CS1061 수리): NT8의 Execution.Position은
+                        // '체결 후 잔량(int)'라 손익 메서드가 없다. 시간순으로 평균단가를 굴려
+                        // 청산 반턴에 (체결가-평단)×청산수량×포인트가치를 싣는다. 진입 반턴은 0
+                        // (어댑터 계약: pnl==0 은 진입으로 간주하고 건너뛴다).
+                        var book = new Dictionary<string, double[]>();   // key → [netQty, avgPrice]
+                        var exs = new List<Execution>();
+                        foreach (Execution e0 in a.Executions) exs.Add(e0);
+                        exs.Sort((x, y) => x.Time.CompareTo(y.Time));
+                        foreach (Execution ex in exs)
                         {
                             if (ex == null || ex.Instrument == null) continue;
+                            double pv = ex.Instrument.MasterInstrument.PointValue;
+                            string bk = a.Name + "|" + ex.Instrument.FullName;
+                            if (!book.ContainsKey(bk)) book[bk] = new double[] { 0.0, 0.0 };
+                            double net = book[bk][0], avg = book[bk][1];
+                            double q = ex.Quantity *
+                                (ex.MarketPosition == MarketPosition.Long ? 1.0 : -1.0);
+                            double realized = 0.0;
+                            if (net != 0 && Math.Sign(net) != Math.Sign(q))
+                            {
+                                double closed = Math.Min(Math.Abs(q), Math.Abs(net));
+                                realized = (ex.Price - avg) * closed * pv * Math.Sign(net);
+                                net += q;
+                                if (net != 0 && Math.Sign(net) == Math.Sign(q))
+                                    avg = ex.Price;              // 초과분 = 반대 방향 신규 진입
+                                else if (net == 0)
+                                    avg = 0.0;
+                            }
+                            else
+                            {
+                                double newAbs = Math.Abs(net) + Math.Abs(q);
+                                avg = newAbs > 0
+                                    ? (avg * Math.Abs(net) + ex.Price * Math.Abs(q)) / newAbs : 0.0;
+                                net += q;
+                            }
+                            book[bk][0] = net; book[bk][1] = avg;
                             executions.Add(new Dictionary<string, object> {
                                 { "account", a.Name },
                                 { "exec_id", ex.ExecutionId },
@@ -153,8 +186,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                                 { "time", ex.Time.ToUniversalTime()
                                             .ToString("yyyy-MM-ddTHH:mm:ssZ") },
                                 { "commission", ex.Commission },
-                                { "pnl", ex.Position != null ? ex.Position.GetUnrealizedProfitLoss(
-                                            PerformanceUnit.Currency, ex.Price) : 0.0 },
+                                { "pnl", realized },
                             });
                         }
                     }
