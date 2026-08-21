@@ -2427,10 +2427,22 @@ class App:
                  "Broker & keys in ① stay untouched.")):
             return
         self._collect_acct_widgets()
-        self._acfg[dst]["accounts"] = [_copy.deepcopy(a) for a in src_accts]
+        # 행 브로커 실체화(대표 2026-08-21 실사고: NQ 루시드 계좌를 GC로 복사하니 Topstep이
+        # 됨): 행의 broker 칸이 비면 '그 자산의 기본 브로커'로 해석되는데, 복사 후엔 해석
+        # 기준이 목적지 자산으로 바뀐다. 복사 시점에 원본 자산 기준 실효 브로커를 박는다.
+        _copied = []
+        for a in src_accts:
+            a2 = _copy.deepcopy(a)
+            try:
+                a2["broker"] = self._acct_broker(src_asset, a)
+            except Exception:
+                pass
+            _copied.append(a2)
+        self._acfg[dst]["accounts"] = _copied
         self._save_cfg()
         self._build()
-        self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개)")
+        self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개, "
+                 f"브로커 유지)")
 
     def _add_acct(self):
         """[계좌 추가] = 빈 행 추가(대표 2026-08-11 행 중심 등록). 브로커·계좌·1R은 행에서
