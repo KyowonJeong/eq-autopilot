@@ -4928,7 +4928,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.20h"
+    _APP_VER = "2026.08.21i"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5308,7 +5308,8 @@ class App:
                 import requests as _rq          # 모듈 레벨에 requests 없음 - 지역 임포트 필수
                 _rq.post(PUSH_BASE + "eqalive", timeout=8,
                          json={"t": self._token, "armed": bool(armed),
-                               "v": self._APP_VER})
+                               "v": self._APP_VER,
+                               "m": _machine_id()})   # 기기별 생존 집계(2026-08-21 액티브 앱 카운터)
             except Exception:
                 pass
         threading.Thread(target=_bg, daemon=True).start()
