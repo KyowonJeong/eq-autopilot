@@ -4928,7 +4928,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.21i"
+    _APP_VER = "2026.08.21j"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -4953,6 +4953,7 @@ class App:
                 _d = self._fill_acc.setdefault(str(asset), {"micro": 0.0, "coin": 0.0, "n": 0})
                 _d["micro"] += float(micro or 0)
                 _d["coin"] += float(coin or 0)
+                _d["n"] += 1          # 계좌(leg) 수 - 예전엔 except 블록 안이라 늘 0이었다
             if not hasattr(self, "_open_assets"):
                 self._open_assets = set()
             self._open_assets.add(str(asset))        # 청산 버튼 노출 근거(2026-08-11)
@@ -4965,7 +4966,6 @@ class App:
                 self.root.after(0, self._refresh_live_panel)
             except Exception:
                 pass
-                _d["n"] += 1
         except Exception:
             pass
 
@@ -5262,7 +5262,30 @@ class App:
             self.log(f"   ✅ {_sym} 진입 완료 ×{_qty}")
             # 대시보드 보고용 누적(#53) - 미니/마이크로가 섞이므로 마이크로 환산 계약으로
             # 통일한다(미니 1 = 마이크로 10). 심볼 앞 M이 마이크로.
-            self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
+            # ⚠️2026-08-21(대표 "루시드 하나 안 들어갔었네"): 예전엔 주문이 **접수**만 되면
+            # 셌다 - 거절·마진부족으로 실제 포지션이 없어도 공개 트랙레코드 수량이 부풀었다.
+            # 이제 브로커 포지션을 짧게 확인해 **실제로 잡힌 계좌만** 보고한다(읽기 전용,
+            # 발주 경로 무간섭. 확인 실패해도 주문 자체는 그대로 살아 있다).
+            _confirmed = True
+            try:
+                import time as _tvf
+                _seen_qty = 0
+                for _i in range(4):                    # 0.5s 간격 4회 = 최대 2초
+                    try:
+                        _seen_qty = abs(int(b.position_qty(_aid, _con) or 0))
+                    except Exception:
+                        _seen_qty = 0
+                    if _seen_qty:
+                        break
+                    _tvf.sleep(0.5)
+                _confirmed = bool(_seen_qty)
+            except Exception:
+                _confirmed = True                      # 확인 자체가 불가하면 종전대로 센다
+            if _confirmed:
+                self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
+            else:
+                self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
+                         f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
             self._send_gap(asset, sig, b, _con)          # 체결 갭 실측(자산당 1회, 2026-08-11)
             _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
