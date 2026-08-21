@@ -4940,7 +4940,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.21j"
+    _APP_VER = "2026.08.21k"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -4951,6 +4951,18 @@ class App:
     # 실패하면 5분 창 안에서만 재시도. 그 뒤 미실현은 서버가 현재가로 계속 계산한다.
     # ⚠️ 발주 경로에는 손대지 않는다 - 이 호출은 전부 별도 스레드이고, 실패해도 조용하다.
     _FILL_RETRY_WINDOW_S = 300      # 5분 창 - 그 뒤로는 포기(서버는 현재가로 계속 계산)
+
+    def _nt8_standby(self) -> bool:
+        """대기조 모드(대표 2026-08-21): 같은 루시드 계좌를 다른 기기(집 머신)가 함께 무장한
+        과도기용. config.yaml에 `nt8_standby: true` 한 줄을 넣으면 NT8 진입이 ①신호 후
+        200초(폴링 창 초과) 기다렸다가 ②같은 방향 포지션이 이미 있으면 그 계좌를 양보한다.
+        기본 꺼짐 - 일반 회원(1기기) 동작 불변."""
+        try:
+            import yaml
+            with open(CFG_PATH, encoding="utf-8") as f:
+                return bool((yaml.safe_load(f) or {}).get("nt8_standby"))
+        except Exception:
+            return False
 
     def _note_fill(self, asset, micro=0.0, coin=0.0):
         """진입 leg 하나가 체결될 때마다 자산별로 누적. 멀티 계좌·멀티 leg를 합산해서
@@ -5218,6 +5230,17 @@ class App:
         if len(resolved) > 1:
             self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
                      + " (미니 묶음 — 커미션 절감)")
+        # ── 대기조 모드(2026-08-21): 다른 기기 선진입 창을 통째로 기다린 뒤 포지션을 본다 ──
+        _standby = type(b).__name__ == "NT8Broker" and self._nt8_standby()
+        if _standby and live:
+            _sid0 = str((sig or {}).get("id") or "")
+            _sw = getattr(self, "_standby_waited", None)
+            if _sw is None:
+                _sw = self._standby_waited = set()
+            if _sid0 and _sid0 not in _sw:
+                _sw.add(_sid0)
+                self.log("   ⏳ 대기조: 다른 기기 선진입 창 대기(200초) — 집 기기가 살아 있으면 양보합니다")
+                _t.sleep(200)
         # ── 잔여 포지션 정리(leg 계약별) — 연속 세션 순서 보장 ──
         existing = b.list_open_positions()
         _mycons = {c for _, _, c in resolved}
@@ -5226,6 +5249,14 @@ class App:
             self.log(f"   ⚠ 다른 심볼 포지션 {len(others)}개 감지 — 건드리지 않음: "
                      + ", ".join(f"{p.symbol}" for p in others[:3]))
         mine = [p for p in existing if p.symbol in _mycons]
+        if mine and _standby:
+            _want = 1 if str(direction).upper() in ("LONG", "BUY", "0") else -1
+            if any((1 if int(p.net_qty) > 0 else -1) == _want for p in mine):
+                # 같은 방향 기존 포지션 = 이번 세션을 다른 기기가 먼저 넣은 것. 청산·재진입
+                # 대신 이 계좌를 통째로 양보한다(수수료 이중·손절 고아 방지).
+                self.log(f"   🤝 대기조: 같은 방향 포지션 {len(mine)}개 확인 — 다른 기기 선진입, "
+                         f"이 계좌 양보(진입 안 함)")
+                return
         if mine:
             if not live:
                 self.log(f"   (DRY-RUN) 이전 세션 잔여 {len(mine)}개 — LIVE면 청산 확인 후 진입.")
