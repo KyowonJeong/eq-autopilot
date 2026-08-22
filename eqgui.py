@@ -4940,7 +4940,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.22l"
+    _APP_VER = "2026.08.22m"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -4951,6 +4951,30 @@ class App:
     # 실패하면 5분 창 안에서만 재시도. 그 뒤 미실현은 서버가 현재가로 계속 계산한다.
     # ⚠️ 발주 경로에는 손대지 않는다 - 이 호출은 전부 별도 스레드이고, 실패해도 조용하다.
     _FILL_RETRY_WINDOW_S = 300      # 5분 창 - 그 뒤로는 포기(서버는 현재가로 계속 계산)
+
+    def _claim_entry(self, sig, acct_id) -> bool:
+        """서버 진입 클레임(대표 2026-08-22 "같은 토큰 다른 머신 이중 진입 막게"):
+        같은 (토큰, 신호, 계좌)에 서버가 선착 1기기만 허가한다 - 기기 간 타이밍 경쟁 소멸.
+        계좌번호는 안 보낸다(sha256 해시 12자). **fail-open**: 서버 불가침·오류면 True
+        (단일 기기 회원이 서버 순단에 막히면 안 됨 - 신호가 방금 서버에서 왔으니 사실상
+        항상 도달한다). False = 다른 기기가 선점 → 이 계좌 양보."""
+        try:
+            import hashlib
+            import requests as _rq
+            import autopilot_crypto
+            tid = autopilot_crypto.path_id(self._token or "")
+            sid = str((sig or {}).get("id") or "")
+            if not tid or not sid:
+                return True
+            ah = hashlib.sha256(str(acct_id).strip().lower().encode()).hexdigest()[:12]
+            r = _rq.post(PUSH_BASE + "eqclaim", timeout=6,
+                         json={"tok_id": tid, "sig_id": sid, "acct_h": ah,
+                               "mid": _machine_id()})
+            if r.ok and r.text.startswith("claim:taken"):
+                return False
+            return True
+        except Exception:
+            return True
 
     def _nt8_standby(self) -> bool:
         """대기조 모드(대표 2026-08-21): 같은 루시드 계좌를 다른 기기(집 머신)가 함께 무장한
@@ -5232,6 +5256,10 @@ class App:
         if len(resolved) > 1:
             self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
                      + " (미니 묶음 — 커미션 절감)")
+        # ── 서버 진입 클레임(2026-08-22): 같은 토큰의 다른 기기가 이 계좌를 선점했으면 양보 ──
+        if live and not self._claim_entry(sig, _aid):
+            self.log(f"   🤝 다른 기기가 이 계좌의 이번 진입을 선점 — 양보(진입 안 함)")
+            return
         # ── 대기조 모드(2026-08-21): 다른 기기 선진입 창을 통째로 기다린 뒤 포지션을 본다 ──
         _standby = type(b).__name__ == "NT8Broker" and self._nt8_standby()
         if _standby and live:
@@ -5921,6 +5949,10 @@ class App:
                                 self.log(f"   ⚖ [{lbl}] 실거리 사이징 — 거리 {_d_ref:.2f}→{_d_act:.2f} "
                                          f"→ 수량 {size:g}→{_sz2:g} (리스크 1R 유지)")
                                 size = _sz2
+                if live and not self._claim_entry(sig, lbl or sym):
+                    # 서버 진입 클레임(2026-08-22): 같은 토큰 다른 기기 선점 시 양보
+                    self.log(f"   🤝 [{lbl}] 다른 기기 선점 — 이 계좌 양보(진입 안 함)")
+                    return
                 if live:
                     self._auto_leverage(b, sym, size)
                 res = b.place_entry(symbol=sym, side=direction, size=size,
