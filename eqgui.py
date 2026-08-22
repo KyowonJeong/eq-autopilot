@@ -4940,7 +4940,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.21k"
+    _APP_VER = "2026.08.22l"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -4993,7 +4993,7 @@ class App:
         except Exception:
             pass
 
-    def _send_gap(self, asset, sig, b, sym_match):
+    def _send_gap(self, asset, sig, b, sym_match, mkt_at_send=None):
         """체결 갭 실측 보고(/eqgap, 대표 2026-08-11): 봉마감 기준가(entry_ref) 대비 실제
         평균 체결가. 자산당 신호 1건에 1회(첫 성공 계좌 기준 - 같은 순간 시장가라 계좌 간
         차이는 무시 가능). 포지션 평균단가가 브로커에 잡힐 때까지 최대 60초 폴링.
@@ -5056,6 +5056,8 @@ class App:
                         "direction": str(_dir).upper(), "entry_ref": float(_ref),
                         "fill_price": float(fill), "sent_ts": _sent_ts,
                         "fill_ts": _t.time()}
+                if mkt_at_send:
+                    body["mkt_at_send"] = float(mkt_at_send)   # 협의 슬리피지(서버가 계산)
                 for _try in range(3):
                     try:
                         r = requests.post(PUSH_BASE + "eqgap", timeout=8, json=body)
@@ -5275,6 +5277,12 @@ class App:
                     self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
                 except Exception as _ce:
                     self.log(f"   ❌ 잔여 청산 실패: {_ce} — 진입 중단."); return
+        # 발주 직전 시장가 1회 샘플(2026-08-22, 21l 협의 슬리피지 실측용) - 실패해도 무해.
+        _px_at_send = None
+        try:
+            _px_at_send = b.current_market_price(resolved[0][2])
+        except Exception:
+            pass
         # ── 체결 정책(GC 등 지정가) — leg 전부 동일 정책 적용 ──
         _polf = ((sig.get("exec_policy") or {}).get("entry")
                  if isinstance(sig.get("exec_policy"), dict) else None)
@@ -5329,7 +5337,8 @@ class App:
             else:
                 self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
                          f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
-            self._send_gap(asset, sig, b, _con)          # 체결 갭 실측(자산당 1회, 2026-08-11)
+            self._send_gap(asset, sig, b, _con,
+                           mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
             _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
                 _sp = res.get("stop_price")
@@ -5375,7 +5384,11 @@ class App:
                 _rq.post(PUSH_BASE + "eqalive", timeout=8,
                          json={"t": self._token, "armed": bool(armed),
                                "v": self._APP_VER,
-                               "m": _machine_id()})   # 기기별 생존 집계(2026-08-21 액티브 앱 카운터)
+                               "m": _machine_id(),
+                               # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
+                               # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
+                               "demo": bool(getattr(self, "live_dry", None)
+                                            and self.live_dry.get())})
             except Exception:
                 pass
         threading.Thread(target=_bg, daemon=True).start()
