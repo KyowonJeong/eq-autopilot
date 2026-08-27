@@ -41,7 +41,14 @@ class IBKRBroker(BrokerAdapter):
             asyncio.set_event_loop(asyncio.new_event_loop())
         ib = IB()
         # TWS/Gateway must already be running on the user's machine (API enabled in settings).
-        ib.connect(self.cfg.host, int(self.cfg.port), clientId=int(self.cfg.client_id), timeout=15)
+        # 로컬호스트 강제(2026-08-27 일치성 P2-39): 약관 §14.5가 "같은 컴퓨터의 TWS/Gateway"를
+        # 전제하는데 host 칸이 임의 원격 주소를 받았다. NT8의 127.0.0.1 고정과 동일 원칙.
+        _host = str(self.cfg.host or "127.0.0.1").strip()
+        if _host not in ("127.0.0.1", "localhost", "::1"):
+            raise RuntimeError(
+                "IBKR host must be local (127.0.0.1/localhost/::1) - TWS or IB Gateway "
+                "runs on this computer per the supported setup.")
+        ib.connect(_host, int(self.cfg.port), clientId=int(self.cfg.client_id), timeout=15)
         self._ib = ib
         return ib
 

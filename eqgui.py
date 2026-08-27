@@ -262,26 +262,26 @@ _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
     "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (예: 127.0.0.1)", "f2": None,
-                    "f3": "Port (7497/7496)", "acct": True, "futures": True, "preview": True},
+                    "f3": "Port (7497/7496)", "acct": True, "futures": True, "status": "unverified"},
     "bybit":       {"label": "Bybit (USDT perp)", "f1": "API Key", "f2": "API Secret",
-                    "f3": "Testnet (1=on)", "acct": False, "futures": False, "preview": True,
+                    "f3": "Testnet (1=on)", "acct": False, "futures": False,
                     "f1_secret": True},
     "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
-                    "f3": "Passphrase", "acct": False, "futures": False, "preview": True,
+                    "f3": "Passphrase", "acct": False, "futures": False, "status": "beta",
                     "f1_secret": True},
     # Lucid = NT8 브리지(대표 2026-08-10, #38). API가 없어 NinjaTrader 애드온 경유 -
     #   f1 = 앱-애드온 공유 토큰(비밀), f3 = 브리지 포트. 계좌 = NT8 계정 이름 그대로.
     #   Windows 전용(앱과 NT8 같은 머신). preview = 데모 실증 전.
     "nt8":         {"label": "Lucid (NT8)", "f1": "Bridge Token (앱-애드온 공유)", "f2": None,
                     "f3": "Bridge Port (기본 8377)", "acct": True, "futures": True,
-                    "preview": True, "f1_secret": True},
+                    "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
     #   (API 키 페어 콜론 연결 — 셋째 토막 'demo'면 데모 서버). preview=데모 실검증 전.
     # f2 라벨 주의(2026-08-17 실사): "Password"로만 쓰면 마스터 로그인 비밀번호를 넣게 유도한다.
     # Tradovate 키 발급 시 "Protect with a dedicated password"로 정한 전용 비밀번호가 맞다.
     "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "API dedicated password",
                     "f3": "API cid:sec[:demo]", "acct": True, "futures": True,
-                    "preview": True},
+                    "status": "unverified"},
 }
 
 
@@ -341,7 +341,8 @@ T = {
     "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
                  "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
     "broker": {"ko": "브로커", "en": "Broker"},
-    "broker_preview": {"ko": "(미검증 — 테스트넷/Sim 먼저)", "en": "(unverified — testnet/Sim first)"},
+    "broker_preview": {"ko": "(검증 전 — 테스트넷/Sim 먼저)", "en": "(unverified — testnet/Sim first)"},
+    "broker_beta": {"ko": "(베타 — 일부 경로 검증 중)", "en": "(beta — some paths still verifying)"},
     "acct_topstep_only": {"ko": "계좌 목록은 Topstep 전용입니다.", "en": "Account list is Topstep-only."},
     "token": {"ko": "멤버십 토큰", "en": "Membership token"},
     "token_show": {"ko": "표시", "en": "Show"},
@@ -396,8 +397,9 @@ T = {
                  "en": "Immediate close (flatten all positions on the chosen account now)"},
     "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
-    "consent": {"ko": "동의: 본인 키·본인 기기·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
-                "en": "I agree: my key, my device, my responsibility. EdgeQuant does not trade. (required to act)"},
+    # 약관 §14.9·Privacy 5.4와 문언 일치(2026-08-27 일치성 P2-40): '본인 계좌' 항목 누락 수리
+    "consent": {"ko": "동의: 본인 키·본인 기기·본인 계좌·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
+                "en": "I agree: my key, my device, my account, my responsibility. EdgeQuant does not trade. (required to act)"},
     "consent_detail": {
         "ko": ("· 크립토 진입 시 잔고가 부족하면 앱이 거래소 계좌의 레버리지 설정을 올립니다"
                "(주문이 아니라 계좌 설정 변경입니다. 내리지는 않습니다).\n"
@@ -1252,8 +1254,13 @@ class App:
                                       state="readonly", width=22)
         self.brokerbox.set(_broker_label(self._broker_name)); self.brokerbox.pack(side="left")
         self.brokerbox.bind("<<ComboboxSelected>>", self._on_broker)
-        if spec.get("preview"):
+        # 검증 상태 3단(2026-08-27 일치성 P1-11): 웹 tier_config.BROKER_STATUS 미러.
+        # 약관 §14.5의 unverified/beta 라벨 정의와 표기를 앱·웹에서 일치시킨다.
+        _bst = spec.get("status")
+        if _bst == "unverified":
             ttk.Label(rb, text=self.t("broker_preview"), foreground="#b06f00").pack(side="left", padx=(8, 0))
+        elif _bst == "beta":
+            ttk.Label(rb, text=self.t("broker_beta"), foreground="#8a8f00").pack(side="left", padx=(8, 0))
         # 설정법 안내는 홈피 정본 한 줄로(대표 2026-08-11 "설명 너무 지저분 - 홈피 어디서
         # 볼 수 있는지만 딱"). 인앱 멀티라인 스텝은 제거, 연결되면 이 줄도 사라진다.
         if not self._conn_by_broker.get(self._broker_name):
