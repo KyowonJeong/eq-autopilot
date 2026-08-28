@@ -146,6 +146,9 @@ PUSH_BASE = "https://app.edgequant.app/"           # 공개 트랙레코드 푸�
 TR_LOOKBACK_DAYS = 90                              # 푸시당 체결 조회 범위(서버가 tid로 멱등 병합)
 TR_CHUNK = 40                                      # 청크당 trade 수(URL 길이 안전)
 SIG_POLL_SECS = 3                                   # feed poll cadence while the loop runs
+# 표시 전용 피드는 느리게 돈다(2026-08-28): 매매 루프의 3초는 진입 속도 때문이고,
+# 화면에 적기만 하는 쪽은 그럴 이유가 없다 - 회원 PC와 서버 양쪽 부담을 낮춘다.
+_WATCH_POLL_SECS = 20
 HB_REFRESH_MS = 5 * 60 * 1000                       # heartbeat re-check every 5 min
 HB_GRACE_MIN = 60      # 네트워크 순단 유예(분) - 서버(홈피) 재시작·과부하가 자동매매 권한을
 #                        끊지 않게(대표 2026-08-07: 8/5 홈피 반복 재시작이 15분 유예 소진→
@@ -956,6 +959,8 @@ class App:
         # 테스트가 끝난 done()은 자기 번호가 낡았으면 무장을 **버린다**. 안 그러면
         # 정지가 취소되고 신호 루프가 하나 더 떠서 같은 신호에 이중 진입까지 간다.
         self._arm_seq = 0
+        self._hb_on = False          # 상시 하트비트 스레드(아래 _hb_loop) 기동 여부
+        self._watch_on = False       # 표시 전용 피드 스레드(_watch_loop) 기동 여부
         self._live_session = False   # [라이브 시작]~[전체 정지] 사이인가(무장 0이어도 True)
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성 (현재 탭 기준)
@@ -1767,6 +1772,13 @@ class App:
                 self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
                          f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
             self._gate = gate
+            # 하트비트가 한 번이라도 돌면 상시 생존 핑을 띄운다(2026-08-28 R14 P0) -
+            # 신호 루프 유무와 무관하게 앱이 떠 있는 동안 심박이 뛰어야 한다.
+            try:
+                self._hb_start()
+                self._watch_start()      # 표시 전용 피드(등급 무관 - 지연은 서버가 건다)
+            except Exception:
+                pass
             self.root.after(0, self._apply_gating)
         threading.Thread(target=w, daemon=True).start()
         if periodic:
@@ -3906,9 +3918,26 @@ class App:
         perm_use = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
         if not (perm_use or perm_auto):
-            messagebox.showwarning(self.t("token"),
-                                   "멤버십 권한이 없습니다 — 토큰을 확인하세요."
-                                   if self.lang == "ko" else "No membership permission — check your token."); return
+            # 연결 권한만 있는 등급(오픈 후 Preview)에는 **왜 안 되는지와 무엇이 되는지**를
+            # 같이 말한다(2026-08-28 R14 P0). 종전 "멤버십 권한이 없습니다"는 앱을 정식으로
+            # 내려받아 브로커까지 붙인 회원에게 막다른 골목이었다 - 그 회원이 받기로 한
+            # 혜택(지연 30분 신호 표시)은 라이브 없이도 이미 돌고 있다(_watch_loop).
+            _conn_ok = bool(caps.get("connect", True))
+            try:
+                _need_l = "Operator"
+            except Exception:
+                _need_l = "Operator"
+            messagebox.showinfo(
+                self.t("token"),
+                ((f"자동 실행은 {_need_l} 등급부터입니다.\n\n"
+                  "지금 등급에서도 브로커 연결과 신호 수신은 그대로 돕니다 - 신호는 "
+                  "아래 로그에 지연 발행 시각에 맞춰 표시됩니다."
+                  if _conn_ok else "멤버십 권한이 없습니다 - 토큰을 확인하세요.")
+                 if self.lang == "ko" else
+                 (f"Automated execution starts at the {_need_l} tier.\n\n"
+                  "Broker connection and signal delivery keep working on your tier - "
+                  "signals appear in the log below at their scheduled time."
+                  if _conn_ok else "No membership permission - check your token."))); return
         live = not dry
         # 가동 조건을 기억한다(대표 2026-08-28 "금 설정했어"): 라이브 도중 실행 자산을
         # 체크하면 그때 같은 조건(LIVE/모의, 신호대기 권한)으로 무장해야 한다.
@@ -5259,7 +5288,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28e"
+    _APP_VER = "2026.08.28f"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5713,6 +5742,94 @@ class App:
         if not gb:
             return True
         return bool(gb.get(self._HB_BROKER_KEY.get(broker, broker), False))
+
+    def _watch_loop(self):
+        """표시 전용 신호 피드(2026-08-28 R14 P0). **주문은 절대 내지 않는다.**
+
+        ⚠️이게 없어서 오픈 후 Preview 퍼널이 끊겨 있었다: 서버는 30분 지연 피드를 큐에
+        넣어 발행하는데(signals/autopilot_feed._queue_preview) 앱은 자동 진입 권한이
+        있을 때만 도는 _sig_loop에서만 그 피드를 읽어, "브로커를 연결하면 60분이 30분이
+        된다"는 등급표·약관의 약속을 받을 경로가 아예 없었다. 그 파일 주석도
+        "표시용 소비는 다음 앱 빌드가 얹는다"고 적어두고 있었다 - 그게 이 루프다.
+
+        _sig_on(매매 루프)이 도는 동안에는 쉰다 - 같은 신호를 두 번 로그하지 않기 위해서다.
+        진입·손절·청산 코드를 일절 부르지 않으므로 이 루프로는 주문이 나갈 수 없다."""
+        import time as _tw
+        import requests
+        import autopilot_crypto
+        _last = None
+        while True:
+            try:
+                if (not (self._token or "").strip()) or self._sig_on:
+                    _tw.sleep(_WATCH_POLL_SECS); continue
+                r = requests.get(_feed_url(self._token),
+                                 params={"t": int(_tw.time())}, timeout=8)
+                sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
+                sid = sig.get("id")
+                if sid and sid != _last:
+                    _last = sid
+                    self.root.after(0, lambda g=sig: self._log_watch_signal(g))
+            except Exception:
+                pass
+            _tw.sleep(_WATCH_POLL_SECS)
+
+    def _log_watch_signal(self, sig):
+        """표시 전용 신호 한 건을 로그에 적는다(메인 스레드). 주문 코드 없음."""
+        import datetime as _dw
+        _ko = self.lang == "ko"
+        _inst = sig.get("instrument") or "?"
+        _dir = str(sig.get("direction") or "").upper()
+        _tr = bool(sig.get("tradeable") and _dir)
+        try:
+            _pub = float(sig.get("published_at") or 0)
+            _lag = int((_dw.datetime.now().timestamp() - _pub) // 60) if _pub else None
+        except (TypeError, ValueError):
+            _lag = None
+        _tail = (f" (지연 {_lag}분)" if _ko else f" ({_lag} min delay)") if _lag is not None else ""
+        if _tr:
+            _side = ("롱" if _dir == "LONG" else "숏") if _ko else _dir.lower()
+            self.log(f"\n📩 {_inst} {_side}" + (f" 신호 수신{_tail}" if _ko else
+                                                f" signal received{_tail}"))
+            _e, _s = sig.get("entry"), sig.get("stop")
+            if _e is not None:
+                self.log((f"   진입 {_e}" if _ko else f"   entry {_e}")
+                         + (f"  ·  손절 {_s}" if (_ko and _s is not None) else
+                            (f"  ·  stop {_s}" if _s is not None else "")))
+        else:
+            self.log(f"\n📭 {_inst} " + (f"거래 없음{_tail}" if _ko else f"no trade{_tail}"))
+        if not (self._sig_accts or self._auto_accts):
+            self.log("   " + ("표시 전용입니다 - 자동 실행은 라이브를 시작해야 돕니다."
+                              if _ko else
+                              "Display only - start live for automated execution."))
+
+    def _watch_start(self):
+        if getattr(self, "_watch_on", False):
+            return
+        self._watch_on = True
+        threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    def _hb_loop(self):
+        """상시 생존 핑(4분). ⚠️2026-08-28 R14 P0: 주기 핑이 _sig_loop 안에만 있었다.
+        오픈 후 Operator는 신호 대기 권한이 없어 _sig_loop 자체가 안 뜨므로 **핑이 0회**가
+        되고, 웹은 15분 뒤부터 영구 '응답 없음'을 찍는데 앱 다운 알림은 armed=False라
+        영영 안 나간다 - 랜딩과 가이드가 '응답이 멈추면 15분 이내 알림'을 약속하는데
+        정작 자동 청산만 쓰는 유료 등급에서 그 약속이 깨졌다. 루프와 무관하게 앱이 떠
+        있는 동안 돈다. armed는 실제 무장 상태(신호 대기 + 자동 청산)를 따라간다."""
+        import time as _th
+        while True:
+            try:
+                if (self._token or "").strip():
+                    self._alive_ping(armed=bool(self._sig_accts or self._auto_accts))
+            except Exception:
+                pass
+            _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
+
+    def _hb_start(self):
+        """토큰이 생기면 한 번만 띄운다(데몬이라 종료를 막지 않는다)."""
+        if getattr(self, "_hb_on", False):
+            return
+        self._hb_on = True
+        threading.Thread(target=self._hb_loop, daemon=True).start()
 
     def _armed_assets(self):
         """지금 무장(신호 대기) 중인 자산 목록. _sig_accts(자산,계좌) 키의 자산만 뽑는다.
