@@ -2870,6 +2870,28 @@ class App:
             self.log(f"   … 재시도 {i + 1} 실패: {sr.get('stop_error')}")
         self.log("   🔴 손절 미거치(네트워크) — 포지션 유지 중. 세션 마감 자동청산이 백스톱이지만, "
                  "지금 수동으로 손절/확인을 권장!")
+        # ⚠️로그로 끝내지 않는다(2026-08-28 R16 P0). 이 상태가 정확히 제품 페이지가
+        # "손절 없는 포지션은 존재할 수 없습니다"라고 단정한 것의 반례다. 회원이 자리에
+        # 없으면 세션 마감까지 무방비인데 스크롤백 말고는 알 길이 없었다.
+        _sym = str(contract or "").upper()[:16]
+        self._member_alert(
+            "stop_miss",
+            f"[EQ Autopilot] 손절 주문이 걸리지 않았습니다 ({_sym}). 포지션은 살아 있고 "
+            f"세션 마감 자동 청산이 유일한 백스톱입니다. 브로커 화면에서 지금 손절을 "
+            f"직접 걸거나 포지션을 정리하세요.",
+            f"[EQ Autopilot] The protective stop did not go in ({_sym}). The position is open "
+            f"and session-close auto-flatten is the only backstop. Place the stop yourself at "
+            f"your broker now, or close the position.")
+        try:
+            self.root.after(0, lambda: messagebox.showwarning(
+                "EQ Autopilot",
+                (f"손절 주문이 걸리지 않았습니다 ({_sym}).\n포지션은 살아 있습니다.\n\n"
+                 "브로커 화면에서 지금 손절을 직접 걸거나 포지션을 정리하세요."
+                 if self.lang == "ko" else
+                 f"The protective stop did not go in ({_sym}).\nThe position is open.\n\n"
+                 "Place the stop yourself at your broker now, or close the position.")))
+        except Exception:
+            pass
 
     def _flatten_unprotected(self, b, aid, contract, why):
         """Market-close a just-entered position whose protective stop was rejected."""
@@ -2879,6 +2901,13 @@ class App:
             self.log("   ↩ 포지션 청산 완료(손절 불가로 진입 취소).")
         except Exception as ce:
             self.log(f"   ❌ 긴급 청산 실패: {ce} — 즉시 수동 확인 필요!")
+            # 손절이 거부돼 청산하려 했는데 그것마저 실패 - 가장 위험한 상태다.
+            self._member_alert(
+                "flatten_fail",
+                f"[EQ Autopilot] 손절이 거부돼 포지션을 정리하려 했으나 청산도 실패했습니다 "
+                f"({str(contract or '')[:16]}). 브로커 화면에서 즉시 확인하세요.",
+                f"[EQ Autopilot] The stop was rejected and the emergency close also failed "
+                f"({str(contract or '')[:16]}). Check your broker now.")
 
     def _auto_loop(self):
         """자산별 세션 마감 자동청산. 잡은 self._auto_jobs에서 매 사이클 동적으로 읽는다
@@ -5421,7 +5450,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28m"
+    _APP_VER = "2026.08.28n"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5960,6 +5989,29 @@ class App:
             return
         self._watch_on = True
         threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    def _member_alert(self, kind: str, ko: str, en: str):
+        """회원 본인에게 즉시 알림(2026-08-28 R16 P0). 서버가 텔레그램/디스코드로 보낸다.
+
+        ⚠️왜 필요한가: 사고가 나는 순간 회원은 대개 자리에 없다. 앱 로그 한 줄은 아무도
+        안 읽는다. 특히 **손절이 안 걸린 채 살아 있는 포지션**은 제품 페이지가
+        "손절 없는 포지션은 존재할 수 없습니다"라고 단정하는 바로 그 상태의 반례라,
+        조용히 지나가면 안 된다. 앱이 죽었을 때 DM을 보내는 경로는 이미 있는데
+        정작 더 위험한 이 상태에는 안 붙어 있었다(서버 헬퍼는 있고 호출부가 0이었다).
+        백그라운드 전송이라 매매 경로를 막지 않고, 실패해도 무해하다(로그는 남는다)."""
+        def _bg():
+            try:
+                import requests as _rq
+                _rq.post(PUSH_BASE + "eqalert", timeout=8,
+                         json={"t": self._token, "kind": str(kind)[:24],
+                               "ko": str(ko)[:600], "en": str(en)[:600]})
+            except Exception:
+                pass
+        try:
+            if (self._token or "").strip():
+                threading.Thread(target=_bg, daemon=True).start()
+        except Exception:
+            pass
 
     def _hb_loop(self):
         """상시 생존 핑(4분). ⚠️2026-08-28 R14 P0: 주기 핑이 _sig_loop 안에만 있었다.
