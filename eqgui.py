@@ -951,6 +951,12 @@ class App:
         # 독립. 탭 전환은 보기 전환일 뿐 무장을 안 바꾼다. _*_on은 '루프 살아있음' 플래그.
         self._auto_accts = {}   # {(asset,idx): [job,...]}  자동청산
         self._sig_accts = {}    # {(asset,idx): cfg}        신호대기 진입
+        # 무장 요청 세대(2026-08-28 리뷰 P0): 연결 테스트는 백그라운드로 수 초 걸리는데
+        # 그동안 [전체 정지]·체크 해제가 다 눌린다. 해제 계열 경로가 이 번호를 올리고,
+        # 테스트가 끝난 done()은 자기 번호가 낡았으면 무장을 **버린다**. 안 그러면
+        # 정지가 취소되고 신호 루프가 하나 더 떠서 같은 신호에 이중 진입까지 간다.
+        self._arm_seq = 0
+        self._live_session = False   # [라이브 시작]~[전체 정지] 사이인가(무장 0이어도 True)
         self._unlocked = False
         self._connected = False          # 연결 테스트 통과 전엔 실행 버튼 비활성 (현재 탭 기준)
         self._conn_by_broker = {}        # 브로커 연결테스트 통과 기억(크레덴셜 단위) — 탭 전환 무영향
@@ -2402,11 +2408,37 @@ class App:
                                                             broker="projectx"))
         _th.Thread(target=w, daemon=True).start()
 
+    def _armed_here(self, asset) -> bool:
+        """그 자산이 지금 무장 중이면 설정 변경을 막는다(2026-08-28 리뷰 P1).
+        무장은 [라이브 시작] 시점의 계좌·브로커 스냅샷(_sig_accts/_auto_accts)으로 돈다.
+        가동 중에 계좌나 브로커를 갈아치우면 화면은 새 설정을 보여주는데 실주문은 옛
+        계좌로 나간다 - 회원이 화면을 믿을 수 없게 되는 가장 나쁜 종류의 불일치다."""
+        if not any(k[0] == asset for d in (getattr(self, "_sig_accts", None) or {},
+                                           getattr(self, "_auto_accts", None) or {})
+                   for k in d):
+            return False
+        try:
+            messagebox.showwarning(
+                self.t("sec_live"),
+                (f"{asset}이(가) 지금 무장 중입니다. 가동 중에는 계좌나 브로커 설정을 "
+                 f"바꿀 수 없습니다 - 화면과 실제 발주 대상이 갈라지기 때문입니다.\n\n"
+                 f"{asset} 체크를 껐다가 설정을 바꾸고 다시 켜세요."
+                 if self.lang == "ko" else
+                 f"{asset} is armed right now. Account and broker settings cannot change "
+                 f"while it runs - the screen and the actual order target would diverge."
+                 f"\n\nUncheck {asset}, change the settings, then check it again."))
+        except Exception:
+            pass
+        return True
+
+
     def _copy_broker_setup(self, src_asset):
         """① 브로커 설정만 복사(대표 2026-08-11 "다른 유닛을 하나로 묶으면 언제나 혼란"):
         브로커 선택·크레덴셜(브리지 토큰·포트)·가용 계좌 목록. 사용 계좌(②)는 안 건드린다."""
         import copy as _copy
         dst = self._asset
+        if self._armed_here(dst):
+            return
         _src = self._acfg[src_asset]
         if not any((v.get("f1") or "").strip() for v in (_src.get("creds") or {}).values()):
             messagebox.showinfo(("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
@@ -2414,10 +2446,12 @@ class App:
                                  else f"No broker setup to copy from {src_asset}.")); return
         if not messagebox.askyesno(
                 ("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
-                (f"{src_asset}의 브로커 설정(브로커·키·가용 계좌)을 {dst}(으)로 덮어쓸까요?\n"
-                 "사용 계좌(②)는 그대로 둡니다." if self.lang == "ko" else
-                 f"Overwrite {dst}'s broker setup (broker, keys, available accounts) "
-                 f"with {src_asset}'s? Accounts in ② stay untouched.")):
+                (f"{src_asset}의 브로커 선택과 키, 가용 계좌를 {dst}에 가져올까요?\n"
+                 f"{dst}에만 있는 다른 브로커 키는 지우지 않고, 사용 계좌(②) 행도 "
+                 f"그대로 둡니다." if self.lang == "ko" else
+                 f"Bring {src_asset}'s broker choice, keys and available accounts into "
+                 f"{dst}?\nKeys for brokers only {dst} has are kept, and the account rows "
+                 f"in section 2 stay as they are.")):
             return
         self._collect_acct_widgets()
         # ⚠️creds는 **병합**이다(대표 2026-08-28 "브로커 다른 걸로 선택돼 있으면 카피가
@@ -2426,27 +2460,52 @@ class App:
         # 이 자산에서 못 쓰는 브로커(선물↔크립토)는 애초에 넘기지 않는다.
         _ok_bks = _ASSET_BROKERS.get(dst, [])
         _dstcr = self._acfg[dst].setdefault("creds", {})
+        # ⚠️**빈 자격은 안 넘긴다**(2026-08-28 리뷰 P0). f1이 빈 creds 엔트리는 예외가
+        # 아니라 기본값이다 - _load가 자산 기본 브로커에 대해 항상 만들고, 브로커
+        # 드롭다운을 한 번만 옮겨도 _save_current_asset이 이전 브로커의 빈 엔트리를
+        # 남긴다. 그걸 그대로 옮기면 dst의 **살아 있는 키를 빈 값으로 덮어써**, 멀쩡히
+        # 굴러가던 자산이 조용히 죽는다. dst에 아예 없던 브로커면 빈 엔트리라도 받아
+        # 콤보에는 뜨게 한다(회원이 키를 채워 넣을 자리).
         _moved = []
         for _bk, _cr in (_src.get("creds") or {}).items():
-            if _bk in _ok_bks:
+            if _bk not in _ok_bks:
+                continue
+            if ((_cr.get("f1") or "").strip()) or _bk not in _dstcr:
                 _dstcr[_bk] = _copy.deepcopy(_cr)     # 가용 계좌(avail)도 이 안에 있다
-                _moved.append(_bk)
+                if (_cr.get("f1") or "").strip():
+                    _moved.append(_bk)
         _sb = _src.get("broker")
         if _sb in _ok_bks:
             self._acfg[dst]["broker"] = _sb
-        # 남은 계좌 행 재정합: 자격이 없는 브로커를 가리키는 행은 새 기본 브로커로 돌린다.
-        # 안 하면 ①만 누른 뒤 화면은 멀쩡한데 그 행만 조용히 못 쓰는 상태가 된다.
-        _fixed = 0
-        for _ac in self._acfg[dst].get("accounts") or []:
-            _rb = (_ac.get("broker") or "").strip()
-            if _rb and not ((_dstcr.get(_rb) or {}).get("f1") or "").strip():
-                _ac["broker"] = self._acfg[dst].get("broker")
-                _fixed += 1
+        # ⚠️계좌 행의 브로커는 **안 건드린다**(리뷰 P0). 자격 없는 행을 기본 브로커로
+        # 돌리던 종전 처리는 Topstep 계좌명이 붙은 행을 Lucid 행으로 만들었고, 그 조합은
+        # 프리플라이트·연결 테스트를 다 통과한 뒤 신호가 온 순간에야 '계좌 없음'으로
+        # 드러났다(화면은 계속 초록). 자격이 없으면 라이브 시작이 "키 미설정"으로
+        # 크게 막는 편이 조용한 오배선보다 안전하다. 대신 어느 행인지 미리 알려준다.
+        _need = sorted({(_ac.get("broker") or "").strip()
+                        for _ac in (self._acfg[dst].get("accounts") or [])
+                        if (_ac.get("broker") or "").strip()
+                        and not ((_dstcr.get((_ac.get("broker") or "").strip()) or {})
+                                 .get("f1") or "").strip()})
         self._save_cfg()
         self._build()
         self.log(f"📋 {src_asset} → {dst} 브로커 설정 복사 완료 "
-                 f"(브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종"
-                 + (f", 계좌 행 {_fixed}개 브로커 재지정" if _fixed else "") + ")")
+                 f"(브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종 이동)")
+        if _need:
+            _lbls = ", ".join(_broker_label(b) for b in _need)
+            self.log(f"⚠ 키가 없는 브로커를 가리키는 계좌 행이 있습니다: {_lbls}")
+            try:
+                messagebox.showwarning(
+                    ("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
+                    (f"복사는 끝났지만 {dst}의 계좌 행 중 일부가 키 없는 브로커"
+                     f"({_lbls})를 가리킵니다.\n행의 브로커를 바꾸거나 그 브로커 키를 "
+                     f"입력하세요 - 그대로 두면 라이브 시작이 막힙니다."
+                     if self.lang == "ko" else
+                     f"Copied, but some {dst} account rows point at brokers with no key "
+                     f"({_lbls}).\nChange the row broker or enter that broker's key - "
+                     f"otherwise going live is blocked."))
+            except Exception:
+                pass
 
     def _copy_acct_setup(self, src_asset):
         """② 사용 계좌 복사: 계좌 목록·1R·모드 + 그 행들이 굴러가는 데 필요한
@@ -2455,6 +2514,8 @@ class App:
         ②는 계좌 행을 옮기면서 그 행이 필요로 하는 자격을 딸려 보낸다."""
         import copy as _copy
         dst = self._asset
+        if self._armed_here(dst):
+            return
         src_accts = self._accts_of(src_asset)
         if not src_accts or not any((x.get("id") or "").strip() for x in src_accts):
             messagebox.showinfo(self.t("btn_accts"),
@@ -2498,9 +2559,12 @@ class App:
         _sb = self._acfg[src_asset].get("broker")
         _moved = []
         for _bk in dict.fromkeys(_need + ([_sb] if _sb else [])):
-            if _bk in _ok_bks and _bk in _srccr:
+            # 빈 자격은 실제 키를 못 덮는다(①과 같은 이유 - 리뷰 P0)
+            if _bk in _ok_bks and _bk in _srccr and (
+                    ((_srccr[_bk].get("f1") or "").strip()) or _bk not in _dstcr):
                 _dstcr[_bk] = _copy.deepcopy(_srccr[_bk])   # 키 + 가용 계좌 목록
-                _moved.append(_bk)
+                if (_srccr[_bk].get("f1") or "").strip():
+                    _moved.append(_bk)
         if _sb in _ok_bks:
             self._acfg[dst]["broker"] = _sb
         self._save_cfg()
@@ -3226,7 +3290,12 @@ class App:
         체크 목록으로만 이뤄지므로, 가동 중에 자산을 체크하면 화면은 켜진 것처럼 보이는데
         서버로 가는 arm 목록에는 없었다 - **그 자산 신호가 와도 주문이 안 나갔다**.
         표시 버그가 아니라 실행 누락이었다. 체크가 곧 무장이 되게 한다."""
-        _running = bool(getattr(self, "_sig_accts", None) or getattr(self, "_auto_accts", None))
+        # ⚠️세션 기준이다(2026-08-28 리뷰 P0). 무장 dict가 비었는지로 판정하면,
+        # 마지막 무장 자산을 껐다가 다시 켤 때 _running=False가 되어 영영 재무장되지
+        # 않는다 - "체크가 곧 무장"이라는 이번 수리의 약속이 바로 그 순간 깨진다.
+        _running = bool(getattr(self, "_live_session", False)
+                        or getattr(self, "_sig_accts", None)
+                        or getattr(self, "_auto_accts", None))
         _was = {a for a in _ASSETS if self._acfg.get(a, {}).get("include", True)}
         for a, var in getattr(self, "_live_include", {}).items():
             try:
@@ -3237,24 +3306,65 @@ class App:
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
         if _running:
             for a in sorted(_was - _now):
-                self._live_disarm_asset(a)
+                if not self._live_disarm_asset(a):      # 회원이 취소 - 체크를 되돌린다
+                    self._acfg[a]["include"] = True
+                    try:
+                        self._live_include[a].set(1)
+                    except Exception:
+                        pass
+                    self._save_cfg()
             _add = sorted(_now - _was)
             if _add:
                 self._live_arm_assets(_add)
         self._refresh_live_panel()
 
-    def _live_disarm_asset(self, asset):
-        """가동 중 자산 체크 해제 → 그 자산 무장 즉시 해제(I/O 없음, 메인 스레드 안전)."""
+    def _live_disarm_asset(self, asset) -> bool:
+        """가동 중 자산 체크 해제 → 그 자산 무장 즉시 해제(I/O 없음, 메인 스레드 안전).
+
+        ⚠️해제는 **세션 마감 자동 청산까지** 없앤다(_auto_accts에서 그 자산 잡을 지운다).
+        열린 포지션이 있는데 조용히 그러면, 회원은 청산이 예약된 줄 알고 자는 사이
+        포지션이 밤을 넘긴다 - 2026-08-28 리뷰 P0. 그래서 무장 중인 자산은 반드시 묻는다.
+        반환: 실제로 해제했으면 True, 회원이 취소했으면 False(호출부가 체크를 되돌린다)."""
+        _keys = [k for d in (getattr(self, "_sig_accts", None) or {},
+                             getattr(self, "_auto_accts", None) or {})
+                 for k in d if k[0] == asset]
+        _auto = [k for k in (getattr(self, "_auto_accts", None) or {}) if k[0] == asset]
+        if _keys:
+            _msg = (f"{asset} 자동 실행을 해제합니다.\n\n"
+                    "열린 포지션이 있다면 **세션 마감 자동 청산도 함께 사라집니다** - "
+                    "그 포지션은 회원이 직접 정리해야 합니다.\n\n계속할까요?"
+                    if self.lang == "ko" else
+                    f"Disarming {asset}.\n\nIf a position is open, its **session-close "
+                    "auto-flatten goes away too** - you would have to close it yourself."
+                    "\n\nContinue?") if _auto else (
+                    f"{asset} 신호 대기를 해제합니다. 계속할까요?" if self.lang == "ko"
+                    else f"Stop watching signals for {asset}. Continue?")
+            try:
+                if not messagebox.askyesno(self.t("sec_live"), _msg):
+                    return False
+            except Exception:
+                pass
+        # 진행 중인 무장 요청도 함께 무효화(리뷰 P0): 연결 테스트가 도는 중에 체크를
+        # 되돌리면 pop할 키가 없어 여기는 무음으로 지나가고 done()이 무장해버렸다.
+        self._arm_seq = getattr(self, "_arm_seq", 0) + 1
         _n = 0
         for d in (getattr(self, "_sig_accts", None) or {}, getattr(self, "_auto_accts", None) or {}):
             for k in [k for k in list(d) if k[0] == asset]:
                 d.pop(k, None); _n += 1
         if _n:
-            self.log(f"⏹ {asset} 무장 해제 — 실행 자산 체크를 껐습니다 ({_n}개 항목)")
+            self.log(f"⏹ {asset} 무장 해제 — 실행 자산 체크를 껐습니다 ({_n}개 항목)"
+                     if self.lang == "ko" else
+                     f"⏹ {asset} disarmed - execution checkbox turned off ({_n} item(s))")
         try:
             self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
+            self._set_auto_ind(bool(self._auto_accts), sorted({k[0] for k in self._auto_accts}))
         except Exception:
             pass
+        try:
+            self._alive_ping(armed=bool(self._sig_accts or self._auto_accts), force=True)
+        except Exception:
+            pass
+        return True
 
     def _live_arm_assets(self, assets):
         """가동 중 자산 체크 → 그 자산 무장. 라이브 시작과 **같은 검사**를 거친다
@@ -3300,6 +3410,8 @@ class App:
             self._save_cfg()
             return
 
+        _seq = getattr(self, "_arm_seq", 0)      # 이 요청의 세대(아래 done에서 대조)
+
         def w():
             fails, tested = [], {}
             for a in assets:
@@ -3318,6 +3430,18 @@ class App:
                         fails.append(f"{a} ({_broker_label(bk)}): {err}")
 
             def done():
+                # ⚠️최우선 재검증(2026-08-28 리뷰 P0). 연결 테스트가 도는 수 초 동안
+                # 화면은 안 잠긴다 - [전체 정지]도 체크 해제도 다 눌린다. 그 결과를
+                # 안 보고 무장하면 **정지가 취소되고** 신호 루프가 하나 더 떠서 같은
+                # 신호에 이중 진입까지 간다. 세대가 낡았거나, 세션이 닫혔거나, 그 사이
+                # 체크가 꺼졌으면 무장하지 않고 이유를 남긴다.
+                if (_seq != getattr(self, "_arm_seq", 0)
+                        or not getattr(self, "_live_session", False)
+                        or not all(self._acfg.get(a, {}).get("include") for a in assets)):
+                    self.log("⏹ 무장 취소 — 연결 테스트 중에 정지 또는 체크 해제가 있었습니다."
+                             if self.lang == "ko" else
+                             "⏹ Arming cancelled - stopped or unchecked while the test ran.")
+                    self._refresh_live_panel(); return
                 if fails:
                     self.log("⛔ 무장 중단 — " + ", ".join(fails))
                     messagebox.showerror(self.t("sec_live"),
@@ -3789,6 +3913,7 @@ class App:
         # 가동 조건을 기억한다(대표 2026-08-28 "금 설정했어"): 라이브 도중 실행 자산을
         # 체크하면 그때 같은 조건(LIVE/모의, 신호대기 권한)으로 무장해야 한다.
         self._live_ctx = {"live": bool(live), "perm_auto": bool(perm_auto)}
+        self._live_session = True
         self.b_live_start.config(state="disabled")
         if hasattr(self, "b_demo_start"):
             self.b_demo_start.config(state="disabled")
@@ -3873,6 +3998,11 @@ class App:
     def _master_stop(self):
         """[⏹ 전체 정지] — 모든 계좌 무장 해제(루프는 무장 0이면 자연 종료)."""
         n = len(set(list(self._sig_accts) + list(self._auto_accts)))
+        # 진행 중인 무장 요청 무효화(2026-08-28 리뷰 P0) - _live_ctx도 비워, 스테일 done()이
+        # 정지 전 LIVE 플래그를 재사용해 실주문 상태로 부활하지 못하게 한다.
+        self._arm_seq = getattr(self, "_arm_seq", 0) + 1
+        self._live_ctx = {}
+        self._live_session = False
         self._sig_accts.clear()
         self._auto_accts.clear()
         self._sig_on = False
@@ -5129,7 +5259,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28d"
+    _APP_VER = "2026.08.28e"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5587,8 +5717,24 @@ class App:
     def _armed_assets(self):
         """지금 무장(신호 대기) 중인 자산 목록. _sig_accts(자산,계좌) 키의 자산만 뽑는다.
         비어 있으면 앱이 떠 있어도 '실행 대기 아님' - 회원 화면은 이걸 꺼짐으로 표시한다."""
+        # ⚠️자동 청산 무장도 센다(2026-08-28 리뷰 P1). Operator 등급은 신호 대기 권한이
+        # 없어 _auto_accts에만 들어가는데, _sig_accts만 보면 멀쩡히 자동 청산이 도는
+        # 회원의 서버 칩이 'off'로 뜨고, 앱 다운 감시도 '무장 아님'으로 분류해 앱이
+        # 죽어도 알림이 안 간다. 회원 입장에서 자동 청산은 엄연히 가동 중이다.
         try:
-            return sorted({str(k[0]) for k in (getattr(self, "_sig_accts", None) or [])})
+            return sorted({str(k[0])
+                           for d in (getattr(self, "_sig_accts", None) or {},
+                                     getattr(self, "_auto_accts", None) or {})
+                           for k in d})
+        except Exception:
+            return []
+
+    def _included_assets(self):
+        """실행 자산 체크가 켜진 자산(2026-08-28 리뷰 P1). 서버가 "브로커는 붙였는데
+        무장 안 됨" 경고를 띄울 때 이 목록이 없으면, 일부러 안 돌리는 자산까지 상시
+        경고 대상이 된다 - 정상 구성을 문제로 부르는 화면은 곧 무시된다."""
+        try:
+            return [a for a in _ASSETS if (self._acfg.get(a) or {}).get("include", True)]
         except Exception:
             return []
 
@@ -5632,8 +5778,13 @@ class App:
                                "a": self._connected_assets(),
                                # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
                                # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
-                               # '꺼짐'으로 보여야 한다. _sig_accts가 무장 정본이다.
+                               # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
+                               # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
                                "arm": self._armed_assets(),
+                               # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
+                               # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
+                               # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
+                               "inc": self._included_assets(),
                                # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
                                # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
                                "demo": bool(getattr(self, "live_dry", None)
@@ -6448,8 +6599,32 @@ def main():
     # ⚠️무장을 해제하지는 않는다 - 열린 포지션과 자동 청산 계약을 화면 닫기로 바꾸면
     # 위험하다. 상태만 정직하게 보고하고 종료한다(다운 경보 대상에서도 빠진다).
     def _on_close():
+        # ⚠️무장 중 종료는 **묻는다**(2026-08-28 리뷰 P1). 종전엔 무조건 armed=False를
+        # 보내, 무장한 채 창을 닫아도 서버가 '정상 종료'로 분류해 다운 경보가 통째로
+        # 무력화됐다 - 자동화가 실제로 멈추는데 아무도 안 알려주는 상태다.
+        # 열린 포지션의 세션 마감 자동 청산도 함께 죽으므로 회원이 알고 닫아야 한다.
         try:
-            _app._alive_ping(armed=False, force=True)
+            _armed = bool(getattr(_app, "_sig_accts", None) or getattr(_app, "_auto_accts", None))
+        except Exception:
+            _armed = False
+        if _armed:
+            try:
+                _ko = getattr(_app, "lang", "ko") == "ko"
+                if not messagebox.askyesno(
+                        "EQ Autopilot",
+                        ("자동 실행이 켜져 있습니다. 지금 종료하면 신호 진입과 세션 마감 "
+                         "자동 청산이 멈춥니다.\n열린 포지션과 손절 주문은 브로커에 그대로 "
+                         "남습니다.\n\n종료할까요?" if _ko else
+                         "Automation is running. Quitting stops signal entries and "
+                         "session-close auto-flatten.\nOpen positions and stop orders stay "
+                         "at the broker.\n\nQuit?")):
+                    return
+            except Exception:
+                pass
+        try:
+            # 무장 중 종료는 armed=True로 신고한다 - 화면은 마지막 핑 신선도(15분)로
+            # 곧 '응답 없음'이 되고, 다운 경보도 정상 작동한다.
+            _app._alive_ping(armed=_armed, force=True)
             import time as _tq
             _tq.sleep(0.35)          # 백그라운드 전송 스레드가 나갈 시간(실패해도 무해)
         except Exception:
@@ -6471,7 +6646,8 @@ def main():
     root.mainloop()
     # mainloop를 어떤 경로로 빠져나오든 마지막으로 한 번 더(중복 핑은 무해).
     try:
-        _app._alive_ping(armed=False, force=True)
+        _app._alive_ping(armed=bool(getattr(_app, "_sig_accts", None)
+                                    or getattr(_app, "_auto_accts", None)), force=True)
         import time as _tq2
         _tq2.sleep(0.3)
     except Exception:
