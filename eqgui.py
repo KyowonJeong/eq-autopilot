@@ -1020,6 +1020,16 @@ class App:
                                 bg="#22a722" if on else "#dddddd")
         except Exception:
             pass
+        # 무장 상태가 **바뀌는 순간** 서버에 즉시 알린다(대표 2026-08-28 "라이브 버튼 누르면
+        # armed 바로 뜨게 해, 기다리지 말고"). 종전에는 4분 주기 핑을 기다려야 회원 화면의
+        # 상태 칩이 따라왔다. 값이 실제로 달라졌을 때만 보내 핑 폭주를 막는다.
+        try:
+            _k = (bool(on), tuple(sorted(assets or [])))
+            if getattr(self, "_sig_ind_key", None) != _k:
+                self._sig_ind_key = _k
+                self._alive_ping(armed=bool(on), force=True)
+        except Exception:
+            pass
 
     def _build(self):
         d = _load()
@@ -4947,7 +4957,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28a"
+    _APP_VER = "2026.08.28b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
