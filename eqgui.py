@@ -1029,6 +1029,7 @@ class App:
         # 테스트가 끝난 done()은 자기 번호가 낡았으면 무장을 **버린다**. 안 그러면
         # 정지가 취소되고 신호 루프가 하나 더 떠서 같은 신호에 이중 진입까지 간다.
         self._arm_seq = 0
+        self._ping_lock = threading.Lock()   # 핑 직렬화(2026-08-28: 두 경로가 서로 덮었다)
         self._hb_on = False          # 상시 하트비트 스레드(아래 _hb_loop) 기동 여부
         self._watch_on = False       # 표시 전용 피드 스레드(_watch_loop) 기동 여부
         self._live_session = False   # [라이브 시작]~[전체 정지] 사이인가(무장 0이어도 True)
@@ -5366,7 +5367,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28j"
+    _APP_VER = "2026.08.28k"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6022,32 +6023,42 @@ class App:
             self._alive_sig = _sig
 
         def _bg():
-            try:
-                import requests as _rq          # 모듈 레벨에 requests 없음 - 지역 임포트 필수
-                _rq.post(PUSH_BASE + "eqalive", timeout=8,
-                         json={"t": self._token, "armed": bool(armed),
-                               "v": self._APP_VER,
-                               "m": _machine_id(),
-                               # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
-                               # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
-                               # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
-                               # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
-                               "a": self._connected_assets(),
-                               # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
-                               # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
-                               # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
-                               # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
-                               "arm": self._armed_assets(),
-                               # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
-                               # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
-                               # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
-                               "inc": self._included_assets(),
-                               # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
-                               # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
-                               "demo": bool(getattr(self, "live_dry", None)
-                                            and self.live_dry.get())})
-            except Exception:
-                pass
+            # ⚠️핑은 **한 번에 하나씩**(대표 2026-08-28 "라이브 눌렀었어 근데 안되던거야").
+            # 2026-08-28 v2026.08.28f에서 상시 하트비트(_hb_loop)가 생기면서 핑 경로가
+            # 둘이 됐다. 둘 다 백그라운드로 POST하는데, 하트비트가 무장 **직전** 상태를
+            # 들고 이미 전송 중이면 라이브 시작의 즉시 핑보다 **늦게 도착해 덮어쓴다** -
+            # 회원은 눌렀는데 화면이 안 바뀌는 것을 본다(다음 주기에 저절로 맞춰지지만,
+            # 그 몇 분 동안 할 수 있는 판단은 "안 된다"뿐이다).
+            # 락 안에서 페이로드를 **그 순간 다시 읽어** 만들면 늦게 도착한 핑도 최신값을
+            # 싣는다 - 순서가 뒤집혀도 내용은 안 뒤집힌다.
+            with self._ping_lock:
+                try:
+                    import requests as _rq      # 모듈 레벨에 requests 없음 - 지역 임포트 필수
+                    _rq.post(PUSH_BASE + "eqalive", timeout=8,
+                             json={"t": self._token,
+                                   "armed": bool(self._sig_accts or self._auto_accts),
+                                   "v": self._APP_VER,
+                                   "m": _machine_id(),
+                                   # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
+                                   # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
+                                   # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
+                                   # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
+                                   "a": self._connected_assets(),
+                                   # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
+                                   # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
+                                   # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
+                                   # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
+                                   "arm": self._armed_assets(),
+                                   # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
+                                   # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
+                                   # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
+                                   "inc": self._included_assets(),
+                                   # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
+                                   # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
+                                   "demo": bool(getattr(self, "live_dry", None)
+                                                and self.live_dry.get())})
+                except Exception:
+                    pass
         threading.Thread(target=_bg, daemon=True).start()
 
     def _live_now(self, live_flag: bool) -> bool:
