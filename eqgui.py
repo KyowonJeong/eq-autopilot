@@ -4947,7 +4947,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.27a"
+    _APP_VER = "2026.08.28a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5402,6 +5402,14 @@ class App:
             return True
         return bool(gb.get(self._HB_BROKER_KEY.get(broker, broker), False))
 
+    def _armed_assets(self):
+        """지금 무장(신호 대기) 중인 자산 목록. _sig_accts(자산,계좌) 키의 자산만 뽑는다.
+        비어 있으면 앱이 떠 있어도 '실행 대기 아님' - 회원 화면은 이걸 꺼짐으로 표시한다."""
+        try:
+            return sorted({str(k[0]) for k in (getattr(self, "_sig_accts", None) or [])})
+        except Exception:
+            return []
+
     def _connected_assets(self):
         """브로커 자격이 실제로 입력된 자산 목록(["NQ","GC","BTC"] 부분집합).
         서버는 이것만 보고 3자산 연결 여부를 판정한다 - 키·계좌번호는 보내지 않는다."""
@@ -5440,6 +5448,10 @@ class App:
                                # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
                                # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
                                "a": self._connected_assets(),
+                               # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
+                               # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
+                               # '꺼짐'으로 보여야 한다. _sig_accts가 무장 정본이다.
+                               "arm": self._armed_assets(),
                                # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
                                # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
                                "demo": bool(getattr(self, "live_dry", None)
