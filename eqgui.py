@@ -4090,6 +4090,10 @@ class App:
                 _what = ("자동 청산" + (" + 신호 대기" if perm_auto else " (신호 대기는 Autopilot 등급)")
                          if self.lang == "ko" else
                          "auto-close" + (" + signal watch" if perm_auto else ""))
+                try:
+                    self._alive_ping(armed=True, force=True)   # 홈피 즉시 반영(이중 안전)
+                except Exception:
+                    pass
                 self.log(f"🚀 라이브 가동 시작 — {narmed}개 계좌 [{_alabels}] · {_what} · "
                          f"{'LIVE' if live else 'dry-run(모의)'}")
                 self.log(f"   {self.t('warn_mix')}")
@@ -5362,7 +5366,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28i"
+    _APP_VER = "2026.08.28j"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5998,9 +6002,24 @@ class App:
         맞다**(자동화가 실제로 멈추니까, 크래시·정전과 회원 입장에선 같은 상태).
         발송 경로에 부하를 주지 않게 백그라운드 스레드 + 실패 무해(다음 핑이 복구)."""
         import time as _t
-        if not force and _t.time() - getattr(self, "_alive_at", 0.0) < 240:
+        # ⚠️**무장 상태가 바뀌면 스로틀을 무조건 통과한다**(대표 2026-08-28 "라이브 눌렀었어
+        # 근데 안 되던거야"). 종전에는 240초 스로틀만 있어, 라이브 시작으로 자산을 무장해도
+        # 서버가 최대 4분간 옛 목록을 들고 있었다. 대표는 누르고 홈피를 봤는데 GC·BTC가
+        # 없으니 "안 된다"고 판단할 수밖에 없었다 - 실제로는 무장이 됐는데 화면만 늦었다.
+        # 경로마다 force=True를 붙이는 방식은 한 곳만 빠뜨려도 같은 일이 나므로,
+        # **상태가 바뀌었다는 사실 자체**를 통과 조건으로 삼는다. 앞으로 어느 경로가
+        # 무장을 바꾸든 즉시 보고된다.
+        try:
+            _sig = (bool(armed), tuple(self._armed_assets()), tuple(self._connected_assets()),
+                    tuple(self._included_assets()))
+        except Exception:
+            _sig = None
+        _changed = _sig is not None and _sig != getattr(self, "_alive_sig", None)
+        if not (force or _changed) and _t.time() - getattr(self, "_alive_at", 0.0) < 240:
             return
         self._alive_at = _t.time()
+        if _sig is not None:
+            self._alive_sig = _sig
 
         def _bg():
             try:
