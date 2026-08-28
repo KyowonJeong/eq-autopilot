@@ -5288,7 +5288,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28f"
+    _APP_VER = "2026.08.28g"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5760,7 +5760,20 @@ class App:
         _last = None
         while True:
             try:
-                if (not (self._token or "").strip()) or self._sig_on:
+                if not (self._token or "").strip():
+                    _tw.sleep(_WATCH_POLL_SECS); continue
+                if self._sig_on:
+                    # 매매 루프가 도는 동안에는 로그하지 않는다. 다만 **마지막 id는 따라간다**
+                    # (2026-08-28 리뷰 P2): 안 그러면 전체 정지 직후 이미 매매 루프가 적은
+                    # 신호를 이 루프가 '새 신호'로 한 번 더 적는다.
+                    try:
+                        _r0 = requests.get(_feed_url(self._token),
+                                           params={"t": int(_tw.time())}, timeout=8)
+                        _s0 = autopilot_crypto.decrypt(self._token, _r0.text) if _r0.ok else {}
+                        if _s0.get("id"):
+                            _last = _s0["id"]
+                    except Exception:
+                        pass
                     _tw.sleep(_WATCH_POLL_SECS); continue
                 r = requests.get(_feed_url(self._token),
                                  params={"t": int(_tw.time())}, timeout=8)
@@ -5780,9 +5793,13 @@ class App:
         _inst = sig.get("instrument") or "?"
         _dir = str(sig.get("direction") or "").upper()
         _tr = bool(sig.get("tradeable") and _dir)
+        # ⚠️지연 기준은 barclose_ts(봉마감 정시)다(2026-08-28 리뷰 P1). published_at은
+        # 지연 발행 시점에 서버가 새로 찍으므로, 그걸로 재면 30분 지연 신호가 항상
+        # "(지연 0분)"으로 찍힌다 - 회원이 받기로 한 값과 화면이 정반대를 말한다.
+        # barclose_ts는 이 앱의 기존 지연 표시 관례와도 같은 기준이다.
         try:
-            _pub = float(sig.get("published_at") or 0)
-            _lag = int((_dw.datetime.now().timestamp() - _pub) // 60) if _pub else None
+            _bc = float(sig.get("barclose_ts") or 0) or float(sig.get("published_at") or 0)
+            _lag = int((_dw.datetime.now().timestamp() - _bc) // 60) if _bc else None
         except (TypeError, ValueError):
             _lag = None
         _tail = (f" (지연 {_lag}분)" if _ko else f" ({_lag} min delay)") if _lag is not None else ""
@@ -5790,11 +5807,14 @@ class App:
             _side = ("롱" if _dir == "LONG" else "숏") if _ko else _dir.lower()
             self.log(f"\n📩 {_inst} {_side}" + (f" 신호 수신{_tail}" if _ko else
                                                 f" signal received{_tail}"))
-            _e, _s = sig.get("entry"), sig.get("stop")
+            # ⚠️키 이름(2026-08-28 리뷰 P1): 피드 페이로드는 entry_ref/stop_price다.
+            # entry/stop을 읽던 종전 코드는 **영원히 None**이라 진입가·손절가가 한 번도
+            # 안 찍혔다 - 표시 전용 피드의 존재 이유가 바로 그 두 값인데.
+            _e, _s = sig.get("entry_ref"), sig.get("stop_price")
             if _e is not None:
                 self.log((f"   진입 {_e}" if _ko else f"   entry {_e}")
-                         + (f"  ·  손절 {_s}" if (_ko and _s is not None) else
-                            (f"  ·  stop {_s}" if _s is not None else "")))
+                         + ((f"  ·  손절 {_s}" if _ko else f"  ·  stop {_s}")
+                            if _s is not None else ""))
         else:
             self.log(f"\n📭 {_inst} " + (f"거래 없음{_tail}" if _ko else f"no trade{_tail}"))
         if not (self._sig_accts or self._auto_accts):
