@@ -940,6 +940,9 @@ def _mark_pushed() -> None:
         pass
 
 
+_KC_LAST_FAILED = []       # 직전 저장에서 키체인에 못 넣고 평문으로 남은 필드(경고용)
+
+
 def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acct_open=None):
     """자산별 설정(acfg={자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}) + lang/token/전역
     dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음."""
@@ -972,7 +975,15 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
                           "accounts": [dict(x) for x in (c.get("accounts") or [])]}
         payload = {"live": False, "lang": lang, "token": token, "assets": _assets}
         if _kept_plain:
-            payload["kc_failed"] = _kept_plain   # 앱이 다음 기동에 경고로 알린다
+            payload["kc_failed"] = _kept_plain   # 다음 기동 경고용(영속)
+            # ⚠️**그 순간에도 알린다**(2026-08-28 리뷰 P1). 종전에는 다음 기동에만
+            # 경고해서, 키체인 저장이 실패한 바로 그 순간 회원이 보는 것은 초록색
+            # "✓ 저장됨"뿐이었다 - 랜딩과 약관이 "보안 저장소가 없으면 앱이 알려
+            # 드립니다"라고 약속한 그 시점이 정확히 여기다. 모듈 전역에 남겨
+            # 호출부(_flash_saved)가 읽는다(_save_full은 App 메서드가 아니다).
+            globals()["_KC_LAST_FAILED"] = list(_kept_plain)
+        else:
+            globals()["_KC_LAST_FAILED"] = []
         if dry_run is not None:
             payload["dry_run"] = bool(dry_run)
         if cfg_open is not None:
@@ -1949,10 +1960,22 @@ class App:
             lbl = getattr(self, "_saved_lbl", None)
             if lbl is None:
                 return
-            lbl.config(text=("✓ 저장됨 " if self.lang == "ko" else "✓ saved ")
+            # ⚠️키체인 저장이 실패했으면 **초록 '저장됨'을 띄우지 않는다**(2026-08-28
+            # 리뷰 P1). 랜딩과 약관이 "보안 저장소가 없으면 앱이 알려 드립니다"라고
+            # 약속하는 그 시점이 정확히 여기인데, 종전에는 실패해도 초록 확인만 떴다.
+            _kcf = list(globals().get("_KC_LAST_FAILED") or [])
+            if _kcf and not getattr(self, "_kc_warned_save", None) == tuple(_kcf):
+                self._kc_warned_save = tuple(_kcf)
+                try:
+                    self._kc_warn_now(_kcf)
+                except Exception:
+                    pass
+            lbl.config(text=(("⚠ 저장됨(평문) " if self.lang == "ko" else "⚠ saved (plain) ")
+                             if _kcf else
+                             ("✓ 저장됨 " if self.lang == "ko" else "✓ saved "))
                        + _dtf.datetime.now().strftime("%H:%M:%S")
                        + (" - 재시작해도 유지됩니다" if self.lang == "ko" else " - kept across restarts"),
-                       foreground="#15803d")
+                       foreground=("#b45309" if _kcf else "#15803d"))   # 실패는 주황
             self.root.after(1500, lambda: lbl.config(foreground="#6b7280"))
         except Exception:
             pass
@@ -2066,12 +2089,36 @@ class App:
         bk = self._broker_name
         self._acfg[self._asset]["broker"] = bk
         cr = self._creds_of(self._asset, bk)
+        # ⚠️**삭제 경로**(2026-08-28 리뷰 P0). v2026.08.28h가 비밀을 키체인으로 옮기면서
+        # 저장만 옮기고 삭제를 안 옮겨, 자격을 지워도 다음 기동에 되살아났다 - 회원이
+        # "이 거래소는 끊었다"고 믿는 계좌로 실주문이 다시 나가는 상태였다(대표 맥이
+        # 이미 그랬다: config.yaml은 빈 값인데 키체인에 값이 살아 있었다).
+        # ⚠️판정은 "지금 비어 있다"가 아니라 **"값이 있었는데 비워졌다"**여야 한다.
+        # 키체인 읽기가 실패한 기동(잠긴 키체인, 헤드리스, keyring 백엔드 없음)에서는
+        # _load 되채우기가 비어 메모리도 빈 값이 되는데, 그때 "비어 있으니 지운다"를
+        # 하면 첫 자동저장이 자격을 영구 파괴한다.
+        _prev_f1 = str(cr.get("f1") or "").strip()
+        _prev_f3 = str(cr.get("f3") or "").strip()
         if hasattr(self, "user"):
             cr["f1"] = self.user.get().strip()
         if hasattr(self, "f3"):
             cr["f3"] = self._f3()
+        _sec = _secret_fields(bk)
+        if "f1" in _sec and _prev_f1 and not str(cr.get("f1") or "").strip():
+            _kc_del(_kc_key(self._asset, bk, "f1"))
+            _kc_del(_prev_f1)               # f2의 레거시 계정 키(=옛 f1 값)도 함께
+            self.log("🗑 " + ("저장된 자격을 삭제했습니다(보안 저장소 포함)."
+                              if self.lang == "ko" else
+                              "Deleted the stored credential, including the secret store."))
+        if "f3" in _sec and _prev_f3 and not str(cr.get("f3") or "").strip():
+            _kc_del(_kc_key(self._asset, bk, "f3"))
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
-            _kc_save(cr.get("f1", ""), self.key.get())
+            _f1_now = str(cr.get("f1") or "").strip()
+            if _f1_now:
+                _kc_save(_f1_now, self.key.get())
+            elif _prev_f1:
+                _kc_del(_prev_f1)           # f1을 지웠으면 f2도 남기지 않는다
+            # f1이 비었는데 f2를 저장하면 "default" 계정으로 새 비밀이 생겨 영영 안 지워진다
         # 실행 자산(라이브 패널 체크) → 자산별 include 반영
         for _a, _v in getattr(self, "_live_include", {}).items():
             try:
@@ -2251,11 +2298,18 @@ class App:
                  "paste each broker key again (accounts, 1R and other settings are kept). "
                  "Continue?")):
             return
+        # ⚠️새 키체인 항목까지 지운다(2026-08-28 리뷰 P1). 이 대화상자는 "이 앱에 저장된
+        # 모든 API 비밀키가 삭제된다"고 고지하는데, v2026.08.28h 이후로는 레거시 f2 항목만
+        # 지워 Bybit·Bitget의 API Key, Bitget Passphrase, NT8 Bridge Token,
+        # Tradovate cid:sec가 그대로 남았다 - 고지가 거짓이 된 상태였다.
         for _a, _s in (self._acfg or {}).items():            # 등록된 브로커 비밀 전부 삭제
             for _b, _cr in (_s.get("creds") or {}).items():
                 _f1 = (_cr.get("f1") or "").strip()
                 if _f1:
-                    _kc_del(_f1)
+                    _kc_del(_f1)                             # 레거시 f2(계정 키=f1 값)
+                for _f in _secret_fields(_b):                # 신 스키마 eq:<자산>:<브로커>:<필드>
+                    _kc_del(_kc_key(_a, _b, _f))
+                    _cr[_f] = ""                             # 메모리도 비워 되채움 차단
         _kc_del("__eqpin__")
         self._unlocked = False
         self._f1_unlocked = False
@@ -5367,7 +5421,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28k"
+    _APP_VER = "2026.08.28m"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5924,29 +5978,67 @@ class App:
             _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
 
     def _warn_kc_failed(self):
-        """평문으로 남은 비밀이 있으면 기동 시 1회 경고(2026-08-28)."""
+        """평문으로 남은 비밀이 있으면 기동 시 1회 경고(2026-08-28).
+        ⚠️문구 주의(리뷰 P1): 회원에게 f1/f3 같은 내부 필드 ID를 보여주면 안 되고,
+        저장소 이름도 OS를 따라가야 한다(이 실패가 가장 잘 나는 쪽이 Windows인데
+        '키체인을 열라'고 하면 없는 것을 열라는 말이 된다). 해결책도 사실이어야 한다 -
+        '다시 켜면 자동으로 옮겨진다'는 코드에 없는 동작이었다. 실제 경로는
+        '보안 저장소를 쓸 수 있게 만든 뒤 그 값을 다시 입력하고 저장'이다."""
         _f = list(getattr(self, "_kc_failed", []) or [])
         if not _f or getattr(self, "_kc_warned", False):
             return                       # 하트비트는 주기적이라 1회 가드가 필요하다
         self._kc_warned = True
-        self.log("⚠ " + ("OS 보안 저장소에 저장하지 못한 자격이 있습니다(설정 파일에 평문으로 "
-                         "남았습니다): " if self.lang == "ko" else
-                         "Some credentials could not be stored in the OS secret store and "
-                         "remain in plain text in the config file: ") + ", ".join(_f))
+        self._kc_warn_now(_f)
+
+    def _kc_label(self) -> str:
+        """이 OS의 보안 저장소 이름(회원이 실제로 찾을 수 있는 이름)."""
+        if _IS_MAC:
+            return "키체인" if self.lang == "ko" else "Keychain"
+        if os.name == "nt":
+            return "자격 증명 관리자" if self.lang == "ko" else "Credential Manager"
+        return "OS 보안 저장소" if self.lang == "ko" else "the OS secret store"
+
+    def _kc_pretty(self, items) -> str:
+        """'BTC/bitget/f3' → '비트코인 (BTC) - Bitget (USDT-F)의 Passphrase'.
+        회원은 f1/f3가 뭔지 모른다 - 브로커 화면에 적힌 이름으로 되돌려 준다."""
+        _ko = self.lang == "ko"
+        out = []
+        for it in items:
+            try:
+                _a, _b, _f = str(it).split("/")
+            except ValueError:
+                out.append(str(it)); continue
+            _lbl = (_BROKER_SPEC.get(_b) or {}).get(_f) or _f
+            _an = (_ASSET_LABEL.get(_a) or {}).get("ko" if _ko else "en", _a)
+            out.append(f"{_an} - {_broker_label(_b)}의 {_lbl}" if _ko
+                       else f"{_an} - {_broker_label(_b)} {_lbl}")
+        return ", ".join(out)
+
+    def _kc_warn_now(self, items):
+        """평문 잔존 경고 1건(로그 + 팝업). 저장 직후에도, 기동 시에도 같은 문구."""
+        _ko = self.lang == "ko"
+        _store = self._kc_label()
+        _what = self._kc_pretty(items)
+        self.log("⚠ " + ((f"{_store}에 저장하지 못해 설정 파일에 평문으로 남은 값이 "
+                          f"있습니다: {_what}") if _ko else
+                         (f"Could not store these in {_store}, so they stay in plain text "
+                          f"in the config file: {_what}")))
         try:
             messagebox.showwarning(
                 "EQ Autopilot",
-                (("이 컴퓨터의 보안 저장소(키체인)에 자격을 저장하지 못했습니다.\n"
-                  f"평문으로 남은 항목: {', '.join(_f)}\n\n"
-                  "전체 디스크 암호화를 켜고, 공용 또는 무인 컴퓨터에서는 실행하지 마세요.\n"
-                  "키체인이 잠겨 있거나 원격 세션이면 잠금을 풀고 앱을 다시 켜면 자동으로 "
-                  "옮겨집니다." )
-                 if self.lang == "ko" else
-                 ("Credentials could not be saved to this computer's secret store.\n"
-                  f"Left in plain text: {', '.join(_f)}\n\n"
-                  "Turn on full-disk encryption and do not run on a shared or unattended "
-                  "machine.\nIf the keychain was locked or this is a remote session, unlock "
-                  "it and restart the app - they move automatically.")))
+                ((f"이 컴퓨터의 {_store}에 저장하지 못했습니다.\n"
+                  f"평문으로 남은 값: {_what}\n\n"
+                  f"{_store}를 쓸 수 있게 만든 뒤(잠금 해제, 원격 세션이면 로그인 세션에서 "
+                  f"실행) 그 값을 다시 입력하고 저장하면 옮겨집니다.\n"
+                  "그 전까지는 전체 디스크 암호화를 켜고, 공용 또는 무인 컴퓨터에서는 "
+                  "실행하지 마세요.")
+                 if _ko else
+                 (f"Could not save to {_store} on this computer.\n"
+                  f"Left in plain text: {_what}\n\n"
+                  f"Make {_store} available (unlock it; in a remote session run inside a "
+                  f"login session), then re-enter and save those values to move them.\n"
+                  "Until then, turn on full-disk encryption and do not run on a shared or "
+                  "unattended machine.")))
         except Exception:
             pass
 
@@ -6018,9 +6110,11 @@ class App:
         _changed = _sig is not None and _sig != getattr(self, "_alive_sig", None)
         if not (force or _changed) and _t.time() - getattr(self, "_alive_at", 0.0) < 240:
             return
-        self._alive_at = _t.time()
-        if _sig is not None:
-            self._alive_sig = _sig
+        # ⚠️성공했을 때만 기억한다(2026-08-28 리뷰 P1). 종전에는 POST **전에** _alive_at과
+        # _alive_sig를 갱신해, 전송이 실패해도 "그 상태를 보냈다"로 기억했다. 그러면
+        # 다음 변화가 있을 때까지 서버가 옛 값을 들고 있고, j에서 고친 4분 스테일이
+        # 그대로 재발한다. 실패는 다음 호출이 다시 시도해야 한다.
+        self._alive_at = _t.time()      # 스로틀 기준은 시도 시각(도배 방지가 목적)
 
         def _bg():
             # ⚠️핑은 **한 번에 하나씩**(대표 2026-08-28 "라이브 눌렀었어 근데 안되던거야").
@@ -6034,7 +6128,7 @@ class App:
             with self._ping_lock:
                 try:
                     import requests as _rq      # 모듈 레벨에 requests 없음 - 지역 임포트 필수
-                    _rq.post(PUSH_BASE + "eqalive", timeout=8,
+                    _ok = _rq.post(PUSH_BASE + "eqalive", timeout=8,
                              json={"t": self._token,
                                    "armed": bool(self._sig_accts or self._auto_accts),
                                    "v": self._APP_VER,
@@ -6057,6 +6151,8 @@ class App:
                                    # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
                                    "demo": bool(getattr(self, "live_dry", None)
                                                 and self.live_dry.get())})
+                    if getattr(_ok, "ok", False) and _sig is not None:
+                        self._alive_sig = _sig      # **전송 성공 뒤에만** 기억한다
                 except Exception:
                     pass
         threading.Thread(target=_bg, daemon=True).start()
