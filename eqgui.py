@@ -270,7 +270,7 @@ _BROKER_SPEC = {
                     "f3": "Testnet (1=on)", "acct": False, "futures": False,
                     "f1_secret": True},
     "bitget":      {"label": "Bitget (USDT-F)", "f1": "API Key", "f2": "API Secret",
-                    "f3": "Passphrase", "acct": False, "futures": False, "status": "beta",
+                    "f3": "Passphrase", "f3_secret": True, "acct": False, "futures": False, "status": "beta",
                     "f1_secret": True},
     # Lucid = NT8 브리지(대표 2026-08-10, #38). API가 없어 NinjaTrader 애드온 경유 -
     #   f1 = 앱-애드온 공유 토큰(비밀), f3 = 브리지 포트. 계좌 = NT8 계정 이름 그대로.
@@ -283,7 +283,7 @@ _BROKER_SPEC = {
     # f2 라벨 주의(2026-08-17 실사): "Password"로만 쓰면 마스터 로그인 비밀번호를 넣게 유도한다.
     # Tradovate 키 발급 시 "Protect with a dedicated password"로 정한 전용 비밀번호가 맞다.
     "tradovate":   {"label": "Tradovate", "f1": "Username", "f2": "API dedicated password",
-                    "f3": "API cid:sec[:demo]", "acct": True, "futures": True,
+                    "f3": "API cid:sec[:demo]", "f3_secret": True, "acct": True, "futures": True,
                     "status": "unverified"},
 }
 
@@ -506,23 +506,56 @@ KC_SERVICE = "EQAutopilot"   # Keychain / Credential-Manager service name
 _IS_MAC = sys.platform == "darwin"
 
 
-def _kc_save(account, secret):
-    """Store the API key in the OS secret store (never on disk): macOS Keychain via `security`,
-    Windows/Linux via the `keyring` lib (Windows Credential Manager / Secret Service)."""
+def _kc_save(account, secret) -> bool:
+    """OS 보안 저장소에 비밀 저장(macOS는 `security`, 그 외는 keyring).
+
+    ⚠️**성공 여부를 돌려준다**(2026-08-28). 종전에는 예외를 통째로 삼켜 성공과 실패를
+    구분할 수 없었다. 그 상태에서 '키체인에 옮기고 평문을 지우기'를 하면, 키체인 쓰기가
+    조용히 실패한 기기에서 자격이 그대로 증발한다(헤드리스 VM, 잠긴 키체인, keyring
+    백엔드 없음이 전부 현실적인 경우다). 그래서 쓰기 뒤 **되읽어 값까지 대조**한다 -
+    백엔드가 성공을 반환하고도 빈 값을 돌려주는 경우가 있기 때문."""
     if not secret:
-        return
+        return False
     if _IS_MAC:
         try:
-            subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
-                            "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, timeout=8)
+            r = subprocess.run(["/usr/bin/security", "add-generic-password", "-a", account or "default",
+                                "-s", KC_SERVICE, "-w", secret, "-U"], capture_output=True, timeout=8)
+            if r.returncode != 0:
+                return False
         except Exception:
-            pass
-        return
-    try:
-        import keyring
-        keyring.set_password(KC_SERVICE, account or "default", secret)
-    except Exception:
-        pass
+            return False
+    else:
+        try:
+            import keyring
+            keyring.set_password(KC_SERVICE, account or "default", secret)
+        except Exception:
+            return False
+    return _kc_load(account) == secret        # 되읽기 대조 - 이게 통과해야 진짜 저장이다
+
+
+def _secret_fields(broker: str) -> tuple:
+    """그 브로커에서 **비밀로 다뤄야 하는 평문 필드**(f2는 이미 키체인 전용이라 제외).
+
+    2026-08-28 실사: 앱은 이 값들을 화면에서 마스킹하고 PIN으로 잠그면서 **저장은 평문
+    YAML**로 했다. 랜딩이 "API secrets stay in your OS secret store"라고 단정하는데
+    실제로는 Bitget Passphrase, Tradovate cid:sec, NT8 Bridge Token, 크립토 API Key가
+    전부 평문이었다. 약관 §14.3만 정직했다(그 파일은 암호화 안 됨이라 경고까지 한다).
+    비밀이 아닌 것(호스트, 포트, 이메일, 사용자명, 테스트넷 플래그)은 평문으로 둔다 -
+    옮길 이유가 없고, 키체인이 없는 환경에서 앱이 못 뜨게 만들 이유는 더 없다."""
+    _sp = _BROKER_SPEC.get(broker) or {}
+    out = []
+    if _sp.get("f1_secret"):
+        out.append("f1")
+    if _sp.get("f3_secret"):
+        out.append("f3")
+    return tuple(out)
+
+
+def _kc_key(asset: str, broker: str, field: str) -> str:
+    """키체인 계정 키. **값에서 파생하지 않는다** - f2가 f1 값을 계정 키로 쓰는 레거시
+    방식은 f1을 파일에서 지우는 순간 f2까지 못 읽게 만든다(이번 설계의 최대 함정).
+    자산·브로커·필드로만 만들어 값이 바뀌어도 키가 안 흔들린다."""
+    return f"eq:{asset}:{broker}:{field}"
 
 
 def _kc_load(account):
@@ -701,6 +734,16 @@ def _load():
                 acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
                 accounts = [_new_acct(one_r, acct_id, True,
                                       acct_id[-4:] if acct_id else _broker_label(bk))]
+        # 비밀 필드를 키체인에서 되채운다(2026-08-28). 저장 때 벗겼으므로 파일에는 빈
+        # 값이고, 메모리에는 실값이 있어야 앱 전체(_kc_load(f1) 8곳 포함)가 그대로 돈다.
+        # 평문에 값이 남아 있으면(구버전 설정, 또는 키체인 쓰기 실패분) 그대로 쓴다 -
+        # 다음 저장 때 옮겨진다. 즉 마이그레이션은 "한 번 저장하면 끝"이고 별도 절차가 없다.
+        for _b, _cr in creds.items():
+            for _f in _secret_fields(_b):
+                if not str(_cr.get(_f) or "").strip():
+                    _kv = _kc_load(_kc_key(a, _b, _f))
+                    if _kv:
+                        _cr[_f] = _kv
         # 저장돼 버린 중복 계좌 행 청소(2026-08-18): 같은 id의 뒤 행은 통째로 버린다.
         _dseen, _duniq = set(), []
         for _x in accounts:
@@ -726,6 +769,9 @@ def _load():
                 acfg[a]["accounts"] = [_new_acct(d.get("one_r", 600), facct, True, _broker_label(fb))]
                 break
     out["assets"] = acfg
+    # 키체인 쓰기가 실패해 평문으로 남은 필드 목록(2026-08-28) - 앱이 기동 시 경고한다.
+    # 조용히 넘기면 회원은 랜딩·약관이 약속한 보안 상태를 받고 있다고 믿게 된다.
+    out["kc_failed"] = _kc_failed
     out["dry_run"] = bool(d.get("dry_run", True))
     if "cfg_open" in d:
         out["cfg_open"] = bool(d.get("cfg_open"))
@@ -897,12 +943,34 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
     dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음."""
     try:
         import yaml
-        payload = {"live": False, "lang": lang, "token": token,
-                   "assets": {a: {"broker": c.get("broker"),
-                                  "creds": {b: dict(v) for b, v in (c.get("creds") or {}).items()},
-                                  "include": bool(c.get("include", True)),
-                                  "accounts": [dict(x) for x in (c.get("accounts") or [])]}
-                              for a, c in (acfg or {}).items()}}
+        # ⚠️비밀 필드를 **디스크에 쓰기 직전에 벗긴다**(2026-08-28). 메모리(acfg)는 손대지
+        # 않는다 - 앱 전체가 _acfg에서 f1/f3를 읽고, f2 키체인 계정 키가 f1 값이라
+        # 메모리에서 지우면 f2까지 못 읽는다(이 설계의 최대 함정). 그래서 야머 페이로드
+        # 사본에서만 지운다.
+        # 순서가 안전의 전부다: **키체인에 쓰고 → 되읽어 대조가 통과했을 때만** 평문을
+        # 비운다. 실패하면 평문을 그대로 남긴다 - 보안을 조금 늦추는 것이 자격을 잃고
+        # 라이브가 멈추는 것보다 낫다(헤드리스 VM·잠긴 키체인이 현실적인 경우다).
+        _kept_plain = []
+        _assets = {}
+        for a, c in (acfg or {}).items():
+            _creds = {}
+            for b, v in (c.get("creds") or {}).items():
+                _v = dict(v)
+                for _f in _secret_fields(b):
+                    _val = str(_v.get(_f) or "")
+                    if not _val:
+                        continue
+                    if _kc_save(_kc_key(a, b, _f), _val):
+                        _v[_f] = ""              # 키체인에 안전하게 들어갔다 - 평문 제거
+                    else:
+                        _kept_plain.append(f"{a}/{_broker_label(b)}/{_f}")
+                _creds[b] = _v
+            _assets[a] = {"broker": c.get("broker"), "creds": _creds,
+                          "include": bool(c.get("include", True)),
+                          "accounts": [dict(x) for x in (c.get("accounts") or [])]}
+        payload = {"live": False, "lang": lang, "token": token, "assets": _assets}
+        if _kept_plain:
+            payload["kc_failed"] = _kept_plain   # 앱이 다음 기동에 경고로 알린다
         if dry_run is not None:
             payload["dry_run"] = bool(dry_run)
         if cfg_open is not None:
@@ -976,6 +1044,9 @@ class App:
         self._open_assets = set(self._profile.get("open_assets") or [])
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         self._token = _d0.get("token", "")
+        # 키체인 저장 실패 경고(2026-08-28): 평문으로 남은 비밀이 있으면 회원이 알아야 한다.
+        # 랜딩과 약관이 "비밀은 OS 보안 저장소에"라고 말하는데 이 기기에서만 아니기 때문.
+        self._kc_failed = list(_d0.get("kc_failed") or [])
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
                       "caps": {"use": False, "manualentry": False, "autoentry": False},
@@ -1775,6 +1846,7 @@ class App:
             # 하트비트가 한 번이라도 돌면 상시 생존 핑을 띄운다(2026-08-28 R14 P0) -
             # 신호 루프 유무와 무관하게 앱이 떠 있는 동안 심박이 뛰어야 한다.
             try:
+                self.root.after(0, self._warn_kc_failed)   # 평문 잔존 경고(1회)
                 self._hb_start()
                 self._watch_start()      # 표시 전용 피드(등급 무관 - 지연은 서버가 건다)
             except Exception:
@@ -5288,7 +5360,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28g"
+    _APP_VER = "2026.08.28h"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5843,6 +5915,33 @@ class App:
             except Exception:
                 pass
             _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
+
+    def _warn_kc_failed(self):
+        """평문으로 남은 비밀이 있으면 기동 시 1회 경고(2026-08-28)."""
+        _f = list(getattr(self, "_kc_failed", []) or [])
+        if not _f or getattr(self, "_kc_warned", False):
+            return                       # 하트비트는 주기적이라 1회 가드가 필요하다
+        self._kc_warned = True
+        self.log("⚠ " + ("OS 보안 저장소에 저장하지 못한 자격이 있습니다(설정 파일에 평문으로 "
+                         "남았습니다): " if self.lang == "ko" else
+                         "Some credentials could not be stored in the OS secret store and "
+                         "remain in plain text in the config file: ") + ", ".join(_f))
+        try:
+            messagebox.showwarning(
+                "EQ Autopilot",
+                (("이 컴퓨터의 보안 저장소(키체인)에 자격을 저장하지 못했습니다.\n"
+                  f"평문으로 남은 항목: {', '.join(_f)}\n\n"
+                  "전체 디스크 암호화를 켜고, 공용 또는 무인 컴퓨터에서는 실행하지 마세요.\n"
+                  "키체인이 잠겨 있거나 원격 세션이면 잠금을 풀고 앱을 다시 켜면 자동으로 "
+                  "옮겨집니다." )
+                 if self.lang == "ko" else
+                 ("Credentials could not be saved to this computer's secret store.\n"
+                  f"Left in plain text: {', '.join(_f)}\n\n"
+                  "Turn on full-disk encryption and do not run on a shared or unattended "
+                  "machine.\nIf the keychain was locked or this is a remote session, unlock "
+                  "it and restart the app - they move automatically.")))
+        except Exception:
+            pass
 
     def _hb_start(self):
         """토큰이 생기면 한 번만 띄운다(데몬이라 종료를 막지 않는다)."""
