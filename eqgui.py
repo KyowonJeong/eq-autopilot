@@ -691,6 +691,8 @@ def _load():
     out = {"lang": d.get("lang", "ko"), "token": d.get("token", "")}
     assets_raw = d.get("assets") or {}
     _has_accounts = any(isinstance(v, dict) and "accounts" in v for v in assets_raw.values())
+    # 키체인 저장 실패로 평문에 남은 필드 목록(2026-08-28) - 아래 out에 실어 앱이 경고한다.
+    _kc_failed = [str(x) for x in (d.get("kc_failed") or [])]
     _broker_centric = (not _has_accounts) and (d.get("asset_broker") is not None
                                                or isinstance(d.get("accounts"), dict))
     acfg = {}
@@ -5360,7 +5362,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28h"
+    _APP_VER = "2026.08.28i"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
