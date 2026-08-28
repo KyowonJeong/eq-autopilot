@@ -4947,7 +4947,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.22m"
+    _APP_VER = "2026.08.27a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5402,6 +5402,21 @@ class App:
             return True
         return bool(gb.get(self._HB_BROKER_KEY.get(broker, broker), False))
 
+    def _connected_assets(self):
+        """브로커 자격이 실제로 입력된 자산 목록(["NQ","GC","BTC"] 부분집합).
+        서버는 이것만 보고 3자산 연결 여부를 판정한다 - 키·계좌번호는 보내지 않는다."""
+        out = []
+        try:
+            for _a in _ASSETS:
+                _c = (self._acfg.get(_a) or {})
+                _b = _c.get("broker")
+                _cr = ((_c.get("creds") or {}).get(_b) or {}) if _b else {}
+                if _b and any(str(v or "").strip() for v in _cr.values()):
+                    out.append(_a)
+        except Exception:
+            return []
+        return out
+
     def _alive_ping(self, armed: bool = True, force: bool = False):
         """생존 핑(/eqalive, 대표 2026-08-17 '앱 다운 알림은 해') - 무장 중 4분마다.
         서버는 15분 무소식(핑 3회 결번)이면 회원에게 '앱이 죽었다'를 DM한다.
@@ -5420,6 +5435,11 @@ class App:
                          json={"t": self._token, "armed": bool(armed),
                                "v": self._APP_VER,
                                "m": _machine_id(),
+                               # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
+                               # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
+                               # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
+                               # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
+                               "a": self._connected_assets(),
                                # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
                                # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
                                "demo": bool(getattr(self, "live_dry", None)
