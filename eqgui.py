@@ -5450,7 +5450,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28n"
+    _APP_VER = "2026.08.28p"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6155,7 +6155,13 @@ class App:
         # **상태가 바뀌었다는 사실 자체**를 통과 조건으로 삼는다. 앞으로 어느 경로가
         # 무장을 바꾸든 즉시 보고된다.
         try:
-            _sig = (bool(armed), tuple(self._armed_assets()), tuple(self._connected_assets()),
+            # ⚠️첫 원소는 **실제 상태**여야 한다(2026-08-28 리뷰 P2, 실측으로 확인).
+            # 인자 armed를 쓰면 _sig_loop(항상 True)과 _hb_loop(실제 상태)이 서로 다른
+            # 서명을 만들어 번갈아 "변했다"로 판정하고, 결국 **양쪽 다 4분 스로틀을
+            # 통과해 1~3초마다 핑을 쏜다**(대표 기기 3대에서 실측: 마지막 보고 1~3초 전).
+            # _bg가 전송 직전에 다시 읽는 값과도 같은 기준이어야 서명이 뜻을 갖는다.
+            _sig = (bool(self._sig_accts or self._auto_accts),
+                    tuple(self._armed_assets()), tuple(self._connected_assets()),
                     tuple(self._included_assets()))
         except Exception:
             _sig = None
@@ -6199,6 +6205,11 @@ class App:
                                    # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
                                    # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
                                    "inc": self._included_assets(),
+                                   # 종료 표식(2026-08-28): 창을 닫으면 칩이 15분
+                                   # 신선도 창을 기다리지 않고 즉시 꺼짐으로 바뀐다.
+                                   # armed는 실상태 그대로 보낸다 - 무장 중 종료는
+                                   # 다운 경보 대상이 맞기 때문이다(R14 P1).
+                                   "closed": bool(getattr(self, "_closing", False)),
                                    # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
                                    # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
                                    "demo": bool(getattr(self, "live_dry", None)
@@ -7038,8 +7049,10 @@ def main():
             except Exception:
                 pass
         try:
-            # 무장 중 종료는 armed=True로 신고한다 - 화면은 마지막 핑 신선도(15분)로
-            # 곧 '응답 없음'이 되고, 다운 경보도 정상 작동한다.
+            # 무장 중 종료는 armed=True로 신고한다 - 다운 경보가 정상 작동해야 한다.
+            # 동시에 closed=True를 실어, 회원 화면의 칩은 15분을 기다리지 않고 즉시
+            # 꺼짐이 된다(대표 2026-08-28 "앱 껐는데 안 변해"). 경보와 표시는 다른 축이다.
+            _app._closing = True
             _app._alive_ping(armed=_armed, force=True)
             import time as _tq
             _tq.sleep(0.35)          # 백그라운드 전송 스레드가 나갈 시간(실패해도 무해)
