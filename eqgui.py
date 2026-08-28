@@ -4957,7 +4957,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28b"
+    _APP_VER = "2026.08.28c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6267,8 +6267,43 @@ def main():
     except Exception:
         pass
     _bind_clipboard(root)
-    App(root)
+    _app = App(root)
+
+    # 창을 닫을 때도 서버에 '꺼짐'을 알린다(대표 2026-08-28 "앱 끌 때 마지막 동작으로
+    # 정지 버튼 누른다든지 해서 서버로 꺼졌다 메시지 못 보내나").
+    # 종전에는 [전체 정지]를 눌러야만 종료 신고가 나갔고, 창을 그냥 닫으면 서버가 15분
+    # 무응답으로 판정할 때까지 회원 화면에 '무장 중'이 남았다.
+    # ⚠️무장을 해제하지는 않는다 - 열린 포지션과 자동 청산 계약을 화면 닫기로 바꾸면
+    # 위험하다. 상태만 정직하게 보고하고 종료한다(다운 경보 대상에서도 빠진다).
+    def _on_close():
+        try:
+            _app._alive_ping(armed=False, force=True)
+            import time as _tq
+            _tq.sleep(0.35)          # 백그라운드 전송 스레드가 나갈 시간(실패해도 무해)
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    try:
+        root.protocol("WM_DELETE_WINDOW", _on_close)       # 창 닫기(X)
+    except Exception:
+        pass
+    # macOS Cmd+Q와 Dock 종료는 WM_DELETE_WINDOW를 안 거친다(별도 Apple Event) - 함께 묶는다.
+    try:
+        root.createcommand("::tk::mac::Quit", _on_close)
+    except Exception:
+        pass
     root.mainloop()
+    # mainloop를 어떤 경로로 빠져나오든 마지막으로 한 번 더(중복 핑은 무해).
+    try:
+        _app._alive_ping(armed=False, force=True)
+        import time as _tq2
+        _tq2.sleep(0.3)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
