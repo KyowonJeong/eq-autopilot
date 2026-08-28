@@ -2420,15 +2420,39 @@ class App:
                  f"with {src_asset}'s? Accounts in ② stay untouched.")):
             return
         self._collect_acct_widgets()
-        self._acfg[dst]["broker"] = _src.get("broker")
-        self._acfg[dst]["creds"] = _copy.deepcopy(_src.get("creds", {}))
+        # ⚠️creds는 **병합**이다(대표 2026-08-28 "브로커 다른 걸로 선택돼 있으면 카피가
+        # 이상하게 됨"). 통째 대입은 dst가 갖고 있던 다른 브로커의 자격을 지워, 그 브로커를
+        # 가리키던 계좌 행이 키 없는 행으로 죽었다(라이브 시작 프리플라이트 "키 미설정").
+        # 이 자산에서 못 쓰는 브로커(선물↔크립토)는 애초에 넘기지 않는다.
+        _ok_bks = _ASSET_BROKERS.get(dst, [])
+        _dstcr = self._acfg[dst].setdefault("creds", {})
+        _moved = []
+        for _bk, _cr in (_src.get("creds") or {}).items():
+            if _bk in _ok_bks:
+                _dstcr[_bk] = _copy.deepcopy(_cr)     # 가용 계좌(avail)도 이 안에 있다
+                _moved.append(_bk)
+        _sb = _src.get("broker")
+        if _sb in _ok_bks:
+            self._acfg[dst]["broker"] = _sb
+        # 남은 계좌 행 재정합: 자격이 없는 브로커를 가리키는 행은 새 기본 브로커로 돌린다.
+        # 안 하면 ①만 누른 뒤 화면은 멀쩡한데 그 행만 조용히 못 쓰는 상태가 된다.
+        _fixed = 0
+        for _ac in self._acfg[dst].get("accounts") or []:
+            _rb = (_ac.get("broker") or "").strip()
+            if _rb and not ((_dstcr.get(_rb) or {}).get("f1") or "").strip():
+                _ac["broker"] = self._acfg[dst].get("broker")
+                _fixed += 1
         self._save_cfg()
         self._build()
-        self.log(f"📋 {src_asset} → {dst} 브로커 설정 복사 완료 (브로커 {_src.get('broker')})")
+        self.log(f"📋 {src_asset} → {dst} 브로커 설정 복사 완료 "
+                 f"(브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종"
+                 + (f", 계좌 행 {_fixed}개 브로커 재지정" if _fixed else "") + ")")
 
     def _copy_acct_setup(self, src_asset):
-        """② 사용 계좌만 복사: 계좌 목록·1R·모드. 브로커·키(①)는 안 건드린다
-        (대표 2026-08-11 유닛 분리 - 구 "싸그리 복사"를 ①/② 두 버튼으로 갈랐다)."""
+        """② 사용 계좌 복사: 계좌 목록·1R·모드 + 그 행들이 굴러가는 데 필요한
+        브로커 선택·키·가용 계좌까지(대표 2026-08-28 "브로커 선택 자체도 다 완전 동일하게
+        카피 되야 해"). ①과의 차이는 방향이다 - ①은 계좌 행을 안 건드리고 자격만 옮기고,
+        ②는 계좌 행을 옮기면서 그 행이 필요로 하는 자격을 딸려 보낸다."""
         import copy as _copy
         dst = self._asset
         src_accts = self._accts_of(src_asset)
@@ -2438,28 +2462,51 @@ class App:
                                  else f"No accounts to copy from {src_asset}.")); return
         if not messagebox.askyesno(
                 ("계좌 설정 복사" if self.lang == "ko" else "Copy account setup"),
-                (f"{src_asset}의 사용 계좌(계좌·1R·모드)를 {dst}(으)로 덮어쓸까요?\n"
-                 "브로커·키(①)는 그대로 둡니다." if self.lang == "ko" else
-                 f"Overwrite {dst}'s accounts (ids, 1R, modes) with {src_asset}'s? "
-                 "Broker & keys in ① stay untouched.")):
+                (f"{src_asset}의 사용 계좌를 {dst}(으)로 덮어쓸까요?\n"
+                 f"계좌·1R·모드와 함께 브로커 선택·키·가용 계좌도 {src_asset} 것으로 "
+                 f"맞춥니다 - 복사 직후 바로 굴러가게." if self.lang == "ko" else
+                 f"Overwrite {dst}'s accounts with {src_asset}'s?\n"
+                 f"Broker choice, keys and available accounts come along, so the copy "
+                 f"works as-is.")):
             return
         self._collect_acct_widgets()
         # 행 브로커 실체화(대표 2026-08-21 실사고: NQ 루시드 계좌를 GC로 복사하니 Topstep이
         # 됨): 행의 broker 칸이 비면 '그 자산의 기본 브로커'로 해석되는데, 복사 후엔 해석
         # 기준이 목적지 자산으로 바뀐다. 복사 시점에 원본 자산 기준 실효 브로커를 박는다.
-        _copied = []
+        _ok_bks = _ASSET_BROKERS.get(dst, [])
+        _copied, _need = [], []
         for a in src_accts:
             a2 = _copy.deepcopy(a)
             try:
-                a2["broker"] = self._acct_broker(src_asset, a)
+                _rb = self._acct_broker(src_asset, a)
             except Exception:
-                pass
+                _rb = ""
+            if _rb in _ok_bks:
+                a2["broker"] = _rb
+                _need.append(_rb)
+            else:
+                a2.pop("broker", None)    # 이 자산에서 못 쓰는 브로커 - dst 기본으로 해석
             _copied.append(a2)
         self._acfg[dst]["accounts"] = _copied
+        # ★ 브로커 선택과 자격까지 함께 옮긴다(대표 2026-08-28 "브로커 선택 자체도 다
+        # 완전 동일하게 카피 되야 해"). 종전에는 계좌 행만 옮기고 브로커·키는 dst 것을
+        # 그대로 뒀는데, dst가 다른 브로커를 고르고 있으면 옮겨온 행이 **자격 없는
+        # 브로커**를 가리켜 계좌 드롭다운이 비고 라이브 시작이 "키 미설정"으로 막혔다.
+        # 복사 = 그대로 굴러가는 상태여야 한다.
+        _srccr = (self._acfg[src_asset].get("creds") or {})
+        _dstcr = self._acfg[dst].setdefault("creds", {})
+        _sb = self._acfg[src_asset].get("broker")
+        _moved = []
+        for _bk in dict.fromkeys(_need + ([_sb] if _sb else [])):
+            if _bk in _ok_bks and _bk in _srccr:
+                _dstcr[_bk] = _copy.deepcopy(_srccr[_bk])   # 키 + 가용 계좌 목록
+                _moved.append(_bk)
+        if _sb in _ok_bks:
+            self._acfg[dst]["broker"] = _sb
         self._save_cfg()
         self._build()
         self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개, "
-                 f"브로커 유지)")
+                 f"브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종 동반)")
 
     def _add_acct(self):
         """[계좌 추가] = 빈 행 추가(대표 2026-08-11 행 중심 등록). 브로커·계좌·1R은 행에서
@@ -2733,8 +2780,9 @@ class App:
         "덜 됐다"고 말해, 한 자산으로 시작한 회원에게 계속 미완성 신호를 준다(대표 2026-08-15).
         완결성 = 크레덴셜 f1 · 켜진 계좌 최소 1개 · (acct 브로커면)계좌ID · 1R>0.
         계좌별 브로커(대표 2026-08-09): 라벨·키·연결 판정을 켜진 계좌들의 브로커 전체로."""
-        # ⚠ 무장 판정이 먼저다. 체크를 풀어도 이미 무장된 자산은 그 세션이 끝날 때까지 계속
-        # 돈다(_on_asset_toggle은 include만 바꾸고 해제하지 않는다). armed를 안 보고 숨기면
+        # ⚠ 무장 판정이 먼저다. 체크 해제는 2026-08-28부터 _on_asset_toggle이 즉시
+        # 무장 해제까지 하지만, 그 경로가 실패했거나 구 설정으로 살아 있을 수 있다.
+        # armed를 안 보고 숨기면
         # **실주문이 나가는 자산이 화면에서 사라진다** — 미관을 안전과 맞바꾸는 것이다.
         _armed_now = any(k[0] == asset for k in getattr(self, "_sig_accts", {})) or \
                      any(k[0] == asset for k in getattr(self, "_auto_accts", {}))
@@ -3171,14 +3219,135 @@ class App:
         self._refresh_live_panel()
 
     def _on_asset_toggle(self):
-        """실행 자산 체크 변경 → 자산별 include 반영 + 영속(계좌 재구성 불필요 — 계좌는 자산탭 관리)."""
+        """실행 자산 체크 변경 → include 반영 + **가동 중이면 무장/해제까지**.
+
+        ⚠️2026-08-28 실사고(대표 "금 설정했어. 왜 금도 1/2??"): 종전에는 include 플래그만
+        저장했다. 무장(_master_arm → _sig_accts)은 [라이브 시작]을 누르는 그 순간의
+        체크 목록으로만 이뤄지므로, 가동 중에 자산을 체크하면 화면은 켜진 것처럼 보이는데
+        서버로 가는 arm 목록에는 없었다 - **그 자산 신호가 와도 주문이 안 나갔다**.
+        표시 버그가 아니라 실행 누락이었다. 체크가 곧 무장이 되게 한다."""
+        _running = bool(getattr(self, "_sig_accts", None) or getattr(self, "_auto_accts", None))
+        _was = {a for a in _ASSETS if self._acfg.get(a, {}).get("include", True)}
         for a, var in getattr(self, "_live_include", {}).items():
             try:
                 self._acfg[a]["include"] = bool(var.get())
             except Exception:
                 pass
+        _now = {a for a in _ASSETS if self._acfg.get(a, {}).get("include", True)}
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
+        if _running:
+            for a in sorted(_was - _now):
+                self._live_disarm_asset(a)
+            _add = sorted(_now - _was)
+            if _add:
+                self._live_arm_assets(_add)
         self._refresh_live_panel()
+
+    def _live_disarm_asset(self, asset):
+        """가동 중 자산 체크 해제 → 그 자산 무장 즉시 해제(I/O 없음, 메인 스레드 안전)."""
+        _n = 0
+        for d in (getattr(self, "_sig_accts", None) or {}, getattr(self, "_auto_accts", None) or {}):
+            for k in [k for k in list(d) if k[0] == asset]:
+                d.pop(k, None); _n += 1
+        if _n:
+            self.log(f"⏹ {asset} 무장 해제 — 실행 자산 체크를 껐습니다 ({_n}개 항목)")
+        try:
+            self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
+        except Exception:
+            pass
+
+    def _live_arm_assets(self, assets):
+        """가동 중 자산 체크 → 그 자산 무장. 라이브 시작과 **같은 검사**를 거친다
+        (프리플라이트 → 연결 테스트 → _master_arm). 실패하면 무장하지 않고 이유를 말한다 -
+        조용히 안 켜지는 것이 이 사고의 본질이었으므로 여기서는 반드시 이유를 남긴다."""
+        _ctx = getattr(self, "_live_ctx", None) or {}
+        live = bool(_ctx.get("live"))
+        perm_auto = bool(_ctx.get("perm_auto"))
+        # 프리플라이트(라이브 시작과 동일 기준): 켜진 계좌·키·브로커 허용·계좌ID
+        bad = []
+        for a in assets:
+            _act = self._active_accts(a)
+            if not _act:
+                bad.append(f"{a}: " + ("켜진 계좌 없음" if self.lang == "ko" else "no account on"))
+                continue
+            for ac in _act:
+                bk = self._acct_broker(a, ac)
+                _nm = ac.get("label") or _broker_label(bk)
+                if not (self._creds_of(a, bk).get("f1") or "").strip():
+                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                               + ("키 미설정" if self.lang == "ko" else "key missing"))
+                elif not self._broker_allowed(bk):
+                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                               + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
+                                  else "broker disabled (server)"))
+                elif _BROKER_SPEC.get(bk, {}).get("acct") and not (ac.get("id") or "").strip():
+                    bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
+        if bad:
+            for _b in bad:
+                self.log(f"⛔ {_b}")
+            messagebox.showwarning(
+                self.t("sec_live"),
+                (("체크한 자산을 무장하지 못했습니다 - 아래를 고치고 다시 체크하세요.\n\n"
+                  if self.lang == "ko" else
+                  "Could not arm the checked asset(s) - fix these and check again.\n\n")
+                 + "\n".join(bad)))
+            for a in assets:                      # 체크를 되돌린다(켜진 척 금지)
+                self._acfg[a]["include"] = False
+                try:
+                    self._live_include[a].set(0)
+                except Exception:
+                    pass
+            self._save_cfg()
+            return
+
+        def w():
+            fails, tested = [], {}
+            for a in assets:
+                for ac in self._active_accts(a):
+                    bk = self._acct_broker(a, ac)
+                    _tk = (bk, (self._creds_of(a, bk).get("f1") or "").strip())
+                    if _tk in tested:
+                        err = tested[_tk]
+                    else:
+                        self.log(f"── {a} · {_broker_label(bk)} 연결 테스트 ──")
+                        err = self._conn_check(a, bk)
+                        tested[_tk] = err
+                        self.log(f"✅ {a} · {_broker_label(bk)} 연결 OK" if not err
+                                 else f"❌ {a} · {_broker_label(bk)}: {err}")
+                    if err:
+                        fails.append(f"{a} ({_broker_label(bk)}): {err}")
+
+            def done():
+                if fails:
+                    self.log("⛔ 무장 중단 — " + ", ".join(fails))
+                    messagebox.showerror(self.t("sec_live"),
+                                         (("연결 실패 - 무장하지 않았습니다:\n"
+                                           if self.lang == "ko" else
+                                           "Connection failed - not armed:\n")
+                                          + "\n".join(fails)))
+                    for a in assets:
+                        self._acfg[a]["include"] = False
+                        try:
+                            self._live_include[a].set(0)
+                        except Exception:
+                            pass
+                    self._save_cfg(); self._refresh_live_panel(); return
+                _n = 0
+                for a in assets:
+                    for idx, ac in enumerate(self._accts_of(a)):
+                        if ac.get("on"):
+                            self._master_arm(a, idx, live, arm_sig=perm_auto)
+                            _n += 1
+                self.log(f"🚀 {'·'.join(assets)} 무장 — {_n}개 계좌 "
+                         f"({'LIVE' if live else 'dry-run(모의)'})")
+                self._refresh_live_panel()
+                self._apply_gating()
+                try:
+                    self._alive_ping(armed=True, force=True)   # 서버 칩 즉시 반영
+                except Exception:
+                    pass
+            self.root.after(0, done)
+        self._run(w)
 
     def _copy_f1(self):
         """f1 복사 - 기기 이전용(대표 2026-08-10). f1은 브로커마다 다르다(ProjectX=이메일,
@@ -3617,6 +3786,9 @@ class App:
                                    "멤버십 권한이 없습니다 — 토큰을 확인하세요."
                                    if self.lang == "ko" else "No membership permission — check your token."); return
         live = not dry
+        # 가동 조건을 기억한다(대표 2026-08-28 "금 설정했어"): 라이브 도중 실행 자산을
+        # 체크하면 그때 같은 조건(LIVE/모의, 신호대기 권한)으로 무장해야 한다.
+        self._live_ctx = {"live": bool(live), "perm_auto": bool(perm_auto)}
         self.b_live_start.config(state="disabled")
         if hasattr(self, "b_demo_start"):
             self.b_demo_start.config(state="disabled")
@@ -4957,7 +5129,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28c"
+    _APP_VER = "2026.08.28d"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
