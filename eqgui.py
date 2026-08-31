@@ -914,7 +914,7 @@ def _ledger_add(asset: str, symbol: str = "", direction: str = "", tag: str = ""
         pass
 
 
-def _idle_days() -> int | None:
+def _idle_days():   # 반환 int | None. ⚠️어노테이션으로 쓰지 마라 - 앱 파이썬은 3.9(Tk 8.6 제약)라 PEP 604가 기동 즉시 TypeError(2026-08-31 실사고: 배포 빌드가 안 열림)
     """EQ 자동 진입이 없었던 경과 일수(달력일). 판정 불가면 None.
 
     프롭 비활동 경고용(대표 2026-08-31 "걍 앱에 경고 띄워, 그걸로 끝"): 프롭 회사는 대체로
@@ -5538,7 +5538,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31a"
+    _APP_VER = "2026.08.31b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
