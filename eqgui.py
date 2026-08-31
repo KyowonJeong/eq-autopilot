@@ -449,6 +449,19 @@ T = {
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
     "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
+    # 프롭 비활동 경고(대표 2026-08-31). {d}=경과 일수. 문구 주의: "바로 나와"라고 쓰지
+    # 않는다 - Lucid는 5초 이하 보유 거래가 이익의 절반을 넘으면 마이크로스캘핑으로
+    # 자동 플래그하므로, 오래 쉰 계좌의 첫 왕복이 초단타면 그 규정을 정면으로 밟는다.
+    "idle_warn": {"ko": ("프롭 계좌 주의: EQ 자동 진입이 {d}일째 없습니다. 프롭 회사는 보통 "
+                         "30일 무거래 계좌를 폐쇄할 수 있습니다(홀드 신청 불가). 계좌를 "
+                         "지키려면 최소 수량으로 한 번 진입했다 청산해 두십시오. 초단타로 "
+                         "끝내지 말고 몇 분은 들고 있다 청산하십시오. 비활동 기준은 회사마다 "
+                         "다르니 이용 중인 회사 규정을 확인하십시오."),
+                  "en": ("Prop account notice: no EQ entry for {d} days. Prop firms can close "
+                         "accounts after about 30 days of inactivity (no hold available). To "
+                         "keep the account alive, place one minimum-size trade and close it - "
+                         "hold it for a few minutes rather than seconds. Inactivity rules "
+                         "differ by firm, so check the rules of the firm you use.")},
     "live_stopall": {"ko": "⏹ 전체 정지 (포지션 유지)", "en": "⏹ Stop all (positions kept)"},
     "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk) · 시장 국면의 기대값에 따라 최대 3R"
                            "(maximum risk)까지 — 계좌 여유는 1R의 3배로 잡으세요.",
@@ -901,6 +914,32 @@ def _ledger_add(asset: str, symbol: str = "", direction: str = "", tag: str = ""
         pass
 
 
+def _idle_days() -> int | None:
+    """EQ 자동 진입이 없었던 경과 일수(달력일). 판정 불가면 None.
+
+    프롭 비활동 경고용(대표 2026-08-31 "걍 앱에 경고 띄워, 그걸로 끝"): 프롭 회사는 대체로
+    30일 무거래 계좌를 폐쇄할 수 있고(Topstep 펀디드 "30일 초과 폐쇄 가능, 홀드 불가",
+    Lucid "30일, 영구 삭제"), 우리 방법론의 실측 최장 무거래는 나스닥+금 결합 28일이라
+    여유가 3일뿐이다. 21일에 울리면 실측상 9.3년에 1회꼴이라 경보 피로가 없고 10일이 남는다.
+    기준은 이 앱의 진입 원장(_LEDGER_PATH) - 원장이 비어 있으면 원장 시작 표식
+    (_LEDGER_SINCE_PATH)부터 잰다(앱을 켜 두고도 진입이 한 번도 없던 기간)."""
+    import time as _t
+    try:
+        d = _ledger_load()
+        if d:
+            last = max(float(r.get("ts_ms") or 0) for r in d)
+        else:
+            last = _ledger_since()
+        if not last:
+            return None
+        return int((_t.time() * 1000 - last) // 86400000)
+    except Exception:
+        return None
+
+
+IDLE_WARN_DAYS = 21          # 실측 근거는 _idle_days 독스트링
+
+
 def _ledger_since() -> float:
     """원장 필터 적용 시작 시각(ms). 이 이전 체결은 원장이 없으니 옛 방식(전부 포함) —
     필터는 '앞으로'만(대표 2026-07-17). 기존 회원의 과거 트랙레코드를 지우지 않기 위함.
@@ -1073,6 +1112,7 @@ class App:
         self._precheck_done = {}                                    # {(asset, entry_iso): True}
         root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
+        root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -5011,6 +5051,54 @@ class App:
             except Exception as e:
                 self.log(f"   · 통과 익절 감시 오류({asset}/{aid_cfg}): {e}")
 
+    def _prop_in_use(self) -> bool:
+        """켜진 계좌 중 프롭 계열 브로커(projectx=Topstep 계열, nt8=Lucid)가 있는가.
+        크립토(bybit/bitget)나 자기자본(tradovate/ibkr)만 쓰면 비활동 경고는 소음이다."""
+        try:
+            for _a in ("NQ", "GC"):
+                _cfg = self._acfg.get(_a) or {}
+                _default = _cfg.get("broker") or _ASSET_BROKERS[_a][0]
+                for _row in (_cfg.get("accounts") or []):
+                    if not _row.get("on"):
+                        continue
+                    if (_row.get("broker") or _default) in ("projectx", "nt8"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _idle_warn_tick(self):
+        """프롭 비활동 경고(대표 2026-08-31 "걍 앱에 경고 띄워, 그걸로 끝").
+        EQ 자동 진입이 21일째 없고 프롭 계좌가 켜져 있으면 하루 한 번 경고창 + 로그.
+        21일 근거는 _idle_days 독스트링(실측 최장 28일, 30일 규정까지 10일 여유).
+        판정 불가(None)면 조용히 - 경고를 못 띄우는 것보다 오경보가 더 해롭다."""
+        try:
+            _d = _idle_days()
+            if _d is not None and _d >= IDLE_WARN_DAYS and self._prop_in_use():
+                _msg = self.t("idle_warn").format(d=_d)
+                self.log("⚠ " + _msg)
+                _mark = os.path.join(APP_DIR, ".eqidle_warned")
+                import datetime as _dtm
+                _today = _dtm.date.today().isoformat()
+                _prev = ""
+                try:
+                    _prev = open(_mark, encoding="utf-8").read().strip()
+                except Exception:
+                    pass
+                if _prev != _today:
+                    try:
+                        open(_mark, "w", encoding="utf-8").write(_today)
+                    except Exception:
+                        pass
+                    messagebox.showwarning("EQ Autopilot", _msg)
+        except Exception:
+            pass
+        finally:
+            try:      # 하루 두 번 재확인 - 켜둔 채 방치해도 날짜가 넘어가면 다시 판정
+                self.root.after(12 * 3600 * 1000, self._idle_warn_tick)
+            except Exception:
+                pass
+
     def _precheck_tick(self):
         try:
             from datetime import datetime
@@ -5450,7 +5538,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.28p"
+    _APP_VER = "2026.08.31a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
