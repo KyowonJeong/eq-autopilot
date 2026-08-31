@@ -5538,7 +5538,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31b"
+    _APP_VER = "2026.08.31c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6228,7 +6228,7 @@ class App:
             return []
         return out
 
-    def _alive_ping(self, armed: bool = True, force: bool = False):
+    def _alive_ping(self, armed: bool = True, force: bool = False, sync: bool = False):
         """생존 핑(/eqalive, 대표 2026-08-17 '앱 다운 알림은 해') - 무장 중 4분마다.
         서버는 15분 무소식(핑 3회 결번)이면 회원에게 '앱이 죽었다'를 DM한다.
         [전체 정지]만 armed=False로 경보 대상에서 빠진다 - **무장 중 창을 닫으면 경보가
@@ -6306,7 +6306,15 @@ class App:
                         self._alive_sig = _sig      # **전송 성공 뒤에만** 기억한다
                 except Exception:
                     pass
-        threading.Thread(target=_bg, daemon=True).start()
+        # ⚠️종료 경로는 **동기 전송**(대표 2026-08-31 "앱 끄고 나서는 한참 모르네").
+        # 종전엔 종료 직전 핑도 백그라운드 스레드 + 0.35초 대기였는데, 집 네트워크의
+        # TLS 왕복이 그보다 길면 프로세스가 먼저 죽어 closed 마커가 유실됐다 - 그러면
+        # 칩은 15분 신선도 창이 다 마를 때까지 켜진 것으로 남는다. 켤 때 빠른 이유는
+        # 앱이 살아 있어 스레드가 끝까지 가기 때문이다. 종료는 몇 초 기다려도 된다.
+        if sync:
+            _bg()
+        else:
+            threading.Thread(target=_bg, daemon=True).start()
 
     def _live_now(self, live_flag: bool) -> bool:
         """발주 '순간'의 실거래 여부 = 시작 시 선택 AND 현재 게이트의 강제 모의 아님.
@@ -7141,9 +7149,7 @@ def main():
             # 동시에 closed=True를 실어, 회원 화면의 칩은 15분을 기다리지 않고 즉시
             # 꺼짐이 된다(대표 2026-08-28 "앱 껐는데 안 변해"). 경보와 표시는 다른 축이다.
             _app._closing = True
-            _app._alive_ping(armed=_armed, force=True)
-            import time as _tq
-            _tq.sleep(0.35)          # 백그라운드 전송 스레드가 나갈 시간(실패해도 무해)
+            _app._alive_ping(armed=_armed, force=True, sync=True)   # 동기 - 마커 유실 방지
         except Exception:
             pass
         try:
@@ -7162,11 +7168,13 @@ def main():
         pass
     root.mainloop()
     # mainloop를 어떤 경로로 빠져나오든 마지막으로 한 번 더(중복 핑은 무해).
+    # ⚠️여기도 closed 마커 + 동기(2026-08-31): 이 경로로만 나온 종료는 마커 없이 나가
+    # 칩이 15분을 기다렸다. 어떤 탈출이든 '앱이 꺼졌다'는 사실은 같다.
     try:
+        _app._closing = True
         _app._alive_ping(armed=bool(getattr(_app, "_sig_accts", None)
-                                    or getattr(_app, "_auto_accts", None)), force=True)
-        import time as _tq2
-        _tq2.sleep(0.3)
+                                    or getattr(_app, "_auto_accts", None)),
+                         force=True, sync=True)
     except Exception:
         pass
 
