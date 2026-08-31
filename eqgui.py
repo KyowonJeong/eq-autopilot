@@ -5143,20 +5143,63 @@ class App:
                                    if ko else
                                    "Could not find the Token slot in the bridge file - follow the manual steps in the guide.")
             return
+        # NT8 폴더 탐색 3겹(대표 2026-08-31 "닌자 폴더가 다르면?"):
+        # ①지난번 성공 경로(프로필 기억) ②윈도 레지스트리의 실제 '문서' 위치(폴더
+        # 리다이렉트를 어디로 했든 이게 정답) ③기본/OneDrive 후보. 전부 실패하면
+        # 폴더 선택창으로 대표가 직접 지정 - 한 번 고르면 기억한다.
+        _cands = []
+        _saved = str((self._profile or {}).get("nt8_custom_dir") or "")
+        if _saved:
+            _cands.append(_saved)
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion"
+                                r"\Explorer\User Shell Folders") as _k:
+                _docs = winreg.QueryValueEx(_k, "Personal")[0]
+                _docs = os.path.expandvars(_docs)
+                _cands.append(os.path.join(_docs, "NinjaTrader 8", "bin", "Custom"))
+        except Exception:
+            pass                      # 맥/리눅스 또는 레지스트리 접근 실패 - 후보로 계속
         _home = os.path.expanduser("~")
-        _cands = [os.path.join(_home, "Documents", "NinjaTrader 8", "bin", "Custom")]
+        _cands.append(os.path.join(_home, "Documents", "NinjaTrader 8", "bin", "Custom"))
         _od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer") or ""
         if _od:
             _cands.append(os.path.join(_od, "Documents", "NinjaTrader 8", "bin", "Custom"))
             _cands.append(os.path.join(_od, "문서", "NinjaTrader 8", "bin", "Custom"))
-        _dstb = next((c for c in _cands if os.path.isdir(c)), None)
+        _dstb = next((c for c in _cands if c and os.path.isdir(c)), None)
+        if not _dstb:
+            # 마지막 수단: 대표가 직접 고른다. 'NinjaTrader 8' 폴더를 고르면 bin/Custom을
+            # 이어 붙이고, Custom까지 고른 경우도 알아서 받는다.
+            try:
+                from tkinter import filedialog
+                _pick = filedialog.askdirectory(
+                    title=("NinjaTrader 8 폴더를 선택하세요 (문서 안의 'NinjaTrader 8')"
+                           if ko else "Select your 'NinjaTrader 8' folder (inside Documents)"))
+            except Exception:
+                _pick = ""
+            if _pick:
+                for _try in (os.path.join(_pick, "bin", "Custom"), _pick):
+                    if os.path.isdir(_try) and os.path.basename(_try).lower() == "custom":
+                        _dstb = _try
+                        break
+                    if os.path.isdir(os.path.join(_try, "AddOns")):
+                        _dstb = _try
+                        break
         if not _dstb:
             messagebox.showwarning("EQ Autopilot",
-                                   "NinjaTrader 8 폴더를 찾지 못했습니다(문서\\NinjaTrader 8).\n"
-                                   "NT8이 설치된 이 PC에서 눌러야 합니다." if ko else
-                                   "NinjaTrader 8 folder not found (Documents\\NinjaTrader 8).\n"
-                                   "Press this on the PC where NT8 is installed.")
+                                   "NinjaTrader 8 폴더를 찾지 못했습니다.\n"
+                                   "NT8이 설치된 이 PC에서 누르고, 선택창에서는 문서 안의 "
+                                   "'NinjaTrader 8' 폴더를 고르세요." if ko else
+                                   "NinjaTrader 8 folder not found.\n"
+                                   "Press this on the PC where NT8 is installed and pick the "
+                                   "'NinjaTrader 8' folder inside Documents.")
             return
+        try:                          # 다음번을 위해 기억(수동 선택, 레지스트리 어느 쪽이든)
+            self._profile["nt8_custom_dir"] = _dstb
+            self._save_cfg()
+        except Exception:
+            pass
         _addons = os.path.join(_dstb, "AddOns")
         try:
             os.makedirs(_addons, exist_ok=True)
@@ -5653,7 +5696,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31e"
+    _APP_VER = "2026.08.31f"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
