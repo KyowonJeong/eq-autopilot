@@ -929,7 +929,15 @@ def _idle_days():   # 반환 int | None. ⚠️어노테이션으로 쓰지 마�
         if d:
             last = max(float(r.get("ts_ms") or 0) for r in d)
         else:
-            last = _ledger_since()
+            # ⚠️_ledger_since()를 부르지 않는다(2026-08-31 R20 P2-4): 그 함수는 파일이
+            # 없으면 '지금'을 **써서 박제**하는 쓰기 함수고, 그 시각은 트랙레코드 원장
+            # 필터의 grandfather 기준점이다. 경고 틱이 기동 7초에 돌면서 기준점을 '첫
+            # 실행'으로 앞당겨 버렸다 - 기준점 박제는 원래 소유자(첫 푸시 경로)에게 남긴다.
+            try:
+                with open(_LEDGER_SINCE_PATH, encoding="utf-8") as f:
+                    last = float(f.read().strip())
+            except Exception:
+                return None            # 기준점 없음 = 판정 불가(경고 안 띄움이 정답)
         if not last:
             return None
         return int((_t.time() * 1000 - last) // 86400000)
@@ -5538,7 +5546,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31c"
+    _APP_VER = "2026.08.31d"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6274,7 +6282,9 @@ class App:
             with self._ping_lock:
                 try:
                     import requests as _rq      # 모듈 레벨에 requests 없음 - 지역 임포트 필수
-                    _ok = _rq.post(PUSH_BASE + "eqalive", timeout=8,
+                    # 종료 경로(sync)는 짧게 - 메인스레드가 락 대기+POST를 동기로 하므로
+                    # 불통 네트워크에서 8초 타임아웃은 최악 16초 동결을 만들었다(R20 P2-5).
+                    _ok = _rq.post(PUSH_BASE + "eqalive", timeout=(3 if sync else 8),
                              json={"t": self._token,
                                    "armed": bool(self._sig_accts or self._auto_accts),
                                    "v": self._APP_VER,
