@@ -5102,12 +5102,19 @@ class App:
         except Exception:
             cr = {}
         tok = (cr.get("f1") or "").strip()
+        _gen = False
         if not tok:
-            messagebox.showwarning("EQ Autopilot",
-                                   "Bridge Token(f1)을 먼저 입력해 저장하세요 - 그 값을 브리지에 넣습니다."
-                                   if ko else
-                                   "Enter and save the Bridge Token (f1) first - it gets injected into the bridge.")
-            return
+            # 처음 까는 사람은 토큰을 지어낼 필요도 없다(대표 2026-08-31 "처음 까는 사람은?").
+            # 앱이 만들고, _save_cfg의 비밀 스윕이 키체인에 넣는다 - 필드에 친 것과 동일 경로.
+            import secrets as _sec
+            tok = _sec.token_urlsafe(18)
+            cr["f1"] = tok
+            _gen = True
+            try:
+                self._save_cfg()
+            except Exception:
+                pass
+            self.log("🧩 Bridge Token 자동 생성 - 앱에 저장했고 브리지에도 같은 값을 넣습니다")
         try:
             _prt = int(str(cr.get("f3") or "").strip() or 8377)
         except (TypeError, ValueError):
@@ -5214,12 +5221,12 @@ class App:
             return
         self.log(f"🧩 브리지 설치 완료: {_dst} (토큰·포트 자동 주입)")
         messagebox.showinfo("EQ Autopilot",
-                            ("브리지를 설치했습니다(토큰 자동 주입" +
+                            ("브리지를 설치했습니다(" + ("토큰 자동 생성·" if _gen else "") + "토큰 자동 주입" +
                              (f", 포트 {_prt}" if _prt != 8377 else "") + ").\n\n"
                              "이제 NinjaTrader 8을 완전히 종료했다가 다시 시작하세요 - "
                              "시작할 때 자동으로 컴파일됩니다.\n"
                              "NT8 로그에 [EQBridge] started 가 뜨면 완료입니다.") if ko else
-                            ("Bridge installed (token injected" +
+                            ("Bridge installed (" + ("token generated and " if _gen else "") + "token injected" +
                              (f", port {_prt}" if _prt != 8377 else "") + ").\n\n"
                              "Now fully quit and restart NinjaTrader 8 - it compiles "
                              "changed add-ons at startup.\n"
@@ -5696,7 +5703,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31f"
+    _APP_VER = "2026.08.31g"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
