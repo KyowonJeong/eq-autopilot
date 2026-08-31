@@ -1518,6 +1518,17 @@ class App:
                                      "account appears above automatically, pick it below and set 1R.")
                           , foreground="#8a8f98", wraplength=740, justify="left"
                           ).pack(anchor="w", pady=(2, 0))
+                # 원클릭 브리지 설치(대표 2026-08-31): 수동 4단계(파일 찾기, 토큰 옮겨적기,
+                # 복사, 컴파일)를 버튼 하나 + "NT8 재시작"으로. 구버전 브리지가 체결 보고를
+                # 열흘 삼킨 실사고의 재발 방지 경로이기도 하다.
+                _brow = ttk.Frame(frm); _brow.pack(fill="x", pady=(4, 0))
+                ttk.Button(_brow, text=("브리지 설치/업데이트" if self.lang == "ko"
+                                        else "Install/Update bridge"),
+                           command=self._nt8_install_bridge).pack(side="left")
+                ttk.Label(_brow, text=("저장된 토큰을 자동 주입 - 설치 후 NT8만 재시작"
+                                       if self.lang == "ko" else
+                                       "injects the saved token - just restart NT8 after"),
+                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
             else:
                 _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
                 self._avail_entry = ttk.Entry(_mrow, width=24)
@@ -5075,6 +5086,102 @@ class App:
             pass
         return False
 
+    def _nt8_install_bridge(self):
+        """[브리지 설치/업데이트] - NT8 애드온 설치를 원클릭으로(대표 2026-08-31 "자동화
+        불가능한가?" → "토큰 입력만 받음 되잖아" - 그 토큰조차 이미 저장돼 있어 입력 0).
+
+        하는 일: 앱 패키지에 동봉된 EQAutopilotBridge.cs를 읽어 ①Token 상수에 저장된
+        Bridge Token(f1)을, ②BaseUrl 포트에 f3(기본 8377)을 주입하고, ③문서/NinjaTrader 8/
+        bin/Custom/AddOns/ 에 덮어쓴다(기존 파일은 .bak). 컴파일은 NT8이 재시작할 때
+        스스로 한다 - 그래서 남는 수동 단계는 "NT8 재시작" 하나다.
+        실사고 배경: 대표 윈도 머신의 구버전 브리지가 포지션 조회에 빈 값을 줘, 8/21의
+        확인 게이트가 체결 보고를 열흘간 전부 제외했다(매매는 무사, 보고만 소실)."""
+        ko = self.lang == "ko"
+        try:
+            cr = self._creds_of(self._asset, "nt8")
+        except Exception:
+            cr = {}
+        tok = (cr.get("f1") or "").strip()
+        if not tok:
+            messagebox.showwarning("EQ Autopilot",
+                                   "Bridge Token(f1)을 먼저 입력해 저장하세요 - 그 값을 브리지에 넣습니다."
+                                   if ko else
+                                   "Enter and save the Bridge Token (f1) first - it gets injected into the bridge.")
+            return
+        try:
+            _prt = int(str(cr.get("f3") or "").strip() or 8377)
+        except (TypeError, ValueError):
+            _prt = 8377
+        import sys as _sys
+        _base = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        src = None
+        for _c in (os.path.join(_base, "nt8_addon", "EQAutopilotBridge.cs"),
+                   os.path.join(_base, "_internal", "nt8_addon", "EQAutopilotBridge.cs"),
+                   os.path.join(os.path.dirname(_base), "nt8_addon", "EQAutopilotBridge.cs")):
+            if os.path.exists(_c):
+                src = _c
+                break
+        if not src:
+            messagebox.showwarning("EQ Autopilot",
+                                   "앱 패키지에서 브리지 파일을 찾지 못했습니다 - 재설치 후 다시 시도하세요."
+                                   if ko else
+                                   "Bridge file not found in the app package - reinstall the app and retry.")
+            return
+        try:
+            txt = open(src, encoding="utf-8").read()
+        except Exception as _e:
+            messagebox.showwarning("EQ Autopilot", f"브리지 파일 읽기 실패: {_e}")
+            return
+        import re as _re
+        txt, _n1 = _re.subn(r'(private const string Token\s*=\s*")[^"]*(")',
+                            lambda m: m.group(1) + tok + m.group(2), txt, count=1)
+        txt, _n2 = _re.subn(r'(private const string BaseUrl\s*=\s*"http://127\.0\.0\.1:)\d+(")',
+                            lambda m: m.group(1) + str(_prt) + m.group(2), txt, count=1)
+        if not _n1:
+            messagebox.showwarning("EQ Autopilot",
+                                   "브리지 파일에서 Token 자리를 찾지 못했습니다 - 수동 절차(가이드)를 따르세요."
+                                   if ko else
+                                   "Could not find the Token slot in the bridge file - follow the manual steps in the guide.")
+            return
+        _home = os.path.expanduser("~")
+        _cands = [os.path.join(_home, "Documents", "NinjaTrader 8", "bin", "Custom")]
+        _od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer") or ""
+        if _od:
+            _cands.append(os.path.join(_od, "Documents", "NinjaTrader 8", "bin", "Custom"))
+            _cands.append(os.path.join(_od, "문서", "NinjaTrader 8", "bin", "Custom"))
+        _dstb = next((c for c in _cands if os.path.isdir(c)), None)
+        if not _dstb:
+            messagebox.showwarning("EQ Autopilot",
+                                   "NinjaTrader 8 폴더를 찾지 못했습니다(문서\\NinjaTrader 8).\n"
+                                   "NT8이 설치된 이 PC에서 눌러야 합니다." if ko else
+                                   "NinjaTrader 8 folder not found (Documents\\NinjaTrader 8).\n"
+                                   "Press this on the PC where NT8 is installed.")
+            return
+        _addons = os.path.join(_dstb, "AddOns")
+        try:
+            os.makedirs(_addons, exist_ok=True)
+            _dst = os.path.join(_addons, "EQAutopilotBridge.cs")
+            if os.path.exists(_dst):
+                import shutil as _sh
+                _sh.copyfile(_dst, _dst + ".bak")
+            with open(_dst, "w", encoding="utf-8") as f:
+                f.write(txt)
+        except Exception as _e:
+            messagebox.showwarning("EQ Autopilot", f"브리지 설치 실패: {_e}")
+            return
+        self.log(f"🧩 브리지 설치 완료: {_dst} (토큰·포트 자동 주입)")
+        messagebox.showinfo("EQ Autopilot",
+                            ("브리지를 설치했습니다(토큰 자동 주입" +
+                             (f", 포트 {_prt}" if _prt != 8377 else "") + ").\n\n"
+                             "이제 NinjaTrader 8을 완전히 종료했다가 다시 시작하세요 - "
+                             "시작할 때 자동으로 컴파일됩니다.\n"
+                             "NT8 로그에 [EQBridge] started 가 뜨면 완료입니다.") if ko else
+                            ("Bridge installed (token injected" +
+                             (f", port {_prt}" if _prt != 8377 else "") + ").\n\n"
+                             "Now fully quit and restart NinjaTrader 8 - it compiles "
+                             "changed add-ons at startup.\n"
+                             "You are done when the NT8 log shows [EQBridge] started."))
+
     def _idle_warn_tick(self):
         """프롭 비활동 경고(대표 2026-08-31 "걍 앱에 경고 띄워, 그걸로 끝").
         EQ 자동 진입이 21일째 없고 프롭 계좌가 켜져 있으면 하루 한 번 경고창 + 로그.
@@ -5546,7 +5653,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31d"
+    _APP_VER = "2026.08.31e"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
