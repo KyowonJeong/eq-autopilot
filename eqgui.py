@@ -1104,6 +1104,11 @@ class App:
         # 이 앱이 연 포지션 흔적(청산 버튼 노출 근거) - 재시작에도 유지(2026-08-11)
         self._open_assets = set(self._profile.get("open_assets") or [])
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
+        # 서버가 지정한 계획 청산 시각(exit_ts) — {asset: (epoch, 사유)}. 고영향 지표
+        # 발표에 걸리는 날 서버가 청산을 앞당겨 보낸다(FOMC 14:00 ET ↔ NQ 청산 14:00 ET:
+        # 발표를 관통해 포지션을 들고 있으면 브로커 규정 위반이라 2분 전에 평평해진다).
+        # 신호 수신 때 채우고 그날 발화하면 지운다. 없으면 기존 고정 시각(_ASSET_EXITS) 그대로.
+        self._exit_override = {}
         self._token = _d0.get("token", "")
         # 키체인 저장 실패 경고(2026-08-28): 평문으로 남은 비밀이 있으면 회원이 알아야 한다.
         # 랜딩과 약관이 "비밀은 OS 보안 저장소에"라고 말하는데 이 기기에서만 아니기 때문.
@@ -2994,8 +2999,27 @@ class App:
                 key = (j["asset"], j["hour"], j.get("acct") or j["broker"])
                 cur = now.hour * 60 + now.minute
                 due = j["hour"] * 60
+                # 서버 지정 청산 시각(뉴스 선행 청산). 고영향 지표 발표를 관통해 포지션을
+                # 들고 있으면 브로커 규정 위반이라, 그 날만 서버가 시각을 앞당겨 보낸다.
+                # 오늘·이 자산 것일 때만 쓰고, 값이 이상하면 조용히 고정 시각으로 돌아간다.
+                _ovr = (self._exit_override or {}).get(j["asset"])
+                _ovr_why = ""
+                if _ovr:
+                    try:
+                        _ov_dt = _dt.datetime.fromtimestamp(_ovr[0], _dt.timezone.utc)
+                        _ov_loc = _ov_dt.astimezone(now.tzinfo)
+                        if _ov_loc.date() == now.date():
+                            due = _ov_loc.hour * 60 + _ov_loc.minute
+                            _ovr_why = _ovr[1] or ""
+                    except Exception:
+                        pass
                 if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
                     continue
+                if _ovr_why:
+                    self.log(f"\n⏰ {j['asset']} " + (
+                        f"선행 청산 발화 ({_ovr_why})" if self.lang == "ko"
+                        else f"early close fired ({_ovr_why})"))
+                    self._exit_override.pop(j["asset"], None)   # 그날 1회로 소진
                 fired[key] = today
                 # 🛡 오살 방지(연속 세션): 이 자산에 '방금'(발화창 이내) LIVE 새 진입이 있었으면
                 # 이번 마감 청산 스킵 — 신호 루프가 이미 "잔여 청산→확인→진입"을 끝냈다는 뜻이고,
@@ -5703,7 +5727,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.08.31g"
+    _APP_VER = "2026.09.01a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6200,6 +6224,34 @@ class App:
             except Exception:
                 pass
             _tw.sleep(_WATCH_POLL_SECS)
+
+    def _note_exit_ts(self, sig):
+        """서버가 보낸 계획 청산 시각(exit_ts)을 기억한다. 없으면 아무것도 안 한다.
+
+        평소엔 서버 값 = 앱이 자체 계산하는 고정 시각이라 결과가 같다. 다른 날은 하나뿐:
+        고영향 지표 발표에 걸려 서버가 **앞당겨** 보낸 날(FOMC 등). 그때만 _auto_loop이
+        이 시각에 청산한다. 파싱 실패·과거 시각은 조용히 무시(기존 고정 시각 유지) -
+        청산은 절대 이 필드 때문에 죽으면 안 된다."""
+        try:
+            asset = str((sig or {}).get("instrument") or "").upper()
+            ts = (sig or {}).get("exit_ts")
+            if not asset or ts is None:
+                return
+            ts = float(ts)
+            import time as _te
+            if ts < _te.time() - 3600:          # 한참 지난 값은 무시
+                return
+            why = str((sig or {}).get("exit_early") or "")
+            prev = (self._exit_override or {}).get(asset)
+            self._exit_override[asset] = (ts, why)
+            if why and (not prev or prev[0] != ts):
+                import datetime as _dx
+                _lt = _dx.datetime.fromtimestamp(ts).strftime("%H:%M")
+                self.log(f"\n⏰ {asset} " + (
+                    f"청산을 {_lt}(현지)로 앞당깁니다 — {why}" if self.lang == "ko"
+                    else f"exit moved earlier to {_lt} (local) — {why}"))
+        except Exception:
+            pass
 
     def _log_watch_signal(self, sig):
         """표시 전용 신호 한 건을 로그에 적는다(메인 스레드). 주문 코드 없음."""
@@ -7079,6 +7131,7 @@ class App:
             if getattr(self, "_feed_errs", 0) >= 20:
                 self.log("   ✓ 신호 피드 정상 복구")
             self._feed_errs = 0
+            self._note_exit_ts(sig)      # 서버 지정 계획 청산 시각(뉴스 선행 청산) 반영
             sid = sig.get("id")
             # no-trade(거래 없음) 신호도 새로 오면 '받았다'만 표시(포지션은 안 잡음).
             if sid and sid != last_id and not (sig.get("tradeable") and sig.get("direction")):
