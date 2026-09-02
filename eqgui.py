@@ -1103,6 +1103,12 @@ class App:
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
         # 이 앱이 연 포지션 흔적(청산 버튼 노출 근거) - 재시작에도 유지(2026-08-11)
         self._open_assets = set(self._profile.get("open_assets") or [])
+        # 손절 청산 감지용(2026-09-02): 진입 때 쓴 브로커·심볼을 기억해 두고, 포지션이
+        # 브로커에서 사라졌는지 하트비트 주기로 확인한다. 첨부 스탑은 거래소가 체결하므로
+        # 앱의 청산 보고 경로(_send_fill(closed=True))가 시간 청산에서만 불렸고, 그래서
+        # 서버 버킷이 영구 open으로 남아 회원 화면에 '내 계좌 확인 필요'가 36시간 떴다.
+        self._open_ctx = {}          # {asset: {"b": broker, "sym": 심볼조각}}
+        self._flat_seen = {}         # {asset: 연속 flat 관측 횟수} - 1회는 안 믿는다
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         # 서버가 지정한 계획 청산 시각(exit_ts) — {asset: (epoch, 사유)}. 고영향 지표
         # 발표에 걸리는 날 서버가 청산을 앞당겨 보낸다(FOMC 14:00 ET ↔ NQ 청산 14:00 ET:
@@ -5727,7 +5733,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.01a"
+    _APP_VER = "2026.09.02a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -5881,6 +5887,65 @@ class App:
                 pass
         _th.Thread(target=w, daemon=True).start()
 
+    def _remember_open(self, asset, b, sym):
+        """진입에 쓴 브로커·심볼을 기억한다 - _check_stop_closed가 이걸로 조회한다."""
+        try:
+            if not hasattr(self, "_open_ctx"):
+                self._open_ctx = {}
+            self._open_ctx[str(asset)] = {"b": b, "sym": str(sym)}
+            getattr(self, "_flat_seen", {}).pop(str(asset), None)
+        except Exception:
+            pass
+
+    def _check_stop_closed(self):
+        """브로커 첨부 스탑이 발동해 포지션이 사라진 경우를 감지해 서버에 청산을 보고한다.
+
+        왜 필요한가: 손절은 거래소/브로커에 첨부된 스탑이 체결하므로 앱의 청산 경로를
+        타지 않는다(_send_fill(closed=True)는 시간 청산 flatten 뒤에서만 불린다).
+        그래서 서버의 체결 버킷이 영구 open으로 남고, 회원 대시보드는 손절이 날 때마다
+        '시스템 기준 청산 - 내 계좌 확인 필요'를 36시간 띄웠다(실데이터: 마지막 청산
+        보고 2026-08-21, 그 뒤 진입은 전부 open).
+
+        ⚠️조회 실패를 청산으로 오판하지 않는다 - 예외면 관측을 버리고, **연속 2회**
+        flat일 때만 보고한다(하트비트 60초 주기이므로 약 1~2분 확인). 읽기 전용이라
+        주문 경로에 개입하지 않는다."""
+        _assets = list(getattr(self, "_open_assets", set()) or [])
+        if not _assets:
+            return
+        for _a in _assets:
+            _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(_a))
+            if not _ctx:
+                continue                      # 이 앱이 연 포지션이 아니면 판단하지 않는다
+            _b, _sym = _ctx.get("b"), _ctx.get("sym")
+            if not _b or not _sym:
+                continue
+            try:
+                _poss = _b.list_open_positions()
+            except Exception:
+                self._flat_seen.pop(str(_a), None)     # 조회 실패 = 무판단
+                continue
+            if _poss is None:
+                self._flat_seen.pop(str(_a), None)
+                continue
+            try:
+                _still = any(str(_sym) in str(getattr(_p, "symbol", "")) for _p in _poss)
+            except Exception:
+                self._flat_seen.pop(str(_a), None)
+                continue
+            if _still:
+                self._flat_seen.pop(str(_a), None)
+                continue
+            _n = int(self._flat_seen.get(str(_a), 0)) + 1
+            self._flat_seen[str(_a)] = _n
+            if _n < 2:
+                continue                      # 한 번은 안 믿는다(전송 지연·일시 오류)
+            self._flat_seen.pop(str(_a), None)
+            self.log(f"\u2139 {_a} \ud3ec\uc9c0\uc158\uc774 \ube0c\ub85c\ucee4\uc5d0\uc11c "
+                     f"\uc0ac\ub77c\uc84c\uc2b5\ub2c8\ub2e4(\uc190\uc808 \ucd94\uc815) "
+                     f"- \uc11c\ubc84\uc5d0 \uccad\uc0b0\uc744 \ubcf4\uace0\ud569\ub2c8\ub2e4.")
+            self._open_ctx.pop(str(_a), None)
+            self._send_fill(_a, closed=True)
+
     def _send_fill(self, asset, closed=False):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
         (2026-08-11) closed면 열린 포지션 흔적 해제 - 청산 버튼 자동 숨김.
@@ -5912,7 +5977,13 @@ class App:
                 if not tid:
                     return
                 if closed:
-                    body = {"tok_id": tid, "inst": str(asset), "qty_micro": 0, "qty_btc": 0}
+                    # mid를 실어 보낸다(2026-09-02): 진입은 mid로 기기별 버킷을 만드는데
+                    # 청산만 mid가 없어 서버가 '_'로 받았다. 서버는 mid='_'면 그 자산의
+                    # 열린 버킷을 **전부** 닫는 보수적 경로를 타므로, 두 기기를 함께 쓰면
+                    # 한쪽 손절이 다른 기기 보유까지 닫힌 것으로 보고된다. mid가 안 맞으면
+                    # 서버의 역방향 폴백이 여전히 열린 버킷을 닫아 준다(재설치 대비).
+                    body = {"tok_id": tid, "inst": str(asset), "mid": MACHINE_ID,
+                            "qty_micro": 0, "qty_btc": 0}
                 else:
                     if not hasattr(self, "_fill_lock"):
                         return              # 이 자산에서 체결된 게 없다
@@ -6154,6 +6225,7 @@ class App:
                          f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
             self._send_gap(asset, sig, b, _con,
                            mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
+            self._remember_open(asset, b, _con)          # 손절 청산 감지용(2026-09-02)
             _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
             if res.get("stop"):
                 _sp = res.get("stop_price")
@@ -6330,6 +6402,13 @@ class App:
             try:
                 if (self._token or "").strip():
                     self._alive_ping(armed=bool(self._sig_accts or self._auto_accts))
+            except Exception:
+                pass
+            # 손절 청산 감지(2026-09-02) - 열린 포지션이 있을 때만 브로커를 읽는다.
+            # 하트비트에 얹는 이유: 앱이 떠 있는 동안 항상 도는 유일한 주기 루프이고,
+            # 60초면 손절 뒤 최대 2분 안에 서버 버킷이 닫힌다.
+            try:
+                self._check_stop_closed()
             except Exception:
                 pass
             _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
@@ -7096,6 +7175,7 @@ class App:
                 self._entered_at = _mark_entered(asset)
                 self._note_fill(asset, coin=float(size or 0))   # 대시보드 보고용(#53)
                 self._send_gap(asset, sig, b, sym)               # 체결 갭 실측(2026-08-11)
+                self._remember_open(asset, b, sym)               # 손절 청산 감지용(2026-09-02)
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
