@@ -246,6 +246,7 @@ _BROKERS = ["projectx", "tradovate", "ibkr", "bybit", "bitget"]
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
 #   ⚠️ BTC를 CME MBTC 선물로 안 함 — MBTC는 주말 휴장인데 BTC 엣지가 주말(일요일)에 몰려 있어
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
+_CONSENT_VER = "golive-4item-2026-08"
 _ASSETS = ["NQ", "GC", "BTC"]
 _ASSET_BROKERS = {"NQ": ["projectx", "nt8", "tradovate", "ibkr"],
                   "GC": ["projectx", "nt8", "tradovate", "ibkr"],
@@ -401,6 +402,8 @@ T = {
     "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
     # 약관 §14.9·Privacy 5.4와 문언 일치(2026-08-27 일치성 P2-40): '본인 계좌' 항목 누락 수리
+    # 동의 문안 버전(대표 2026-09-03 증거 스탬프): consent 문구를 실질 변경하면 반드시 올릴 것
+    # - 서버 원장에 "어느 버전 문안에 동의했나"가 이 값으로 남는다.
     "consent": {"ko": "동의: 본인 키·본인 기기·본인 계좌·본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my account, my responsibility. EdgeQuant does not trade. (required to act)"},
     "consent_detail": {
@@ -2497,7 +2500,32 @@ class App:
     def _consent_ok(self):
         if not self.consent.get():
             messagebox.showwarning(self.t("need_consent"), self.t("need_consent")); return False
+        # 동의 스탬프(대표 2026-09-03): 문안 버전이 바뀐 첫 실행 동작 때 1회 영속 -
+        # 생존 핑(cv/ct)으로 서버 증거 원장에 "어느 문안에 언제 동의했나"가 남는다.
+        try:
+            _c = (self._profile or {}).get("consent") or {}
+            if _c.get("ver") != _CONSENT_VER:
+                import time as _t0
+                self._profile["consent"] = {"ver": _CONSENT_VER, "at": int(_t0.time())}
+                self._save_cfg()
+                self._alive_ping(force=True)
+        except Exception:
+            pass
         return True
+
+    def _send_ev(self, kind, asset, **extra):
+        """실행 라이프사이클 마커(/eqalive ev, 대표 2026-09-03 "진입 시도 진입 성공 등등").
+        서버 증거 원장 전용 단발 - 생존 상태 페이로드는 안 실어(핑 지문 오염 방지) 서버가
+        ev 단독 요청으로 처리한다. 실패 무해·비차단."""
+        def _bg():
+            try:
+                import requests as _rq
+                _rq.post(PUSH_BASE + "eqalive", timeout=6,
+                         json={"t": self._token, "m": _machine_id(), "v": self._APP_VER,
+                               "ev": dict({"kind": kind, "inst": asset}, **extra)})
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _fill_scope(self, names, asset=None, broker=None):
         """브로커의 신선한 계좌 목록 → 가용 계좌 **미러링(교체)** + UI 갱신.
@@ -3064,6 +3092,8 @@ class App:
                     # 곧장 시장가 청산. (_exec_close_limit는 롤백용 보존, 호출만 끔)
                     if live and j["broker"] == "projectx" and j["asset"] in _LIMIT_EXIT_FUT:
                         self._exec_close_limit_fut(b, j["asset"])
+                    if live:
+                        self._send_ev("exit_attempt", j["asset"])   # 증거 원장(2026-09-03)
                     res = b.flatten_all(dry_run=not live)   # 잔여 확인 겸 최종 청산(플랫이면 no-op)
                     if not res.planned:
                         self.log("   no open positions (flat).")
@@ -3083,6 +3113,7 @@ class App:
                             # 🚨 청산 후에도 포지션이 남았거나 실패 — 로그만으론 못 본다(2026-07-27
                             # Follower 계좌 청산 거부 실사고). 팝업으로 즉시 수동 개입 요청.
                             _errs = "\n".join(str(e)[:120] for e in res.errors[:4])
+                            self._report_error("auto_close", _errs)   # 원장+회원 DM(2026-09-03)
                             _pt = ("자동청산 실패 — 수동 확인 필요" if self.lang == "ko"
                                    else "Auto-close failed — manual action needed")
                             _pm = ((f"{_lab} 자동청산이 완전히 끝나지 않았습니다.\n\n{_errs}\n\n"
@@ -5733,7 +5764,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.02a"
+    _APP_VER = "2026.09.03a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6524,6 +6555,21 @@ class App:
             return []
         return out
 
+    def _asset_brokers(self):
+        """자산→브로커명 매핑(대표 2026-09-03 로그 페이지 '브로커 상태'). 자격이 실제로
+        입력된 자산만. 브로커 키 이름뿐 - 자격 정보는 절대 보내지 않는다."""
+        out = {}
+        try:
+            for _a in _ASSETS:
+                _c = (self._acfg.get(_a) or {})
+                _b = _c.get("broker")
+                _cr = ((_c.get("creds") or {}).get(_b) or {}) if _b else {}
+                if _b and any(str(v or "").strip() for v in _cr.values()):
+                    out[_a] = str(_b)[:16]
+        except Exception:
+            return {}
+        return out
+
     def _alive_ping(self, armed: bool = True, force: bool = False, sync: bool = False):
         """생존 핑(/eqalive, 대표 2026-08-17 '앱 다운 알림은 해') - 무장 중 4분마다.
         서버는 15분 무소식(핑 3회 결번)이면 회원에게 '앱이 죽었다'를 DM한다.
@@ -6587,6 +6633,10 @@ class App:
                                    # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
                                    # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
                                    "arm": self._armed_assets(),
+                                   # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
+                                   "bk": self._asset_brokers(),
+                                   "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
+                                   "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
                                    # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
                                    # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
                                    # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
@@ -7155,6 +7205,7 @@ class App:
             if res.get("error"):
                 self.log(f"   ❌ [{lbl}] 진입 실패: {res.get('error')}")
                 _em = str(res.get("error"))[:300]; _hint = _entry_fail_hint(_em, self.lang == "ko")
+                self._report_error(f"entry:{asset}", _em)   # 거절 사유도 원장+회원 DM(2026-09-03)
                 self.root.after(0, lambda m=_em, a=asset, h=_hint, L=lbl: messagebox.showerror(
                     "진입 실패" if self.lang == "ko" else "Entry failed",
                     (f"[{L}] {a} 진입 주문이 거절되었습니다:\n\n{m}\n\n{h}" if self.lang == "ko"
@@ -7305,6 +7356,7 @@ class App:
                          f"진입참조 {sig.get('entry_ref')} · size×{_mult:.2f} · {len(_fire)}개 계좌 자동 진입")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'}  ·  "
                          f"받은 시각 {_recv.strftime('%H:%M:%S')}  ·  지연 {_lat}")
+                self._send_ev("entry_attempt", _asset, accounts=len(_fire))  # 증거 원장(2026-09-03)
                 # 계좌별 병렬 발주 — 순차 지연으로 계좌 간 진입가가 벌어지는 것 방지(대표 2026-07-24).
                 # 각 계좌는 독립 스레드로 동시에 쏘고(스레드마다 독립 브로커 객체), 로그는 계좌
                 # 라벨 [펀디드]/[챌린지]로 구분된다. 한 계좌 실패는 그 계좌만 스킵(다른 계좌 진행).
