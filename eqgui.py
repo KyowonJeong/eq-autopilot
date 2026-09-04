@@ -1635,18 +1635,24 @@ class App:
                                        else "exact account name"),
                           foreground="#9ca3af").pack(side="left", padx=(8, 0))
         if spec.get("acct"):
-            # ① 브로커 설정 복사(대표 2026-08-11 "브로커 설정 복사, 계좌 설정 복사 둘 다")
-            _bsrcs = [a for a in _ASSETS if a != self._asset
-                      and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
-            if _bsrcs:
+            # ① 브로커 키 전수 가져오기(대표 2026-09-04 "전 브로커 세팅을 다 복사해오게" -
+            #    자산 단위 복사는 자산마다 브로커가 다르면 브로커 선택까지 갈아쳐
+            #    엉뚱한 필드 값으로 보였다). 소스 선택 없이 버튼 하나로 브로커별 병합.
+            _has_src = any(
+                str((cr2 or {}).get("f1") or "").strip()
+                for a2 in _ASSETS if a2 != self._asset
+                for bk2, cr2 in (self._acfg.get(a2, {}).get("creds") or {}).items()
+                if bk2 in _ASSET_BROKERS.get(self._asset, []))
+            if _has_src:
                 _bcp = ttk.Frame(frm); _bcp.pack(fill="x", pady=(2, 0))
-                ttk.Label(_bcp, text=("브로커 설정 복사 ←" if self.lang == "ko"
-                                      else "Copy broker setup ←"),
-                          foreground="#888").pack(side="left")
-                for _srcb in _bsrcs:
-                    ttk.Button(_bcp, text=_srcb, width=5,
-                               command=lambda a=_srcb: self._copy_broker_setup(a)
-                               ).pack(side="left", padx=(4, 0))
+                ttk.Button(_bcp, text=("다른 자산의 브로커 키 전부 가져오기"
+                                       if self.lang == "ko"
+                                       else "Pull all broker keys from other assets"),
+                           command=self._pull_broker_keys).pack(side="left")
+                ttk.Label(_bcp, text=("브로커별 자동 병합 - 이 자산의 브로커 선택은 그대로"
+                                      if self.lang == "ko" else
+                                      "auto-merge per broker - this asset's broker choice stays"),
+                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
 
         # ── 둘째 접이식: 자산별 계좌 설정(대표 2026-08-11 "브로커 설정 드롭다운, 그 아래
         #    계좌 설정 드롭다운" - 두 유닛을 독립 접이식으로). 자산 탭은 공유(_asset 하나).
@@ -2131,7 +2137,16 @@ class App:
                        + _dtf.datetime.now().strftime("%H:%M:%S")
                        + (" - 재시작해도 유지됩니다" if self.lang == "ko" else " - kept across restarts"),
                        foreground=("#b45309" if _kcf else "#15803d"))   # 실패는 주황
-            self.root.after(1500, lambda: lbl.config(foreground="#6b7280"))
+            # 1.5초 뒤 회색 복귀 - 위젯을 캡처하는 예약 콜백이라, 그 사이 화면이 재구성되면
+            # 죽은 라벨을 만져 [tk] invalid command 오류가 실행 기록을 도배했다(9/4 새 기기
+            # 셋업 중 브로커 연속 전환 실사고). 생존 확인 후에만 만진다.
+            def _dim(l=lbl):
+                try:
+                    if l.winfo_exists():
+                        l.config(foreground="#6b7280")
+                except Exception:
+                    pass
+            self.root.after(1500, _dim)
         except Exception:
             pass
 
@@ -2771,80 +2786,54 @@ class App:
         return True
 
 
-    def _copy_broker_setup(self, src_asset):
-        """① 브로커 설정만 복사(대표 2026-08-11 "다른 유닛을 하나로 묶으면 언제나 혼란"):
-        브로커 선택·크레덴셜(브리지 토큰·포트)·가용 계좌 목록. 사용 계좌(②)는 안 건드린다."""
+    def _pull_broker_keys(self):
+        """① 브로커 키 전수 가져오기(대표 2026-09-04 "전 브로커 세팅을 다 복사해오게").
+        다른 자산들의 브로커 자격(f1·f3·가용 계좌)을 **브로커별로** 그러모아 이 자산에
+        병합한다. 종전 자산 단위 복사는 자산마다 브로커가 다르면(나스닥=탑스텝, 금=루시드)
+        브로커 선택까지 소스 것으로 갈아쳐 엉뚱한 필드 값이 뜬 것처럼 보였다 - 폐지.
+        원칙:
+          · 이 자산의 브로커 선택(드롭다운)은 안 건드린다 - 보던 화면 유지
+          · 이 자산에 이미 f1이 있는 브로커는 안 덮는다(살아 있는 키 보호) - 값이 다르면
+            ⚠ 로그로 알려만 준다
+          · 같은 브로커가 여러 자산에 있으면 f1이 있는 첫 자산 것(NQ·GC·BTC 순)
+          · f2(비밀)는 키체인이 f1 값을 키로 공유하므로 따로 옮길 게 없다
+          · 사용 계좌(②) 행은 그대로(유닛 분리)"""
         import copy as _copy
         dst = self._asset
         if self._armed_here(dst):
+            self.log("⏸ 무장 중에는 브로커 키를 가져오지 않습니다 - 정지 후 다시 시도하세요.")
             return
-        _src = self._acfg[src_asset]
-        if not any((v.get("f1") or "").strip() for v in (_src.get("creds") or {}).values()):
-            messagebox.showinfo(("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
-                                (f"{src_asset}에 복사할 브로커 설정이 없습니다." if self.lang == "ko"
-                                 else f"No broker setup to copy from {src_asset}.")); return
-        if not messagebox.askyesno(
-                ("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
-                (f"{src_asset}의 브로커 선택과 키, 가용 계좌를 {dst}에 가져올까요?\n"
-                 f"{dst}에만 있는 다른 브로커 키는 지우지 않고, 사용 계좌(②) 행도 "
-                 f"그대로 둡니다." if self.lang == "ko" else
-                 f"Bring {src_asset}'s broker choice, keys and available accounts into "
-                 f"{dst}?\nKeys for brokers only {dst} has are kept, and the account rows "
-                 f"in section 2 stay as they are.")):
-            return
-        self._collect_acct_widgets()
-        # ⚠️creds는 **병합**이다(대표 2026-08-28 "브로커 다른 걸로 선택돼 있으면 카피가
-        # 이상하게 됨"). 통째 대입은 dst가 갖고 있던 다른 브로커의 자격을 지워, 그 브로커를
-        # 가리키던 계좌 행이 키 없는 행으로 죽었다(라이브 시작 프리플라이트 "키 미설정").
-        # 이 자산에서 못 쓰는 브로커(선물↔크립토)는 애초에 넘기지 않는다.
-        _ok_bks = _ASSET_BROKERS.get(dst, [])
+        self._save_current_asset()
+        _ok = _ASSET_BROKERS.get(dst, [])
         _dstcr = self._acfg[dst].setdefault("creds", {})
-        # ⚠️**빈 자격은 안 넘긴다**(2026-08-28 리뷰 P0). f1이 빈 creds 엔트리는 예외가
-        # 아니라 기본값이다 - _load가 자산 기본 브로커에 대해 항상 만들고, 브로커
-        # 드롭다운을 한 번만 옮겨도 _save_current_asset이 이전 브로커의 빈 엔트리를
-        # 남긴다. 그걸 그대로 옮기면 dst의 **살아 있는 키를 빈 값으로 덮어써**, 멀쩡히
-        # 굴러가던 자산이 조용히 죽는다. dst에 아예 없던 브로커면 빈 엔트리라도 받아
-        # 콤보에는 뜨게 한다(회원이 키를 채워 넣을 자리).
-        _moved = []
-        for _bk, _cr in (_src.get("creds") or {}).items():
-            if _bk not in _ok_bks:
-                continue
-            if ((_cr.get("f1") or "").strip()) or _bk not in _dstcr:
-                _dstcr[_bk] = _copy.deepcopy(_cr)     # 가용 계좌(avail)도 이 안에 있다
-                if (_cr.get("f1") or "").strip():
-                    _moved.append(_bk)
-        _sb = _src.get("broker")
-        if _sb in _ok_bks:
-            self._acfg[dst]["broker"] = _sb
-        # ⚠️계좌 행의 브로커는 **안 건드린다**(리뷰 P0). 자격 없는 행을 기본 브로커로
-        # 돌리던 종전 처리는 Topstep 계좌명이 붙은 행을 Lucid 행으로 만들었고, 그 조합은
-        # 프리플라이트·연결 테스트를 다 통과한 뒤 신호가 온 순간에야 '계좌 없음'으로
-        # 드러났다(화면은 계속 초록). 자격이 없으면 라이브 시작이 "키 미설정"으로
-        # 크게 막는 편이 조용한 오배선보다 안전하다. 대신 어느 행인지 미리 알려준다.
-        _need = sorted({(_ac.get("broker") or "").strip()
-                        for _ac in (self._acfg[dst].get("accounts") or [])
-                        if (_ac.get("broker") or "").strip()
-                        and not ((_dstcr.get((_ac.get("broker") or "").strip()) or {})
-                                 .get("f1") or "").strip()})
-        self._save_cfg()
-        self._build()
-        self.log(f"📋 {src_asset} → {dst} 브로커 설정 복사 완료 "
-                 f"(브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종 이동)")
-        if _need:
-            _lbls = ", ".join(_broker_label(b) for b in _need)
-            self.log(f"⚠ 키가 없는 브로커를 가리키는 계좌 행이 있습니다: {_lbls}")
-            try:
-                messagebox.showwarning(
-                    ("브로커 설정 복사" if self.lang == "ko" else "Copy broker setup"),
-                    (f"복사는 끝났지만 {dst}의 계좌 행 중 일부가 키 없는 브로커"
-                     f"({_lbls})를 가리킵니다.\n행의 브로커를 바꾸거나 그 브로커 키를 "
-                     f"입력하세요 - 그대로 두면 라이브 시작이 막힙니다."
-                     if self.lang == "ko" else
-                     f"Copied, but some {dst} account rows point at brokers with no key "
-                     f"({_lbls}).\nChange the row broker or enter that broker's key - "
-                     f"otherwise going live is blocked."))
-            except Exception:
-                pass
+        _moved, _kept = [], []
+        for bk in _ok:
+            _mine = str((_dstcr.get(bk) or {}).get("f1") or "").strip()
+            for a2 in _ASSETS:
+                if a2 == dst:
+                    continue
+                cr2 = (self._acfg.get(a2, {}).get("creds") or {}).get(bk) or {}
+                _theirs = str(cr2.get("f1") or "").strip()
+                if not _theirs:
+                    continue
+                if _mine:
+                    if _mine != _theirs:
+                        _kept.append(f"{_broker_label(bk)}({a2})")
+                    break                       # 살아 있는 키 보호 - 안 덮는다
+                _dstcr[bk] = _copy.deepcopy(cr2)
+                _moved.append(f"{_broker_label(bk)}←{a2}")
+                break
+        if not _moved and not _kept:
+            self.log("📋 가져올 브로커 키가 없습니다 - 다른 자산에도 키가 없거나 이미 다 있습니다.")
+            return
+        if _moved:
+            self._save_cfg()
+            self._build()
+            self.log("📋 브로커 키 가져오기 완료: " + ", ".join(_moved)
+                     + " (브로커 선택과 기존 키, 사용 계좌 행은 그대로)")
+        if _kept:
+            self.log("⚠ 값이 달라 안 덮은 키: " + ", ".join(_kept)
+                     + " - 이 자산 키를 쓰려면 해당 브로커 칸을 비운 뒤 다시 가져오세요.")
 
     def _transfer_pin(self):
         """PIN 게이트(설정 내보내기 공용). 없으면 새로 만들고, 틀리면 재설정 흐름(_pin_forgot)."""
@@ -5446,6 +5435,21 @@ class App:
         실사고 배경: 대표 윈도 머신의 구버전 브리지가 포지션 조회에 빈 값을 줘, 8/21의
         확인 게이트가 체결 보고를 열흘간 전부 제외했다(매매는 무사, 보고만 소실)."""
         ko = self.lang == "ko"
+        # 토큰 설명을 버튼 흐름이 직접 한다(대표 2026-09-04 "루시드 토큰 설정 열라 헷갈려" -
+        # "이건 루시드 브로커 토큰이고 네가 설정하고 기억해라"). 회원이 만들 것도 기억할
+        # 것도 없다는 걸 팝업이 먼저 선언한다.
+        if not messagebox.askyesno(
+                "EQ Autopilot",
+                ("NT8 브리지를 설치/업데이트합니다.\n\n"
+                 "여기 쓰이는 토큰은 Lucid(NT8) 연결용 Bridge Token입니다. 앱이 자동으로 "
+                 "만들어 저장하고, 브리지 파일에도 같은 값을 넣습니다.\n"
+                 "직접 정할 필요도, 기억할 필요도 없습니다.\n\n계속할까요?"
+                 if ko else
+                 "Install/update the NT8 bridge.\n\n"
+                 "The token used here is the Bridge Token for the Lucid (NT8) connection. "
+                 "The app creates and stores it automatically, and injects the same value "
+                 "into the bridge file.\nNothing to type, nothing to remember.\n\nContinue?")):
+            return
         try:
             # 자산 컨텍스트 자가 결정(2026-09-04, 버튼 최상단 이동에 따른 수리): 현재 탭이
             # 크립토여도 ①f1 저장된 자산 ②브로커=nt8인 자산 순으로 찾는다 - 아니면 엉뚱한
@@ -5577,11 +5581,14 @@ class App:
         messagebox.showinfo("EQ Autopilot",
                             ("브리지를 설치했습니다(" + ("토큰 자동 생성·" if _gen else "") + "토큰 자동 주입" +
                              (f", 포트 {_prt}" if _prt != 8377 else "") + ").\n\n"
+                             "Bridge Token은 앱이 저장해 두었습니다 - 기억하지 않으셔도 "
+                             "됩니다.\n\n"
                              "이제 NinjaTrader 8을 완전히 종료했다가 다시 시작하세요 - "
                              "시작할 때 자동으로 컴파일됩니다.\n"
                              "NT8 로그에 [EQBridge] started 가 뜨면 완료입니다.") if ko else
                             ("Bridge installed (" + ("token generated and " if _gen else "") + "token injected" +
                              (f", port {_prt}" if _prt != 8377 else "") + ").\n\n"
+                             "The Bridge Token is stored by the app - nothing to remember.\n\n"
                              "Now fully quit and restart NinjaTrader 8 - it compiles "
                              "changed add-ons at startup.\n"
                              "You are done when the NT8 log shows [EQBridge] started."))
@@ -6057,7 +6064,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04f"
+    _APP_VER = "2026.09.04g"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
