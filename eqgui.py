@@ -1276,6 +1276,19 @@ class App:
         ttk.Button(rt, text=self.t("token_get"), width=9, command=self._open_free).pack(side="left", padx=(4, 0))
         self.gate_lbl = tk.Label(frm, text="", foreground="#888", anchor="w", justify="left", wraplength=660)
         self.gate_lbl.pack(anchor="w", pady=(0, 4))
+        # 브리지 설치를 최상단으로(대표 2026-09-04 "토큰 넣는 데 바로 아래, 눈에 잘 띄는 데") -
+        # NT8 브로커 접이 안에 묻혀 있어 업데이트 순간에 못 찾던 문제. NT8은 윈도우 전용이라
+        # 윈도우에서만 보인다. 자산 컨텍스트는 _nt8_install_bridge가 스스로 찾는다.
+        if sys.platform.startswith("win"):
+            _bridge_row = ttk.Frame(frm); _bridge_row.pack(fill="x", pady=(0, 4))
+            ttk.Button(_bridge_row, text=("NT8 브리지 설치/업데이트" if self.lang == "ko"
+                                          else "Install/Update NT8 bridge"),
+                       command=self._nt8_install_bridge).pack(side="left")
+            ttk.Label(_bridge_row,
+                      text=("Lucid(NT8)용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
+                            if self.lang == "ko" else
+                            "for Lucid (NT8) - injects the saved token; restart NT8 after"),
+                      foreground="#9ca3af").pack(side="left", padx=(8, 0))
 
         # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-24 자산별 계좌) ──────────
         #   계좌·계좌별 1R은 각 **자산 탭 브로커 설정**에서 관리(자산마다 브로커·계좌 독립).
@@ -1532,17 +1545,15 @@ class App:
                                      "account appears above automatically, pick it below and set 1R.")
                           , foreground="#8a8f98", wraplength=740, justify="left"
                           ).pack(anchor="w", pady=(2, 0))
-                # 원클릭 브리지 설치(대표 2026-08-31): 수동 4단계(파일 찾기, 토큰 옮겨적기,
-                # 복사, 컴파일)를 버튼 하나 + "NT8 재시작"으로. 구버전 브리지가 체결 보고를
-                # 열흘 삼킨 실사고의 재발 방지 경로이기도 하다.
-                _brow = ttk.Frame(frm); _brow.pack(fill="x", pady=(4, 0))
-                ttk.Button(_brow, text=("브리지 설치/업데이트" if self.lang == "ko"
-                                        else "Install/Update bridge"),
-                           command=self._nt8_install_bridge).pack(side="left")
-                ttk.Label(_brow, text=("저장된 토큰을 자동 주입 - 설치 후 NT8만 재시작"
-                                       if self.lang == "ko" else
-                                       "injects the saved token - just restart NT8 after"),
-                          foreground="#9ca3af").pack(side="left", padx=(8, 0))
+                # 브리지 설치 버튼은 앱 최상단(토큰 아래)으로 이동(대표 2026-09-04) -
+                # 여기엔 위치 안내만 남긴다.
+                ttk.Label(frm, text=("브리지 설치는 화면 맨 위 [NT8 브리지 설치/업데이트] "
+                                     "버튼으로 - 저장된 토큰이 자동 주입됩니다."
+                                     if self.lang == "ko" else
+                                     "To install the bridge, use [Install/Update NT8 bridge] "
+                                     "at the top of the window - the saved token is injected."),
+                          foreground="#9ca3af", wraplength=740, justify="left"
+                          ).pack(anchor="w", pady=(4, 0))
             else:
                 _mrow = ttk.Frame(frm); _mrow.pack(fill="x", pady=(2, 0))
                 self._avail_entry = ttk.Entry(_mrow, width=24)
@@ -4022,6 +4033,35 @@ class App:
                         self.log(f"   ⚠ {_broker_label(bk)} {_w}")
             except Exception:
                 pass
+            if bk == "nt8":
+                # 구버전 브리지 조기 경보(대표 2026-09-04 협의: 자동 설치는 컴파일 실패
+                # 지뢰라 기각, 대신 라이브 시작 때 검사 + 팝업 '예'로 그 자리 설치).
+                # 브리지가 push하는 bridge_ver와 앱 동봉 .cs의 BridgeVer를 대조한다 -
+                # 구버전 브리지는 표기 자체가 없어 빈 값 = 구버전으로 판정된다.
+                try:
+                    _have = ""
+                    try:
+                        _have = str(b._snapshot().get("bridge_ver") or "")
+                    except Exception:
+                        _have = ""
+                    _want = self._bundled_bridge_ver()
+                    if _want and _have != _want and not getattr(self, "_bridge_ver_warned", False):
+                        self._bridge_ver_warned = True     # 앱 세션당 1회
+                        self.log(f"   🚨 NT8 브리지 구버전 감지 — 현재 "
+                                 f"{_have or '표기 없음'} / 동봉 {_want}")
+
+                        def _ask_install():
+                            if messagebox.askyesno(
+                                    "EQ Autopilot",
+                                    ("NT8 브리지 애드온이 구버전입니다.\n"
+                                     "지금 설치할까요? (설치 후 NT8 재시작이 필요합니다)"
+                                     if self.lang == "ko" else
+                                     "The NT8 bridge add-on is outdated.\n"
+                                     "Install now? (NT8 must be restarted afterwards)")):
+                                self._nt8_install_bridge()
+                        self.root.after(0, _ask_install)
+                except Exception:
+                    pass
             return None
         except Exception as e:
             return str(e)[:200]
@@ -5165,6 +5205,24 @@ class App:
             pass
         return False
 
+    def _bundled_bridge_ver(self) -> str:
+        """앱 동봉 브리지 .cs의 BridgeVer 문자열("" = 동봉 없음/파싱 실패).
+        라이브 시작 구버전 경보(_conn_check)가 실행 중 브리지와 대조하는 기준값."""
+        import re as _re
+        import sys as _sys
+        _base = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        for _c in (os.path.join(_base, "nt8_addon", "EQAutopilotBridge.cs"),
+                   os.path.join(_base, "_internal", "nt8_addon", "EQAutopilotBridge.cs"),
+                   os.path.join(os.path.dirname(_base), "nt8_addon", "EQAutopilotBridge.cs")):
+            try:
+                if os.path.exists(_c):
+                    m = _re.search(r'BridgeVer\s*=\s*"([^"]+)"',
+                                   open(_c, encoding="utf-8").read())
+                    return m.group(1) if m else ""
+            except Exception:
+                pass
+        return ""
+
     def _nt8_install_bridge(self):
         """[브리지 설치/업데이트] - NT8 애드온 설치를 원클릭으로(대표 2026-08-31 "자동화
         불가능한가?" → "토큰 입력만 받음 되잖아" - 그 토큰조차 이미 저장돼 있어 입력 0).
@@ -5177,7 +5235,12 @@ class App:
         확인 게이트가 체결 보고를 열흘간 전부 제외했다(매매는 무사, 보고만 소실)."""
         ko = self.lang == "ko"
         try:
-            cr = self._creds_of(self._asset, "nt8")
+            # 자산 컨텍스트 자가 결정(2026-09-04, 버튼 최상단 이동에 따른 수리): 현재 탭이
+            # 크립토여도 ①f1 저장된 자산 ②브로커=nt8인 자산 순으로 찾는다 - 아니면 엉뚱한
+            # 자산 밑에 새 토큰을 만들어 기존 브리지와 토큰이 어긋난다(통신 두절 지뢰).
+            _cands = [a for a in _ASSETS if (self._creds_of(a, "nt8") or {}).get("f1")]
+            _cands += [a for a in _ASSETS if self._broker_of(a) == "nt8"]
+            cr = self._creds_of(_cands[0] if _cands else self._asset, "nt8")
         except Exception:
             cr = {}
         tok = (cr.get("f1") or "").strip()
@@ -5782,7 +5845,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04d"
+    _APP_VER = "2026.09.04e"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
