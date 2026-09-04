@@ -43,7 +43,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string Token   = "CHANGE-ME-SHARED-TOKEN";   // 앱 config의 nt8.token
         private const int    PollMs  = 1000;
 
-        private const string BridgeVer = "2026.09.04";   // 앱이 구/신 애드온 판별(orders 지원)
+        private const string BridgeVer = "2026.09.04b";   // 앱이 구/신 애드온 판별(orders 지원)
 
         private DispatcherTimer timer;
         private static readonly HttpClient http = new HttpClient();
@@ -119,9 +119,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 string reason = "";
                 try
                 {
-                    if (e.Error != ErrorCode.NoError)
-                        reason = e.Error.ToString()
-                                 + (string.IsNullOrEmpty(e.NativeError) ? "" : ": " + e.NativeError);
+                    // 거절 사유: 이 빌드의 OrderEventArgs엔 Error/NativeError가 없을 수
+                    // 있다(9/4 실기기 CS1061 x2). 리플렉션으로 있으면 읽고 없으면 생략 -
+                    // 사유가 비면 앱 쪽이 상태 문자열(Rejected)로 폴백한다.
+                    var pe = e.GetType().GetProperty("Error");
+                    var pn = e.GetType().GetProperty("NativeError");
+                    object ev = pe != null ? pe.GetValue(e, null) : null;
+                    object nv = pn != null ? pn.GetValue(e, null) : null;
+                    if (ev != null && ev.ToString() != "NoError")
+                        reason = ev.ToString()
+                                 + (nv == null || string.IsNullOrEmpty(nv.ToString())
+                                    ? "" : ": " + nv.ToString());
                 }
                 catch (Exception) { }
                 lock (ordersLock)
@@ -137,8 +145,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                         { "reason", reason },
                     };
                 }
-                bool dead = e.OrderState == OrderState.Rejected
-                            || e.OrderState == OrderState.Cancelled;
                 if (e.OrderState == OrderState.Rejected && acct != null)
                 {
                     if (name.StartsWith("EQ-"))
