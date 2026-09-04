@@ -43,10 +43,21 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string Token   = "CHANGE-ME-SHARED-TOKEN";   // 앱 config의 nt8.token
         private const int    PollMs  = 1000;
 
+        private const string BridgeVer = "2026.09.04";   // 앱이 구/신 애드온 판별(orders 지원)
+
         private DispatcherTimer timer;
         private static readonly HttpClient http = new HttpClient();
         private readonly HashSet<string> doneTids = new HashSet<string>();
         private bool busy;
+
+        // ── EQ 주문 장부(2026-09-04 다계좌 진입 누락 수리) ──
+        // NT8 Submit은 fire-and-forget: 브로커의 비동기 거절은 OrderUpdate 이벤트로만
+        // 온다. 종전엔 아무도 안 들어 '진입 완료' ack 뒤 조용히 사라졌다(9/4 GC 1계좌,
+        // 8/21 동일 사고). 여기 기록해 /v1/state의 "orders"로 앱에 준다. 키 = 주문 Name.
+        private readonly object ordersLock = new object();
+        private readonly Dictionary<string, Dictionary<string, object>> eqOrders
+            = new Dictionary<string, Dictionary<string, object>>();
+        private readonly HashSet<string> subscribedAccounts = new HashSet<string>();
 
         protected override void OnStateChange()
         {
@@ -77,12 +88,88 @@ namespace NinjaTrader.NinjaScript.AddOns
             // 마지막 창이 닫힐 때만 정지 — NT 종료 시 자동 정리
         }
 
+        // 계좌별 OrderUpdate 1회 구독(중복 방지). 연결이 늦게 붙는 계좌도 다음 틱에 잡힌다.
+        private void EnsureOrderSubscriptions()
+        {
+            lock (Account.All)
+            {
+                foreach (Account a in Account.All)
+                {
+                    if (a.ConnectionStatus != ConnectionStatus.Connected) continue;
+                    if (subscribedAccounts.Contains(a.Name)) continue;
+                    subscribedAccounts.Add(a.Name);
+                    a.OrderUpdate += OnOrderUpdate;
+                }
+            }
+        }
+
+        // EQ 주문의 상태·거절 사유 기록 + 브래킷 무결성(기계적 정리만 - 판단 없음):
+        //  · 진입(EQ-)이 거절되면 짝 스탑(EQS-)을 취소한다 - 포지션 없는 계좌에 StopMarket
+        //    대기 = 알몸 진입 지뢰(9/4 실사고의 고아 스탑).
+        //  · 스탑(EQS-)이 거절되면 그 종목을 Flatten한다 - 알몸 포지션 불가 원칙(동기
+        //    경로의 catch와 동일한 규칙을 비동기 거절에도 적용).
+        private void OnOrderUpdate(object sender, OrderEventArgs e)
+        {
+            try
+            {
+                if (e == null || e.Order == null) return;
+                string name = e.Order.Name ?? "";
+                if (!name.StartsWith("EQ")) return;
+                var acct = e.Order.Account;
+                string reason = "";
+                try
+                {
+                    if (e.Error != ErrorCode.NoError)
+                        reason = e.Error.ToString()
+                                 + (string.IsNullOrEmpty(e.NativeError) ? "" : ": " + e.NativeError);
+                }
+                catch (Exception) { }
+                lock (ordersLock)
+                {
+                    eqOrders[name] = new Dictionary<string, object> {
+                        { "account", acct != null ? acct.Name : "" },
+                        { "name", name },
+                        { "order_id", e.Order.OrderId ?? "" },
+                        { "instrument", e.Order.Instrument != null
+                                        ? e.Order.Instrument.FullName : "" },
+                        { "state", e.OrderState.ToString() },
+                        { "filled", e.Order.Filled },
+                        { "reason", reason },
+                    };
+                }
+                bool dead = e.OrderState == OrderState.Rejected
+                            || e.OrderState == OrderState.Cancelled;
+                if (e.OrderState == OrderState.Rejected && acct != null)
+                {
+                    if (name.StartsWith("EQ-"))
+                    {
+                        // 진입 거절 → 짝 스탑 취소(고아 지뢰 제거)
+                        string stopName = "EQS-" + name.Substring(3);
+                        Order stop = null;
+                        lock (Account.All)
+                            stop = acct.Orders.FirstOrDefault(o => o.Name == stopName
+                                    && o.OrderState != OrderState.Filled
+                                    && o.OrderState != OrderState.Cancelled
+                                    && o.OrderState != OrderState.Rejected);
+                        if (stop != null) acct.Cancel(new[] { stop });
+                    }
+                    else if (name.StartsWith("EQS-") && e.Order.Instrument != null)
+                    {
+                        // 스탑 거절 → 그 종목 정리(알몸 포지션 불가)
+                        acct.Flatten(new[] { e.Order.Instrument });
+                    }
+                }
+            }
+            catch (Exception) { /* 이벤트 핸들러는 NT8 스레드 - 절대 던지지 않는다 */ }
+        }
+
         private async Task TickAsync()
         {
             if (busy) return;                             // 재진입 방지
             busy = true;
             try
             {
+                EnsureOrderSubscriptions();
                 await PushStateAsync();
                 await DrainCommandsAsync();
             }
@@ -194,9 +281,49 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             catch (Exception) { /* 체결 조회 실패는 상태 push 전체를 막지 않는다 */ }
 
+            // ── EQ 주문 스냅샷(2026-09-04): 장부(OrderUpdate 기록, 거절 사유 포함)를
+            //    기본으로, 아직 이벤트가 안 온 라이브 주문은 Account.Orders에서 보충한다.
+            var orders = new List<object>();
+            try
+            {
+                var seen = new HashSet<string>();
+                lock (ordersLock)
+                {
+                    foreach (var kv in eqOrders)
+                    {
+                        orders.Add(kv.Value);
+                        seen.Add(kv.Key);
+                    }
+                }
+                lock (Account.All)
+                {
+                    foreach (Account a in Account.All)
+                    {
+                        if (a.ConnectionStatus != ConnectionStatus.Connected) continue;
+                        foreach (Order o in a.Orders)
+                        {
+                            string nm = o.Name ?? "";
+                            if (!nm.StartsWith("EQ") || seen.Contains(nm)) continue;
+                            orders.Add(new Dictionary<string, object> {
+                                { "account", a.Name },
+                                { "name", nm },
+                                { "order_id", o.OrderId ?? "" },
+                                { "instrument", o.Instrument != null
+                                                ? o.Instrument.FullName : "" },
+                                { "state", o.OrderState.ToString() },
+                                { "filled", o.Filled },
+                                { "reason", "" },
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception) { /* 주문 스냅샷 실패는 상태 push를 막지 않는다 */ }
+
             var body = new Dictionary<string, object> {
                 { "accounts", accounts }, { "positions", positions },
-                { "executions", executions },
+                { "executions", executions }, { "orders", orders },
+                { "bridge_ver", BridgeVer },
                 { "ts", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
             };
             await PostAsync("/v1/state", body);
@@ -273,7 +400,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             acct.Submit(new[] { entry });
 
             var ack = Ack(true);
-            ack["order_id"] = entry.OrderId;
+            // 폴백(2026-09-04): 생성 직후 OrderId가 아직 비어 있을 수 있다(오늘 🛡 라인
+            // 누락 원인 추정) - 비면 주문 Name으로 준다. 앱은 존재 여부만 본다.
+            ack["order_id"] = string.IsNullOrEmpty(entry.OrderId)
+                              ? ("EQ-" + c.Str("tid")) : entry.OrderId;
             if (c.Get("stop_loss_price") != null)
             {
                 try
@@ -284,7 +414,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         0, c.Dbl("stop_loss_price"),
                         "", "EQS-" + c.Str("tid"), Core.Globals.MaxDate, null);
                     acct.Submit(new[] { stop });
-                    ack["stop_order_id"] = stop.OrderId;
+                    ack["stop_order_id"] = string.IsNullOrEmpty(stop.OrderId)
+                                           ? ("EQS-" + c.Str("tid")) : stop.OrderId;
                 }
                 catch (Exception ex)
                 {

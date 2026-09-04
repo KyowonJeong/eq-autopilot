@@ -2438,7 +2438,10 @@ class App:
             import datetime as _dtl2
             _m = str(m)
             if _m.strip() and not _m.startswith(("═", "─", "\n═")):
-                _pfx = _dtl2.datetime.now().strftime("%H:%M:%S ")
+                # 버전 마커(대표 2026-09-04 "각 로그 옆에 발생 시 버전"): 붙여넣은 로그만
+                # 봐도 어느 빌드가 찍었는지 알게. 압축 표기 = 버전 끝 3~4자(예: 04a).
+                _vp = self._APP_VER.rsplit(".", 1)[-1] if "." in self._APP_VER else self._APP_VER
+                _pfx = _dtl2.datetime.now().strftime("%H:%M:%S ") + f"[{_vp}] "
                 _m = ("\n" + _pfx + _m.lstrip("\n")) if _m.startswith("\n") else (_pfx + _m)
             self.q.put(_m)
             return
@@ -5764,7 +5767,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.03a"
+    _APP_VER = "2026.09.04a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6042,7 +6045,9 @@ class App:
                             return
                     except Exception:
                         pass
-                    _t.sleep(20)                # 5분 창 안에서만 - 그 뒤엔 조용히 포기
+                    _t.sleep(20)                # 5분 창 안에서만
+                self.log(f"   ⚠ {asset} 체결 보고 전송 실패(5분 재시도 소진) — 대시보드 "
+                         "수량·금액 표시가 빠질 수 있습니다(다음 거래 보고는 정상).")
             except Exception:
                 pass
         _th.Thread(target=w, daemon=True).start()
@@ -6206,65 +6211,138 @@ class App:
         _use_limit = bool(_polf and _polf.get("mode") == "limit_then_market"
                           and _polf.get("limit_price") is not None)
         _ok = 0
+        # NT8 재시도(대표 2026-09-04 "안 들어가지면 재진입" + 8/21·9/4 조용한 거절 사고):
+        # NT8 Submit은 접수=성공이 아니어서, 확인 실패 시 잔재 정리 후 최대 2회 재진입.
+        # 타 브로커(ProjectX)는 동기 응답이라 기존 1회 동작 유지. 확인 없는 재진입 금지 원칙 -
+        # 재시도 전 close_contract(Flatten 기반)로 늦은 체결까지 정리하므로 이중 진입 불가.
+        _is_nt8 = type(b).__name__ == "NT8Broker"
         for _sym, _qty, _con in resolved:
-            _tag = f"EQ-AP-{int(recv.timestamp() * 1000)}-{_sym}"
-            try:
-                if _use_limit:
-                    res = self._exec_entry_limit_fut(b, _aid, _con, direction, _qty,
-                                                     stop, dict(_polf), live, _tag)
-                else:
-                    res = b.place_entry(account_id=_aid, contract_id=_con, side=direction,
-                                        size=_qty, order_type=2, stop_loss_price=stop,
-                                        custom_tag=_tag, dry_run=not live)
-            except Exception as _ee:
-                self.log(f"   ❌ {_sym} 진입 예외: {_ee}"); continue
-            if res.get("skipped"):
-                self.log(f"   ⏭ {_sym} 정책 스킵(불리 이동)."); continue
-            if res.get("error"):
-                self.log(f"   ❌ {_sym} 진입 실패: {str(res.get('error'))[:200]}"); continue
-            if not live:
-                self.log(f"   DRY-RUN {_sym} entry: {res.get('would_place')}")
-                if res.get("would_place_stop"):
-                    self.log(f"   DRY-RUN {_sym} stop:  {res.get('would_place_stop')}")
-                _ok += 1; continue
-            self.log(f"   ✅ {_sym} 진입 완료 ×{_qty}")
-            # 대시보드 보고용 누적(#53) - 미니/마이크로가 섞이므로 마이크로 환산 계약으로
-            # 통일한다(미니 1 = 마이크로 10). 심볼 앞 M이 마이크로.
-            # ⚠️2026-08-21(대표 "루시드 하나 안 들어갔었네"): 예전엔 주문이 **접수**만 되면
-            # 셌다 - 거절·마진부족으로 실제 포지션이 없어도 공개 트랙레코드 수량이 부풀었다.
-            # 이제 브로커 포지션을 짧게 확인해 **실제로 잡힌 계좌만** 보고한다(읽기 전용,
-            # 발주 경로 무간섭. 확인 실패해도 주문 자체는 그대로 살아 있다).
-            _confirmed = True
-            try:
-                import time as _tvf
-                _seen_qty = 0
-                for _i in range(4):                    # 0.5s 간격 4회 = 최대 2초
+            _base_tag = f"EQ-AP-{int(recv.timestamp() * 1000)}-{_sym}"
+            _placed = False          # True=확정 체결 / None=정책 스킵 / False=실패
+            _last_why = ""
+            _res_ok = None           # 확정 시의 res(스탑 표시용)
+            _tag = _base_tag
+            _tries = 3 if (_is_nt8 and live) else 1
+            for _try in range(_tries):
+                _tag = _base_tag if _try == 0 else f"{_base_tag}-r{_try}"   # tid 멱등 우회
+                if _try:
+                    self.log(f"   ↻ {_sym} 미체결 감지({_last_why}) — 잔재 정리 후 재진입 {_try}/2")
+                    self._send_ev("entry_attempt", asset, leg=_sym, try_n=_try + 1)
+                    try:
+                        b.close_contract(_aid, _con)   # 고아 주문 취소+잔재 정리(Flatten 기반)
+                    except Exception as _cx:
+                        self.log(f"   ⚠ {_sym} 잔재 정리 실패(계속): {_cx}")
+                    _t.sleep(1.5)
+                try:
+                    if _use_limit:
+                        res = self._exec_entry_limit_fut(b, _aid, _con, direction, _qty,
+                                                         stop, dict(_polf), live, _tag)
+                    else:
+                        res = b.place_entry(account_id=_aid, contract_id=_con, side=direction,
+                                            size=_qty, order_type=2, stop_loss_price=stop,
+                                            custom_tag=_tag, dry_run=not live)
+                except Exception as _ee:
+                    _last_why = str(_ee)[:160]
+                    self.log(f"   ❌ {_sym} 진입 예외: {_ee}")
+                    self._report_error(f"entry:{asset}", _ee)
+                    continue
+                if res.get("skipped"):
+                    self.log(f"   ⏭ {_sym} 정책 스킵({res.get('note') or '불리 이동'}) — "
+                             "재시도·경보 대상 아님.")
+                    _placed = None; break
+                if res.get("error"):
+                    _last_why = str(res.get("error"))[:160]
+                    self.log(f"   ❌ {_sym} 진입 거절: {_last_why}")
+                    continue
+                if not live:
+                    self.log(f"   DRY-RUN {_sym} entry: {res.get('would_place')}")
+                    if res.get("would_place_stop"):
+                        self.log(f"   DRY-RUN {_sym} stop:  {res.get('would_place_stop')}")
+                    _placed = True; break
+                self.log(f"   📨 {_sym} 진입 접수 ×{_qty} (주문 {res.get('order_id') or _tag})")
+                # ── 확인 창(대표 "체결 확인 안 된 게 왜인지"): NT8=6초(0.5×12, 애드온 push
+                # 1초 주기 감안), 타 브로커=2초(기존). 포지션 잡히면 확정, NT8은 주문 상태로
+                # 거절을 조기 감지해 **사유까지** 확보(신 애드온 orders 스냅샷).
+                _seen_qty = 0; _rej = ""
+                _rounds = 12 if _is_nt8 else 4
+                for _i in range(_rounds):
                     try:
                         _seen_qty = abs(int(b.position_qty(_aid, _con) or 0))
                     except Exception:
                         _seen_qty = 0
                     if _seen_qty:
                         break
-                    _tvf.sleep(0.5)
-                _confirmed = bool(_seen_qty)
-            except Exception:
-                _confirmed = True                      # 확인 자체가 불가하면 종전대로 센다
-            if _confirmed:
-                self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
-            else:
-                self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
-                         f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
+                    if _is_nt8:
+                        try:
+                            _os = b.order_status(_aid, _tag) or {}
+                            _en0 = _os.get("entry") or {}
+                            if str(_en0.get("state")) in ("Rejected", "Cancelled"):
+                                _rej = str(_en0.get("reason") or _en0.get("state"))[:160]
+                                break
+                        except Exception:
+                            pass
+                    _t.sleep(0.5)
+                if _seen_qty:
+                    _placed = True; _res_ok = res
+                    self.log(f"   ✅ {_sym} 체결 확인 ×{_seen_qty}")
+                    break
+                _last_why = _rej or f"포지션 미확인({'6' if _is_nt8 else '2'}초)"
+                if not _is_nt8:
+                    # 타 브로커: 기존 동작 유지(주문은 살아 있을 수 있음 - 보고만 제외)
+                    _placed = False; _res_ok = res
+                    break
+            if _placed is None:
+                continue                                   # 정책 스킵 - 다음 leg
+            if live and not _placed:
+                if _is_nt8:
+                    self.log(f"   🚨 {_sym} 진입 실패 — {_last_why or '사유 미상'} "
+                             f"({_tries}회 시도, 계좌 [{sc}])")
+                    self._report_error(f"entry:{asset}", f"{_sym} {sc} {_last_why or 'unconfirmed'} "
+                                       f"({_tries}tries)")
+                    self._member_alert(
+                        "entry_miss",
+                        f"⚠️ {asset} 진입 실패 — 계좌 {sc} {_sym} {_tries}회 시도 후 미체결. "
+                        f"사유: {_last_why or '미상'}. 브로커 화면을 확인해 주세요.",
+                        f"⚠️ {asset} entry failed — account {sc} {_sym} unfilled after "
+                        f"{_tries} attempts. Reason: {_last_why or 'unknown'}. "
+                        "Please check your broker.")
+                else:
+                    self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
+                             f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
+                    # 기존 동작: 갭·오픈추적·원장은 진행(주문이 살아있을 수 있음)
+                    self._send_gap(asset, sig, b, _con, mkt_at_send=_px_at_send)
+                    self._remember_open(asset, b, _con)
+                    _ledger_add(asset, _con, direction, _tag)
+                continue
+            if not live:
+                _ok += 1; continue
+            res = _res_ok or {}
+            # ── 확정 체결 보고 경로(위 확인 루프에서 포지션 실확인된 계좌만) ──
+            # 대시보드 보고 누적(#53): 미니/마이크로 혼합 → 마이크로 환산(미니 1=마이크로 10).
+            self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
             self._send_gap(asset, sig, b, _con,
                            mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
             self._remember_open(asset, b, _con)          # 손절 청산 감지용(2026-09-02)
-            _ledger_add(asset, _con, direction, _tag)      # EQ 원장 — 트랙레코드 필터 근거
-            if res.get("stop"):
+            _ledger_add(asset, _con, direction, _tag)      # 실제 사용 태그(-rN 포함)로 기록
+            # 🛡 판정(대표 2026-09-04): ack의 stop_order_id 또는 NT8 주문 스냅샷의 스탑
+            # 존재로 - 오늘 사고에선 정상 계좌도 ack 필드가 비어 🛡 라인이 누락됐었다.
+            _stop_seen = bool(res.get("stop"))
+            if not _stop_seen and _is_nt8:
+                try:
+                    _os2 = b.order_status(_aid, _tag) or {}
+                    _stop_seen = bool(_os2.get("stop"))
+                except Exception:
+                    pass
+            if _stop_seen:
                 _sp = res.get("stop_price")
                 _adj = (f" (틱 정렬 {stop} → {_sp:g})"
                         if _sp is not None and float(_sp) != float(stop) else "")
-                self.log(f"   🛡 {_sym} 보호 손절 거치.{_adj}")
+                self.log(f"   🛡 {_sym} 보호 손절 거치 @{(_sp if _sp is not None else stop)}{_adj}")
             elif res.get("stop_error"):
                 self._handle_stop_failure(b, _aid, _con, direction, _qty, stop, res)
+            elif stop is not None:
+                self.log(f"   ⚠ {_sym} 손절 거치 확인 안 됨 — 브로커 화면에서 스탑 존재를 "
+                         "확인하십시오(다음 상태 push에서 재확인됩니다).")
             _ok += 1
         if live and _ok:
             self._entered_at = _mark_entered(asset)

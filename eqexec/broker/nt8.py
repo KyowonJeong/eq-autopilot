@@ -219,6 +219,26 @@ class NT8Broker(BrokerAdapter):
                                     net_qty=q, raw=p))
         return out
 
+    def order_status(self, account_id, tag) -> dict | None:
+        """EQ 주문 상태 조회(2026-09-04 다계좌 진입 누락 수리). 스냅샷 "orders"에서
+        EQ-{tag}(진입)/EQS-{tag}(스탑) 행을 {"entry":…, "stop":…}로 반환.
+        구 애드온(orders 키 없음)은 None - 호출측이 종전 동작(포지션 확인만)으로 폴백.
+        행 필드: state(Rejected/Filled/Working…), filled, reason(거절 사유), order_id."""
+        snap = self._snapshot()
+        rows = snap.get("orders")
+        if rows is None:
+            return None
+        en, stp = None, None
+        for o in rows:
+            if str(o.get("account")) != str(account_id):
+                continue
+            nm = str(o.get("name") or "")
+            if nm == f"EQ-{tag}":
+                en = o
+            elif nm == f"EQS-{tag}":
+                stp = o
+        return {"entry": en, "stop": stp}
+
     def position_qty(self, account_id, contract) -> int:
         sym = self._nt_symbol(contract)
         for p in self._snapshot().get("positions", []):
