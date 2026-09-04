@@ -2530,6 +2530,21 @@ class App:
                 pass
         threading.Thread(target=_bg, daemon=True).start()
 
+    def _net_probe(self) -> str:
+        """인터넷 상태 실측 1회(대표 2026-09-04 "인터넷 불안정에 의한 문제도 로깅") -
+        EQ 서버 /eqhb 왕복시간을 재서 짧은 증거 문자열로 돌려준다. 진입 실패 순간의
+        '망이 어땠나'를 로그·서버 보고에 동행시키는 용도. 호출부는 실패 경로뿐이라
+        블로킹(최대 5초)이어도 무해하다. 9/4 사고: NT8 로그에만 있던 지연 8,607ms
+        경고를 우리 기록으로도 갖기 위함."""
+        import time as _tp
+        try:
+            import requests as _rq
+            _s = _tp.time()
+            _r = _rq.get(PUSH_BASE + "eqhb", timeout=5)
+            return f"인터넷 응답 {int((_tp.time() - _s) * 1000)}ms (HTTP {_r.status_code})"
+        except Exception as _pe:
+            return f"인터넷 프로브 실패({type(_pe).__name__})"
+
     def _fill_scope(self, names, asset=None, broker=None):
         """브로커의 신선한 계좌 목록 → 가용 계좌 **미러링(교체)** + UI 갱신.
         2026-08-18b(대표 "예전 계좌가 안 지워져"): append-only였던 avail을 브로커 목록
@@ -5767,7 +5782,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04b"
+    _APP_VER = "2026.09.04c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6226,22 +6241,58 @@ class App:
         _use_limit = bool(_polf and _polf.get("mode") == "limit_then_market"
                           and _polf.get("limit_price") is not None)
         _ok = 0
-        # NT8 재시도(대표 2026-09-04 "안 들어가지면 재진입" + 8/21·9/4 조용한 거절 사고):
-        # NT8 Submit은 접수=성공이 아니어서, 확인 실패 시 잔재 정리 후 최대 2회 재진입.
-        # 타 브로커(ProjectX)는 동기 응답이라 기존 1회 동작 유지. 확인 없는 재진입 금지 원칙 -
-        # 재시도 전 close_contract(Flatten 기반)로 늦은 체결까지 정리하므로 이중 진입 불가.
+        # NT8 재시도(대표 2026-09-04 "안 들어가지면 재진입" + "일분 안쪽" + 8/21·9/4 조용한
+        # 거절 사고): NT8 Submit은 접수=성공이 아니어서, 확인 실패 시 잔재 정리 후 재진입을
+        # **시간 예산 55초** 안에서 반복한다(횟수 상한 6회). 재시도 자격 3겹 -
+        #  ① 늦은 체결 없음(직전 조회 0계약 실확인 - 조회 실패면 이중 진입 방지 위해 보류)
+        #  ② 손절가 기통과 아님(대표 "이미 손절 쳤음 못 가는 거고" - 죽은 트레이드 재진입 금지)
+        #  ③ 예산·횟수 안. 타 브로커(ProjectX)는 동기 응답이라 기존 1회 동작 유지.
+        # 재시도 전 close_contract(Flatten 기반)로 잔재를 정리하므로 이중 진입 불가.
         _is_nt8 = type(b).__name__ == "NT8Broker"
+        _is_long = str(direction).upper() in ("LONG", "BUY", "0")
         for _sym, _qty, _con in resolved:
             _base_tag = f"EQ-AP-{int(recv.timestamp() * 1000)}-{_sym}"
             _placed = False          # True=확정 체결 / None=정책 스킵 / False=실패
             _last_why = ""
+            _net_last = ""           # 마지막 망 프로브 결과(대표 "인터넷 불안정도 로깅")
             _res_ok = None           # 확정 시의 res(스탑 표시용)
             _tag = _base_tag
-            _tries = 3 if (_is_nt8 and live) else 1
-            for _try in range(_tries):
-                _tag = _base_tag if _try == 0 else f"{_base_tag}-r{_try}"   # tid 멱등 우회
+            _budget_s = 55.0 if (_is_nt8 and live) else 0.0   # "일분 안쪽"
+            _t0 = _t.time()
+            _try = 0                 # 지금까지의 제출 횟수(루프 끝에서 = 총 시도 수)
+            res = {}
+            while True:
                 if _try:
-                    self.log(f"   ↻ {_sym} 미체결 감지({_last_why}) — 잔재 정리 후 재진입 {_try}/2")
+                    if _t.time() - _t0 > _budget_s or _try >= 6:
+                        break
+                    # ① 늦은 체결 검사 - 직전 제출이 확인창(6초) 뒤에 체결됐을 수 있다
+                    #    (오늘 사고의 8.6초 지연). 있으면 성공 처리, 조회 실패면 보류.
+                    try:
+                        _lateq = abs(int(b.position_qty(_aid, _con) or 0))
+                    except Exception:
+                        _lateq = -1
+                    if _lateq > 0:
+                        _placed = True; _res_ok = _res_ok or res
+                        self.log(f"   ✅ {_sym} 늦은 체결 확인 ×{_lateq} — 재진입 불필요")
+                        break
+                    if _lateq < 0:
+                        _last_why = (_last_why + " / 포지션 조회 실패 — 무포 확신 불가라 "
+                                     "재진입 보류(이중 진입 방지)")[:220]
+                        break
+                    # ② 손절가 기통과 검사 - 이미 손절 레벨을 지난 트레이드는 죽은 것.
+                    if stop is not None:
+                        try:
+                            _pxn = float(b.current_market_price(_con) or 0)
+                        except Exception:
+                            _pxn = 0.0
+                        if _pxn and ((_is_long and _pxn <= float(stop))
+                                     or ((not _is_long) and _pxn >= float(stop))):
+                            _last_why = f"손절가 기통과(현재가 {_pxn} vs 손절 {stop}) — 재진입 포기"
+                            self.log(f"   🛑 {_sym} {_last_why}")
+                            break
+                    _tag = f"{_base_tag}-r{_try}"                     # tid 멱등 우회
+                    self.log(f"   ↻ {_sym} 미체결 감지({_last_why}) — 잔재 정리 후 재진입 "
+                             f"{_try}회차 (예산 {int(_budget_s - (_t.time() - _t0))}초 남음)")
                     self._send_ev("entry_attempt", asset, leg=_sym, try_n=_try + 1)
                     try:
                         b.close_contract(_aid, _con)   # 고아 주문 취소+잔재 정리(Flatten 기반)
@@ -6259,7 +6310,11 @@ class App:
                 except Exception as _ee:
                     _last_why = str(_ee)[:160]
                     self.log(f"   ❌ {_sym} 진입 예외: {_ee}")
+                    if _is_nt8 and live:
+                        _net_last = self._net_probe()
+                        self.log(f"   🌐 망 점검: {_net_last}")
                     self._report_error(f"entry:{asset}", _ee)
+                    _try += 1
                     continue
                 if res.get("skipped"):
                     self.log(f"   ⏭ {_sym} 정책 스킵({res.get('note') or '불리 이동'}) — "
@@ -6268,6 +6323,7 @@ class App:
                 if res.get("error"):
                     _last_why = str(res.get("error"))[:160]
                     self.log(f"   ❌ {_sym} 진입 거절: {_last_why}")
+                    _try += 1
                     continue
                 if not live:
                     self.log(f"   DRY-RUN {_sym} entry: {res.get('would_place')}")
@@ -6306,20 +6362,26 @@ class App:
                     # 타 브로커: 기존 동작 유지(주문은 살아 있을 수 있음 - 보고만 제외)
                     _placed = False; _res_ok = res
                     break
+                # 실패한 시도마다 망 상태를 실측해 남긴다(대표 "인터넷 불안정도 로깅") -
+                # 미체결의 '왜'에 망 증거를 붙여 서버 보고까지 동행시킨다.
+                _net_last = self._net_probe()
+                self.log(f"   🌐 망 점검: {_net_last}")
+                _try += 1
             if _placed is None:
                 continue                                   # 정책 스킵 - 다음 leg
             if live and not _placed:
                 if _is_nt8:
-                    self.log(f"   🚨 {_sym} 진입 실패 — {_last_why or '사유 미상'} "
-                             f"({_tries}회 시도, 계좌 [{sc}])")
-                    self._report_error(f"entry:{asset}", f"{_sym} {sc} {_last_why or 'unconfirmed'} "
-                                       f"({_tries}tries)")
+                    _whyf = (_last_why or "사유 미상") + (f" | {_net_last}" if _net_last else "")
+                    self.log(f"   🚨 {_sym} 진입 실패 — {_whyf} "
+                             f"({_try}회 시도, 계좌 [{sc}])")
+                    self._report_error(f"entry:{asset}", f"{_sym} {sc} {_whyf} "
+                                       f"({_try}tries)")
                     self._member_alert(
                         "entry_miss",
-                        f"⚠️ {asset} 진입 실패 — 계좌 {sc} {_sym} {_tries}회 시도 후 미체결. "
+                        f"⚠️ {asset} 진입 실패 — 계좌 {sc} {_sym} {_try}회 시도 후 미체결. "
                         f"사유: {_last_why or '미상'}. 브로커 화면을 확인해 주세요.",
                         f"⚠️ {asset} entry failed — account {sc} {_sym} unfilled after "
-                        f"{_tries} attempts. Reason: {_last_why or 'unknown'}. "
+                        f"{_try} attempts. Reason: {_last_why or 'unknown'}. "
                         "Please check your broker.")
                 else:
                     self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
