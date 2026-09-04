@@ -5767,7 +5767,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04a"
+    _APP_VER = "2026.09.04b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6136,7 +6136,12 @@ class App:
         # 계좌 id (1회)
         match = [a for a in b._accounts() if str(a.get("name")) == sc or str(a.get("id")) == sc]
         if not match:
-            self.log(f"   ❌ 계좌 '{sc}' 없음."); return
+            # 미진입 사유는 서버에도 반드시 남긴다(대표 2026-09-04 "못 드가진 원인 확실히
+            # 기록") - 로컬 로그만 남기면 분쟁·진단 때 기기 앞에 가야만 알 수 있다.
+            self.log(f"   ❌ 계좌 '{sc}' 없음.")
+            if live:
+                self._report_error(f"entry:{asset}", f"account missing: {sc}")
+            return
         _aid = match[0]["id"]
         # leg 심볼별 활성 계약 조회
         resolved = []
@@ -6146,7 +6151,11 @@ class App:
                 self.log(f"   ❌ '{_sym}' 활성 계약 없음 — 이 leg 건너뜀."); continue
             resolved.append((_sym, _qty, _con))
         if not resolved:
-            self.log("   ❌ 유효 계약 없음 — 진입 중단."); return
+            self.log("   ❌ 유효 계약 없음 — 진입 중단.")
+            if live:
+                self._report_error(f"entry:{asset}",
+                                   f"no active contract: {[s for s, _ in legs]} ({sc})")
+            return
         if len(resolved) > 1:
             self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
                      + " (미니 묶음 — 커미션 절감)")
@@ -6195,10 +6204,16 @@ class App:
                         if not any(q.symbol in _mycons for q in b.list_open_positions()):
                             _dead = True; break
                     if not _dead:
-                        self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!"); return
+                        self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!")
+                        self._report_error(f"entry:{asset}",
+                                           f"stale-position close unconfirmed ({sc})")
+                        return
                     self.log("   ✅ 잔여 청산 확인 — 진입 진행.")
                 except Exception as _ce:
-                    self.log(f"   ❌ 잔여 청산 실패: {_ce} — 진입 중단."); return
+                    self.log(f"   ❌ 잔여 청산 실패: {_ce} — 진입 중단.")
+                    self._report_error(f"entry:{asset}",
+                                       f"stale-position close failed ({sc}): {_ce}")
+                    return
         # 발주 직전 시장가 1회 샘플(2026-08-22, 21l 협의 슬리피지 실측용) - 실패해도 무해.
         _px_at_send = None
         try:
