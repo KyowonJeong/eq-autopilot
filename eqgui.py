@@ -1649,9 +1649,11 @@ class App:
                                        if self.lang == "ko"
                                        else "Pull all broker keys from other assets"),
                            command=self._pull_broker_keys).pack(side="left")
-                ttk.Label(_bcp, text=("브로커별 자동 병합 - 이 자산의 브로커 선택은 그대로"
+                ttk.Label(_bcp, text=("다른 자산에 저장된 키를 브로커별로 채워 넣습니다. "
+                                      "이미 있는 키는 안 덮습니다."
                                       if self.lang == "ko" else
-                                      "auto-merge per broker - this asset's broker choice stays"),
+                                      "Fills in keys saved on other assets, per broker. "
+                                      "Existing keys are never overwritten."),
                           foreground="#9ca3af").pack(side="left", padx=(6, 0))
 
         # ── 둘째 접이식: 자산별 계좌 설정(대표 2026-08-11 "브로커 설정 드롭다운, 그 아래
@@ -6064,7 +6066,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04g"
+    _APP_VER = "2026.09.04h"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
