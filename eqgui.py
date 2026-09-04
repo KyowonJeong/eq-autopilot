@@ -1405,6 +1405,11 @@ class App:
         self.b_demo_start.pack(side="left", padx=(8, 0))
         self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
         self.b_live_stop.pack(side="left", padx=(6, 0))
+        # 모의 가동 배지(대표 2026-09-04): 모의로 무장 중인 동안 상시 표시 - 9/4 밤
+        # "EQ Autopilot off" 소동(모의 무장을 라이브로 오인)의 재발 방지 2겹째.
+        self._demo_badge = tk.Label(frm, text="", foreground="#b45309", anchor="w",
+                                    justify="left")
+        self._demo_badge.pack(anchor="w", pady=(2, 0))
         # 모든 자산·계좌 포지션 즉시 시장가 청산 — 패닉 버튼(대표 2026-07-27). 무장 해제(전체
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
         # 스타일: 네이티브 ttk 유지(대표 2026-08-11 "흉한 버튼" - tk 빨강 조합이 맥에서
@@ -2875,6 +2880,7 @@ class App:
             assets[a] = c2
         payload = {"kind": "eq-autopilot-settings", "v": 1, "app": self._APP_VER,
                    "lang": self.lang, "token": self._token,
+                   "dry_run": bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
                    "profile": dict(self._profile or {}), "assets": assets}
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(
@@ -2965,6 +2971,10 @@ class App:
             self._profile = d["profile"]
         if not _pin_hash():
             _pin_set(p)                               # 새 기기 PIN = 파일을 연 그 PIN
+        if "dry_run" in d and hasattr(self, "live_dry"):
+            # 모의/라이브 상태도 이관(대표 2026-09-04): 새 기계 기본값(모의)이 구 기계
+            # 상태를 덮어 조용히 모의 무장되던 함정 제거.
+            self.live_dry.set(1 if d.get("dry_run") else 0)
         self._save_cfg()
         self._unlocked = False
         self._build()
@@ -3723,6 +3733,17 @@ class App:
 
     def _refresh_live_panel(self):
         self._sync_pick_hint()
+        try:
+            _armed = bool(self._sig_accts or self._auto_accts)
+            _demo = bool(self.live_dry.get()) if hasattr(self, "live_dry") else False
+            if hasattr(self, "_demo_badge"):
+                self._demo_badge.config(text=(
+                    ("모의 모드 가동 중 - 실주문이 나가지 않습니다"
+                     if self.lang == "ko" else
+                     "DEMO MODE armed - no real orders are sent")
+                    if (_armed and _demo) else ""))
+        except Exception:
+            pass
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
                 txt, col = self._asset_row_state(asset)
@@ -4391,7 +4412,17 @@ class App:
                                 if self.lang == "ko" else
                                 "Already armed — press 'Stop all' first."); return
         # 라이브 오발 방지(2026-08-11 UX 감사, 운영 1순위): 실거래 시작은 명시 확인을 거친다.
-        # 모의는 팝업 없음 - 데모 문턱을 높이지 않는다. 모의 이력 0이면 경고 한 줄 추가(soft-gate).
+        # 모의도 확인창 1회(대표 2026-09-04: 9/4 밤 새 기계에서 모의 무장을 라이브로 오인한
+        # 실사고 - "조용히 모의 무장" 금지. 종전 '데모 문턱 안 높임' 결정을 대체).
+        if dry:
+            if not messagebox.askokcancel(
+                    self.t("sec_live"),
+                    ("모의 모드입니다 - 실주문이 나가지 않습니다.\n"
+                     "실거래는 [▶ 라이브 시작] 버튼으로 시작하세요.\n\n모의로 시작할까요?"
+                     if self.lang == "ko" else
+                     "Demo mode - no real orders will be sent.\n"
+                     "For live trading use [▶ Go Live].\n\nStart in demo?")):
+                return
         if dry:
             try:
                 self._profile["demo_runs"] = int(self._profile.get("demo_runs") or 0) + 1
@@ -6066,7 +6097,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04h"
+    _APP_VER = "2026.09.04i"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
