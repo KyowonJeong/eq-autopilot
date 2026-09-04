@@ -276,8 +276,11 @@ _BROKER_SPEC = {
     # Lucid = NT8 브리지(대표 2026-08-10, #38). API가 없어 NinjaTrader 애드온 경유 -
     #   f1 = 앱-애드온 공유 토큰(비밀), f3 = 브리지 포트. 계좌 = NT8 계정 이름 그대로.
     #   Windows 전용(앱과 NT8 같은 머신). preview = 데모 실증 전.
-    "nt8":         {"label": "Lucid (NT8)", "f1": "Bridge Token (앱-애드온 공유)", "f2": None,
-                    "f3": "Bridge Port (기본 8377)", "acct": True, "futures": True,
+    # 라벨 단문화(대표 2026-09-04 윈도 실기기: 한글 섞인 긴 라벨이 고정폭 칸에서 잘림
+    # "Bridge Token (앱-애." - Tk width 단위가 한글에서 2배라 맥과 달리 안 들어간다).
+    # 공유·설치 안내는 아래 NT8 안내문과 브리지 설치 버튼이 이미 말한다.
+    "nt8":         {"label": "Lucid (NT8)", "f1": "Bridge Token", "f2": None,
+                    "f3": "Bridge Port (8377)", "acct": True, "futures": True,
                     "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
     #   (API 키 페어 콜론 연결 — 셋째 토막 'demo'면 데모 서버). preview=데모 실검증 전.
@@ -520,6 +523,9 @@ T = {
 
 KC_SERVICE = "EQAutopilot"   # Keychain / Credential-Manager service name
 _IS_MAC = sys.platform == "darwin"
+# 설정 행 라벨 칸 폭: Windows Tk는 같은 width 단위에서 실제 폭이 좁게 잡혀 긴 라벨
+# ("API dedicated password", "TopstepX user email")이 잘렸다(대표 2026-09-04 실기기).
+_LBL_W = 18 if _IS_MAC else 24
 
 
 def _kc_save(account, secret) -> bool:
@@ -616,6 +622,56 @@ def _pin_set(pin):
 def _pin_ok(pin):
     h = _pin_hash()
     return bool(h) and hashlib.sha256(pin.encode()).hexdigest() == h
+
+
+# ── 설정 내보내기/가져오기 암호화(대표 2026-09-04 "브로커·계좌 export/import, PIN으로 열기") ──
+# 기기 이전(맥→윈도 통합 등)용. 파일 하나에 자격 비밀(f2 포함)까지 들어가므로 반드시
+# 암호화한다. 키 = PIN에서 PBKDF2-HMAC-SHA256 120만 회로 파생 - PIN이 짧아도 오프라인
+# 추측 1회 비용을 올린다(그래도 이전 끝나면 파일 삭제가 원칙 - UI가 안내). scrypt를
+# 안 쓰는 이유: LibreSSL 파이썬(맥 시스템 등)엔 hashlib.scrypt가 없어, 내보낸 기기와
+# 가져오는 기기의 파이썬이 다르면 파일을 못 연다(pbkdf2_hmac은 stdlib 어디에나 있다).
+# 암호화 = SHA256-CTR + HMAC-SHA256(encrypt-then-MAC) - autopilot_crypto와 동일 원리,
+# stdlib only(앱 배포 전제). 포맷: MAGIC(6)|salt(16)|nonce(16)|ct|tag(32).
+_EXP_MAGIC = b"EQSET1"
+
+
+def _exp_keys(pin: str, salt: bytes):
+    k = hashlib.pbkdf2_hmac("sha256", (pin or "").encode(), salt, 1_200_000, dklen=64)
+    return k[:32], k[32:]
+
+
+def _exp_stream(key: bytes, nonce: bytes, n: int) -> bytes:
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hashlib.sha256(key + nonce + i.to_bytes(8, "big")).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def _settings_export_blob(pin: str, obj: dict) -> bytes:
+    import hmac as _hm
+    import json as _j
+    pt = _j.dumps(obj, ensure_ascii=False).encode()
+    salt, nonce = os.urandom(16), os.urandom(16)
+    ek, mk = _exp_keys(pin, salt)
+    ct = bytes(a ^ b for a, b in zip(pt, _exp_stream(ek, nonce, len(pt))))
+    tag = _hm.new(mk, _EXP_MAGIC + salt + nonce + ct, hashlib.sha256).digest()
+    return _EXP_MAGIC + salt + nonce + ct + tag
+
+
+def _settings_import_blob(pin: str, raw: bytes) -> dict:
+    import hmac as _hm
+    import json as _j
+    if len(raw) < 6 + 16 + 16 + 32 or raw[:6] != _EXP_MAGIC:
+        raise ValueError("not an EQ settings file")
+    salt, nonce, ct, tag = raw[6:22], raw[22:38], raw[38:-32], raw[-32:]
+    ek, mk = _exp_keys(pin, salt)
+    if not _hm.compare_digest(tag, _hm.new(mk, _EXP_MAGIC + salt + nonce + ct,
+                                           hashlib.sha256).digest()):
+        raise ValueError("wrong PIN or corrupted file")
+    pt = bytes(a ^ b for a, b in zip(ct, _exp_stream(ek, nonce, len(ct))))
+    return _j.loads(pt.decode())
 
 
 # Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
@@ -1267,7 +1323,7 @@ class App:
 
         # 멤버십 토큰(게이팅) + 권한 상태
         rt = ttk.Frame(frm); rt.pack(fill="x", pady=3)
-        ttk.Label(rt, text=self.t("token"), width=18).pack(side="left")
+        ttk.Label(rt, text=self.t("token"), width=_LBL_W).pack(side="left")
         self.token_e = ttk.Entry(rt, show="•")  # 토큰 마스킹(잠금) — 기본 •••, 아래 토글로 표시
         self.token_e.pack(side="left", fill="x", expand=True)
         self.token_e.insert(0, d.get("token", "")); self.token_e.bind("<FocusOut>", self._save_token)
@@ -1414,6 +1470,21 @@ class App:
         _outer_frm = frm
         frm = self._cfg_body                      # 아래 설정 위젯들은 접이식 본문으로
 
+        # ── 설정 이동(대표 2026-09-04 "export import, PIN으로 열기") - 기기 이전이 실제로
+        #    잦다(맥→윈도 실행기 통합). 브로커·계좌·비밀 전부를 PIN 잠금 파일 하나로. ──
+        _xr = ttk.Frame(frm); _xr.pack(fill="x", pady=(2, 2))
+        ttk.Label(_xr, text=("설정 이동(기기 이전):" if self.lang == "ko"
+                             else "Move settings:"),
+                  foreground="#888").pack(side="left")
+        ttk.Button(_xr, text=("내보내기" if self.lang == "ko" else "Export"),
+                   width=9, command=self._export_settings).pack(side="left", padx=(6, 0))
+        ttk.Button(_xr, text=("가져오기" if self.lang == "ko" else "Import"),
+                   width=9, command=self._import_settings).pack(side="left", padx=(4, 0))
+        ttk.Label(_xr, text=("PIN으로 잠근 파일 하나 - 새 기기에서 가져오면 끝"
+                             if self.lang == "ko" else
+                             "one PIN-locked file; import it on the new machine"),
+                  foreground="#9ca3af").pack(side="left", padx=(8, 0))
+
         # ── 자산 탭 (NQ/GC/BTC) — 클릭 시 그 자산의 브로커·키·1R로 스왑 ──
         atab = ttk.Frame(frm); atab.pack(fill="x", pady=(2, 6))
         for _a in _ASSETS:
@@ -1430,7 +1501,7 @@ class App:
         # (①/② 번호 라벨 제거 - 접이식 제목 두 개가 유닛 분리를 이미 말한다, 2026-08-11)
         # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
         rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
-        ttk.Label(rb, text=self.t("broker"), width=18).pack(side="left")
+        ttk.Label(rb, text=self.t("broker"), width=_LBL_W).pack(side="left")
         self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _ASSET_BROKERS[self._asset]],
                                       state="readonly", width=22)
         self.brokerbox.set(_broker_label(self._broker_name)); self.brokerbox.pack(side="left")
@@ -1451,7 +1522,7 @@ class App:
                       foreground="#8a8f98").pack(anchor="w", pady=(2, 2))
         # f1 (브로커별 1번 필드)
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
-        ttk.Label(r1, text=spec["f1"], width=18).pack(side="left")
+        ttk.Label(r1, text=spec["f1"], width=_LBL_W).pack(side="left")
         _f1sec = bool(spec.get("f1_secret"))          # 크립토 API Key = 비밀 취급(대표 2026-07-12)
         self._f1_unlocked = False
         self.user = ttk.Entry(r1, show=("•" if _f1sec else ""))
@@ -1470,7 +1541,7 @@ class App:
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
-            ttk.Label(r2, text=spec["f2"], width=18).pack(side="left")
+            ttk.Label(r2, text=spec["f2"], width=_LBL_W).pack(side="left")
             self.key = ttk.Entry(r2, show="•"); self.key.pack(side="left", fill="x", expand=True)
             self.key.config(state="readonly")   # 값은 _async_load_key(c["f1"])가 Keychain서 채움
             self.b_lock = ttk.Button(r2, text=self.t("unlock"), width=11, command=self._unlock)
@@ -1483,7 +1554,7 @@ class App:
         # f3 (추가 필드) — 있는 브로커만
         if spec.get("f3"):
             r3e = ttk.Frame(frm); r3e.pack(fill="x", pady=3)
-            ttk.Label(r3e, text=spec["f3"], width=18).pack(side="left")
+            ttk.Label(r3e, text=spec["f3"], width=_LBL_W).pack(side="left")
             _mask = "•" if ("Secret" in spec["f3"] or "Passphrase" in spec["f3"]) else ""
             self.f3 = ttk.Entry(r3e, show=_mask); self.f3.pack(side="left", fill="x", expand=True)
             self.f3.insert(0, c.get("f3", ""))
@@ -2774,6 +2845,147 @@ class App:
                      f"otherwise going live is blocked."))
             except Exception:
                 pass
+
+    def _transfer_pin(self):
+        """PIN 게이트(설정 내보내기 공용). 없으면 새로 만들고, 틀리면 재설정 흐름(_pin_forgot)."""
+        if not _pin_hash():
+            p = simpledialog.askstring("PIN", self.t("pin_new"), show="*", parent=self.root)
+            if not p:
+                return None
+            _pin_set(p)
+            return p
+        p = simpledialog.askstring("PIN", self.t("pin_enter"), show="*", parent=self.root)
+        if p is None:
+            return None
+        if not p or not _pin_ok(p):
+            self._pin_forgot()
+            return None
+        return p
+
+    def _export_settings(self):
+        """설정 내보내기(대표 2026-09-04 "브로커·계좌 export/import, PIN으로 열기").
+        범위 = 언어·토큰·공개프로필·자산별 전부(브로커 선택·자격 f1/f3·가용/사용 계좌·1R).
+        비밀(f2)은 키체인(f1 키)에서 그러모아 함께 - 전부 **PIN 잠금 파일**로만 나간다."""
+        self._save_current_asset()                     # 화면 값 → _acfg 플러시
+        pin = self._transfer_pin()
+        if not pin:
+            return
+        import copy as _copy
+        assets, n_sec = {}, 0
+        for a, c in (self._acfg or {}).items():
+            c2 = _copy.deepcopy(c)
+            for b, cr in (c2.get("creds") or {}).items():
+                _f1 = str(cr.get("f1") or "").strip()
+                if _f1 and _BROKER_SPEC.get(b, {}).get("f2"):
+                    _f2 = _kc_load(_f1)
+                    if _f2:
+                        cr["f2"] = _f2
+                        n_sec += 1
+            assets[a] = c2
+        payload = {"kind": "eq-autopilot-settings", "v": 1, "app": self._APP_VER,
+                   "lang": self.lang, "token": self._token,
+                   "profile": dict(self._profile or {}), "assets": assets}
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            parent=self.root, defaultextension=".eqset",
+            initialfile=f"eq-settings-{_dt.date.today():%Y%m%d}.eqset",
+            filetypes=[("EQ settings", "*.eqset")])
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(_settings_export_blob(pin, payload))
+        except Exception as e:
+            messagebox.showwarning("Export", str(e)); return
+        self.log("📦 " + (f"설정 내보내기 완료: {path}" if self.lang == "ko"
+                          else f"Settings exported: {path}"))
+        messagebox.showinfo(
+            ("설정 내보내기" if self.lang == "ko" else "Export settings"),
+            ("저장했습니다.\n\n이 파일에는 브로커 키가 들어 있습니다(PIN으로 암호화).\n"
+             "새 기기에서 가져오기가 끝나면 파일을 삭제하세요."
+             if self.lang == "ko" else
+             "Saved.\n\nThis file contains your broker keys (encrypted with your PIN).\n"
+             "Delete it after importing on the new machine."))
+
+    def _import_settings(self):
+        """설정 가져오기 - 내보내기 파일(PIN)로 이 기기를 그 설정 그대로 맞춘다.
+        무장 중엔 금지(_armed_here와 같은 이유 - 화면과 실발주 대상이 갈라진다).
+        적용: f2 → 키체인(f1 키, 현행 저장 방식 그대로), 나머지 → _acfg → _save_cfg
+        (가 f1/f3를 키체인으로 옮기고 평문을 벗긴다). 토큰까지 오므로 재시작 안내."""
+        if (getattr(self, "_sig_accts", None) or getattr(self, "_auto_accts", None)):
+            messagebox.showwarning(
+                self.t("sec_live"),
+                ("가동 중에는 설정을 가져올 수 없습니다. 전체 정지 후 다시 시도하세요."
+                 if self.lang == "ko" else
+                 "Cannot import while live. Stop everything first."))
+            return
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.root, filetypes=[("EQ settings", "*.eqset"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except Exception as e:
+            messagebox.showwarning("Import", str(e)); return
+        p = simpledialog.askstring(
+            "PIN", ("내보낼 때 쓴 PIN을 입력하세요" if self.lang == "ko"
+                    else "Enter the PIN used when exporting"),
+            show="*", parent=self.root)
+        if not p:
+            return
+        try:
+            d = _settings_import_blob(p, raw)
+        except Exception:
+            messagebox.showwarning(
+                ("설정 가져오기" if self.lang == "ko" else "Import settings"),
+                ("PIN이 다르거나 파일이 손상됐습니다." if self.lang == "ko"
+                 else "Wrong PIN or corrupted file."))
+            return
+        if d.get("kind") != "eq-autopilot-settings" or not isinstance(d.get("assets"), dict):
+            messagebox.showwarning("Import", ("설정 파일이 아닙니다." if self.lang == "ko"
+                                              else "Not an EQ settings file."))
+            return
+        if not messagebox.askyesno(
+                ("설정 가져오기" if self.lang == "ko" else "Import settings"),
+                ("이 기기의 브로커·계좌 설정을 파일 내용으로 덮어씁니다.\n계속할까요?"
+                 if self.lang == "ko" else
+                 "This overwrites this machine's broker & account settings.\nContinue?")):
+            return
+        n_sec = 0
+        for a, c in d["assets"].items():
+            if a not in _ASSETS:
+                continue
+            for b, cr in (c.get("creds") or {}).items():
+                _f2 = str(cr.pop("f2", "") or "")     # f2는 _acfg에 안 남긴다(키체인 전용)
+                _f1 = str(cr.get("f1") or "").strip()
+                if _f1 and _f2:
+                    if _kc_save(_f1, _f2):
+                        n_sec += 1
+                    else:
+                        self.log("⚠ " + (f"{a}/{_broker_label(b)}: 비밀 저장 실패 - 보안 저장소 확인 필요"
+                                          if self.lang == "ko" else
+                                          f"{a}/{_broker_label(b)}: secret store write failed"))
+            self._acfg[a] = c
+        self.lang = d.get("lang", self.lang)
+        self._token = str(d.get("token") or self._token)
+        if isinstance(d.get("profile"), dict):
+            self._profile = d["profile"]
+        if not _pin_hash():
+            _pin_set(p)                               # 새 기기 PIN = 파일을 연 그 PIN
+        self._save_cfg()
+        self._unlocked = False
+        self._build()
+        self.log("📥 " + (f"설정 가져오기 완료(비밀 {n_sec}건 포함)" if self.lang == "ko"
+                          else f"Settings imported ({n_sec} secrets)"))
+        messagebox.showinfo(
+            ("설정 가져오기" if self.lang == "ko" else "Import settings"),
+            ("가져왔습니다. 앱을 종료했다가 다시 시작하면 전부 반영됩니다.\n"
+             "원본 파일은 삭제하시는 게 안전합니다."
+             if self.lang == "ko" else
+             "Imported. Quit and restart the app to apply everything.\n"
+             "Delete the file afterwards for safety."))
 
     def _copy_acct_setup(self, src_asset):
         """② 사용 계좌 복사: 계좌 목록·1R·모드 + 그 행들이 굴러가는 데 필요한
@@ -5845,7 +6057,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.04e"
+    _APP_VER = "2026.09.04f"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7736,6 +7948,37 @@ def main():
         root.createcommand("::tk::mac::Quit", _on_close)
     except Exception:
         pass
+
+    # ── 마지막 그물(대표 2026-09-04 "앱이 꺼져도 잘 모르나 봐. 끌 때 서버로 신호 보내줘"):
+    # X·Cmd+Q는 위에서 잡지만, **윈도 재부팅·로그오프·taskkill·인터프리터 해체**는
+    # WM_DELETE_WINDOW를 안 거쳐 closed 마커 없이 죽었다(윈도 실행기 전환 첫날 실측 -
+    # 재부팅 테스트 후 서버가 앱 꺼짐을 몰랐다). atexit = 정상 해체 전 경로,
+    # SIGTERM/SIGBREAK = 종료 시그널 경로. 강제 종료(taskkill /F·크래시·정전)는 어떤
+    # 클라이언트 코드로도 못 잡는다 - 그건 서버 15분 무응답 판정이 맡는다(설계된 최후단).
+    def _last_report(*_a):
+        try:
+            if getattr(_app, "_closing", False):
+                return                        # _on_close가 이미 신고함 - 중복 방지
+            _app._closing = True
+            _app._alive_ping(armed=bool(getattr(_app, "_sig_accts", None)
+                                        or getattr(_app, "_auto_accts", None)),
+                             force=True, sync=True)
+        except Exception:
+            pass
+    try:
+        import atexit as _ax
+        _ax.register(_last_report)
+    except Exception:
+        pass
+    try:
+        import signal as _sg
+        for _s in ("SIGTERM", "SIGBREAK"):
+            if hasattr(_sg, _s):
+                _sg.signal(getattr(_sg, _s),
+                           lambda *_: (_last_report(), sys.exit(0)))
+    except Exception:
+        pass
+
     root.mainloop()
     # mainloop를 어떤 경로로 빠져나오든 마지막으로 한 번 더(중복 핑은 무해).
     # ⚠️여기도 closed 마커 + 동기(2026-08-31): 이 경로로만 나온 종료는 마커 없이 나가
