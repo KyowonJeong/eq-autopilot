@@ -456,6 +456,10 @@ class BybitBroker(BrokerAdapter):
                             "symbol": str(r.get("symbol") or ""),
                             "pnl": float(r.get("closedPnl") or 0),
                             "direction": "LONG" if str(r.get("side")).lower() == "sell" else "SHORT",
+                            # 진입·청산 평균가(closed-pnl이 함께 준다) - 영수증이 회원
+                            # 실체결가를 쓰는 유일한 완전 경로다(2026-09-06).
+                            "entry_px": float(r.get("avgEntryPrice") or 0) or None,
+                            "exit_px": float(r.get("avgExitPrice") or 0) or None,
                         })
                     except (TypeError, ValueError):
                         continue

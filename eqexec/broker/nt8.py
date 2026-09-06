@@ -446,6 +446,10 @@ class NT8Broker(BrokerAdapter):
                     "direction": "LONG" if _side == "SELL" else "SHORT",
                     "acct": str(e.get("account") or ""),
                     "acct_name": str(e.get("account") or ""),
+                    # 청산 체결가(브리지가 execution마다 price를 보낸다) - 트랙레코드
+                    # 영수증이 회원 실체결가를 쓰게 하는 재료(2026-09-06). 진입가는 이
+                    # 페이로드에 없어 서버가 신호 기준가로 채운다.
+                    "exit_px": float(e.get("price") or 0.0) or None,
                 })
             except (TypeError, ValueError):
                 continue
