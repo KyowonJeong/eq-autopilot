@@ -362,7 +362,7 @@ T = {
                         "en": "Locked — Autopilot disabled by admin (master OFF)."},
     "gate_ok": {"ko": "멤버십: {tier} · 자동청산 {u} · 자동진입 {a}{dry}",
                 "en": "Membership: {tier} · auto-close {u} · auto-entry {a}{dry}"},
-    "gate_dry": {"ko": " · 강제 모의(LIVE 잠금)", "en": " · forced dry-run (LIVE locked)"},
+    "gate_dry": {"ko": " · 라이브 잠금(서버)", "en": " · LIVE locked (server)"},
     "warn_mix": {"ko": "⚠ 청산 시 사용 계좌의 모든 포지션이 일괄 청산됩니다. "
                        "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
                  "en": "⚠ Closing flattens EVERY position on the chosen account. "
@@ -402,7 +402,6 @@ T = {
     "btn_accts": {"ko": "계좌 목록 불러오기", "en": "Load accounts"},
     "sec_flat": {"ko": "즉시 청산 (지금 사용 계좌의 모든 포지션 닫기)",
                  "en": "Immediate close (flatten all positions on the chosen account now)"},
-    "dry_close": {"ko": "모의 청산 (Dry-run)", "en": "Dry-run close"},
     "live_close": {"ko": "⚠ 실제 청산 (LIVE)", "en": "⚠ LIVE close"},
     # 약관 §14.9·Privacy 5.4와 문언 일치(2026-08-27 일치성 P2-40): '본인 계좌' 항목 누락 수리
     # 동의 문안 버전(대표 2026-09-03 증거 스탬프): consent 문구를 실질 변경하면 반드시 올릴 것
@@ -453,7 +452,6 @@ T = {
                       "whether to publish it on the membership page is a toggle you control "
                       "anytime in your dashboard."},
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
-    "demo_start": {"ko": "▶ 모의 시작", "en": "▶ Start Demo"},
     "live_start": {"ko": "▶ 라이브 시작", "en": "▶ Go Live"},
     # 프롭 비활동 경고(대표 2026-08-31). {d}=경과 일수. 문구 주의: "바로 나와"라고 쓰지
     # 않는다 - Lucid는 5초 이하 보유 거래가 이익의 절반을 넘으면 마이크로스캘핑으로
@@ -489,14 +487,12 @@ T = {
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET · GC 06:00 ET · BTC 02:00 UTC (auto)"},
-    "auto_live": {"ko": "실제 청산 실행 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "auto_start": {"ko": "자동 청산 시작", "en": "Start auto-close"},
     "auto_stop": {"ko": "자동 청산 중지", "en": "Stop auto-close"},
     "auto_on_ind": {"ko": "  ● 자동 청산 ON  ", "en": "  ● Auto-close ON  "},
     "auto_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sec_sig": {"ko": "자산별 자동 진입 (실시간 신호)", "en": "Per-asset auto-entry (live signal)"},
     "sig_1r": {"ko": "1R ($)", "en": "1R ($)"},
-    "sig_live": {"ko": "실제 진입 (체크 안 하면 모의)", "en": "Run LIVE (unchecked = dry-run)"},
     "sig_start": {"ko": "신호 대기 시작", "en": "Start signal watch"},
     "sig_stop": {"ko": "신호 대기 중지", "en": "Stop signal watch"},
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
@@ -852,8 +848,8 @@ def _load():
     if "acct_open" in d:
         out["acct_open"] = bool(d.get("acct_open"))
     # profile은 저장은 통째로 하는데(_save_cfg) 로드에서 public/handle만 남겨 나머지를 버리고
-    # 있었다 — demo_runs가 재시작마다 증발해 "모의 이력 없음" 경고가 매번 떴다.
-    # 알 수 없는 키를 보존한다(2026-08-15). 월 1회 실행 확인 시각(consent_at)도 여기 산다.
+    # 있었다 — 알 수 없는 키를 보존한다(2026-08-15). 월 1회 실행 확인 시각(consent_at)이 여기 산다.
+    # (옛 demo_runs 키는 모의 모드 폐지(2026-09-07)로 더 안 읽는다 - 남아 있어도 무해.)
     _p = dict(d.get("profile") or {})
     _p["public"] = bool(_p.get("public"))
     _p["handle"] = _p.get("handle", "")
@@ -1394,22 +1390,15 @@ class App:
         ttk.Label(frm, text=self.t("live_1r_note"), foreground="#888",
                   wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
         lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
-        # 모의/라이브 = '시작 버튼 2종'으로 선택(체크박스 폐지 — 켜둔 채 잊는 함정 제거,
-        # 대표 2026-07-22 실사고: 모의 상태로 신호 캡처 → 실진입 놓침). live_dry는 내부 상태.
-        self.live_dry = tk.IntVar(value=1)
-        self.b_live_start = ttk.Button(lc, text=self.t("live_start"),
-                                       command=lambda: self._master_start(dry=False))
+        # 시작 버튼은 [라이브 시작] 하나(대표 2026-09-07 모의 모드 폐지): 9/4 밤 모의 무장을
+        # 라이브로 오인한 실사고의 근본 해결 - 오인할 모드 자체를 없앤다. 실주문 억제는 오직
+        # 서버 게이트(force_dry_run = 라이브 잠금)가 _live_now()로 발주 순간에 건다.
+        # live_dry는 내부 호환 상태로만 남고 항상 0(라이브)이다.
+        self.live_dry = tk.IntVar(value=0)
+        self.b_live_start = ttk.Button(lc, text=self.t("live_start"), command=self._master_start)
         self.b_live_start.pack(side="left")
-        self.b_demo_start = ttk.Button(lc, text=self.t("demo_start"),
-                                       command=lambda: self._master_start(dry=True))
-        self.b_demo_start.pack(side="left", padx=(8, 0))
         self.b_live_stop = ttk.Button(lc, text=self.t("live_stopall"), command=self._master_stop)
         self.b_live_stop.pack(side="left", padx=(6, 0))
-        # 모의 가동 배지(대표 2026-09-04): 모의로 무장 중인 동안 상시 표시 - 9/4 밤
-        # "EQ Autopilot off" 소동(모의 무장을 라이브로 오인)의 재발 방지 2겹째.
-        self._demo_badge = tk.Label(frm, text="", foreground="#b45309", anchor="w",
-                                    justify="left")
-        self._demo_badge.pack(anchor="w", pady=(2, 0))
         # 모든 자산·계좌 포지션 즉시 시장가 청산 — 패닉 버튼(대표 2026-07-27). 무장 해제(전체
         # 정지)와 별개로, 지금 열려 있는 포지션 자체를 정리한다. 확인 대화 후 실행.
         # 스타일: 네이티브 ttk 유지(대표 2026-08-11 "흉한 버튼" - tk 빨강 조합이 맥에서
@@ -1858,13 +1847,11 @@ class App:
                 pass
         if hasattr(self, "tr_ind"):
             self._update_tr_status()
-        # 시작 버튼 2종(체크박스 폐지): 라이브 = 권한 + 서버 모의강제 아님 · 모의 = 권한만
+        # 시작 버튼: 라이브 = 권한 + 서버 라이브 잠금 아님
         if hasattr(self, "b_live_start"):
             _pu = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
             _pa = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
             en(self.b_live_start, (_pu or _pa) and live_ok)
-            if hasattr(self, "b_demo_start"):
-                en(self.b_demo_start, _pu or _pa)
         self._refresh_live_panel()
         # fail-closed: 돌던 루프가 '권한'을 잃으면(토큰 변경·강등·만료·마스터 OFF) 자동 중지한다.
         # 버튼만 끄면 이미 도는 스레드가 계속 진입/청산하는 구멍이 생긴다.
@@ -2158,7 +2145,7 @@ class App:
             pass
 
     def _refresh_next_action(self):
-        """현재 자산 탭의 상태 → '다음 행동' 한 문장. 토큰→키→계좌→저장/테스트→모의→가동."""
+        """현재 자산 탭의 상태 → '다음 행동' 한 문장. 토큰→키→계좌→저장/테스트→가동."""
         try:
             lbl = getattr(self, "_next_lbl", None)
             if lbl is None:
@@ -2178,10 +2165,8 @@ class App:
                 t = "다음: 키·계좌를 입력하세요 - 저장·연결 확인은 자동입니다" if ko else "Next: enter key & account - saving & verification are automatic"
             elif armed:
                 t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Armed - runs automatically on the next signal"
-            elif int((self._profile or {}).get("demo_runs") or 0) == 0:
-                t = "다음: [▶ 모의 시작]으로 첫 사이클을 데모로 확인하세요" if ko else "Next: press [▶ Start Demo] for your first cycle"
             else:
-                t = "준비 완료 - [▶ 모의 시작] 또는 [▶ 라이브 시작]" if ko else "Ready - [▶ Start Demo] or [▶ Go Live]"
+                t = "준비 완료 - [▶ 라이브 시작]" if ko else "Ready - press [▶ Go Live]"
             lbl.config(text="👉 " + t)
         except Exception:
             pass
@@ -2971,10 +2956,6 @@ class App:
             self._profile = d["profile"]
         if not _pin_hash():
             _pin_set(p)                               # 새 기기 PIN = 파일을 연 그 PIN
-        if "dry_run" in d and hasattr(self, "live_dry"):
-            # 모의/라이브 상태도 이관(대표 2026-09-04): 새 기계 기본값(모의)이 구 기계
-            # 상태를 덮어 조용히 모의 무장되던 함정 제거.
-            self.live_dry.set(1 if d.get("dry_run") else 0)
         self._save_cfg()
         self._unlocked = False
         self._build()
@@ -3436,8 +3417,8 @@ class App:
         if _untested:
             return base + (" · 연결 테스트 필요" if self.lang == "ko" else " · test connection"), "#9ca3af"
         if armed:
-            base += " · " + (("가동 중(실거래)" if live else "가동 중(모의)") if self.lang == "ko"
-                             else ("RUNNING live" if live else "RUNNING dry"))
+            base += " · " + (("가동 중(실거래)" if live else "가동 중(주문 보류: 서버 잠금)") if self.lang == "ko"
+                             else ("RUNNING live" if live else "RUNNING (orders held: server lock)"))
             return base, ("#21c55e" if live else "#eab308")
         return base + (" · 준비됨" if self.lang == "ko" else " · ready"), "#9ca3af"
 
@@ -3733,17 +3714,6 @@ class App:
 
     def _refresh_live_panel(self):
         self._sync_pick_hint()
-        try:
-            _armed = bool(self._sig_accts or self._auto_accts)
-            _demo = bool(self.live_dry.get()) if hasattr(self, "live_dry") else False
-            if hasattr(self, "_demo_badge"):
-                self._demo_badge.config(text=(
-                    ("모의 모드 가동 중 - 실주문이 나가지 않습니다"
-                     if self.lang == "ko" else
-                     "DEMO MODE armed - no real orders are sent")
-                    if (_armed and _demo) else ""))
-        except Exception:
-            pass
         for asset, (lbl, dot) in getattr(self, "_live_rows", {}).items():
             try:
                 txt, col = self._asset_row_state(asset)
@@ -4005,8 +3975,7 @@ class App:
                         if ac.get("on"):
                             self._master_arm(a, idx, live, arm_sig=perm_auto)
                             _n += 1
-                self.log(f"🚀 {'·'.join(assets)} 무장 — {_n}개 계좌 "
-                         f"({'LIVE' if live else 'dry-run(모의)'})")
+                self.log(f"🚀 {'·'.join(assets)} 무장 — {_n}개 계좌 (LIVE)")
                 self._refresh_live_panel()
                 self._apply_gating()
                 try:
@@ -4392,59 +4361,38 @@ class App:
                      if self.lang == "ko" else "   ✅ Consent renewed - we will ask again in 30 days.")
         return bool(ok)
 
-    def _master_start(self, dry: bool = True):
-        """[라이브 시작]/[모의 시작] — 실행 체크된 자산을 연결 테스트(자산 브로커, 같은 브로커는
-        중복 테스트 방지), 전부 통과 시에만 각 자산의 켜진 계좌를 일괄 무장(하나라도 실패 시
-        전체 중단). 계좌마다 자기 1R로. 모의/라이브는 누른 버튼이 결정(체크박스 폐지, 대표 2026-07-22)."""
-        if not dry and (self._gate or {}).get("force_dry_run"):
+    def _master_start(self):
+        """[라이브 시작] — 실행 체크된 자산을 연결 테스트(자산 브로커, 같은 브로커는 중복 테스트
+        방지), 전부 통과 시에만 각 자산의 켜진 계좌를 일괄 무장(하나라도 실패 시 전체 중단).
+        계좌마다 자기 1R로. 모의 모드는 폐지(대표 2026-09-07) - 시작은 언제나 실거래이고, 서버가
+        라이브를 잠갔으면(force_dry_run) 시작 자체를 거부한다."""
+        if (self._gate or {}).get("force_dry_run"):
             messagebox.showwarning(self.t("sec_live"),
-                                   "서버가 모의 모드를 강제 중입니다 — 지금은 모의 시작만 가능합니다."
+                                   "서버가 라이브를 잠갔습니다 — 지금은 시작할 수 없습니다. 공지를 확인하세요."
                                    if self.lang == "ko" else
-                                   "Server is forcing dry-run; only demo start is available."); return
-        if not dry and not self._consent_ask():      # 월 1회 확인 - 실거래에만
+                                   "Live is locked by the server — starting is not possible right now. "
+                                   "Check the announcements."); return
+        if not self._consent_ask():      # 월 1회 확인
             self.log("   ⏸ 실행 확인이 없어 라이브 시작을 중단했습니다."
                      if self.lang == "ko" else "   ⏸ Live start cancelled - no confirmation.")
             return
-        self.live_dry.set(1 if dry else 0)
+        self.live_dry.set(0)
         if self._sig_accts or self._auto_accts:
             messagebox.showinfo(self.t("sec_live"),
                                 "이미 가동 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
                                 if self.lang == "ko" else
                                 "Already armed — press 'Stop all' first."); return
         # 라이브 오발 방지(2026-08-11 UX 감사, 운영 1순위): 실거래 시작은 명시 확인을 거친다.
-        # 모의도 확인창 1회(대표 2026-09-04: 9/4 밤 새 기계에서 모의 무장을 라이브로 오인한
-        # 실사고 - "조용히 모의 무장" 금지. 종전 '데모 문턱 안 높임' 결정을 대체).
-        if dry:
-            if not messagebox.askokcancel(
-                    self.t("sec_live"),
-                    ("모의 모드입니다 - 실주문이 나가지 않습니다.\n"
-                     "실거래는 [▶ 라이브 시작] 버튼으로 시작하세요.\n\n모의로 시작할까요?"
-                     if self.lang == "ko" else
-                     "Demo mode - no real orders will be sent.\n"
-                     "For live trading use [▶ Go Live].\n\nStart in demo?")):
-                return
-        if dry:
-            try:
-                self._profile["demo_runs"] = int(self._profile.get("demo_runs") or 0) + 1
-                self._save_cfg()
-            except Exception:
-                pass
-        if not dry:
-            _no_demo = not int((self._profile or {}).get("demo_runs") or 0)
-            _warn_demo = (("\n⚠ 아직 모의 실행 이력이 없습니다 - 첫 주는 데모가 기본 순서입니다.\n"
-                           if self.lang == "ko" else
-                           "\n⚠ You have never run demo mode - demo first is the default path.\n")
-                          if _no_demo else "")
-            if not messagebox.askyesno(
-                    "라이브 시작" if self.lang == "ko" else "Go Live",
-                    ("지금부터 실제 계좌에 실주문이 나갑니다.\n" + _warn_demo +
-                     "신호가 오면 자동으로 진입, 손절, 청산합니다.\n\n"
-                     "라이브를 시작할까요? (연결 테스트는 자동으로 수행됩니다)"
-                     if self.lang == "ko" else
-                     "Real orders will be placed on live accounts from now on.\n" + _warn_demo +
-                     "Entries, stops and exits run automatically on each signal.\n\n"
-                     "Start live? (connection tests run automatically)")):
-                return
+        if not messagebox.askyesno(
+                "라이브 시작" if self.lang == "ko" else "Go Live",
+                ("지금부터 실제 계좌에 실주문이 나갑니다.\n"
+                 "신호가 오면 자동으로 진입, 손절, 청산합니다.\n\n"
+                 "라이브를 시작할까요? (연결 테스트는 자동으로 수행됩니다)"
+                 if self.lang == "ko" else
+                 "Real orders will be placed on live accounts from now on.\n"
+                 "Entries, stops and exits run automatically on each signal.\n\n"
+                 "Start live? (connection tests run automatically)")):
+            return
         if not self._consent_ok():
             return
         if not self._token:
@@ -4508,16 +4456,14 @@ class App:
                   "Broker connection and signal delivery keep working on your tier - "
                   "signals appear in the log below at their scheduled time."
                   if _conn_ok else "No membership permission - check your token."))); return
-        live = not dry
+        live = True
         # 가동 조건을 기억한다(대표 2026-08-28 "금 설정했어"): 라이브 도중 실행 자산을
-        # 체크하면 그때 같은 조건(LIVE/모의, 신호대기 권한)으로 무장해야 한다.
+        # 체크하면 그때 같은 조건(신호대기 권한)으로 무장해야 한다.
         self._live_ctx = {"live": bool(live), "perm_auto": bool(perm_auto)}
         self._live_session = True
         self.b_live_start.config(state="disabled")
-        if hasattr(self, "b_demo_start"):
-            self.b_demo_start.config(state="disabled")
         _alabels = "·".join(incl)
-        self.log(f"\n══ 라이브 시작 — 연결 테스트 {_alabels} ({'LIVE' if live else 'dry-run'}) ══")
+        self.log(f"\n══ 라이브 시작 — 연결 테스트 {_alabels} (LIVE) ══")
 
         def w():
             fails = []
@@ -4560,8 +4506,6 @@ class App:
 
             def done():
                 self.b_live_start.config(state="normal")
-                if hasattr(self, "b_demo_start"):
-                    self.b_demo_start.config(state="normal")
                 if fails:
                     self.log("⛔ 전체 중단 — 아무 계좌도 가동하지 않았습니다.")
                     _msg = (("연결 실패 — 전체 중단:\n" if self.lang == "ko"
@@ -4590,8 +4534,7 @@ class App:
                     self._alive_ping(armed=True, force=True)   # 홈피 즉시 반영(이중 안전)
                 except Exception:
                     pass
-                self.log(f"🚀 라이브 가동 시작 — {narmed}개 계좌 [{_alabels}] · {_what} · "
-                         f"{'LIVE' if live else 'dry-run(모의)'}")
+                self.log(f"🚀 라이브 가동 시작 — {narmed}개 계좌 [{_alabels}] · {_what} · LIVE")
                 self.log(f"   {self.t('warn_mix')}")
                 self._refresh_live_panel()
                 self._apply_gating()
@@ -6109,7 +6052,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.06a"
+    _APP_VER = "2026.09.07a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7127,11 +7070,9 @@ class App:
                                    # 신선도 창을 기다리지 않고 즉시 꺼짐으로 바뀐다.
                                    # armed는 실상태 그대로 보낸다 - 무장 중 종료는
                                    # 다운 경보 대상이 맞기 때문이다(R14 P1).
-                                   "closed": bool(getattr(self, "_closing", False)),
-                                   # 모의/라이브 구분(2026-08-22): 모의 무장은 다운 알림·카운터가
-                                   # 다르게 다루도록 표식만 싣는다(판정은 서버 몫).
-                                   "demo": bool(getattr(self, "live_dry", None)
-                                                and self.live_dry.get())})
+                                   # (옛 "demo" 표식은 모의 모드 폐지(2026-09-07)로 안 싣는다 -
+                                   #  서버는 키 없음 = 실무장으로 본다.)
+                                   "closed": bool(getattr(self, "_closing", False))})
                     if getattr(_ok, "ok", False) and _sig is not None:
                         self._alive_sig = _sig      # **전송 성공 뒤에만** 기억한다
                 except Exception:
@@ -7147,9 +7088,10 @@ class App:
             threading.Thread(target=_bg, daemon=True).start()
 
     def _live_now(self, live_flag: bool) -> bool:
-        """발주 '순간'의 실거래 여부 = 시작 시 선택 AND 현재 게이트의 강제 모의 아님.
-        어드민이 강제 dry run을 켜면(하트비트 ≤5분 반영) 이미 돌던 루프도 다음 발주부터
-        모의로 강등된다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍."""
+        """발주 '순간'의 실거래 여부 = 시작 플래그 AND 현재 게이트의 라이브 잠금 아님.
+        어드민이 라이브 잠금(force_dry_run)을 켜면(하트비트 ≤5분 반영) 이미 돌던 루프도 다음
+        발주부터 주문을 보류한다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍.
+        (회원용 모의 모드는 2026-09-07 폐지 - 이 함수가 유일한 실주문 억제 경로다.)"""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
 
     def _fetch_balance_diag(self, bk, f1, f2, f3, aid, is_fut):
@@ -7772,8 +7714,8 @@ class App:
                     _t.sleep(SIG_POLL_SECS); continue
                 # 월 1회 실행 확인이 무장 중에 만료되면 **새 진입만** 멈춘다.
                 # 자동청산(_auto_loop)은 별도 루프라 계속 돈다 — 열린 포지션은 방치하지 않는다.
-                # 모의는 확인을 받지 않으므로 보류 대상이 아니다(실거래에만 적용).
-                _live_now = not bool(self.live_dry.get()) if hasattr(self, "live_dry") else False
+                # 모의 모드 폐지(2026-09-07) - 시작은 언제나 실거래라 보류 규칙이 항상 적용된다.
+                _live_now = True
                 if _live_now and self._consent_left() <= 0:
                     self.log(f"\n⏸ 신호 [{sid}] {_asset} — 30일 실행 확인이 만료되어 새 진입을 보류했습니다.\n"
                              f"   앱에서 [라이브 시작]을 다시 누르면 확인 후 재개됩니다. "
