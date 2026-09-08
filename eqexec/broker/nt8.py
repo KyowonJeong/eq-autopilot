@@ -420,6 +420,13 @@ class NT8Broker(BrokerAdapter):
         NT8 Execution은 반턴(half-turn) 단위라 진입/청산이 따로 온다. 청산 반턴만 남기려면
         pnl이 실린 것만 취한다 - 애드온이 진입 반턴에는 0을 싣는다.
         """
+        # 브리지 상태 확보(2026-09-08 실사고, 대표 "Lucid 계좌 0개"): 트랙레코드 동기화는 새 인스턴스를
+        # 만들어 바로 이 메서드를 불렀는데, _state는 authenticate()가 붙여 주는 것이라 None → 항상
+        # 0건이었다(매매 루프 인스턴스에만 상태가 있었다). 포트 싱글턴이라 기존 브리지 상태를 공유한다.
+        try:
+            self.authenticate()
+        except Exception:
+            return []
         st = (self._state.last_state if self._state else {}) or {}
         rows = st.get("executions") or []
         out = []
