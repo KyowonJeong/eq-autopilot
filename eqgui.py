@@ -1187,6 +1187,7 @@ class App:
         root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
         root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
+        root.after(120 * 1000, self._unsent_fill_tick)             # 미전송 체결 보고 재시도(2분)
 
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
@@ -5856,13 +5857,17 @@ class App:
         # 보존한다(전 계좌 합산). 같은 (브로커,f1,계좌ID)는 조회 시 중복 제거(seen)된다.
         credlist = []
         for a in _ASSETS:
-            bk = self._broker_of(a)
-            cr = self._creds_of(a)
-            f1 = (cr.get("f1") or "").strip()
-            if not f1:
-                continue
-            _sp = _BROKER_SPEC.get(bk, {})
+            # 계좌마다 자기 브로커(대표 2026-09-08 "Lucid 계좌 0개·Topstep 누락"): 종전엔 자산 탭의
+            # 주 브로커 하나(_broker_of)만 돌아, 같은 자산에 Topstep+Lucid를 함께 쓰면 두 번째
+            # 브로커 계좌의 체결이 트랙레코드에서 통째로 빠졌다. 진입은 계좌별 브로커
+            # (_acct_broker)로 도는데 동기화만 한 브로커였다 - 같은 축으로 맞춘다.
             for ac in self._accts_of(a):
+                bk = self._acct_broker(a, ac)
+                cr = self._creds_of(a, bk)
+                f1 = (cr.get("f1") or "").strip()
+                if not f1:
+                    continue
+                _sp = _BROKER_SPEC.get(bk, {})
                 aid = (ac.get("id") or "").strip()
                 if _sp.get("acct") and not aid:
                     continue
@@ -6052,7 +6057,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.07a"
+    _APP_VER = "2026.09.08a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6062,7 +6067,7 @@ class App:
     # 앱은 상시 떠들지 않는다(대표 "그 담 한 일분간만, 오분 최대") - 진입이 끝난 시점에 1회,
     # 실패하면 5분 창 안에서만 재시도. 그 뒤 미실현은 서버가 현재가로 계속 계산한다.
     # ⚠️ 발주 경로에는 손대지 않는다 - 이 호출은 전부 별도 스레드이고, 실패해도 조용하다.
-    _FILL_RETRY_WINDOW_S = 300      # 5분 창 - 그 뒤로는 포기(서버는 현재가로 계속 계산)
+    _FILL_RETRY_WINDOW_S = 900      # 15분 창(2026-09-08: 5분) - 그 뒤엔 미전송 큐가 24시간 재시도
 
     def _claim_entry(self, sig, acct_id) -> bool:
         """서버 진입 클레임(대표 2026-08-22 "같은 토큰 다른 머신 이중 진입 막게"):
@@ -6330,12 +6335,76 @@ class App:
                             return
                     except Exception:
                         pass
-                    _t.sleep(20)                # 5분 창 안에서만
-                self.log(f"   ⚠ {asset} 체결 보고 전송 실패(5분 재시도 소진) — 대시보드 "
-                         "수량·금액 표시가 빠질 수 있습니다(다음 거래 보고는 정상).")
+                    _t.sleep(30)                # 15분 창 안에서만
+                # 창 소진 → 미전송 큐(2026-09-08 GC 사고: 서버 기기 슬롯 거부로 5분 안에 못 보낸
+                # 진입·청산 보고가 영영 사라졌다). 2분마다 24시간까지 다시 보낸다.
+                self._queue_unsent_fill(body)
+                self.log(f"   ⚠ {asset} 체결 보고 전송 실패(15분 재시도 소진) — 미전송 큐에 두고 "
+                         "2분마다 24시간 재시도합니다(대시보드 수량·금액은 성공 시 채워짐).")
             except Exception:
                 pass
         _th.Thread(target=w, daemon=True).start()
+
+    _UNSENT_PATH = os.path.join(APP_DIR, "unsent_fills.json")
+
+    def _load_unsent(self) -> list:
+        try:
+            import json as _j
+            with open(self._UNSENT_PATH, encoding="utf-8") as f:
+                q = _j.load(f)
+            return q if isinstance(q, list) else []
+        except Exception:
+            return []
+
+    def _queue_unsent_fill(self, body: dict) -> None:
+        """체결 보고를 미전송 큐(파일)에 둔다 - 앱을 껐다 켜도 살아남는다."""
+        try:
+            import json as _j
+            import time as _t
+            q = self._load_unsent()
+            q.append({"body": body, "ts": _t.time()})
+            with open(self._UNSENT_PATH, "w", encoding="utf-8") as f:
+                _j.dump(q[-50:], f)
+        except Exception:
+            pass
+
+    def _unsent_fill_tick(self):
+        """2분마다 미전송 체결 보고를 다시 보낸다(24시간까지). 전송은 별도 스레드(UI 무정지)."""
+        def w():
+            try:
+                import json as _j
+                import time as _t
+                import requests
+                q = self._load_unsent()
+                if not q:
+                    return
+                keep = []
+                for it in q:
+                    _age = _t.time() - float(it.get("ts") or 0)
+                    if _age > 86400:
+                        continue
+                    try:
+                        r = requests.post(PUSH_BASE + "eqfill", timeout=8, json=it.get("body") or {})
+                        if r.ok and str(r.text).startswith(("fl:ok", "fl:ignored")):
+                            self.log(f"   ✅ {(it.get('body') or {}).get('inst')} 지연 체결 보고 성공"
+                                     f"(대기 {int(_age // 60)}분)")
+                            continue
+                    except Exception:
+                        pass
+                    keep.append(it)
+                with open(self._UNSENT_PATH, "w", encoding="utf-8") as f:
+                    _j.dump(keep, f)
+            except Exception:
+                pass
+        try:
+            if self._load_unsent():
+                threading.Thread(target=w, daemon=True).start()
+        except Exception:
+            pass
+        try:
+            self.root.after(120 * 1000, self._unsent_fill_tick)
+        except Exception:
+            pass
 
     def _report_error(self, ctx, err):
         """예외 자동 리포트(대표 2026-07-27 "필수") — 서버 /eqerr로 익명 전송해 회원 머신의
@@ -6605,7 +6674,7 @@ class App:
                 # 1초 주기 감안), 타 브로커=2초(기존). 포지션 잡히면 확정, NT8은 주문 상태로
                 # 거절을 조기 감지해 **사유까지** 확보(신 애드온 orders 스냅샷).
                 _seen_qty = 0; _rej = ""
-                _rounds = 12 if _is_nt8 else 4
+                _rounds = 30 if _is_nt8 else 4   # NT8 15초(2026-09-08: 6초 창에 체결 확인 뒤 재진입 → 이중 진입 위험)
                 for _i in range(_rounds):
                     try:
                         _seen_qty = abs(int(b.position_qty(_aid, _con) or 0))
@@ -6627,7 +6696,7 @@ class App:
                     _placed = True; _res_ok = res
                     self.log(f"   ✅ {_sym} 체결 확인 ×{_seen_qty}")
                     break
-                _last_why = _rej or f"포지션 미확인({'6' if _is_nt8 else '2'}초)"
+                _last_why = _rej or f"포지션 미확인({'15' if _is_nt8 else '2'}초)"
                 if not _is_nt8:
                     # 타 브로커: 기존 동작 유지(주문은 살아 있을 수 있음 - 보고만 제외)
                     _placed = False; _res_ok = res
