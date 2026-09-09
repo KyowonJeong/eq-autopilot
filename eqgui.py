@@ -6057,7 +6057,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.09a"
+    _APP_VER = "2026.09.09b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7915,8 +7915,12 @@ def _bind_clipboard(root):
                 root.bind_class(cls, ev, fn)
             except Exception:
                 pass
-    # Standard Edit menu (gives macOS menu access + native routing as a fallback).
+    # Standard Edit menu - **macOS only**(대표 2026-09-09 "표준 편집 기능이 왜 필요해, 없애버려"):
+    # 윈도·리눅스는 Ctrl+C/V가 위젯 기본 바인딩으로 이미 되고 창 상단에 메뉴 줄만 하나 더 생긴다.
+    # 맥은 시스템 메뉴바에 Edit 메뉴가 있어야 Cmd+C/V 라우팅이 확실해 남긴다(창 안 공간은 안 먹음).
     try:
+        if sys.platform != "darwin":
+            raise RuntimeError("edit menu: non-mac skip")
         mb = tk.Menu(root)
         em = tk.Menu(mb, tearoff=0)
 
