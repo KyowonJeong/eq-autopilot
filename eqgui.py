@@ -6057,7 +6057,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.08b"
+    _APP_VER = "2026.09.09a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7922,8 +7922,10 @@ def _bind_clipboard(root):
 
         def _ev(name):
             return lambda: (root.focus_get().event_generate(name) if root.focus_get() else None)
-        for label, acc, ev in (("Cut", "Cmd+X", "<<Cut>>"), ("Copy", "Cmd+C", "<<Copy>>"),
-                               ("Paste", "Cmd+V", "<<Paste>>"), ("Select All", "Cmd+A", "<<SelectAll>>")):
+        # 단축키 표기는 플랫폼별(대표 2026-09-09 윈도 실측: 윈도 앱 Edit 메뉴에 'Cmd+X'가 찍힘).
+        _mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
+        for label, acc, ev in (("Cut", f"{_mod}+X", "<<Cut>>"), ("Copy", f"{_mod}+C", "<<Copy>>"),
+                               ("Paste", f"{_mod}+V", "<<Paste>>"), ("Select All", f"{_mod}+A", "<<SelectAll>>")):
             em.add_command(label=label, accelerator=acc, command=_ev(ev))
         mb.add_cascade(label="Edit", menu=em)
         root.config(menu=mb)
