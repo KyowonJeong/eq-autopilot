@@ -167,7 +167,13 @@ AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에�
 # 세션 진입(신호 도착) 시각 — 진입 전 API 사전 점검용(대표 2026-07-13). NQ·GC 주말 스킵.
 _ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 2)],
                   "BTC": [("UTC", 22)]}       # H22 단독 — 02:00 진입 은퇴(2026-07-14)
-PRECHECK_WINDOW_MIN = 70                            # 진입까지 이 분 이내면 사전 점검 발동
+# 사전 점검 창(2026-09-13 대표 "진입 시간 십분 전에 1r 조회 한 번 자동으로 함 어때").
+# 종전에는 70분 창 하나였고 _precheck_done 표식이 영구라 점검이 **딱 한 번**(실질 65~70분
+# 전) 돌았다 - 남은 60분 동안 NT8이 죽어도 재검증이 0이다. NT8은 브리지 하트비트가 5초만
+# 낡아도 healthcheck()가 예외를 던지므로, 진입 직전에 한 번 더 밟는 것이 정확히 그 구멍을
+# 메운다. 틱이 5분 주기라 10분 창은 반드시 한 번 걸린다.
+PRECHECK_WINDOWS_MIN = (70, 10)                     # 넓은 창(여유 있게 고치라고) + 직전 창
+PRECHECK_WINDOW_MIN = PRECHECK_WINDOWS_MIN[0]       # 하위호환(기존 참조)
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
@@ -5618,20 +5624,42 @@ class App:
                 if ent is None:
                     continue
                 mins = (ent - datetime.now(ent.tzinfo)).total_seconds() / 60.0
-                key = (bk, a, ent.isoformat())
-                if not (0 < mins <= PRECHECK_WINDOW_MIN) or self._precheck_done.get(key):
+                if mins <= 0:
                     continue
-                self._precheck_done[key] = True
-                threading.Thread(target=self._precheck_run,
-                                 args=(a, dict(cfg), ent.strftime("%H:%M %Z")),
-                                 daemon=True).start()
+                # 창마다 별도 표식 - 좁은 창이 넓은 창의 표식에 먹히면 안 된다.
+                # 좁은 창부터 본다 - 앱을 진입 직전에 켠 경우 넓은 창이 먼저 걸려
+                # 좁은 창을 삼키면 '직전 점검'이라는 목적 자체가 사라진다.
+                for _w in sorted(PRECHECK_WINDOWS_MIN):
+                    key = (bk, a, ent.isoformat(), _w)
+                    if mins > _w or self._precheck_done.get(key):
+                        continue
+                    # 좁은 창이 돌면 넓은 창은 **포함관계라 같이 소진**시킨다. 안 그러면
+                    # 진입 직전에 앱을 켠 경우 10분 창이 먼저 돌고 다음 틱에 70분 창이
+                    # 또 돌아, 같은 점검이 두 번 나가고 원장에는 T-3분에 win=70이라는
+                    # 뜻이 어긋난 행이 남는다.
+                    for _w2 in PRECHECK_WINDOWS_MIN:
+                        if _w2 >= _w:
+                            self._precheck_done[(bk, a, ent.isoformat(), _w2)] = True
+                    threading.Thread(target=self._precheck_run,
+                                     args=(a, dict(cfg), ent.strftime("%H:%M %Z"), _w),
+                                     daemon=True).start()
+                    break                       # 한 틱에 한 번만(가장 좁은 미발화 창)
         except Exception:
             pass
         finally:
             self.root.after(5 * 60 * 1000, self._precheck_tick)
 
-    def _precheck_run(self, asset, cfg, entry_label):
+    def _precheck_run(self, asset, cfg, entry_label, window_min=PRECHECK_WINDOW_MIN):
+        """진입 전 브로커 왕복 점검 1회. window_min = 몇 분 전 창에서 불렸는가.
+
+        ⚠️2026-09-13: 결과를 **서버에도 보고한다**. 종전에는 self.log + messagebox뿐이라
+        회원이 자리에 없으면 아무도 몰랐고, 서버는 NT8이 죽은 것을 진입 시각까지 알 수
+        없었다(생존 핑은 앱 것이라 계속 간다). NT8에서 healthcheck()는 브리지 하트비트가
+        5초만 낡아도 예외를 던지므로 이 점검이 곧 NT8 생존 판정이다.
+        직전 창(가장 좁은 창) 실패는 회원 DM까지 보낸다 - 그때가 고칠 수 있는 마지막
+        순간이고, 모달은 자리에 없으면 못 본다."""
         ko = self.lang == "ko"
+        _last = (window_min == min(PRECHECK_WINDOWS_MIN))
         try:
             b = _build_broker(cfg.get("broker"), cfg.get("f1", ""), cfg.get("f2", ""),
                               cfg.get("f3", ""), [cfg.get("acct")] if cfg.get("acct") else [])
@@ -5663,16 +5691,32 @@ class App:
                      f"Pre-entry check for {asset} ({entry_label}) has warnings:\n\n{_w}")))
             else:
                 self.log(f"🩺 {asset} API 사전 점검 통과 — 진입 {entry_label} 준비 완료"
-                         f" ({_broker_label(cfg.get('broker'))})")
+                         f" ({_broker_label(cfg.get('broker'))}, T-{window_min}분)")
+            self._send_ev("preflight_ok", asset, broker=str(cfg.get("broker") or "")[:16],
+                          win=int(window_min), warns=len(warns))
         except Exception as e:
             _em = str(e)[:300]
             _hint = _entry_fail_hint(_em, ko)
-            self.log(f"❌ {asset} API 사전 점검 실패 (진입 {entry_label}): {_em}")
+            self.log(f"❌ {asset} API 사전 점검 실패 (진입 {entry_label}, T-{window_min}분): {_em}")
+            self._send_ev("preflight_fail", asset, broker=str(cfg.get("broker") or "")[:16],
+                          win=int(window_min), err=_em[:120])
+            self._report_error(f"preflight:{asset}", e)
+            if _last:
+                # 고칠 수 있는 마지막 순간이다 - 모달만으로는 자리에 없는 회원을 못 잡는다.
+                # 서버가 텔레그램·디스코드로 보낸다(kind별 30분 스로틀은 서버 몫).
+                self._member_alert(
+                    f"preflight_{asset}",
+                    f"{asset} 진입 {window_min}분 전 점검에서 브로커 연결이 확인되지 않았습니다"
+                    f"(진입 {entry_label}). 지금 고치지 않으면 이번 세션은 진입하지 않습니다. {_hint}",
+                    f"The pre-entry check {window_min} minutes before {asset} could not reach your "
+                    f"broker (entry {entry_label}). If it is not fixed now, this session will not "
+                    f"be entered. {_hint}")
             self.root.after(0, lambda: messagebox.showerror(
                 "API 사전 점검 실패" if ko else "API pre-check failed",
-                (f"{asset} 진입({entry_label}) 1시간 전 점검에서 API 호출이 실패했습니다:\n\n{_em}\n\n{_hint}"
+                (f"{asset} 진입({entry_label}) {window_min}분 전 점검에서 API 호출이 실패했습니다:\n\n{_em}\n\n{_hint}"
                  if ko else
-                 f"The pre-entry API check for {asset} ({entry_label}) failed:\n\n{_em}\n\n{_hint}")))
+                 f"The pre-entry API check for {asset} ({entry_label}), {window_min} minutes out, "
+                 f"failed:\n\n{_em}\n\n{_hint}")))
 
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod
@@ -6057,7 +6101,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.10a"
+    _APP_VER = "2026.09.13a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6419,11 +6463,30 @@ class App:
             if _os.environ.get("EQ_ERR_REPORT", "1") == "0":
                 return
             msg = _re.sub(r"\d{5,}", "#", str(err))[:400]
-            key = (str(ctx)[:40], msg[:80])
+            _cs = str(ctx)[:40]
+            # ⚠️종료 잔향은 아예 보내지 않는다(2026-09-13). 구버전 Tk는 창을 닫는 동안
+            # 남은 after 콜백이 이미 파괴된 위젯을 건드려 "invalid command name
+            # .!frame6.!canvas..."를 연발한다. 버그가 아니라 종료 소음인데, 위젯 경로가
+            # 매번 달라 **아래 캡의 키를 10개까지 금방 채운다** - 실측: 대표 원장의
+            # error 57건이 전부 이것이고 2026-09-04 15시에 32건이 몰렸다. 하필 그날이
+            # NT8 진입 누락 사고 당일이라, 그 시간의 entry: 보고는 캡에 막혀 사라졌다.
+            if _cs == "tk" and "invalid command name" in msg:
+                return
+            key = (_cs, msg[:80])
             now = _t.time()
             self._err_sent = {k: v for k, v in getattr(self, "_err_sent", {}).items()
                               if now - v < 3600}
-            if key in self._err_sent or len(self._err_sent) >= 10:
+            if key in self._err_sent:
+                return
+            # 계열별 예산(2026-09-13): 종전엔 전역 10건이라 어떤 소음이든 실행 계열을
+            # 굶길 수 있었다. 돈이 걸린 보고는 자기 예산을 갖는다(서버 쪽도 같은 규약 -
+            # web/error_report.py의 _SEVERE_PAT 버킷 분리).
+            _sev = bool(_re.search(r"진입|청산|손절|entry|exit|close|stop|flatten|order",
+                                   _cs, _re.I))
+            _n = sum(1 for k in self._err_sent
+                     if bool(_re.search(r"진입|청산|손절|entry|exit|close|stop|flatten|order",
+                                        k[0], _re.I)) == _sev)
+            if _n >= (20 if _sev else 10):
                 return
             self._err_sent[key] = now
 
