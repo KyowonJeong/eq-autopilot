@@ -32,6 +32,7 @@ dry_run=True면 아무 주문도 보내지 않는다.
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import math
 import threading
 import time
@@ -41,12 +42,16 @@ from .base import BrokerAdapter, FlattenResult, Position
 
 _ACK_WAIT_S = 2.5            # 주문 접수/거절 판정 대기(TWS는 거절을 비동기 에러로 준다)
 _CONNECT_TIMEOUT_S = 15
-_ROLL_DAYS_INDEX = 8         # 지수 분기물: 만기(3번째 금요일) 8일 전부터 다음 분기물(거래량 이전 시점)
-_ROLL_DAYS_METAL = 5         # 금속: 계약월 시작 5일 전부터 다음 활성월(FND = 직전 월 마지막 영업일)
-_MONTH_CODES = "FGHJKMNQUVXZ"
-_ACTIVE_MONTHS = {"MNQ": "HMUZ", "NQ": "HMUZ", "MES": "HMUZ", "ES": "HMUZ",
-                  "M2K": "HMUZ", "RTY": "HMUZ", "MYM": "HMUZ", "YM": "HMUZ",
-                  "MGC": "GJMQVZ", "GC": "GJMQVZ"}
+# 활성월·롤 규칙은 **공용 달력 한 곳**에서 온다(2026-09-14). 종전엔 이 파일이 자기 표를
+# 들고 있었고 nt8.py와 달랐다 - 금속에 V(10월)를 넣어, 546일 중 62일을 NT8과 **다른
+# 계약월**로 골랐다. 서버 신호는 절대 손절가를 보내고 그 값은 정본 가격 계열(12월물)에서
+# 나오므로, 다른 월물에 보정 없이 얹으면 월물 basis만큼 손절거리가 틀어진다(실측: basis가
+# 손절거리의 75~125%). 롱은 스탑이 시장가 위로 가 거부되고, 숏은 한 번에 약 2R이 나간다.
+from . import futures_cal as _cal
+
+_ROLL_DAYS_INDEX = _cal.ROLL_DAYS_INDEX
+_ROLL_DAYS_METAL = _cal.ROLL_DAYS_METAL
+_MONTH_CODES = _cal.MONTH_CODES
 _EXCHANGE = {"MNQ": "CME", "NQ": "CME", "MES": "CME", "ES": "CME", "M2K": "CME", "RTY": "CME",
              "MGC": "COMEX", "GC": "COMEX", "SIL": "COMEX", "SI": "COMEX",
              "MYM": "CBOT", "YM": "CBOT"}
@@ -87,19 +92,34 @@ def _opp(action: str) -> str:
 
 
 def _root(sym: str) -> str:
-    """'MNQZ5' → 'MNQ', 'MGCG6' → 'MGC' (문자 접두 = 루트)."""
+    """'MNQZ5' → 'MNQ', 'MGCG6' → 'MGC', 'M2KZ6' → 'M2K'.
+
+    ⚠️알파벳만 훑으면 안 된다(2026-09-14): 'M2K'처럼 **숫자가 든 루트**에서 첫 글자
+    'M'에서 멈춰 루트를 'M'으로 읽었다. 그러면 활성월 표에도 틱 표에도 안 맞아
+    Micro Russell은 계약 해석도 틱 정렬도 통째로 꺼진다. 뒤에서부터 '월코드+연도'
+    꼬리를 떼는 쪽이 맞다 - 루트에 무엇이 들었든 꼬리 모양은 하나다."""
     s = str(sym).upper().strip()
-    i = 0
-    while i < len(s) and s[i].isalpha():
-        i += 1
-    # 마지막 글자가 월코드이고 뒤가 숫자면 월코드는 루트가 아니다(MNQZ5 → MNQ).
-    if i >= 2 and i < len(s) and s[i:].isdigit() and s[i - 1] in _MONTH_CODES:
-        return s[:i - 1]
-    return s[:i] if i else s
+    # 꼬리 = 월코드 1자 + 연도 1~2자리(Z5, Z25). 그 앞이 전부 루트다.
+    _m = _re.match(r"^([A-Z0-9]+?)([FGHJKMNQUVXZ])(\d{1,2})$", s)
+    if _m and len(_m.group(1)) >= 1:
+        return _m.group(1)
+    # 꼬리가 없으면 통째로 루트다('M2K'·'GC'). ⚠️여기서 알파벳만 훑어 자르면 'M2K'가
+    # 'M'이 된다 - 위 정규식이 안 맞았다는 것은 애초에 월물 심볼이 아니라는 뜻이다.
+    return s
 
 
 class IBKRBroker(BrokerAdapter):
     name = "ibkr"
+
+    _CID_LOCK = threading.Lock()
+    _CID_SEQ = 0
+
+    @classmethod
+    def _next_cid(cls) -> int:
+        """인스턴스별 clientId 오프셋(0,1,2…). TWS는 32비트 양수면 되고 충돌만 피하면 된다."""
+        with cls._CID_LOCK:
+            cls._CID_SEQ = (cls._CID_SEQ + 1) % 900
+            return cls._CID_SEQ
 
     def __init__(self, cfg):
         self.cfg = cfg                       # eqexec.config.IBKRCfg
@@ -138,8 +158,17 @@ class IBKRBroker(BrokerAdapter):
                     "IBKR host must be local (127.0.0.1/localhost/::1) - TWS or IB Gateway "
                     "runs on this computer per the supported setup.")
             ib = ibi.IB()
-            ib.connect(host, int(self.cfg.port), clientId=int(getattr(self.cfg, "client_id", 11) or 11),
+            # clientId는 **인스턴스마다 달라야 한다**(2026-09-14). TWS는 같은 clientId로
+            # 두 번째 접속이 오면 첫 번째를 끊거나 새 접속을 거부한다. 종전엔 cfg 기본값
+            # 11이 전 인스턴스에 고정이라, 다계좌 병렬 발주에서 **둘째 계좌가 조용히
+            # 빠졌다**(같은 브로커에 계좌를 둘 켜는 것이 우리 표준 구성인데도).
+            # cfg에 명시값이 있으면 그것을 쓰고(회원이 TWS의 다른 도구와 충돌을 피하려
+            # 정한 값), 없으면 기본값에 인스턴스 일련번호를 더해 서로 겹치지 않게 한다.
+            _cid = getattr(self.cfg, "client_id", None)
+            _cid = int(_cid) if _cid else (11 + IBKRBroker._next_cid())
+            ib.connect(host, int(self.cfg.port), clientId=_cid,
                        timeout=_CONNECT_TIMEOUT_S, readonly=False)
+            self._client_id = _cid
             try:
                 ib.reqMarketDataType(3)      # 구독 없으면 지연 시세(주문과 무관, 현재가 폴백용)
             except Exception:
@@ -165,7 +194,7 @@ class IBKRBroker(BrokerAdapter):
             except Exception:
                 ver = "?"
             accts = ", ".join(a["id"] for a in self._accounts()) or "(none)"
-            return [f"IBKR {self.cfg.host}:{self.cfg.port} clientId {getattr(self.cfg, 'client_id', 11)} "
+            return [f"IBKR {self.cfg.host}:{self.cfg.port} clientId {getattr(self, '_client_id', None) or getattr(self.cfg, 'client_id', 11)} "
                     f"· TWS/Gateway server v{ver} · accounts: {accts}",
                     "paper = DU*, live = U* · market data falls back to delayed when unsubscribed"]
 
@@ -223,10 +252,10 @@ class IBKRBroker(BrokerAdapter):
         except (TypeError, ValueError):
             return False
         code = _MONTH_CODES[m - 1]
-        active = _ACTIVE_MONTHS.get(root)
+        active = _cal.active_months(root)
         if active and code not in active:
             return False                                    # 시리얼(비활성) 월물 제외
-        if root in ("MGC", "GC", "SIL", "SI"):
+        if not _cal.is_index(root):
             month_start = date(y, m, 1)
             return (month_start - today).days >= _ROLL_DAYS_METAL
         try:
@@ -389,15 +418,24 @@ class IBKRBroker(BrokerAdapter):
     def _ack(self, ib, trade, wait_s: float = _ACK_WAIT_S) -> str | None:
         """주문 접수 판정. 거절·취소·Inactive면 사유 문자열, 정상(PreSubmitted/Submitted/Filled/
         아직 PendingSubmit)이면 None. TWS는 거절을 비동기 error로 주므로 잠깐 루프를 돌려 기다린다."""
+        # ⚠️'좋은 상태를 보자마자 OK'로 돌아가지 않는다(2026-09-14). TWS는 PreSubmitted를
+        # 먼저 주고 **그 뒤에** 비동기 error로 거절하는 일이 흔하다. 종전에는 첫 좋은
+        # 상태에서 즉시 None을 돌려줘, 1.5초 뒤 거절되는 보호 스탑을 '스탑 걸림'으로
+        # 보고했다 - 회원 화면에 방패가 있다고 적히는데 실제로는 알몸인 상태(거짓 방패).
+        # 창을 끝까지 지켜보되, Filled는 되돌릴 수 없으므로 그때만 즉시 확정한다.
         t0 = time.time()
         while time.time() - t0 < wait_s:
             st = str(trade.orderStatus.status)
             if st in _REJECT_STATES:
                 break
-            if st in ("PreSubmitted", "Submitted", "Filled"):
-                return None
+            if st == "Filled":
+                return None                       # 체결은 되돌아가지 않는다
             ib.sleep(0.25)
         st = str(trade.orderStatus.status)
+        # 창이 끝났는데 아직 접수 신호조차 없으면 **모른다**고 말한다 - 종전엔 None(정상)으로
+        # 돌려줘 타임아웃이 곧 '접수됨'이었다. 호출부가 방패로 삼는 자리라 침묵이 제일 나쁘다.
+        if st not in _REJECT_STATES and st not in ("PreSubmitted", "Submitted", "Filled"):
+            return f"PENDING: {st or 'no status'} after {wait_s:.1f}s"
         if st in _REJECT_STATES:
             msg = ""
             try:
@@ -483,7 +521,18 @@ class IBKRBroker(BrokerAdapter):
                 except Exception:
                     pass
                 raise RuntimeError(f"IBKR entry rejected ({lsym}): {rej}")
-            rej2 = self._ack(ib, t2, wait_s=1.5)
+            # 자식 스탑은 **두 번** 본다(2026-09-14): 첫 창을 통과해도 TWS가 뒤늦게
+            # 거절하는 일이 있어, 한 박자 쉬고 상태를 다시 읽는다. 여기가 방패의 유무를
+            # 판정하는 유일한 자리라 낙관이 제일 비싸다.
+            rej2 = self._ack(ib, t2, wait_s=2.0)
+            if not rej2:
+                try:
+                    ib.sleep(1.0)
+                    _st2 = str(t2.orderStatus.status)
+                    if _st2 in _REJECT_STATES:
+                        rej2 = f"{_st2} (late reject)"
+                except Exception:
+                    pass
             if rej2:
                 return {"entry": self._odict(t1), "order_id": int(t1.order.orderId or 0),
                         "stop_error": f"protective stop rejected: {rej2}", "stop_rejected": True}
@@ -607,16 +656,38 @@ class IBKRBroker(BrokerAdapter):
             ib = self._connect()
             plan = self.list_open_positions()
             res = FlattenResult(dry_run=dry_run, planned=list(plan))
-            if dry_run or not plan:
-                return res
             want = {a["id"] for a in (self._acct_cache or self._accounts())}
+            if dry_run:
+                return res
+            if not plan:
+                # ⚠️포지션이 없어도 **우리 미체결 주문은 걷어낸다**(2026-09-14). 종전엔
+                # 여기서 그냥 돌아가, 청산이 다른 경로로 끝난 뒤 남은 GTC 보호 스탑이
+                # 살아 있었다 - 그 스탑이 나중에 혼자 체결되면 **아무도 모르는 반대
+                # 포지션**이 열린다(보호 스탑이 진입 주문이 되는 것). 자식 스탑은 tif=GTC라
+                # 장을 넘겨도 안 죽는다.
+                try:
+                    for t in list(ib.openTrades()):
+                        _o = t.order
+                        if want and str(_o.account or "") not in want:
+                            continue
+                        if str(getattr(_o, "orderRef", "") or "").startswith("EQ-AP-"):
+                            ib.cancelOrder(_o)
+                except Exception as e:
+                    res.errors.append(f"cancel orphan orders failed: {e}")
+                return res
+            # ⛔reqGlobalCancel을 쓰지 않는다(2026-09-14). 종전엔 '지정 계좌 수 == 관리 계좌
+            # 수'이면 전역 취소로 떨어졌는데, **단일 계좌 로그인에서는 그게 항상 참**이라
+            # 실제로는 거의 매번 전역 취소가 나갔다. 그 계좌에서 회원이 직접 낸 주문
+            # (다른 상품 지정가, 개인 스탑)까지 우리가 지운다 - 우리 것이 아닌 것을 건드리는
+            # 유일한 자리였다. 항상 **우리가 붙인 orderRef가 있는 주문만** 취소한다.
             try:
-                if want and len(want) < len(ib.managedAccounts() or []):
-                    for t in list(ib.openTrades()):          # 지정 계좌의 주문만 취소
-                        if str(t.order.account or "") in want:
-                            ib.cancelOrder(t.order)
-                else:
-                    ib.reqGlobalCancel()
+                for t in list(ib.openTrades()):
+                    _o = t.order
+                    if want and str(_o.account or "") not in want:
+                        continue
+                    if not str(getattr(_o, "orderRef", "") or "").startswith("EQ-AP-"):
+                        continue                             # 회원 본인 주문 - 건드리지 않는다
+                    ib.cancelOrder(_o)
             except Exception as e:
                 res.errors.append(f"cancel open orders failed: {e}")
             ib.sleep(0.5)
@@ -656,18 +727,49 @@ class IBKRBroker(BrokerAdapter):
                 ib.sleep(0.5)                     # CommissionReport는 execDetails 뒤에 온다
             except Exception:
                 pass
-            out = []
+            # ⚠️realizedPNL로 진입/청산을 가르지 않는다(2026-09-14). ib_insync 0.9.86이
+            # wrapper.py에서 UNSET_DOUBLE을 **0.0으로 먼저 뭉개고**(objects.py 기본값도 0.0)
+            # commissionReport도 None이 아니므로, 종전의 센티널 검사(_PNL_UNSET)와 None 검사는
+            # 둘 다 한 번도 발동하지 않는 죽은 코드였다. 그 결과 **진입 체결이 pnl 0.0짜리
+            # 청산 거래로 새어나가고**, 방향도 청산 측(side)에서 역산하던 탓에 반대로 붙었다 -
+            # 트랙레코드에 '그 날 0R 숏 거래'라는 없는 행이 생겨 승률·거래수·연속 줄이 오염된다.
+            #
+            # 대신 **포지션을 걸어서** 가른다: 체결을 시각순으로 훑으며 (계좌, conId)별 부호
+            # 포지션을 누적하고, |포지션|을 **줄이는** 체결만 청산으로 본다. 회원이 TWS에서
+            # 손으로 닫은 것도 잡히고, 손익이 진짜 0.00인 청산도 살아남는다.
+            # 진입 방향은 닫기 직전 포지션의 부호에서 나온다(양수면 LONG 진입).
+            _fills = []
             for f in ib.fills() or []:
                 try:
+                    _t = f.execution.time
+                    _k = (_t.timestamp() if isinstance(_t, datetime)
+                          else datetime.fromisoformat(str(_t)).timestamp())
+                except Exception:
+                    _k = 0.0
+                _fills.append((_k, str(getattr(f.execution, "execId", "")), f))
+            _fills.sort(key=lambda x: (x[0], x[1]))
+            _book = {}                            # (계좌, conId) -> 부호 포지션
+            out = []
+            for _, _eid, f in _fills:
+                try:
                     ex, cr = f.execution, f.commissionReport
-                    if cr is None:
-                        continue
-                    pnl = getattr(cr, "realizedPNL", None)
-                    if pnl is None or (isinstance(pnl, float) and (math.isnan(pnl) or abs(pnl) >= _PNL_UNSET)):
-                        continue                  # 진입 체결(실현손익 없음)
                     acct = str(ex.acctNumber or "")
                     if want and acct.upper() not in want:
                         continue
+                    _cid = int(getattr(f.contract, "conId", 0) or 0)
+                    _key = (acct, _cid)
+                    _prev = _book.get(_key, 0)
+                    _shares = int(ex.shares or 0)
+                    _delta = _shares if str(ex.side).upper().startswith("B") else -_shares
+                    _book[_key] = _prev + _delta
+                    # 청산 = 직전 포지션이 있고 그 반대 방향으로 체결된 것
+                    if _prev == 0 or (_prev > 0) == (_delta > 0):
+                        continue                  # 진입 또는 증량
+                    pnl = getattr(cr, "realizedPNL", 0.0) if cr is not None else 0.0
+                    if pnl is None or (isinstance(pnl, float)
+                                       and (math.isnan(pnl) or abs(pnl) >= _PNL_UNSET)):
+                        pnl = 0.0                 # 값이 아직 안 왔을 뿐 - 청산 사실은 유효
+                    _entry_dir = "LONG" if _prev > 0 else "SHORT"
                     t = ex.time
                     if isinstance(t, datetime):
                         ts_ms = int((t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp() * 1000)
@@ -680,7 +782,7 @@ class IBKRBroker(BrokerAdapter):
                         "ts_ms": ts_ms,
                         "symbol": str(getattr(f.contract, "localSymbol", "") or getattr(f.contract, "symbol", "")),
                         "pnl": float(pnl),
-                        "direction": "LONG" if str(ex.side).upper().startswith("S") else "SHORT",
+                        "direction": _entry_dir,   # 닫기 직전 포지션 부호 = 진입 방향
                         "acct": acct, "acct_name": acct,
                         "qty": int(ex.shares or 0), "price": float(ex.price or 0),
                         "commission": float(getattr(cr, "commission", 0) or 0),
