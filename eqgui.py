@@ -6038,6 +6038,11 @@ class App:
                         _fa = str(f.get("acct") or "")
                         f["_one_r"] = _r_by_acct.get(_fa, _R_FALLBACK)   # 닫힌 계좌=폴백 1R
                         f["_acct_id"] = _fa or c["broker"]
+                        # 체결이 어느 브로커에서 났는지는 **이 자리에서만** 알 수 있다
+                        # (대표 2026-09-15 "빗겟은 한 번도 안 돌았네" - 원장에 브로커가
+                        # 없어서 붙은 날짜로 역산해야 답할 수 있었다). closed_fills는
+                        # 이 로그인(c)의 체결만 돌려주므로 c["broker"]가 곧 그 체결의 브로커다.
+                        f["_broker"] = c["broker"]
                     fills.extend(got)
                     _n_acct = len({f.get("acct") for f in got})
                     self.log(f"   {_broker_label(c['broker'])}: 체결 {len(got)}건 "
@@ -6077,7 +6082,9 @@ class App:
                 d = dt.date().isoformat()
                 k = (d, a, _btc_sess(dt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
-                                       "accts": {}, "base": {}})
+                                       "accts": {}, "base": {}, "brokers": set()})
+                if f.get("_broker"):
+                    e["brokers"].add(str(f["_broker"]))
                 e["pnl"] += float(f.get("pnl") or 0)
                 # 체결가 수집(2026-09-06 트랙레코드 영수증): 그룹의 진입가·청산가.
                 # 계좌가 여럿이면 값이 갈리므로 **첫 값 하나만** 쓴다(평균을 지어내지 않는다).
@@ -6121,6 +6128,10 @@ class App:
                                "scale": round(_rsum / _bsum, 4),   # 개인 기준선 대비 규모 배수
                                # 체결가(있을 때만) - 서버 영수증이 **둘 다 있을 때만** 회원
                                # 체결가로 인쇄하고, 아니면 신호 기준가로 채운다.
+                               # 체결 브로커(2026-09-15): 같은 판단이 두 거래소에서 체결되면
+                               # 둘 다. 서버는 행을 통째로 저장하므로 추가 필드는 그대로 남고,
+                               # 이 필드가 없는 옛 행·구버전 앱 푸시도 그대로 동작한다.
+                               **({"brokers": sorted(v["brokers"])} if v.get("brokers") else {}),
                                **{k: v[k] for k in ("entry_px", "exit_px") if v.get(k)}})
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
@@ -6183,7 +6194,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.15e"
+    _APP_VER = "2026.09.15f"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
