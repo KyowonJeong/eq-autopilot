@@ -57,11 +57,16 @@ def main():
     acct = accts[0]
     aid = acct.get("id")
 
+    # R) 진단 덤프(2026-09-15): 프론트월 선택 + 세 엔티티의 필드명(값 없음) - 어댑터의 문서 가정 대조
+    print("\n[R] 진단(필드명만)...")
+    for k, v in (b.diagnostics() or {}).items():
+        print(f"    {k}: {v}")
     px = b.current_market_price(PROBE_CONTRACT)
     print(f"    {PROBE_CONTRACT} 현재가 {px}")
     if px is None:
-        print("    ⚠ 시세 조회 실패 — Contract Library/Market Data 권한 또는 시세 구독 확인.")
-        print("      (B단계는 가격 없이 진행 불가, 여기서 중단)"); sys.exit(1)
+        print("    ⚠ 시세는 REST로 없음(MD 웹소켓 필요) - B단계(지정가→취소)는 건너뜀.")
+        if not args.fill:
+            print("    → 여기까지가 읽기 검증. 실체결 왕복은 --fill로."); sys.exit(0)
 
     # ── B) 지정가 → 즉시 취소 (체결 위험 0) ──────────────────────────────
     far = round(px * 0.95 / 0.1) * 0.1          # 5% 아래, MGC 틱(0.1) 정렬

@@ -3135,6 +3135,17 @@ class App:
                 pass
             except Exception:
                 pass
+            # Tradovate 데모 검증(2026-09-15): 어댑터가 문서로만 알던 엔티티 필드명(fillPair·fill·
+            # cashBalanceLog)과 프론트월 선택을 로그로 확인한다. 값·키·토큰은 안 찍는다.
+            if self._broker_name == "tradovate":
+                try:
+                    _dg = b.diagnostics() or {}
+                    self.log("   🔎 Tradovate 진단(값 없음, 필드명만):" if self.lang == "ko"
+                             else "   🔎 Tradovate diagnostics (field names only):")
+                    for _k, _v in _dg.items():
+                        self.log(f"      {_k}: {_v}")
+                except Exception as _e:
+                    self.log(f"   🔎 진단 실패: {_e}")
             self.log("🔓 " + self.t("conn_ok"))
             self.root.after(0, self._refresh_live_panel)
         self._run(w)
@@ -6101,7 +6112,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.14a"
+    _APP_VER = "2026.09.15a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6820,7 +6831,8 @@ class App:
             elif res.get("stop_error"):
                 self._handle_stop_failure(b, _aid, _con, direction, _qty, stop, res)
             elif stop is not None:
-                self.log(f"   ⚠ {_sym} 손절 거치 확인 안 됨 — 브로커 화면에서 스탑 존재를 "
+                _why = f" [{res.get('stop_unconfirmed')}]" if res.get("stop_unconfirmed") else ""
+                self.log(f"   ⚠ {_sym} 손절 거치 확인 안 됨{_why} — 브로커 화면에서 스탑 존재를 "
                          "확인하십시오(다음 상태 push에서 재확인됩니다).")
             _ok += 1
         if live and _ok:

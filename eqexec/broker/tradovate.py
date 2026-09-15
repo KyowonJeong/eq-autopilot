@@ -16,10 +16,12 @@ Tradovate REST 요점:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import time
 
 import requests
 
+from . import futures_cal as _cal
 from .base import BrokerAdapter, FlattenResult, Position
 
 _TIMEOUT = (10, 30)          # (connect, read) seconds — never hang forever
@@ -30,8 +32,9 @@ _RENEW_MARGIN = 5 * 60       # re-auth this many seconds before expiry
 _TICK_FALLBACK = {"MNQ": 0.25, "NQ": 0.25, "MES": 0.25, "ES": 0.25,
                   "MGC": 0.1, "GC": 0.1, "MYM": 1.0, "M2K": 0.1}
 
-# 월물 코드(분기물 기준). MNQ/MES/NQ/ES = 분기(H,M,U,Z). MGC/GC = 짝수월(G,J,M,Q,V,Z).
-_MONTH_CODES = "FGHJKMNQUVXZ"          # 1~12월
+# 월물 코드·활성월·롤 창은 futures_cal이 정본(2026-09-15: 종전 '가장 가까운 월물'이 금 시리얼월까지
+# 집어 정본 손절가(12월물 계열)와 basis가 어긋나는 함정 - IBKR 9/14 감사와 같은 축).
+_MONTH_CODES = _cal.MONTH_CODES
 
 
 def _act(side) -> str:
@@ -58,6 +61,7 @@ class TradovateBroker(BrokerAdapter):
         self._contract_cache: dict[int, str] = {}     # id -> name
         self._contract_ids: dict[str, int] = {}       # name -> id
         self._acct_cache: list[dict] | None = None
+        self._last_renew_error: str = ""             # 갱신 실패 사유(진단용, 비밀 아님)
 
     # ── auth ──────────────────────────────────────────────────────────────
     def authenticate(self) -> None:
@@ -89,15 +93,17 @@ class TradovateBroker(BrokerAdapter):
         if not self._token:
             return False
         try:
-            r = requests.get(f"{self.base}/auth/renewAccessToken",
+            # 공식 레퍼런스 경로는 소문자(/auth/renewaccesstoken) - 다른 엔드포인트와 같은 표기.
+            r = requests.get(f"{self.base}/auth/renewaccesstoken",
                              headers=self._headers(), timeout=_TIMEOUT)
             r.raise_for_status()
             tok = (r.json() or {}).get("accessToken")
             if tok:
                 self._token, self._token_at = tok, time.time()
                 return True
-        except Exception:
-            pass
+            self._last_renew_error = f"no accessToken in renew response: {str(r.text)[:120]}"
+        except Exception as e:
+            self._last_renew_error = str(e)[:200]      # 삼키되 사유는 남긴다(진단 출력)
         return False
 
     def _ensure_token(self) -> None:
@@ -147,46 +153,65 @@ class TradovateBroker(BrokerAdapter):
     def closed_fills(self, start_ms: int) -> list[dict]:
         """실현손익 체결 목록(트랙레코드 푸시용). ProjectX·NT8 어댑터와 같은 계약.
 
-        Tradovate는 /fill/list(체결)와 /order/list(주문)를 주지만 반턴별 실현손익은
-        **cashBalance 로그**가 아니라 fillPair(진입·청산 짝)에 있다. 여기서는
-        /fillPair/list로 짝지어진 것만 취해 청산 시각·손익을 만든다.
+        Tradovate 엔티티(공식 REST 레퍼런스 기준, 2026-09-15 대조 - ⚠️데모 실검증 전):
+          FillPair       {id, positionId, buyFillId, sellFillId, qty, buyPrice, sellPrice, active, archived}
+          Fill           {id, orderId, contractId, timestamp, tradeDate, action, qty, price, active, finallyPaired}
+          CashBalanceLog {id, accountId, timestamp, tradeDate, currencyId, amount, realizedPnL,
+                          cashChangeType, fillPairId, fillId, ...}  - TradePaired 행이 짝별 실현손익
+        종전 코드는 FillPair에 accountId·realizedPnl·timestamp가 있다고 가정해 존재하지 않는 필드에서
+        continue → **항상 빈 목록**('체결 0건'으로 성공처럼 보임). 이제 셋을 조인한다:
+        짝(FillPair) → 두 체결(Fill: 계약·시각) → 현금로그(CashBalanceLog: 계좌·손익).
+        청산 시각 = 두 체결 중 나중 것, 방향 = 나중 체결이 매도면 롱. 수수료는 같은 체결의
+        Commission/Fee 행(fillId 일치)을 빼서 ProjectX(순손익)와 같은 기준으로 맞춘다 - 행 유형명이
+        문서와 다르면 0(총손익)으로 남고 data 필드 'fees'가 0이라 대조 시 드러난다.
 
-        ⚠️ 실키 미검증(#36) - 계좌 개설 후 첫 동기화에서 형식 대조 필요. 실패 시 예외를
-        올리면 호출측이 '체결 조회 실패'로 로그하고 그 브로커만 건너뛴다(다른 브로커 무영향).
+        실패는 삼키지 않는다 - 예외가 호출측까지 올라가 '체결 조회 실패'로 찍힌다(빈 목록과 구분).
+        필드명이 문서와 다르면 KeyError가 그대로 올라온다(조용한 0건 금지).
         """
         from datetime import datetime, timezone
+
+        def _ms(ts) -> int:
+            return int(datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                       .astimezone(timezone.utc).timestamp() * 1000)
+
+        want = {int(a["id"]): str(a.get("name") or "") for a in self._accounts()}
+        fills = {int(f["id"]): f for f in (self._get("/fill/list") or [])}
+        pairs = self._get("/fillPair/list") or []
+        logs = self._get("/cashBalanceLog/list") or []
+        pnl_by_pair: dict[int, dict] = {}
+        fee_by_fill: dict[int, float] = {}
+        for lg in logs:
+            kind = str(lg.get("cashChangeType") or "")
+            if lg.get("fillPairId") and kind == "TradePaired":
+                pnl_by_pair[int(lg["fillPairId"])] = lg
+            elif lg.get("fillId") and ("commission" in kind.lower() or "fee" in kind.lower()):
+                fee_by_fill[int(lg["fillId"])] = fee_by_fill.get(int(lg["fillId"]), 0.0) \
+                    + abs(float(lg.get("amount") or 0.0))
         out = []
-        for a in self._accounts():
-            try:
-                pairs = self._get("/fillPair/list") or []
-            except Exception:
+        for fp in pairs:
+            lg = pnl_by_pair.get(int(fp.get("id") or 0))
+            bf = fills.get(int(fp.get("buyFillId") or 0))
+            sf = fills.get(int(fp.get("sellFillId") or 0))
+            if not (lg and bf and sf):
+                continue                                  # 아직 안 닫힌 짝 / 현금로그 미도착
+            acct = int(lg.get("accountId") or 0)
+            if acct not in want:
                 continue
-            for fp in pairs:
-                try:
-                    if int(fp.get("accountId") or 0) != int(a.get("id") or -1):
-                        continue
-                    pnl = fp.get("realizedPnl")
-                    if pnl is None:
-                        continue                       # 아직 안 닫힌 짝
-                    ts = str(fp.get("timestamp") or fp.get("bought") or "")
-                    ts_ms = int(datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                                .astimezone(timezone.utc).timestamp() * 1000)
-                    if ts_ms < int(start_ms):
-                        continue
-                    _qty = int(fp.get("qty") or 0)
-                    out.append({
-                        "tid": str(fp.get("id") or ""),
-                        "ts_ms": ts_ms,
-                        "symbol": self._contract_symbol(fp.get("contractId")),
-                        "pnl": float(pnl),
-                        # active side가 buy면 롱을 청산한 것이 아니라 롱을 연 짝이다 →
-                        # fillPair는 진입 방향을 그대로 준다(buy=LONG).
-                        "direction": "LONG" if _qty > 0 else "SHORT",
-                        "acct": str(a.get("id") or ""),
-                        "acct_name": str(a.get("name") or ""),
-                    })
-                except (TypeError, ValueError):
-                    continue
+            close_f = sf if _ms(sf["timestamp"]) >= _ms(bf["timestamp"]) else bf
+            ts_ms = _ms(close_f["timestamp"])
+            if ts_ms < int(start_ms):
+                continue
+            fees = fee_by_fill.get(int(bf["id"]), 0.0) + fee_by_fill.get(int(sf["id"]), 0.0)
+            out.append({
+                "tid": str(fp["id"]),
+                "ts_ms": ts_ms,
+                "symbol": self._contract_symbol(close_f.get("contractId")),
+                "pnl": float(lg.get("realizedPnL") or 0.0) - fees,
+                "fees": fees,
+                "direction": "LONG" if close_f is sf else "SHORT",    # 매도로 닫음 = 롱
+                "acct": str(acct),
+                "acct_name": want[acct],
+            })
         return out
 
     def account_balance(self, acct):
@@ -218,18 +243,32 @@ class TradovateBroker(BrokerAdapter):
         return sym
 
     def search_contracts(self, text: str, live: bool = False) -> list[dict]:
-        """심볼 루트(예: 'MNQ')로 활성(프론트월) 계약 후보를 찾는다 — ProjectX와 동일 계약:
-        [{id, name, activeContract}] 반환, eqgui._resolve_contract가 첫 활성을 쓴다.
-        GET /contract/suggest?t=MNQ&l=10 → 이름 규칙(루트+월코드+연도)으로 만기 정렬,
-        가장 가까운 미래 월물을 activeContract=True로 표시. VERIFY: suggest 응답 데모 확인."""
+        """심볼 루트(예: 'MNQ')로 활성(프론트월) 계약 후보를 찾는다 - ProjectX·IBKR과 동일 계약:
+        [{id, name, contractId, activeContract}] 반환, eqgui._resolve_contract가 첫 활성을 쓴다.
+
+        **id는 계약명 문자열**(ibkr.py와 동일, 2026-09-15). eqgui가 이 id를 place_entry/position_qty/
+        close_contract에 그대로 넘기고 list_open_positions().symbol과 집합으로 대조하므로(_run_futures_entry)
+        둘이 같은 문자열이어야 한다. 종전엔 id=int·symbol=str라 잔여 포지션을 '다른 심볼'로 오판해 그 위에
+        새 진입을 얹고, 손절 청산 감지(_check_stop_closed)가 살아 있는 포지션을 '사라짐'으로 보고했다.
+        Tradovate 숫자 contractId는 'contractId'로 같이 준다(캐시·flatten용).
+
+        프론트월 = futures_cal(활성월 표 + 롤 창): 지수 분기물·만기 8일 전, 금속 짝수월(10월 제외)·
+        계약월 시작 5일 전. 규칙 모르는 루트는 거르지 않는다(종전 '가장 가까운 월물').
+        GET /contract/suggest?t=MNQ&l=50 → 이름 규칙(루트+월코드+연도)으로 만기 정렬.
+        suggest가 프론트월을 안 주면(목록 상한) 달력이 말하는 이름을 /contract/find로 직접 조회.
+        VERIFY: suggest·find 응답 데모 확인."""
         root = str(text).upper().strip()
+        now = time.gmtime()
+        today = _dt.date(now.tm_year, now.tm_mon, now.tm_mday)
+        cur_key = (now.tm_year % 100) * 12 + (now.tm_mon - 1)
+        active = _cal.active_months(root)                 # "" = 규칙 모르는 루트 → 거르지 않음
+        fm = _cal.front_month(root, today)                # (연, 월) | None
+        fm_key = ((fm[0] % 100) * 12 + (fm[1] - 1)) if fm else None
         try:
-            items = self._get("/contract/suggest", t=root, l=20) or []
+            items = self._get("/contract/suggest", t=root, l=50) or []
         except Exception:
             items = []
         cands = []
-        now = time.gmtime()
-        cur_key = (now.tm_year % 100) * 12 + (now.tm_mon - 1)
         for it in items:
             name = str(it.get("name", ""))
             # 루트 정확 일치 + 월코드+한두자리 연도 (예: MNQZ5, MNQZ25)
@@ -238,6 +277,8 @@ class TradovateBroker(BrokerAdapter):
             tail = name[len(root):]
             if not tail or tail[0] not in _MONTH_CODES or not tail[1:].isdigit():
                 continue
+            if active and tail[0] not in active:
+                continue                                   # 시리얼(비활성) 월물 제외
             mon = _MONTH_CODES.index(tail[0])              # 0~11
             yr = int(tail[1:]) % 100
             if len(tail[1:]) == 1:                         # 한 자리 연도 → 현재 십년대 해석
@@ -252,14 +293,24 @@ class TradovateBroker(BrokerAdapter):
             key = yr * 12 + mon
             if key < cur_key or key - cur_key > 18:        # 만기 지남·18개월 초과 원월물 제외
                 continue
-            cands.append({"id": it.get("id"), "name": name, "activeContract": False,
-                          "_key": key})
+            if fm_key is not None and key < fm_key:
+                continue                                   # 롤 창 안(만기 8일/계약월 5일 전) → 다음 활성월
+            cands.append({"id": name, "name": name, "contractId": it.get("id"),
+                          "activeContract": False, "_key": key})
         cands.sort(key=lambda c: c["_key"])
+        if not cands and fm is not None:
+            # suggest가 프론트월을 안 줬다(목록 상한·검색 누락) → 달력이 말하는 이름을 직접 조회
+            exp = f"{root}{_cal.month_code(fm[1])}{fm[0] % 10}"
+            cid = self._resolve_id(exp)
+            if cid is not None:
+                cands.append({"id": exp, "name": exp, "contractId": cid, "activeContract": False,
+                              "_key": (fm[0] % 100) * 12 + (fm[1] - 1)})
         if cands:
-            cands[0]["activeContract"] = True              # 가장 가까운 미래 월물 = 프론트
+            cands[0]["activeContract"] = True              # 달력 프론트월(규칙 없는 루트=가장 가까운 월물)
             for c in cands:
-                self._contract_cache[int(c["id"])] = c["name"]
-                self._contract_ids[c["name"]] = int(c["id"])
+                if c.get("contractId") is not None:
+                    self._contract_cache[int(c["contractId"])] = c["name"]
+                    self._contract_ids[c["name"]] = int(c["contractId"])
         return cands
 
     def _resolve_id(self, contract) -> int | None:
@@ -309,7 +360,7 @@ class TradovateBroker(BrokerAdapter):
                 account_name=accts[acct_id],
                 symbol=self._contract_symbol(p.get("contractId")),
                 net_qty=net,
-                raw=p,
+                raw={**p, "_accountId": acct_id},        # projectx/ibkr와 같은 키(eqgui 잔여 청산)
             ))
         return out
 
@@ -359,8 +410,15 @@ class TradovateBroker(BrokerAdapter):
             return {"dry_run": True, "would_place": body, "would_place_stop": bracket}
         if bracket is not None:
             resp = self._post("/order/placeoso", {**body, "bracket1": bracket})
-            return {"entry": resp, "stop": {"oso": resp.get("oso1Id") or resp},
-                    "stop_price": sl_px}
+            oso = resp.get("oso1Id") if isinstance(resp, dict) else None
+            if oso:
+                return {"entry": resp, "stop": {"oso": oso}, "stop_price": sl_px}
+            # 응답에 브래킷 id가 없다 = 미검증 모양. 종전엔 응답 전체를 stop에 넣어 항상 '🛡 거치'로
+            # 찍혔다. placeoso는 원자적(브래킷 없이는 진입도 없음)이라 스탑이 있을 가능성이 높으니
+            # 두 번째 스탑을 자동으로 얹지 않고(스탑 둘 = 첫 스탑 체결 후 남은 스탑이 역포지션을
+            # 연다) '확인 안 됨' 경고 경로로 보낸다 - stop·stop_error 둘 다 없이 돌려준다.
+            return {"entry": resp, "stop_price": sl_px,
+                    "stop_unconfirmed": f"placeoso returned no oso1Id: {str(resp)[:160]}"}
         return {"entry": self._post("/order/placeorder", body)}
 
     def place_protective_stop(self, account_id, contract, entry_side, size: int,
@@ -444,3 +502,29 @@ class TradovateBroker(BrokerAdapter):
         self.authenticate()
         self._accounts()
         return True
+
+    def diagnostics(self) -> dict:
+        """연결 테스트가 로그에 찍는 비밀 없는 사실(2026-09-15, 데모 검증용). 계좌 이름·프론트월
+        후보·세 엔티티의 필드명만 - 값·키·토큰은 절대 안 담는다. 실패한 항목은 사유 문자열."""
+        d: dict = {}
+        try:
+            d["accounts"] = [str(a.get("name") or a.get("id")) for a in self._accounts()]
+        except Exception as e:
+            d["accounts"] = f"ERR {str(e)[:80]}"
+        for root in ("MGC", "MNQ"):
+            try:
+                cs = self.search_contracts(root)
+                d[f"front_{root}"] = [c["name"] + ("*" if c.get("activeContract") else "")
+                                      for c in cs[:4]]
+            except Exception as e:
+                d[f"front_{root}"] = f"ERR {str(e)[:80]}"
+        for path in ("/fillPair/list", "/fill/list", "/cashBalanceLog/list", "/position/list"):
+            try:
+                rows = self._get(path) or []
+                d[path] = {"n": len(rows),
+                           "keys": sorted(rows[0].keys())[:20] if rows and isinstance(rows[0], dict) else []}
+            except Exception as e:
+                d[path] = f"ERR {str(e)[:80]}"
+        if self._last_renew_error:
+            d["renew_error"] = self._last_renew_error
+        return d
