@@ -1145,6 +1145,11 @@ class App:
         self.frm = None
         self._auto_on = False
         self._sig_on = False
+        # Operator 등급 신호 확인(watch-only) - 자동 진입 권한(autoentry) 없이도 방향·진입가·
+        # 손절가는 실시간으로 보되, 수량/계약수는 계산도 표시도 하지 않고 주문도 내지 않는다
+        # (대표 2026-09-15 "Operator 등급에 앱 실시간 피드 줘" 뒤 "계약수 숨겨" - 8/10 "수량까지
+        # 주면 Operator가 사실상 반자동이 된다" 결정과의 절충: 방향은 주되 사이징은 Autopilot만).
+        self._watch_only = False
         # 계좌별 무장 상태(대표 2026-07-24 자산별 계좌): 자동청산/자동진입은 (자산,계좌idx)마다
         # 독립. 탭 전환은 보기 전환일 뿐 무장을 안 바꾼다. _*_on은 '루프 살아있음' 플래그.
         self._auto_accts = {}   # {(asset,idx): [job,...]}  자동청산
@@ -1872,12 +1877,20 @@ class App:
         perm_use = bool(g.get("ok") and g.get("enabled") and caps.get("use"))
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
         _tripped = []
-        if getattr(self, "_sig_on", False) and not perm_auto:
+        if getattr(self, "_sig_on", False) and not (perm_auto or perm_use):
             self._sig_on = False
             self._sig_accts.clear()
             self._set_sig_ind(False)
-            self.log("⏹ 자동 진입 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
-            _tripped.append("자동 진입")
+            self.log("⏹ 신호 확인 권한 상실 → 신호 대기 자동 중지 (fail-closed).")
+            _tripped.append("신호 확인")
+        elif getattr(self, "_sig_on", False) and not perm_auto and not getattr(self, "_watch_only", False):
+            # Autopilot→Operator 강등: 자동 발주만 멈추고 계좌 목록·연결은 유지, 확인 모드로 전환
+            # (완전 해제하면 Operator가 다시 켜야 하는데, 이 등급은 수동으로 켤 수 있는 상태다).
+            # ⚠️_tripped에는 안 넣는다 - 그건 15분 반복 알림(_notify_disarmed)을 켜는데, 이 상태는
+            # '고장'이 아니라 등급대로 계속 도는 정상 상태다. autoentry 없는 한 영원히 안 풀려
+            # Operator가 계속 반복 팝업에 시달린다(2026-08-07 리마인드 로직의 함정).
+            self._watch_only = True
+            self.log("⏹ 자동 진입 권한 상실 → 이제부터는 신호 확인만 합니다(수량 비공개, 자동 발주 없음).")
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self._auto_accts.clear()
@@ -3955,6 +3968,8 @@ class App:
         _ctx = getattr(self, "_live_ctx", None) or {}
         live = bool(_ctx.get("live"))
         perm_auto = bool(_ctx.get("perm_auto"))
+        perm_use = bool(_ctx.get("perm_use"))
+        self._watch_only = bool(perm_use and not perm_auto)
         # 프리플라이트(라이브 시작과 동일 기준): 켜진 계좌·키·브로커 허용·계좌ID
         bad = []
         for a in assets:
@@ -4042,7 +4057,7 @@ class App:
                 for a in assets:
                     for idx, ac in enumerate(self._accts_of(a)):
                         if ac.get("on"):
-                            self._master_arm(a, idx, live, arm_sig=perm_auto)
+                            self._master_arm(a, idx, live, arm_sig=(perm_auto or perm_use))
                             _n += 1
                 self.log(f"🚀 {'·'.join(assets)} 무장 — {_n}개 계좌 (LIVE)")
                 self._refresh_live_panel()
@@ -4528,7 +4543,7 @@ class App:
         live = True
         # 가동 조건을 기억한다(대표 2026-08-28 "금 설정했어"): 라이브 도중 실행 자산을
         # 체크하면 그때 같은 조건(신호대기 권한)으로 무장해야 한다.
-        self._live_ctx = {"live": bool(live), "perm_auto": bool(perm_auto)}
+        self._live_ctx = {"live": bool(live), "perm_auto": bool(perm_auto), "perm_use": bool(perm_use)}
         self._live_session = True
         self.b_live_start.config(state="disabled")
         _alabels = "·".join(incl)
@@ -4590,15 +4605,20 @@ class App:
                                   "while NT8 is off."))
                     messagebox.showerror(self.t("sec_live"), _msg)
                     self._refresh_live_panel(); return
+                # Operator(자동진입 없음)도 신호 확인만은 켠다 - 수량은 만들지도 보이지도 않는다.
+                self._watch_only = bool(perm_use and not perm_auto)
                 narmed = 0
                 for a in incl:
                     for idx, ac in enumerate(self._accts_of(a)):
                         if ac.get("on"):
-                            self._master_arm(a, idx, live, arm_sig=perm_auto)
+                            self._master_arm(a, idx, live, arm_sig=(perm_auto or perm_use))
                             narmed += 1
-                _what = ("자동 청산" + (" + 신호 대기" if perm_auto else " (신호 대기는 Autopilot 등급)")
+                _what = ("자동 청산" + (" + 신호 자동 진입" if perm_auto else
+                                     " + 신호 확인 (수량 비공개, 자동 발주 없음 - Autopilot 등급만 자동 진입)")
                          if self.lang == "ko" else
-                         "auto-close" + (" + signal watch" if perm_auto else ""))
+                         "auto-close" + (" + auto-entry on signal" if perm_auto else
+                                        " + signal watch (no quantity shown, no auto orders - "
+                                        "auto-entry is Autopilot tier only)"))
                 try:
                     self._alive_ping(armed=True, force=True)   # 홈피 즉시 반영(이중 안전)
                 except Exception:
@@ -6163,7 +6183,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.15d"
+    _APP_VER = "2026.09.15e"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7640,6 +7660,25 @@ class App:
             self.log(f"   ⚠ [{lbl}] 잔고 조회 실패({str(e)[:80]}) — 펀디드 1R=${rs:g} 그대로")
             return rs
 
+    def _watch_ticket(self, sig, asset, direction, stop):
+        """Operator 등급 신호 확인 카드 - 방향·진입가·손절가만, 수량/계약수는 계산도 표시도 하지
+        않는다(대표 2026-09-15 "Operator 등급에 앱 실시간 피드 줘" 뒤 "계약수 숨겨" - 2026-08-10
+        "Operator에게 수량까지 주면 사실상 반자동이 돼 Autopilot 가치가 얇아진다" 결정과의 절충).
+        주문은 내지 않는다 - 자동 진입은 Autopilot 등급 전용(perm_auto)."""
+        _ko = self.lang == "ko"
+        entry_ref = sig.get("entry_ref")
+        _bar = "─" * 34
+        self.log(f"\n👁 {_bar}")
+        self.log(f"👁 신호 확인 — {asset} {direction}  (Operator - 수량은 Autopilot 등급에서만)" if _ko
+                 else f"👁 Signal watch — {asset} {direction}  (Operator - quantity is Autopilot-tier only)")
+        self.log(f"     {'방향' if _ko else 'Side'} : {direction}")
+        self.log(f"     {'진입 참조' if _ko else 'Entry'} : {entry_ref}")
+        self.log(f"     {'손절가' if _ko else 'Stop'}  : {stop}")
+        self.log(("     → 직접 실행하세요. 수량은 본인 계좌 사이징으로 계산해 넣습니다(자동 발주 없음)."
+                  if _ko else
+                  "     → Place it yourself; size it from your own account (no auto orders)."))
+        self.log(f"👁 {_bar}")
+
     def _manual_ticket(self, cfg, sig, asset, direction, stop, mult):
         """수동 모드 계좌 — 발주 없이 '실행 티켓'만 표시(대표 2026-07-27). 사용자가 이 숫자를
         보고 본인 브로커 화면에 직접 진입한다(예: 프롭 평가·Sim Funded 단계처럼 API 없는 계좌).
@@ -7960,12 +7999,20 @@ class App:
                 # 수동 계좌(manual)는 자동 발주 대상이 아니라 '티켓만' 표시(진입은 사용자가 직접).
                 _fire = []
                 _manual = []
+                _watching = bool(getattr(self, "_watch_only", False))
                 for _key, _cfg in targets:
                     if _sig_day is not None and entered_day.get((_key, _dedup_key)) == _sig_day:
                         self.log(f"   ⏹ [{_cfg.get('label')}] {_asset} 오늘({_sig_day}) 이미 진입 — 재진입 금지.")
                         continue
                     entered_day[(_key, _dedup_key)] = _sig_day   # 성공/실패 무관 — 같은 날 재진입 금지
+                    if _watching:
+                        continue                                  # 아래에서 계좌 단위가 아니라 한 번만 확인 카드
                     (_manual if _cfg.get("manual") else _fire).append(_cfg)
+                if _watching:
+                    # Operator 등급 확인 카드 - 계좌별이 아니라 자산당 한 번(수량은 계좌마다 갈릴 값이라
+                    # 애초에 계산하지 않으므로 계좌별로 반복해 보일 이유가 없다).
+                    self._watch_ticket(sig, _asset, direction, stop)
+                    _t.sleep(SIG_POLL_SECS); continue
                 if _manual:                                       # 수동 티켓(발주 없음)
                     for _cfg in _manual:
                         self._manual_ticket(_cfg, sig, _asset, direction, stop, _mult)
