@@ -246,7 +246,10 @@ def _feed_url(token):
 
 
 # 브로커별 연결 필드 스펙. f1/f2(secret)/f3 라벨(None=숨김), acct=계좌목록, futures=진입/신호 지원.
-_BROKERS = ["projectx", "tradovate", "ibkr", "bybit", "bitget"]
+# Tradovate REST 항목은 선택지에서 뺀다(대표 2026-09-15 "tradovate 브로커는 지워야지 - 둘 다 NinjaTrader"):
+# 새 NinjaTrader 계좌엔 API Access 메뉴가 없고, 자기자본도 Lucid처럼 NT8 브리지로 간다. 어댑터 코드와
+# 저장된 옛 설정은 그대로 두되(라벨 dict 유지) 새로 고를 수는 없다.
+_BROKERS = ["projectx", "ibkr", "bybit", "bitget"]
 
 # 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
@@ -254,8 +257,8 @@ _BROKERS = ["projectx", "tradovate", "ibkr", "bybit", "bitget"]
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
 _CONSENT_VER = "golive-4item-2026-08"
 _ASSETS = ["NQ", "GC", "BTC"]
-_ASSET_BROKERS = {"NQ": ["projectx", "nt8", "tradovate", "ibkr"],
-                  "GC": ["projectx", "nt8", "tradovate", "ibkr"],
+_ASSET_BROKERS = {"NQ": ["projectx", "nt8", "ibkr"],
+                  "GC": ["projectx", "nt8", "ibkr"],
                   "BTC": ["bybit", "bitget"]}
 _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "GC": {"ko": "금 (GC)", "en": "Gold (GC)"},
@@ -288,7 +291,7 @@ _BROKER_SPEC = {
     # 라벨(2026-09-15 대표 "api 쓰지 말고 이 경로"): 브리지는 NT8이 붙는 계좌면 무엇이든 된다 - Lucid뿐
     # 아니라 자기자본 NinjaTrader 브로커리지(=Tradovate 기술) 계좌도. 새 NinjaTrader 계좌엔 REST API
     # 메뉴가 없어(지원 서면 9/15) 자기자본 선물의 Windows 경로는 이 브리지가 기본이다.
-    "nt8":         {"label": "NinjaTrader 8 (Lucid, NinjaTrader)", "f1": "Bridge Token", "f2": None,
+    "nt8":         {"label": "NinjaTrader (Lucid, own account)", "f1": "Bridge Token", "f2": None,
                     "f3": "Bridge Port (8377)", "acct": True, "futures": True,
                     "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
@@ -1347,9 +1350,9 @@ class App:
                                           else "Install/Update NT8 bridge"),
                        command=self._nt8_install_bridge).pack(side="left")
             ttk.Label(_bridge_row,
-                      text=("NinjaTrader 8용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
+                      text=("NinjaTrader용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
                             if self.lang == "ko" else
-                            "for NinjaTrader 8 (Lucid, NinjaTrader) - injects the saved token; restart NT8 after"),
+                            "for NinjaTrader - injects the saved token; restart NT8 after"),
                       foreground="#9ca3af").pack(side="left", padx=(8, 0))
 
         # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-24 자산별 계좌) ──────────
@@ -6115,7 +6118,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.15b"
+    _APP_VER = "2026.09.15c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
