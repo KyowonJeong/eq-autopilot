@@ -1347,7 +1347,7 @@ class App:
                                           else "Install/Update NT8 bridge"),
                        command=self._nt8_install_bridge).pack(side="left")
             ttk.Label(_bridge_row,
-                      text=("Lucid(NT8)용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
+                      text=("NinjaTrader 8용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
                             if self.lang == "ko" else
                             "for NinjaTrader 8 (Lucid, NinjaTrader) - injects the saved token; restart NT8 after"),
                       foreground="#9ca3af").pack(side="left", padx=(8, 0))
