@@ -2210,6 +2210,19 @@ class App:
                     _lbl2bk = {_broker_label(b): b for b in _ASSET_BROKERS.get(self._asset, [])}
                     _bv = _lbl2bk.get(str(w["broker"].get()).strip())
                     if _bv:
+                        # 브로커가 바뀌면 옛 브로커의 계좌 ID를 남기지 않는다(대표 2026-09-15):
+                        # 화면 잠금(_acct_edit_row)이 1차 방어, 여기는 2차 - 남은 ID로 조용히
+                        # 연결 안 된 행이 되는 대신 '계좌 선택'으로 되돌리고 알린다.
+                        _prev = self._acct_broker(self._asset, accts[idx])
+                        if _prev != _bv and (accts[idx].get("id") or "").strip():
+                            accts[idx]["id"] = ""
+                            _icb0 = w.get("acct_id")
+                            if _icb0 is not None:
+                                try:
+                                    _icb0.set("계좌 선택" if self.lang == "ko" else "pick")
+                                except Exception:
+                                    pass
+                            self._bk_switch_warn = True
                         accts[idx]["broker"] = _bv
             except Exception:
                 pass
@@ -2222,6 +2235,18 @@ class App:
                         accts[idx]["id"] = _v
                         if not (accts[idx].get("label") or "").strip():
                             accts[idx]["label"] = _v[-4:]
+            except Exception:
+                pass
+        if getattr(self, "_bk_switch_warn", False):
+            self._bk_switch_warn = False
+            try:
+                messagebox.showwarning(
+                    "EQ Autopilot",
+                    ("브로커를 바꿔서 이 행의 계좌 선택을 비웠습니다 - 새 브로커의 가용 목록에서 "
+                     "계좌를 다시 골라 주세요. 고르기 전에는 이 행으로 주문이 나가지 않습니다."
+                     if self.lang == "ko" else
+                     "The broker changed, so this row's account was cleared - pick an account "
+                     "from the new broker's list. No orders go out on this row until you do."))
             except Exception:
                 pass
         # 같은 계좌 중복 등록 가드(대표 2026-08-18 "같은 계좌가 계속 추가됨" - Lucid 실사고):
@@ -3773,6 +3798,11 @@ class App:
             bk_cb.pack(side="left", padx=(0, 4))
             bk_cb.bind("<<ComboboxSelected>>",
                        lambda e: (self._save_acct_widgets(), self._build()))
+            # 계좌까지 고른 행은 브로커를 잠근다(대표 2026-09-15 "브로커를 실수로 바꾸면 에러 안 떠.
+            # 나도 모르게 연결 안 되어 있어"): 계좌 ID는 그 브로커의 것이라 브로커만 바뀌면 행이
+            # 조용히 죽은 계좌가 된다. 브로커를 바꾸려면 행을 삭제하고 새로 추가한다.
+            if (acct.get("id") or "").strip():
+                bk_cb.config(state="disabled")
         else:
             bk_cb = None
         aid = (acct.get("id") or "").strip()
@@ -3813,8 +3843,16 @@ class App:
             id_cb = ttk.Combobox(row, values=list(self._avail_of(self._asset, _rbk)), width=13)
             id_cb.set(f"…{aid[-6:]}" if aid else ("계좌 선택" if self.lang == "ko" else "pick"))
             id_cb.pack(side="left", padx=(4, 0))
-            id_cb.bind("<<ComboboxSelected>>", lambda e: self._save_acct_widgets())
-            id_cb.bind("<FocusOut>", lambda e: self._save_acct_widgets())
+            # 계좌를 고르는 순간 브로커 콤보를 잠근다(재빌드 없이도) - 대표 2026-09-15.
+            def _pick(e=None, i=idx, _bk=bk_cb):
+                self._save_acct_widgets()
+                try:
+                    if _bk is not None and (self._accts_of(self._asset)[i].get("id") or "").strip():
+                        _bk.config(state="disabled")
+                except Exception:
+                    pass
+            id_cb.bind("<<ComboboxSelected>>", _pick)
+            id_cb.bind("<FocusOut>", _pick)
             self._acct_widgets[idx]["acct_id"] = id_cb
         if deletable:
             ttk.Button(row, text=("삭제" if self.lang == "ko" else "Remove"), width=6,
@@ -6125,7 +6163,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.15c"
+    _APP_VER = "2026.09.15d"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
