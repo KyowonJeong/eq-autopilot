@@ -1596,11 +1596,10 @@ class App:
         if spec.get("acct"):
             _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
             _av = self._avail_of(self._asset, self._broker_name)
-            _avtxt = ", ".join(_av) if _av else ("아직 없음" if self.lang == "ko" else "none yet")
-            self._avail_lbl = ttk.Label(
-                _avrow, text=(("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
-                              + _avtxt),
-                foreground="#555", wraplength=700, justify="left")
+            _avtxt, _avcol = self._avail_text_color(_av)
+            self._avail_lbl = tk.Label(
+                _avrow, text=_avtxt, foreground=_avcol, wraplength=700, justify="left", anchor="w",
+                font=("Helvetica", 11, "bold" if _av else "normal"))
             self._avail_lbl.pack(side="left")
             if self._broker_name == "projectx":
                 ttk.Label(_avrow, text=("(연결하면 자동으로 불러옵니다)" if self.lang == "ko"
@@ -2647,6 +2646,15 @@ class App:
         except Exception as _pe:
             return f"인터넷 프로브 실패({type(_pe).__name__})"
 
+    def _avail_text_color(self, av):
+        """가용 계좌 라벨의 (문구, 색). 있으면 초록 굵게 + 개수, 없으면 회색 '아직 없음'
+        (대표 2026-09-15 "가용 계좌를 좀 더 잘 보이게 초록색 등으로")."""
+        av = list(av or [])
+        if av:
+            head = (f"가용 계좌 {len(av)}개: " if self.lang == "ko" else f"Available accounts ({len(av)}): ")
+            return head + ", ".join(av), "#15803d"
+        return (("가용 계좌: 아직 없음" if self.lang == "ko" else "Available accounts: none yet"), "#555")
+
     def _fill_scope(self, names, asset=None, broker=None):
         """브로커의 신선한 계좌 목록 → 가용 계좌 **미러링(교체)** + UI 갱신.
         2026-08-18b(대표 "예전 계좌가 안 지워져"): append-only였던 avail을 브로커 목록
@@ -2675,9 +2683,8 @@ class App:
             if _a == self._asset and _b == self._broker_name:   # UI는 그 탭이 떠 있을 때만
                 _av = self._avail_of(self._asset, self._broker_name)
                 if _av and hasattr(self, "_avail_lbl"):
-                    self._avail_lbl.config(
-                        text=("가용 계좌: " if self.lang == "ko" else "Available accounts: ")
-                        + ", ".join(_av))
+                    _t, _c = self._avail_text_color(_av)
+                    self._avail_lbl.config(text=_t, foreground=_c, font=("Helvetica", 11, "bold"))
                 for _w in getattr(self, "_acct_widgets", {}).values():
                     _icb = _w.get("acct_id")
                     if _icb is not None:
