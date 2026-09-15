@@ -5438,7 +5438,7 @@ class App:
         if not messagebox.askyesno(
                 "EQ Autopilot",
                 ("NT8 브리지를 설치/업데이트합니다.\n\n"
-                 "여기 쓰이는 토큰은 Lucid(NT8) 연결용 Bridge Token입니다. 앱이 자동으로 "
+                 "여기 쓰이는 토큰은 NinjaTrader 8 연결용 Bridge Token입니다. 앱이 자동으로 "
                  "만들어 저장하고, 브리지 파일에도 같은 값을 넣습니다.\n"
                  "직접 정할 필요도, 기억할 필요도 없습니다.\n\n계속할까요?"
                  if ko else
