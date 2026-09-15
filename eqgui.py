@@ -291,7 +291,7 @@ _BROKER_SPEC = {
     # 라벨(2026-09-15 대표 "api 쓰지 말고 이 경로"): 브리지는 NT8이 붙는 계좌면 무엇이든 된다 - Lucid뿐
     # 아니라 자기자본 NinjaTrader 브로커리지(=Tradovate 기술) 계좌도. 새 NinjaTrader 계좌엔 REST API
     # 메뉴가 없어(지원 서면 9/15) 자기자본 선물의 Windows 경로는 이 브리지가 기본이다.
-    "nt8":         {"label": "NinjaTrader (Lucid, own account)", "f1": "Bridge Token", "f2": None,
+    "nt8":         {"label": "Lucid / Tradovate", "f1": "Bridge Token", "f2": None,
                     "f3": "Bridge Port (8377)", "acct": True, "futures": True,
                     "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
@@ -1350,9 +1350,9 @@ class App:
                                           else "Install/Update NT8 bridge"),
                        command=self._nt8_install_bridge).pack(side="left")
             ttk.Label(_bridge_row,
-                      text=("NinjaTrader용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
+                      text=("Lucid / Tradovate용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
                             if self.lang == "ko" else
-                            "for NinjaTrader - injects the saved token; restart NT8 after"),
+                            "for Lucid / Tradovate - injects the saved token; restart NT8 after"),
                       foreground="#9ca3af").pack(side="left", padx=(8, 0))
 
         # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-24 자산별 계좌) ──────────
