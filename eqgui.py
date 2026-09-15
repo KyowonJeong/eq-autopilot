@@ -285,7 +285,10 @@ _BROKER_SPEC = {
     # 라벨 단문화(대표 2026-09-04 윈도 실기기: 한글 섞인 긴 라벨이 고정폭 칸에서 잘림
     # "Bridge Token (앱-애." - Tk width 단위가 한글에서 2배라 맥과 달리 안 들어간다).
     # 공유·설치 안내는 아래 NT8 안내문과 브리지 설치 버튼이 이미 말한다.
-    "nt8":         {"label": "Lucid (NT8)", "f1": "Bridge Token", "f2": None,
+    # 라벨(2026-09-15 대표 "api 쓰지 말고 이 경로"): 브리지는 NT8이 붙는 계좌면 무엇이든 된다 - Lucid뿐
+    # 아니라 자기자본 NinjaTrader 브로커리지(=Tradovate 기술) 계좌도. 새 NinjaTrader 계좌엔 REST API
+    # 메뉴가 없어(지원 서면 9/15) 자기자본 선물의 Windows 경로는 이 브리지가 기본이다.
+    "nt8":         {"label": "NinjaTrader 8 (Lucid, NinjaTrader)", "f1": "Bridge Token", "f2": None,
                     "f3": "Bridge Port (8377)", "acct": True, "futures": True,
                     "f1_secret": True},
     # Tradovate = 자기자본 주력 브로커(대표 2026-07-27). f3 = "cid:sec[:demo]"
@@ -6112,7 +6115,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.15a"
+    _APP_VER = "2026.09.15b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
