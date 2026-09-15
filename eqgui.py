@@ -1349,7 +1349,7 @@ class App:
             ttk.Label(_bridge_row,
                       text=("Lucid(NT8)용 - 저장된 토큰 자동 주입, 설치 후 NT8 재시작"
                             if self.lang == "ko" else
-                            "for Lucid (NT8) - injects the saved token; restart NT8 after"),
+                            "for NinjaTrader 8 (Lucid, NinjaTrader) - injects the saved token; restart NT8 after"),
                       foreground="#9ca3af").pack(side="left", padx=(8, 0))
 
         # ── 라이브 패널 — 자산별 세팅 후 한방 실행(대표 2026-07-24 자산별 계좌) ──────────
@@ -5443,7 +5443,7 @@ class App:
                  "직접 정할 필요도, 기억할 필요도 없습니다.\n\n계속할까요?"
                  if ko else
                  "Install/update the NT8 bridge.\n\n"
-                 "The token used here is the Bridge Token for the Lucid (NT8) connection. "
+                 "The token used here is the Bridge Token for the NinjaTrader 8 connection. "
                  "The app creates and stores it automatically, and injects the same value "
                  "into the bridge file.\nNothing to type, nothing to remember.\n\nContinue?")):
             return
