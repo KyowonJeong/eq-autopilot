@@ -6199,7 +6199,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.16a"
+    _APP_VER = "2026.09.16b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -7213,7 +7213,13 @@ class App:
 
     def _asset_brokers(self):
         """자산→브로커명 매핑(대표 2026-09-03 로그 페이지 '브로커 상태'). 자격이 실제로
-        입력된 자산만. 브로커 키 이름뿐 - 자격 정보는 절대 보내지 않는다."""
+        입력된 자산만. 브로커 키 이름뿐 - 자격 정보는 절대 보내지 않는다.
+
+        ⚠️한 자산을 **여러 브로커에 나눠 건** 구성(가이드가 권장하는 Lucid+Tradovate 한 NT8)은
+        이 한 겹 딕셔너리로 표현되지 않아, 웹 '연결 자산' 칸이 브로커 하나만 말했다 - 어느
+        연결이 죽었는지 회원이 알 수 없었다(2026-09-16 R34 P2-#15). 값은 종전대로 대표 브로커
+        하나를 유지하고(구버전 서버·구버전 화면 호환), 전체 목록은 _asset_brokers_multi가
+        따로 싣는다."""
         out = {}
         try:
             for _a in _ASSETS:
@@ -7222,6 +7228,27 @@ class App:
                 _cr = ((_c.get("creds") or {}).get(_b) or {}) if _b else {}
                 if _b and any(str(v or "").strip() for v in _cr.values()):
                     out[_a] = str(_b)[:16]
+        except Exception:
+            return {}
+        return out
+
+    def _asset_brokers_multi(self):
+        """자산→브로커 **목록**(2026-09-16 R34 P2-#15). 계좌 행마다 브로커가 따로이므로
+        켜진 계좌들의 브로커를 모은다. 자격이 없는 브로커는 넣지 않는다(연결이 아니다).
+        브로커 키 이름뿐 - 자격 정보는 절대 보내지 않는다."""
+        out = {}
+        try:
+            for _a in _ASSETS:
+                _bs = []
+                for _ac in self._accts_of(_a):
+                    if not _ac.get("on"):
+                        continue
+                    _b = self._acct_broker(_a, _ac)
+                    _cr = self._creds_of(_a, _b) or {}
+                    if _b and any(str(v or "").strip() for v in _cr.values()) and _b not in _bs:
+                        _bs.append(str(_b)[:16])
+                if _bs:
+                    out[_a] = _bs[:4]
         except Exception:
             return {}
         return out
@@ -7291,6 +7318,7 @@ class App:
                                    "arm": self._armed_assets(),
                                    # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
                                    "bk": self._asset_brokers(),
+                                   "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
                                    "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
                                    "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
                                    # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
