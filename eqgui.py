@@ -1772,7 +1772,11 @@ class App:
                   foreground="#6b7280").pack(side="left")
         ttk.Button(_logrow, text=("로그 복사" if self.lang == "ko" else "Copy log"),
                    command=self._copy_log).pack(side="right")
-        ttk.Label(_logrow, text=f"v{self._APP_VER}", foreground="#6b7280").pack(
+        # 기기 ID 6자를 버전 옆에(2026-09-17 R37 P2-#41): 웹 기기 칸이 같은 6자로 기기를 구분하는데
+        # 앱 어디에도 표시가 없어 회원이 어느 칸이 이 기기인지 맞출 수 없었다. 설치별 난수라 개인정보 아님.
+        ttk.Label(_logrow,
+                  text=f"v{self._APP_VER}   {'기기' if self.lang == 'ko' else 'device'} {MACHINE_ID[:6]}",
+                  foreground="#6b7280").pack(
             side="right", padx=(0, 8))   # 지원 DM에 버전 필수(2026-08-11 UX 감사)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
         self.out.pack(fill="both", expand=True, pady=(0, 0))
@@ -2569,7 +2573,7 @@ class App:
         try:
             txt = self.out.get("1.0", "end").strip()
             self.root.clipboard_clear()
-            self.root.clipboard_append(f"[EQ Autopilot v{self._APP_VER}]\n" + txt[-8000:])
+            self.root.clipboard_append(f"[EQ Autopilot v{self._APP_VER} device {MACHINE_ID[:6]}]\n" + txt[-8000:])
             self.log("로그를 클립보드에 복사했습니다." if self.lang == "ko"
                      else "Log copied to clipboard.")
         except Exception:
@@ -6199,7 +6203,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.16b"
+    _APP_VER = "2026.09.17a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -6247,20 +6251,28 @@ class App:
         except Exception:
             return False
 
-    def _note_fill(self, asset, micro=0.0, coin=0.0):
+    def _note_fill(self, asset, micro=0.0, coin=0.0, acct=None):
         """진입 leg 하나가 체결될 때마다 자산별로 누적. 멀티 계좌, 멀티 leg를 합산해서
         보낸다(대표 "그건 합산해서 보여주기") - 계좌별로 보내면 서버가 계좌 단위 정보를
-        들고 있게 되고 카드도 길어진다."""
+        들고 있게 되고 카드도 길어진다.
+        계좌 수는 계좌 키 집합의 크기다(2026-09-17 R38 P1-#8): 종전 n은 leg마다 1씩 더해
+        미니+마이크로로 나눠 발주한 1계좌가 '체결 2계좌'로 보고됐고, 그러면 대시보드의 부분
+        미진입 경고(발주 계좌 > 체결 계좌)가 그 구성에서 영영 뜨지 않았다. leg 수는 따로 싣는다."""
         try:
             import threading as _th
             if not hasattr(self, "_fill_lock"):
                 self._fill_lock = _th.Lock()
                 self._fill_acc = {}
             with self._fill_lock:
-                _d = self._fill_acc.setdefault(str(asset), {"micro": 0.0, "coin": 0.0, "n": 0})
+                _d = self._fill_acc.setdefault(str(asset), {"micro": 0.0, "coin": 0.0, "n": 0,
+                                                            "legs": 0, "accts": set()})
                 _d["micro"] += float(micro or 0)
                 _d["coin"] += float(coin or 0)
-                _d["n"] += 1          # 계좌(leg) 수 - 예전엔 except 블록 안이라 늘 0이었다
+                _d["legs"] = int(_d.get("legs") or 0) + 1
+                if acct:
+                    _d.setdefault("accts", set()).add(str(acct))
+                # 계좌 키를 못 받은 호출(구 경로)만 leg 수로 센다 - 예전엔 except 블록 안이라 늘 0이었다
+                _d["n"] = len(_d.get("accts") or ()) or _d["legs"]
             if not hasattr(self, "_open_assets"):
                 self._open_assets = set()
             self._open_assets.add(str(asset))        # 청산 버튼 노출 근거(2026-08-11)
@@ -6318,8 +6330,11 @@ class App:
                             if str(sym_match) not in str(_p.symbol):
                                 continue
                             _raw = getattr(_p, "raw", {}) or {}
+                            # avg_price = NT8 브리지의 평단 키(2026-09-17 R38 P2-#36): 빠져 있어
+                            # NT8 체결은 갭 보고가 통째로 빠졌고, 혼합 구성에서 NT8이 첫 계좌면
+                            # 자산당 1회 키를 먼저 차지해 ProjectX 보고까지 막혔다.
                             for _k2 in ("avgPrice", "averagePrice", "entryPrice",
-                                        "avgEntryPrice", "buyAvgPrice"):
+                                        "avgEntryPrice", "buyAvgPrice", "avg_price"):
                                 try:
                                     _v = float(_raw.get(_k2) or 0)
                                 except Exception:
@@ -6338,7 +6353,9 @@ class App:
                 body = {"tok_id": tid, "id": str(_sid or ""), "inst": str(asset),
                         "direction": str(_dir).upper(), "entry_ref": float(_ref),
                         "fill_price": float(fill), "sent_ts": _sent_ts,
-                        "fill_ts": _t.time()}
+                        "fill_ts": _t.time(),
+                        # 기기와 브로커(R38 P2-#36) - 서버가 '기기별 첫 체결 계좌' 값의 출처를 안다
+                        "mid": MACHINE_ID, "broker": str(getattr(b, "name", "") or "")[:12]}
                 if mkt_at_send:
                     body["mkt_at_send"] = float(mkt_at_send)   # 협의 슬리피지(서버가 계산)
                 for _try in range(3):
@@ -6458,7 +6475,8 @@ class App:
                     if not _d:
                         return
                     body = {"tok_id": tid, "inst": str(asset), "mid": MACHINE_ID,
-                            "accounts": int(_d.get("n") or 0)}
+                            "accounts": int(_d.get("n") or 0),
+                            "legs": int(_d.get("legs") or 0)}     # 주문 건수(R38 P1-#8)
                     if str(asset) == "BTC":
                         body["qty_btc"] = round(float(_d.get("coin") or 0), 6)
                     else:
@@ -6896,7 +6914,8 @@ class App:
             res = _res_ok or {}
             # ── 확정 체결 보고 경로(위 확인 루프에서 포지션 실확인된 계좌만) ──
             # 대시보드 보고 누적(#53): 미니/마이크로 혼합 → 마이크로 환산(미니 1=마이크로 10).
-            self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10))
+            self._note_fill(asset, micro=float(_qty) * (1 if str(_sym).upper().startswith("M") else 10),
+                            acct=f"{getattr(b, 'name', '')}:{sc}")          # 계좌 단위 집계(R38 P1-#8)
             self._send_gap(asset, sig, b, _con,
                            mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
             self._remember_open(asset, b, _con)          # 손절 청산 감지용(2026-09-02)
@@ -7926,7 +7945,8 @@ class App:
                     _tot = "?"
                 self.log(f"   ⏱ [{lbl}] 체결 확인 {_fill.strftime('%H:%M:%S')}, 발송 후 {_tot}")
                 self._entered_at = _mark_entered(asset)
-                self._note_fill(asset, coin=float(size or 0))   # 대시보드 보고용(#53)
+                self._note_fill(asset, coin=float(size or 0),
+                                acct=f"{_broker}:{sc}")          # 대시보드 보고용(#53), 계좌 단위(R38 P1-#8)
                 self._send_gap(asset, sig, b, sym)               # 체결 갭 실측(2026-08-11)
                 self._remember_open(asset, b, sym)               # 손절 청산 감지용(2026-09-02)
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
