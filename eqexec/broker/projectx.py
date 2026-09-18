@@ -7,6 +7,7 @@ fully flattens. dry_run=True sends NO close calls.
 """
 from __future__ import annotations
 
+import threading as _thr
 import time
 
 import requests
@@ -16,6 +17,25 @@ from .base import BrokerAdapter, FlattenResult, Position
 _TIMEOUT = (10, 30)
 _TOKEN_TTL = 24 * 60 * 60       # ProjectX session token ~24h
 _RENEW_MARGIN = 60 * 60         # re-auth 1h before expiry
+
+# ── 자격증명 단위 토큰 캐시(2026-09-18 대표 "일곱 개 돌리니까 좀 차이가 나더라고") ──────────
+# 왜: 진입은 계좌마다 독립 스레드로 동시에 쏘는데(eqgui의 병렬 발주), 스레드마다 브로커 객체를
+# 새로 만들어 **각자 로그인**했다. 계좌 7개면 /api/Auth/loginKey 요청 7개가 같은 순간에 날아가고
+# 브로커가 그걸 줄 세우는 만큼 계좌 간 진입가가 벌어진다. 토큰은 자격증명 단위로 24시간 유효하니
+# 객체가 달라도 나눠 쓰면 된다 - 진입 순간에는 주문 한 번만 남는다.
+# 안전 규약 셋:
+#   ① 키는 (base, 사용자, API키) **완전 일치**만. 조금이라도 다르면 새로 로그인한다(다른 계좌
+#      토큰으로 주문이 나가는 것이 이 최적화의 유일한 치명적 실패라, 느슨하게 맞추지 않는다).
+#   ② 캐시는 (토큰, 발급시각) 튜플뿐 - 브로커 객체나 requests.Session은 공유하지 않는다.
+#   ③ 발급시각을 그대로 들고 오므로 기존 _ensure_token의 만료 가드(TTL-여유)가 그대로 작동한다.
+#      가짜 시각을 심지 않는다.
+_TOK_CACHE: dict = {}
+_TOK_LOCK = _thr.Lock()
+
+
+def _tok_key(cfg):
+    return (str(getattr(cfg, "base_url", "")).rstrip("/"),
+            str(getattr(cfg, "user_name", "")), str(getattr(cfg, "api_key", "")))
 _LONG = 1                       # position.type: 1=long, 2=short (docs don't state it; common ProjectX
                                 # convention). Only affects the displayed net sign — closeContract
                                 # flattens the whole position regardless. ⚠ 2026-08-18: no longer
@@ -64,10 +84,24 @@ class ProjectXBroker(BrokerAdapter):
             raise RuntimeError(f"ProjectX auth failed (errorCode={d.get('errorCode')}): "
                                f"{d.get('errorMessage') or d}")
         self._token, self._token_at = d["token"], time.time()
+        with _TOK_LOCK:                      # 같은 자격증명의 다른 스레드가 재로그인하지 않게
+            _TOK_CACHE[_tok_key(self.cfg)] = (self._token, self._token_at)
 
     def _ensure_token(self) -> None:
+        if self._token is None:
+            with _TOK_LOCK:                  # 다른 스레드/객체가 이미 받아 둔 토큰이 있으면 쓴다
+                _c = _TOK_CACHE.get(_tok_key(self.cfg))
+            if _c and (time.time() - _c[1]) <= (_TOKEN_TTL - _RENEW_MARGIN):
+                self._token, self._token_at = _c
+                return
         if self._token is None or (time.time() - self._token_at) > (_TOKEN_TTL - _RENEW_MARGIN):
             self.authenticate()
+
+    def _drop_token(self) -> None:
+        """무효 판정된 토큰을 나와 캐시에서 함께 버린다(다음 호출이 새로 받는다)."""
+        self._token = None
+        with _TOK_LOCK:
+            _TOK_CACHE.pop(_tok_key(self.cfg), None)
 
     def _post(self, path: str, body: dict):
         self._ensure_token()
@@ -75,6 +109,17 @@ class ProjectXBroker(BrokerAdapter):
                           headers={"Authorization": f"Bearer {self._token}",
                                    "Content-Type": "application/json"},
                           json=body, timeout=_TIMEOUT)
+        # 토큰이 무효면 한 번 다시 받아서 재시도한다(2026-09-18): 종전엔 주문 직전에 새로 로그인해
+        # 이 창이 거의 없었지만, 토큰을 나눠 쓰면 그 사이에 서버가 세션을 끊는 창이 생긴다. 그때
+        # 401을 그대로 raise하면 그 계좌는 **진입을 놓친다**. 재시도는 1회뿐이고, 실패하면 종전대로
+        # 예외를 올린다(조용한 성공 위장 금지).
+        if r.status_code in (401, 403):
+            self._drop_token()
+            self._ensure_token()
+            r = requests.post(f"{self.base}{path}",
+                              headers={"Authorization": f"Bearer {self._token}",
+                                       "Content-Type": "application/json"},
+                              json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         d = r.json()
         # ProjectX returns HTTP 200 even on logical failures — the response's success/errorCode
