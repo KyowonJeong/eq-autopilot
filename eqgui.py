@@ -6116,6 +6116,41 @@ class App:
         except Exception:
             pass
 
+    def _assets_with_open_position(self, assets) -> set:
+        """지금 포지션이 살아 있는 자산들. 트랙레코드 푸시 보류 판정용(2026-09-21).
+
+        왜: 수집기는 브로커의 **실현 손익**을 날짜·세션으로 묶는데, 포지션이 살아 있는
+        중에 부분 청산(수동 반익 등)이 나면 그 조각이 **그날의 완결된 거래**로 올라간다.
+        2026-09-21 실제로 그랬다 - BTC가 열려 있는데 달력에 +16.31R이 결론처럼 찍혔다
+        (대표 "아직 결론 안 났는데"). 트랙레코드는 '판단 하나가 얼마를 냈나'를 보여주는
+        자리라, 진행 중인 판단을 결론으로 인쇄하면 승률·평균R이 통째로 흔들린다.
+
+        판정 재료는 둘: ①브로커 실측(position_qty>0) ②그게 안 되면 _open_assets.
+        ⚠️모르면 **올리지 않는 쪽으로 기울지 않는다** - 조회 실패로 기록이 영영 안 올라가는
+          편이 더 나쁘다(빠진 기록은 아무도 못 알아챈다). 그래서 폴백이 '열림 없음'이 아니라
+          _open_assets이고, 그것도 없으면 빈 집합이라 종전대로 올라간다.
+        """
+        out = set()
+        try:
+            _ctxs = getattr(self, "_open_ctx", {}) or {}
+            _known = getattr(self, "_open_assets", set()) or set()
+            for a in (assets or ()):
+                q = None
+                try:
+                    c = _ctxs.get(a) or {}
+                    b = c.get("b")
+                    if b is not None and hasattr(b, "position_qty"):
+                        q = abs(float(b.position_qty(c.get("sym")) or 0))
+                except Exception:
+                    q = None
+                if q is None:
+                    q = 1.0 if a in _known else 0.0
+                if q:
+                    out.add(a)
+        except Exception:
+            return set()
+        return out
+
     def push_profile(self, auto: bool = False):
         """브로커 체결(closed PnL)을 로컬에서 R로 변환, 일별 합산해 요약만 서버로 푸시.
         키·잔고 무전송. 서버는 tid로 멱등 병합 → 페이지(?u=핸들) 즉시 갱신.
@@ -6257,8 +6292,23 @@ class App:
             # R 정규화(대표 2026-07-24 멀티계좌) = **$손익 합 ÷ 참여 계좌 1R 합** — 시그널의 진짜
             # 배수를 보존한다(계좌 A +$1200@1R600 + 계좌 B +$600@1R300 = $1800÷$900 = +2R,
             # 계좌 수만큼 뻥튀기 안 됨). 계좌당 단일 1R·자산 등가중.
+            # 🚨아직 열려 있는 자산은 올리지 않는다(대표 2026-09-21 "열려 있으면 안 올린다").
+            # 왜: 수집기는 브로커의 **실현 손익**을 날짜·세션으로 묶는데, 포지션이 살아 있는
+            # 중에 부분 청산(수동 반익 등)이 나면 그 조각이 **그날의 완결된 거래**로 올라간다.
+            # 2026-09-21 실제로 그랬다 - BTC가 열려 있는데 달력에 +16.31R이 결론처럼 찍혔고
+            # 대표가 "아직 결론 안 났는데"로 잡았다. 트랙레코드는 '판단 하나가 얼마를 냈나'를
+            # 보여주는 자리라, 진행 중인 판단을 결론으로 인쇄하면 승률·평균R이 통째로 흔들린다.
+            # 판단 재료: 브로커 실측(position_qty>0)을 먼저 보고, 조회가 안 되면 _open_assets.
+            # ⚠️모르면 **올리지 않는 쪽**이 아니라 종전대로 올린다 - 조회 실패로 기록이 영영
+            #   안 올라가는 편이 더 나쁘다(빠진 기록은 아무도 못 알아챈다).
+            _open_now = self._assets_with_open_position({a for (_d, a, _s) in agg})
+
             trades = []
             for (d, a, s), v in sorted(agg.items()):
+                if a in _open_now:
+                    self.log(f"   ⏸ 트랙레코드 보류 - {a} 포지션이 아직 열려 있습니다"
+                             f"(부분 청산이 완결로 올라가는 것 방지). 청산되면 올라갑니다.")
+                    continue
                 _rsum = sum(v["accts"].values()) or 600.0
                 # 규모 배수 = 현재 1R 합 ÷ 그 회원 '첫 진입 1R 합'(개인 기준선). 공개 상수 600으로
                 # 나누면 서버가 rsum=scale×600으로 절대 1R을 역산할 수 있어 개인정보 유출 →
