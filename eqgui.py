@@ -4916,6 +4916,13 @@ class App:
             if cur is not None and ((tgt < cur) if is_long else (tgt > cur)):
                 self.log(f"   ⏸ 손절 이동 생략 — 목표 {tgt:g}가 현재 손절 {cur:g}보다 불리(느슨해짐 방지)")
                 return
+            # 수동이 우선(대표 2026-09-21): 회원이 이 포지션의 손절을 직접 옮겼으면 앱은
+            # 더 이상 안 건드린다. 조이는 방향이라도 마찬가지다 - 회원이 일부러 여유를
+            # 준 것일 수 있고, 그걸 앱이 조용히 되감으면 회원 계좌에서 회원 판단을 덮는다.
+            if (getattr(self, "_open_ctx", {}) or {}).get("BTC", {}).get("manual"):
+                self.log(f"   ⏸ 손절 이동 생략 — 회원이 직접 옮긴 손절({cur:g}) 존중"
+                         if cur else "   ⏸ 손절 이동 생략 — 회원이 직접 옮긴 손절 존중")
+                return
             r = b.set_stop("BTCUSDT", tgt) if hasattr(b, "set_stop") else None
             if r is None:
                 self.log(f"   ⚠ 손절 이동 미지원(어댑터) — 기존 손절 유지 (목표 {tgt:g})"); return
@@ -6470,6 +6477,7 @@ class App:
             if stop is not None:
                 try:
                     _c["stop"] = float(stop)
+                    _c["app_stop"] = float(stop)      # 진입 손절도 '앱이 건 값'이다
                 except (TypeError, ValueError):
                     pass
             if aid is not None:
@@ -6499,7 +6507,12 @@ class App:
             _d[str(asset)] = {"broker": str(getattr(_c.get("b"), "name", "") or ""),
                               "sym": _c.get("sym"), "stop": _c.get("stop"),
                               "dir": _c.get("dir"), "size": _c.get("size"),
-                              "aid": _c.get("aid"), "ts": _t.time()}
+                              "aid": _c.get("aid"),
+                              # 🚨재시작을 넘겨야 하는 둘: app_stop(=앱이 건 값, 수동 판정의
+                              # 기준)과 manual(=회원이 만졌다). 이걸 안 남기면 앱을 껐다 켠
+                              # 순간 '수동이 우선'이 풀려 트레일이 회원 손절을 도로 옮긴다.
+                              "app_stop": _c.get("app_stop"), "manual": bool(_c.get("manual")),
+                              "ts": _t.time()}
             _save_open_ctx(_d)
         except Exception:
             pass
@@ -6545,17 +6558,23 @@ class App:
             self._open_ctx = {}
         self._open_ctx[_k] = {"b": _b, "sym": _r.get("sym"), "stop": _r.get("stop"),
                               "dir": _r.get("dir"), "size": _r.get("size"),
-                              "aid": _r.get("aid")}
+                              "aid": _r.get("aid"), "app_stop": _r.get("app_stop"),
+                              "manual": bool(_r.get("manual"))}
         self.log(f"   · {_k} 감시 맥락 복구({_bk}) — 손절 감시를 이어갑니다.")
         return True
 
     def _remember_stop(self, asset, stop):
         """손절이 새 자리로 옮겨졌을 때 기억을 갱신한다 - 재거치가 **옛 자리**를 되살려
-        트레일로 좁혀 둔 손절을 느슨하게 만들면 안 된다(2026-09-21)."""
+        트레일로 좁혀 둔 손절을 느슨하게 만들면 안 된다(2026-09-21).
+
+        app_stop = **앱이 직접 건 값**. stop(=현재 최선)과 따로 든다 - 회원이 손으로
+        만졌는지는 "브로커에 걸린 값이 앱이 건 값과 다른가"로만 알 수 있기 때문이다.
+        """
         try:
             _c = (getattr(self, "_open_ctx", {}) or {}).get(str(asset))
             if _c is not None and stop is not None:
                 _c["stop"] = float(stop)
+                _c["app_stop"] = float(stop)
                 self._persist_open_ctx(str(asset))
         except (TypeError, ValueError, AttributeError):
             pass
@@ -6648,14 +6667,36 @@ class App:
         try:
             if not seen_px:
                 return
+            # ── 회원이 손으로 만졌나: 브로커에 걸린 값 vs **앱이 건 값** ──────────────
+            # 대표 2026-09-21 "수동이 우선". 만진 흔적이 있으면 앱은 그 손절에서 손을 뗀다
+            # (아래 _btc_move_stop_be가 manual 플래그를 보고 이동을 건너뛴다). 회원 계좌의
+            # 회원 판단이고, 앱이 조용히 되돌리면 그게 제일 나쁘다.
+            # ⚠️보호 자체는 안 뗀다 - 손절이 통째로 사라지면 감시가 다시 건다. 다만 그때
+            #   거는 자리는 **회원이 둔 자리**다(아래에서 stop에 학습해 두므로).
+            _apx = ctx.get("app_stop")
+            _tol = max(abs(float(_apx)) * 1e-4, 1e-6) if _apx else None
+            if _apx and abs(seen_px - float(_apx)) > _tol and not ctx.get("manual"):
+                ctx["manual"] = True
+                self.log(f"   · {asset} 손절이 앱이 건 값({float(_apx):g})과 다릅니다"
+                         f"({seen_px:g}) - 회원이 직접 옮긴 것으로 보고 이동에서 손을 뗍니다.")
+                self._member_alert(
+                    "stop_manual",
+                    f"[EQ Autopilot] {asset} 손절이 직접 옮겨진 것으로 보입니다"
+                    f"(앱이 건 값 {float(_apx):g}, 지금 {seen_px:g}). 앞으로 이 포지션의 "
+                    f"손절은 앱이 옮기지 않습니다. 손절이 아예 사라지면 그때만 지금 자리에 "
+                    f"다시 걸고 알려 드립니다.",
+                    f"[EQ Autopilot] The {asset} stop looks like it was moved by hand "
+                    f"(app set {float(_apx):g}, now {seen_px:g}). The app will not move this "
+                    f"position's stop from here on. If the stop disappears entirely, it will be "
+                    f"re-placed at the current level and you will be told.")
             _cur = ctx.get("stop")
             _lg = str(ctx.get("dir") or "LONG").upper() == "LONG"
-            if _cur is None or ((seen_px > float(_cur)) if _lg else (seen_px < float(_cur))):
-                ctx["stop"] = float(seen_px)
-                self._persist_open_ctx(str(asset))
-                if _cur is not None:
-                    self.log(f"   · {asset} 브로커 손절 {seen_px:g} 확인 - 기억 갱신"
-                             f"(종전 {float(_cur):g})")
+            # 회원이 만진 뒤에는 방향을 안 따진다 - 회원이 둔 자리가 곧 기준이다.
+            if (_cur is None or ctx.get("manual")
+                    or ((seen_px > float(_cur)) if _lg else (seen_px < float(_cur)))):
+                if _cur is None or abs(seen_px - float(_cur)) > 1e-9:
+                    ctx["stop"] = float(seen_px)
+                    self._persist_open_ctx(str(asset))
         except (TypeError, ValueError, AttributeError):
             pass
 
