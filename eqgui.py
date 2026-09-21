@@ -4895,6 +4895,7 @@ class App:
                 self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:300]}) — 기존 손절 유지")
                 self._stop_move_alert(tgt, cur, r["error"]); return
             self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (본절)" if entry and abs(tgt - entry) < 1e-9 else ""))
+            self._remember_stop("BTC", tgt)      # 재거치가 옛 자리를 되살리지 않도록
         except Exception as e:
             self.log(f"   ⚠ 손절 이동 예외({e}) — 기존 손절 유지")
             try:
@@ -6422,14 +6423,47 @@ class App:
                 pass
         _th.Thread(target=w, daemon=True).start()
 
-    def _remember_open(self, asset, b, sym):
-        """진입에 쓴 브로커, 심볼을 기억한다 - _check_stop_closed가 이걸로 조회한다."""
+    def _remember_open(self, asset, b, sym, *, stop=None, aid=None, direction=None, size=None):
+        """진입에 쓴 브로커, 심볼을 기억한다 - _check_stop_closed가 이걸로 조회한다.
+
+        2026-09-21부터 **손절 재거치에 필요한 것**까지 같이 든다(stop/aid/direction/size).
+        _check_stop_alive가 보호 손절이 사라진 걸 보면 이 값으로 다시 건다 - 없으면
+        알리기만 하고 끝나므로, 넘길 수 있는 자리에서는 반드시 넘긴다.
+        ⚠️메모리에만 있다: 앱을 껐다 켜면 비고, 그러면 감시도 재거치도 안 돈다
+        (_check_stop_closed가 종전부터 '이 앱이 연 포지션'만 판단하는 것과 같은 한계다).
+        """
         try:
             if not hasattr(self, "_open_ctx"):
                 self._open_ctx = {}
-            self._open_ctx[str(asset)] = {"b": b, "sym": str(sym)}
+            _c = {"b": b, "sym": str(sym)}
+            if stop is not None:
+                try:
+                    _c["stop"] = float(stop)
+                except (TypeError, ValueError):
+                    pass
+            if aid is not None:
+                _c["aid"] = aid
+            if direction:
+                _c["dir"] = str(direction).upper()
+            if size:
+                try:
+                    _c["size"] = abs(int(size)) or None
+                except (TypeError, ValueError):
+                    _c["size"] = size
+            self._open_ctx[str(asset)] = _c
             getattr(self, "_flat_seen", {}).pop(str(asset), None)
+            getattr(self, "_nostop_seen", {}).pop(str(asset), None)
         except Exception:
+            pass
+
+    def _remember_stop(self, asset, stop):
+        """손절이 새 자리로 옮겨졌을 때 기억을 갱신한다 - 재거치가 **옛 자리**를 되살려
+        트레일로 좁혀 둔 손절을 느슨하게 만들면 안 된다(2026-09-21)."""
+        try:
+            _c = (getattr(self, "_open_ctx", {}) or {}).get(str(asset))
+            if _c is not None and stop is not None:
+                _c["stop"] = float(stop)
+        except (TypeError, ValueError, AttributeError):
             pass
 
     def _check_stop_closed(self):
@@ -6497,60 +6531,121 @@ class App:
             self._open_ctx.pop(str(_a), None)
             self._send_fill(_a, closed=True)
 
-    def _check_stop_alive(self, asset, pos):
-        """열린 포지션에 **보호 손절이 아직 붙어 있는지** 매 하트비트 확인한다(2026-09-21).
+    # 선물 손절 주문 조회 주기(초). 하트비트는 60초지만 선물은 조회가 **추가 API 호출**이라
+    # (크립토는 이미 받아 온 포지션 응답에 손절이 들어 있어 공짜다) 더 성기게 본다.
+    STOP_ORDER_CHECK_SEC = 180
 
-        왜 여기인가: 거치 시점의 실패는 _handle_stop_failure가 막는데(거부=즉시 청산,
-        일시 실패=재시도 후 회원 경보), **거치 이후**는 아무도 안 봤다. 손절이 브로커
-        쪽에서 사라지거나 이동에 실패해도 앱은 로그 한 줄만 남겼고, 2026-09-21 아침
-        Bitget이 정확히 그랬다 - 대표가 차트를 보다 직접 발견했다.
+    def _check_stop_alive(self, asset, pos):
+        """열린 포지션에 **보호 손절이 아직 붙어 있는지** 확인하고, 없으면 다시 건다(2026-09-21).
+
+        왜 필요한가: 거치 시점의 실패는 _handle_stop_failure가 막는다(거부=즉시 청산,
+        일시 실패=재시도 후 회원 경보). 그런데 **거치 이후**는 아무도 안 봤다. 손절이
+        브로커 쪽에서 사라지거나 이동에 실패해도 앱은 로그 한 줄만 남겼고, 2026-09-21
+        아침 Bitget이 정확히 그랬다 - 대표가 차트를 보다 직접 발견했다.
 
         🚨BTC가 제일 위험하다: X2+TR이 홀드를 판정하면 _auto_loop이 세션 마감 자동청산을
-        건너뛴다(continue). 즉 **백스톱이 없다** - 손절이 사라지면 며칠을 무방비로 간다.
+        건너뛴다(continue) - 백스톱이 없다. 손절이 사라지면 며칠을 무방비로 간다.
         NQ/GC는 하루 안에 마감 청산이 있어 노출이 시간 단위로 묶인다.
 
-        범위: 손절을 포지션 속성으로 들고 오는 크립토(Bybit/Bitget)만 이 경로로 판정한다.
-        선물은 손절이 **별도 주문**이라 raw에 안 담기므로 여기서 '없다'고 말하면 전부
-        오경보다 - ProjectX는 _open_orders가 있어 따로 붙일 수 있고, NT8은 주문 조회
-        API 자체가 없다(eqgui.py:5289). 없는 것을 있다고도, 있는 것을 없다고도 안 한다.
+        두 축을 따로 본다 - 손절이 어디 사는지가 브로커마다 다르기 때문이다:
+          크립토(Bybit/Bitget) = 포지션 **속성**(raw["stopLoss"]). 이미 받아 온 응답이라 공짜.
+          선물(ProjectX)       = **별도 주문**(type 4). _open_orders로 따로 조회, 180초 주기.
+          IBKR/Tradovate/NT8   = 주문 조회 경로가 없다 → **판단하지 않는다**. NT8은 API 자체가
+                                 없고(eqgui.py:5289), 없는 것을 있다고도 있는 것을 없다고도 안 한다.
 
-        ⚠️읽기 전용이다. 주문을 다시 걸지 않는다 - 조회가 순간적으로 손절을 빠뜨렸을 때
-        옛 손절가를 덮어쓰면 트레일로 좁혀 둔 자리가 느슨해진다. 알리고, 판단은 회원이.
-        조회 흔들림에 대비해 **연속 2회**일 때만 말한다(_flat_seen과 같은 규약).
+        ⚠️재거치는 **기억해 둔 손절 자리**로만 한다(_remember_open/_remember_stop). 트레일이
+        옮겨 둔 값을 계속 갱신하므로 옛 자리를 되살려 손절을 느슨하게 만들지 않는다. 기억이
+        없으면 알리기만 한다 - 모르는 자리에 스탑을 찍느니 회원을 부르는 편이 낫다.
+        조회 흔들림 방어로 **연속 2회** 없을 때만 움직인다(_flat_seen과 같은 규약).
         """
-        try:
-            _raw = getattr(pos, "raw", None) or {}
-            if "stopLoss" not in _raw:
-                return                        # 손절을 속성으로 안 주는 어댑터 = 판단 안 함
+        import time as _t
+        _k = str(asset)
+        _ctx = (getattr(self, "_open_ctx", {}) or {}).get(_k) or {}
+        _b = _ctx.get("b")
+        _raw = getattr(pos, "raw", None) or {}
+        if not hasattr(self, "_nostop_seen"):
+            self._nostop_seen = {}
+        _alive = None                      # None = 판단 안 함
+
+        if "stopLoss" in _raw:                                   # ── 크립토
             try:
-                _sl = float(_raw.get("stopLoss") or 0)
+                _alive = bool(float(_raw.get("stopLoss") or 0))
+            except (TypeError, ValueError):
+                _alive = False
+        elif hasattr(_b, "_open_orders"):                        # ── 선물(ProjectX)
+            if not hasattr(self, "_stop_chk_at"):
+                self._stop_chk_at = {}
+            if _t.time() - float(self._stop_chk_at.get(_k, 0)) < self.STOP_ORDER_CHECK_SEC:
+                return
+            self._stop_chk_at[_k] = _t.time()
+            _aid = _raw.get("_accountId") or getattr(pos, "account_id", None)
+            _con = str(_raw.get("contractId") or getattr(pos, "symbol", "") or "")
+            try:
+                _ords = _b._open_orders(_aid) or []
             except Exception:
-                _sl = 0.0
-            if not hasattr(self, "_nostop_seen"):
-                self._nostop_seen = {}
-            _k = str(asset)
-            if _sl:
-                self._nostop_seen.pop(_k, None)
+                self._nostop_seen.pop(_k, None)      # 조회 실패 = 무판단
                 return
-            _n = int(self._nostop_seen.get(_k, 0)) + 1
-            self._nostop_seen[_k] = _n
-            self.log(f"   · {_k} 보호 손절 미발견 {_n}/2 — 포지션은 살아 있음")
-            if _n < 2:
-                return
-            self._nostop_seen[_k] = -999       # 한 번만 알린다(복구되면 위에서 리셋)
-            self.log(f"\u26a0 {_k} 열린 포지션에 보호 손절이 없습니다 - 회원에게 알립니다.")
+            # 보호 손절 = type 4(스탑). 같은 계약에 걸린 것만 센다.
+            _alive = any(int(_o.get("type") or 0) == 4
+                         and (not _con or str(_o.get("contractId") or "") == _con)
+                         for _o in _ords if isinstance(_o, dict))
+        if _alive is None:
+            return
+        if _alive:
+            self._nostop_seen.pop(_k, None)
+            return
+
+        _n = int(self._nostop_seen.get(_k, 0))
+        if _n < 0:
+            return                                   # 이미 알렸다(복구되면 위에서 리셋)
+        _n += 1
+        self._nostop_seen[_k] = _n
+        self.log(f"   · {_k} 보호 손절 미발견 {_n}/2 — 포지션은 살아 있음")
+        if _n < 2:
+            return
+        self._nostop_seen[_k] = -1                   # 한 번만 움직인다
+
+        _lvl = _ctx.get("stop")
+        _done, _why = False, "기억해 둔 손절 자리가 없습니다"
+        if _lvl:
+            try:
+                if "stopLoss" in _raw and hasattr(_b, "set_stop"):
+                    _r = _b.set_stop(_ctx.get("sym") or getattr(pos, "symbol", ""), _lvl) or {}
+                    _done = not _r.get("error"); _why = str(_r.get("error") or "")[:160]
+                elif hasattr(_b, "place_protective_stop"):
+                    _r = _b.place_protective_stop(
+                        _ctx.get("aid") or _raw.get("_accountId") or getattr(pos, "account_id", None),
+                        str(_raw.get("contractId") or getattr(pos, "symbol", "") or ""),
+                        _ctx.get("dir") or "LONG",
+                        int(_ctx.get("size") or abs(int(getattr(pos, "net_qty", 0) or 0)) or 1),
+                        _lvl, custom_tag=f"EQ-AP-RE-{int(_t.time() * 1000)}") or {}
+                    _done = bool(_r.get("stop")); _why = str(_r.get("stop_error") or "")[:160]
+            except Exception as _e:
+                _done, _why = False, str(_e)[:160]
+
+        if _done:
+            self._nostop_seen.pop(_k, None)          # 다음 주기에 정상으로 확인된다
+            self.log(f"   \u2705 {_k} 보호 손절이 사라져 {_lvl:g}에 다시 걸었습니다.")
             self._member_alert(
-                "stop_vanished",
-                f"[EQ Autopilot] 열려 있는 {_k} 포지션에 보호 손절이 걸려 있지 않습니다. "
-                f"브로커 화면에서 지금 손절을 직접 걸거나 포지션을 정리하세요."
-                + (" BTC는 홀드 중 세션 마감 자동 청산이 동작하지 않으므로 손절이 유일한 "
-                   "보호 장치입니다." if _k == "BTC" else ""),
-                f"[EQ Autopilot] Your open {_k} position has no protective stop at the broker. "
-                f"Place a stop yourself now, or close the position."
-                + (" For BTC the session-close auto-flatten does not run while the position is "
-                   "held, so the stop is the only protection." if _k == "BTC" else ""))
-        except Exception:
-            pass
+                "stop_restored",
+                f"[EQ Autopilot] 열려 있는 {_k} 포지션에서 보호 손절이 사라져 있었고, "
+                f"앱이 {_lvl:g}에 다시 걸었습니다. 브로커 화면에서 한 번 확인해 주세요.",
+                f"[EQ Autopilot] The protective stop on your open {_k} position had "
+                f"disappeared; the app re-placed it at {_lvl:g}. Please confirm at your broker.")
+            return
+
+        self.log(f"   \u26a0 {_k} 보호 손절 없음 + 재거치 실패({_why}) — 회원에게 알립니다.")
+        self._member_alert(
+            "stop_vanished",
+            f"[EQ Autopilot] 열려 있는 {_k} 포지션에 보호 손절이 걸려 있지 않고, 앱이 다시 "
+            f"거는 것도 실패했습니다({_why}). 브로커 화면에서 지금 손절을 직접 걸거나 "
+            f"포지션을 정리하세요."
+            + (" BTC는 홀드 중 세션 마감 자동 청산이 동작하지 않으므로 손절이 유일한 "
+               "보호 장치입니다." if _k == "BTC" else ""),
+            f"[EQ Autopilot] Your open {_k} position has no protective stop and the app could "
+            f"not re-place it ({_why}). Place a stop yourself now, or close the position."
+            + (" For BTC the session-close auto-flatten does not run while the position is "
+               "held, so the stop is the only protection." if _k == "BTC" else ""))
 
     def _send_fill(self, asset, closed=False):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
@@ -7029,7 +7124,8 @@ class App:
                              f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
                     # 기존 동작: 갭·오픈추적·원장은 진행(주문이 살아있을 수 있음)
                     self._send_gap(asset, sig, b, _con, mkt_at_send=_px_at_send)
-                    self._remember_open(asset, b, _con)
+                    self._remember_open(asset, b, _con, stop=stop, aid=_aid,
+                                        direction=direction, size=_qty)
                     _ledger_add(asset, _con, direction, _tag)
                 continue
             if not live:
@@ -7041,7 +7137,8 @@ class App:
                             acct=f"{getattr(b, 'name', '')}:{sc}")          # 계좌 단위 집계(R38 P1-#8)
             self._send_gap(asset, sig, b, _con,
                            mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
-            self._remember_open(asset, b, _con)          # 손절 청산 감지용(2026-09-02)
+            self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
+                                aid=_aid, direction=direction, size=_qty)   # 감지+재거치용
             _ledger_add(asset, _con, direction, _tag)      # 실제 사용 태그(-rN 포함)로 기록
             # 🛡 판정(대표 2026-09-04): ack의 stop_order_id 또는 NT8 주문 스냅샷의 스탑
             # 존재로 - 오늘 사고에선 정상 계좌도 ack 필드가 비어 🛡 라인이 누락됐었다.
@@ -8077,7 +8174,8 @@ class App:
                 # **영원히 False**였고, 진입 100초 뒤(하트비트 2회)마다 없는 손절 청산을
                 # 서버에 보고했다 - 09-21 BTC에서 기기 두 대가 동시에 그랬다.
                 # 바로 위에서 이미 _mysym으로 정규화해 쓰고 있었다.
-                self._remember_open(asset, b, _mysym)            # 손절 청산 감지용(2026-09-02)
+                self._remember_open(asset, b, _mysym, stop=stop,
+                                    direction=direction, size=size)     # 감지+재거치용
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
