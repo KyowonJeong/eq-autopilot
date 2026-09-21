@@ -6411,7 +6411,15 @@ class App:
                 self._flat_seen.pop(str(_a), None)
                 continue
             try:
-                _still = any(str(_sym) in str(getattr(_p, "symbol", "")) for _p in _poss)
+                # 양쪽을 같은 규약으로 정규화하고 **양방향**으로 본다(2026-09-21):
+                # 한쪽만 .P가 붙어 있으면 한 방향 부분일치는 영원히 실패한다.
+                def _nrm(x):
+                    return (str(x or "").upper().replace(".P", "")
+                            .replace("-", "").replace("/", "").replace("_", ""))
+                _sn = _nrm(_sym)
+                _still = any(
+                    bool(_sn) and bool(_pn) and (_sn in _pn or _pn in _sn)
+                    for _pn in (_nrm(getattr(_p, "symbol", "")) for _p in _poss))
             except Exception:
                 self._flat_seen.pop(str(_a), None)
                 continue
@@ -7948,7 +7956,13 @@ class App:
                 self._note_fill(asset, coin=float(size or 0),
                                 acct=f"{_broker}:{sc}")          # 대시보드 보고용(#53), 계좌 단위(R38 P1-#8)
                 self._send_gap(asset, sig, b, sym)               # 체결 갭 실측(2026-08-11)
-                self._remember_open(asset, b, sym)               # 손절 청산 감지용(2026-09-02)
+                # 🚨브로커가 돌려주는 형식으로 기억한다(2026-09-21 실사고): 여기서 원본
+                # sym('BTCUSDT.P')을 넘기고 있었는데 list_open_positions는 'BTCUSDT'를
+                # 준다. _check_stop_closed의 부분일치가 'BTCUSDT.P' in 'BTCUSDT'라
+                # **영원히 False**였고, 진입 100초 뒤(하트비트 2회)마다 없는 손절 청산을
+                # 서버에 보고했다 - 09-21 BTC에서 기기 두 대가 동시에 그랬다.
+                # 바로 위에서 이미 _mysym으로 정규화해 쓰고 있었다.
+                self._remember_open(asset, b, _mysym)            # 손절 청산 감지용(2026-09-02)
                 _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
