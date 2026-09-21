@@ -4889,7 +4889,10 @@ class App:
             if r is None:
                 self.log(f"   ⚠ 손절 이동 미지원(어댑터) — 기존 손절 유지 (목표 {tgt:g})"); return
             if r.get("error"):
-                self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:60]}) — 기존 손절 유지"); return
+                # 60자 자르기는 원인을 통째로 삼켰다(2026-09-21 실사고): Bitget 오류 문자열이
+                # "... HTTP 400: " 까지가 딱 60자라 정작 필요한 code=·msg가 화면에서 날아갔다.
+                # 브로커가 준 원인은 끝까지 보여 준다 - 이 한 줄이 다음 수리의 출발점이다.
+                self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:300]}) — 기존 손절 유지"); return
             self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (본절)" if entry and abs(tgt - entry) < 1e-9 else ""))
         except Exception as e:
             self.log(f"   ⚠ 손절 이동 예외({e}) — 기존 손절 유지")

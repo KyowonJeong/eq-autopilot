@@ -392,6 +392,7 @@ class BitgetBroker(BrokerAdapter):
                    and str(r.get("symbol", "")).upper() == sym]
         except Exception as e:
             return {"error": f"plan query: {e}"}
+        _mod_err = None
         if _sl:
             try:
                 self._req("POST", "/api/v2/mix/order/modify-tpsl-order",
@@ -402,7 +403,13 @@ class BitgetBroker(BrokerAdapter):
                                 "executePrice": "0"})          # 0 = 트리거 시 시장가
                 return {"error": None}
             except Exception as e:
-                return {"error": f"modify: {e}"}
+                # 🚨modify 실패로 끝내지 않는다(2026-09-21 실사고: 대표 BTC 보유 중 4시간 경계마다
+                # "modify-tpsl-order HTTP 400"으로 트레일이 두 번 연속 멈췄고, 대표가 수동으로
+                # 손절을 옮겨야 했다. 같은 시각 Bybit은 정상). Bitget은 pos_loss를 place로 다시
+                # 올리면 기존 것을 대체하므로, 아래 등록 경로로 한 번 더 간다.
+                # ⚠️취소를 먼저 하지 않는다 - 실패하면 무방비 구간이 생긴다. place가 실패해도
+                # 기존 손절은 그대로 살아 있다(호출측이 '기존 손절 유지'로 로그).
+                _mod_err = e
         # 대기 손절 플랜 없음(진입 preset이 소진됐거나 미첨부) → 포지션 손절 신규 등록
         try:
             _side = None
@@ -419,7 +426,8 @@ class BitgetBroker(BrokerAdapter):
                             "holdSide": _side})
             return {"error": None}
         except Exception as e:
-            return {"error": f"place: {e}"}
+            return {"error": (f"modify: {_mod_err} / place: {e}" if _mod_err is not None
+                              else f"place: {e}")}
 
     def block_4h(self, symbol, end_utc):
         """우리 4H 블록(22-02, 02-06, …)의 (시가, 종가). end_utc = 블록 마감 UTC datetime.
