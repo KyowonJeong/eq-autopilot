@@ -6632,6 +6632,33 @@ class App:
     # (크립토는 이미 받아 온 포지션 응답에 손절이 들어 있어 공짜다) 더 성기게 본다.
     STOP_ORDER_CHECK_SEC = 180
 
+    def _learn_seen_stop(self, asset, ctx, seen_px) -> None:
+        """브로커에 실제로 걸려 있는 손절이 우리 기억보다 **유리하면** 기억을 갱신한다.
+
+        왜(대표 2026-09-21 "수동으로 해도 자동 손절 라인 등이 문제 없게"): 회원이 손으로
+        손절을 좁혀 두는 일이 있다 - 오늘 아침 Bitget 트레일이 실패했을 때 대표가 직접
+        옮겼다. 그런데 앱의 기억은 **우리가 마지막으로 성공시킨 자리**라, 그 손절이
+        사라져 재거치가 돌면 회원이 좁혀 둔 자리를 버리고 더 느슨한 옛 자리로 되돌린다.
+        매 확인마다 실제 값을 보고 있으니, 유리한 쪽이면 그대로 배운다.
+
+        ⚠️한 방향으로만 배운다 - 느슨한 값은 절대 안 받는다. 조회가 잠깐 옛 값을 주거나
+        (2026-09-21 Bitget처럼) 이동이 실패해 옛 자리가 읽혀도 기억이 뒤로 가면 안 된다.
+        LONG은 높을수록, SHORT는 낮을수록 유리하다.
+        """
+        try:
+            if not seen_px:
+                return
+            _cur = ctx.get("stop")
+            _lg = str(ctx.get("dir") or "LONG").upper() == "LONG"
+            if _cur is None or ((seen_px > float(_cur)) if _lg else (seen_px < float(_cur))):
+                ctx["stop"] = float(seen_px)
+                self._persist_open_ctx(str(asset))
+                if _cur is not None:
+                    self.log(f"   · {asset} 브로커 손절 {seen_px:g} 확인 - 기억 갱신"
+                             f"(종전 {float(_cur):g})")
+        except (TypeError, ValueError, AttributeError):
+            pass
+
     def _check_stop_alive(self, asset, pos):
         """열린 포지션에 **보호 손절이 아직 붙어 있는지** 확인하고, 없으면 다시 건다(2026-09-21).
 
@@ -6664,9 +6691,11 @@ class App:
             self._nostop_seen = {}
         _alive = None                      # None = 판단 안 함
 
+        _seen_px = None                    # 브로커에 실제로 걸려 있는 손절가(알 수 있을 때만)
         if "stopLoss" in _raw:                                   # ── 크립토
             try:
-                _alive = bool(float(_raw.get("stopLoss") or 0))
+                _seen_px = float(_raw.get("stopLoss") or 0) or None
+                _alive = _seen_px is not None
             except (TypeError, ValueError):
                 _alive = False
         elif hasattr(_b, "_open_orders"):                        # ── 선물(ProjectX)
@@ -6683,13 +6712,19 @@ class App:
                 self._nostop_seen.pop(_k, None)      # 조회 실패 = 무판단
                 return
             # 보호 손절 = type 4(스탑). 같은 계약에 걸린 것만 센다.
-            _alive = any(int(_o.get("type") or 0) == 4
-                         and (not _con or str(_o.get("contractId") or "") == _con)
-                         for _o in _ords if isinstance(_o, dict))
+            _stops = [_o for _o in _ords if isinstance(_o, dict)
+                      and int(_o.get("type") or 0) == 4
+                      and (not _con or str(_o.get("contractId") or "") == _con)]
+            _alive = bool(_stops)
+            try:
+                _seen_px = float(_stops[0].get("stopPrice")) if _stops else None
+            except (TypeError, ValueError):
+                _seen_px = None
         if _alive is None:
             return
         if _alive:
             self._nostop_seen.pop(_k, None)
+            self._learn_seen_stop(_k, _ctx, _seen_px)
             return
 
         _n = int(self._nostop_seen.get(_k, 0))
@@ -6714,7 +6749,13 @@ class App:
                         _ctx.get("aid") or _raw.get("_accountId") or getattr(pos, "account_id", None),
                         str(_raw.get("contractId") or getattr(pos, "symbol", "") or ""),
                         _ctx.get("dir") or "LONG",
-                        int(_ctx.get("size") or abs(int(getattr(pos, "net_qty", 0) or 0)) or 1),
+                        # 🚨수량은 **살아 있는 포지션**이 먼저다(대표 2026-09-21 수동 반익절):
+                        # 기억해 둔 진입 수량을 쓰면, 회원이 손으로 일부를 덜어낸 뒤 재거치가
+                        # 돌 때 남은 것보다 큰 스탑이 걸린다. ProjectX 보호 손절은 별도
+                        # 주문이고 reduceOnly가 없어, 발동하면 남은 것을 닫고 **반대
+                        # 포지션까지 연다**. 크립토는 손절이 포지션 속성이라 무관하지만
+                        # 선물은 이 한 줄이 갈린다. 기억은 조회가 0을 줄 때만 쓴다.
+                        int(abs(int(getattr(pos, "net_qty", 0) or 0)) or _ctx.get("size") or 1),
                         _lvl, custom_tag=f"EQ-AP-RE-{int(_t.time() * 1000)}") or {}
                     _done = bool(_r.get("stop")); _why = str(_r.get("stop_error") or "")[:160]
             except Exception as _e:
