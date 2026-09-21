@@ -4815,15 +4815,33 @@ class App:
         포지션 없으면 True(아래 flatten_all이 no-op으로 잔여 주문만 정리)."""
         import datetime as _d
         k = _BTC_BLOCK_K[j["hour"]]
+        # 🚨조회 실패와 '확인된 플랫'을 가른다(2026-09-21 실사고, 대표 "빗겟 손절 네 시간봉 때
+        # 업뎃 안 되네 / 바이빗은 되는데"). 종전엔 둘 다 return True였다 - 로그 한 줄 없이
+        # 손절 이동을 건너뛰고 청산 경로로 넘어갔다. 모르는 상태에서 청산을 부르면 안 되고,
+        # 무엇보다 **왜 안 옮겼는지가 화면에 남아야** 다음에 헤매지 않는다.
+        _qerr = None
         try:
             qty = b.position_qty("BTCUSDT") if hasattr(b, "position_qty") else None
-        except Exception:
-            qty = None
+        except Exception as _qe:
+            qty, _qerr = None, _qe
+        if _qerr is not None or qty is None:
+            self.log(f"   ⚠ X2+TR 블록{k}: 포지션 조회 실패({_qerr}) — 손절 이동 건너뜀(홀드)")
+            return False                      # 모르면 청산하지 않는다
         if not qty:
-            return True                       # 플랫 → 평소 경로(잔여 정리)
-        pos = next((p for p in b.list_open_positions() if "BTC" in str(p.symbol).upper()), None)
+            return True                       # 확인된 플랫 → 평소 경로(잔여 정리)
+        try:
+            _poss = list(b.list_open_positions() or [])
+        except Exception as _pe:
+            self.log(f"   ⚠ X2+TR 블록{k}: 포지션 목록 조회 실패({_pe}) — 손절 이동 건너뜀(홀드)")
+            return False
+        pos = next((p for p in _poss if "BTC" in str(p.symbol).upper()), None)
         if pos is None:
-            return True
+            # 수량은 있다는데 목록엔 없다 = 어댑터가 이 계정의 포지션을 못 보고 있다.
+            # 오늘 오전 가짜 청산 보고(_check_stop_closed)와 같은 뿌리일 수 있어 목록을 남긴다.
+            self.log(f"   ⚠ X2+TR 블록{k}: 수량 {qty}인데 포지션 목록에 BTC 없음 "
+                     f"(목록 {len(_poss)}건: {[str(getattr(p,'symbol','')) for p in _poss][:4]}) "
+                     f"— 손절 이동 건너뜀(홀드)")
+            return False
         is_long = pos.net_qty > 0
         now = _d.datetime.now(utc_tz)
         end = now.replace(minute=0, second=0, microsecond=0)   # 방금 닫힌 블록의 마감시각
@@ -6428,6 +6446,11 @@ class App:
                 continue
             _n = int(self._flat_seen.get(str(_a), 0)) + 1
             self._flat_seen[str(_a)] = _n
+            # 무엇을 보고 '사라졌다'고 판단했는지 남긴다(2026-09-21): 오늘 오전 Bitget에서
+            # 목록이 비어 오던 것을 로그 없이 청산으로 읽어, 멀쩡한 포지션에 가짜 청산을
+            # 보고했다. 다음엔 이 줄만 보면 갈린다.
+            self.log(f"   · {_a} 포지션 미발견 {_n}/2 — 브로커 목록 {len(_poss)}건 "
+                     f"{[str(getattr(p,'symbol','')) for p in _poss][:4]} (찾는 심볼 {_sym})")
             if _n < 2:
                 continue                      # 한 번은 안 믿는다(전송 지연·일시 오류)
             self._flat_seen.pop(str(_a), None)
