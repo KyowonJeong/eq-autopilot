@@ -870,6 +870,12 @@ def _load():
 
 
 _ENTERED_PATH = os.path.join(APP_DIR, ".entered.json")
+# 열린 포지션의 감시 맥락(2026-09-21 대표 "어 넣어"). _open_assets는 프로필에 이미 영속인데
+# _open_ctx만 메모리라, 앱을 껐다 켜면 손절 생존 감시도 자동 재거치도 안 돌았다.
+# ⛔브로커 **객체**는 못 담는다(소켓·키) - 다시 만들 재료만 적고, 복구는 _restore_open_ctx가
+#   설정+키체인에서 어댑터를 새로 짓는다. 비밀은 여기 안 들어간다(f1/f2/f3 전부 제외).
+_OPENCTX_PATH = os.path.join(APP_DIR, ".open_ctx.json")
+_OPENCTX_MAX_AGE = 14 * 86400        # 이보다 오래된 기록은 안 믿는다(닫힌 지 오래된 잔재)
 
 
 def _load_entered() -> dict:
@@ -882,6 +888,31 @@ def _load_entered() -> dict:
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+
+
+def _load_open_ctx() -> dict:
+    """{asset: {broker, acct, sym, stop, dir, size}} - 비밀 없음."""
+    try:
+        import json as _json
+        import time as _t
+        with open(_OPENCTX_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        if not isinstance(d, dict):
+            return {}
+        _now = _t.time()
+        return {k: v for k, v in d.items()
+                if isinstance(v, dict) and _now - float(v.get("ts") or 0) < _OPENCTX_MAX_AGE}
+    except Exception:
+        return {}
+
+
+def _save_open_ctx(d: dict) -> None:
+    try:
+        import json as _json
+        with open(_OPENCTX_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f)
+    except Exception:
+        pass
 
 
 def _mark_entered(asset: str) -> dict:
@@ -6453,8 +6484,70 @@ class App:
             self._open_ctx[str(asset)] = _c
             getattr(self, "_flat_seen", {}).pop(str(asset), None)
             getattr(self, "_nostop_seen", {}).pop(str(asset), None)
+            self._persist_open_ctx(str(asset))
         except Exception:
             pass
+
+    def _persist_open_ctx(self, asset) -> None:
+        """감시 맥락을 디스크에 남긴다 - 앱을 껐다 켜도 손절 감시가 이어지게(2026-09-21).
+        브로커 객체와 비밀은 안 담는다: 브로커 **이름**과 계좌만 적고, 복구할 때
+        설정+키체인에서 어댑터를 새로 짓는다."""
+        import time as _t
+        try:
+            _c = (getattr(self, "_open_ctx", {}) or {}).get(str(asset)) or {}
+            _d = _load_open_ctx()
+            _d[str(asset)] = {"broker": str(getattr(_c.get("b"), "name", "") or ""),
+                              "sym": _c.get("sym"), "stop": _c.get("stop"),
+                              "dir": _c.get("dir"), "size": _c.get("size"),
+                              "aid": _c.get("aid"), "ts": _t.time()}
+            _save_open_ctx(_d)
+        except Exception:
+            pass
+
+    def _forget_open_ctx(self, asset) -> None:
+        """포지션이 끝났다 - 디스크 기록도 같이 지운다(안 지우면 다음 실행이 없는 포지션을
+        감시하려 들고, 그 자리에 손절이 없다고 경보가 난다)."""
+        try:
+            _d = _load_open_ctx()
+            if _d.pop(str(asset), None) is not None:
+                _save_open_ctx(_d)
+        except Exception:
+            pass
+
+    def _restore_open_ctx(self, asset) -> bool:
+        """재시작 뒤 첫 확인: 디스크 기록으로 브로커를 다시 지어 _open_ctx를 채운다.
+
+        왜 지연 복구인가: 시작할 때 한꺼번에 지으면 UI 스레드가 키체인·네트워크를 기다린다.
+        여기(하트비트 스레드)서 **필요할 때** 한 자산씩 짓는다. 실패하면 판단하지 않고
+        5분 뒤 다시 시도한다 - 설정을 고치면 스스로 이어지게(한 번만 시도하면 영영 안 붙는다).
+        """
+        import time as _t
+        _k = str(asset)
+        if not hasattr(self, "_ctx_retry_at"):
+            self._ctx_retry_at = {}
+        if _t.time() < float(self._ctx_retry_at.get(_k, 0)):
+            return False
+        self._ctx_retry_at[_k] = _t.time() + 300
+        _r = _load_open_ctx().get(_k) or {}
+        _bk = str(_r.get("broker") or "").strip()
+        if not _bk:
+            return False
+        try:
+            _cr = self._creds_of(_k, _bk)
+            _f1 = (_cr.get("f1") or "").strip()
+            _acct = str(_r.get("aid") or "").strip()
+            _b = _build_broker(_bk, _f1, _kc_load(_f1) or "", _cr.get("f3", ""),
+                               [_acct] if _acct else [])
+        except Exception as _e:
+            self.log(f"   · {_k} 감시 맥락 복구 실패({str(_e)[:80]}) — 5분 뒤 재시도")
+            return False
+        if not hasattr(self, "_open_ctx"):
+            self._open_ctx = {}
+        self._open_ctx[_k] = {"b": _b, "sym": _r.get("sym"), "stop": _r.get("stop"),
+                              "dir": _r.get("dir"), "size": _r.get("size"),
+                              "aid": _r.get("aid")}
+        self.log(f"   · {_k} 감시 맥락 복구({_bk}) — 손절 감시를 이어갑니다.")
+        return True
 
     def _remember_stop(self, asset, stop):
         """손절이 새 자리로 옮겨졌을 때 기억을 갱신한다 - 재거치가 **옛 자리**를 되살려
@@ -6463,6 +6556,7 @@ class App:
             _c = (getattr(self, "_open_ctx", {}) or {}).get(str(asset))
             if _c is not None and stop is not None:
                 _c["stop"] = float(stop)
+                self._persist_open_ctx(str(asset))
         except (TypeError, ValueError, AttributeError):
             pass
 
@@ -6483,6 +6577,8 @@ class App:
             return
         for _a in _assets:
             _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(_a))
+            if not _ctx and self._restore_open_ctx(_a):      # 재시작 뒤 첫 확인(2026-09-21)
+                _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(_a))
             if not _ctx:
                 continue                      # 이 앱이 연 포지션이 아니면 판단하지 않는다
             _b, _sym = _ctx.get("b"), _ctx.get("sym")
@@ -6529,6 +6625,7 @@ class App:
                      f"\uc0ac\ub77c\uc84c\uc2b5\ub2c8\ub2e4(\uc190\uc808 \ucd94\uc815) "
                      f"- \uc11c\ubc84\uc5d0 \uccad\uc0b0\uc744 \ubcf4\uace0\ud569\ub2c8\ub2e4.")
             self._open_ctx.pop(str(_a), None)
+            self._forget_open_ctx(_a)
             self._send_fill(_a, closed=True)
 
     # 선물 손절 주문 조회 주기(초). 하트비트는 60초지만 선물은 조회가 **추가 API 호출**이라
