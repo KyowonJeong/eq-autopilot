@@ -1750,6 +1750,13 @@ class App:
             # 가용 목록에서 선택"): 하단 통합 드롭다운 폐지 - [계좌 추가]가 빈 행을 만든다.
             ttk.Button(addr, text=("계좌 추가" if self.lang == "ko" else "Add account"), width=10,
                        command=self._add_acct).pack(side="left")
+            _ed = bool(getattr(self, "_acct_edit", False))
+            tk.Button(addr,
+                      text=(("수정 중 - 잠그기" if _ed else "계좌 수정") if self.lang == "ko"
+                            else ("Editing - lock" if _ed else "Edit accounts")),
+                      command=self._toggle_acct_edit, relief=("sunken" if _ed else "raised"),
+                      bg=("#fff4d6" if _ed else "#e2e8f0"), fg="#333",
+                      padx=8, pady=2).pack(side="left", padx=(4, 0))
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
             # 가용 계좌 자동 로드 - 행의 계좌 콤보가 이 목록을 쓴다.
             # Topstep=API, Lucid=브리지 tick(2026-08-12부터 자동 - NT8 켜져 있을 때).
@@ -1785,6 +1792,15 @@ class App:
             _addr = ttk.Frame(frm); _addr.pack(fill="x", pady=(3, 2))
             ttk.Button(_addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
                        command=self._add_acct).pack(side="left")
+            # 🚨크립토에도 같은 토글이 있어야 한다: 행 잠금은 자산을 안 가리는데 토글이
+            # 선물 분기에만 있으면 BTC의 1R을 영영 못 고친다(2026-09-21 배선 중 잡음).
+            _ed2 = bool(getattr(self, "_acct_edit", False))
+            tk.Button(_addr,
+                      text=(("수정 중 - 잠그기" if _ed2 else "계좌 수정") if self.lang == "ko"
+                            else ("Editing - lock" if _ed2 else "Edit accounts")),
+                      command=self._toggle_acct_edit, relief=("sunken" if _ed2 else "raised"),
+                      bg=("#fff4d6" if _ed2 else "#e2e8f0"), fg="#333",
+                      padx=8, pady=2).pack(side="left", padx=(4, 0))
         # 다음 행동 안내(2026-08-11 UX #65: "언제 연결 버튼 눌러야 하는지 모르겠다") -
         # 상태에서 계산한 딱 한 문장이 다음 버튼을 가리킨다.
         self._next_lbl = ttk.Label(frm, text="", foreground="#1d4ed8",
@@ -3135,6 +3151,9 @@ class App:
     def _add_acct(self):
         """[계좌 추가] = 빈 행 추가(대표 2026-08-11 행 중심 등록). 브로커, 계좌, 1R은 행에서
         고른다 - 행의 계좌 콤보가 그 행 브로커의 가용 목록을 보여준다."""
+        # 잠겨 있어도 추가는 되게 하되 **그 순간 편집을 연다**(대표 2026-09-21): 빈 행을
+        # 만들어 놓고 못 채우면 더 혼란스럽다.
+        self._acct_edit = True
         asset = self._asset
         self._collect_acct_widgets()             # 다른 행 미저장 편집 보존
         _bk0 = self._broker_name
@@ -3907,9 +3926,42 @@ class App:
             id_cb.bind("<<ComboboxSelected>>", _pick)
             id_cb.bind("<FocusOut>", _pick)
             self._acct_widgets[idx]["acct_id"] = id_cb
+        _del_b = None
         if deletable:
-            ttk.Button(row, text=("삭제" if self.lang == "ko" else "Remove"), width=6,
-                       command=lambda i=idx: self._del_acct(self._asset, i)).pack(side="right")
+            _del_b = ttk.Button(row, text=("삭제" if self.lang == "ko" else "Remove"), width=6,
+                                command=lambda i=idx: self._del_acct(self._asset, i))
+            _del_b.pack(side="right")
+        # ── 계좌 정보 잠금(대표 2026-09-21 "실수로 자꾸 계좌 정보 바꾸게 돼") ──────────
+        # 평소에는 못 고치게 두고 [계좌 수정] 토글로만 연다. 기본 잠김이고 **영속하지 않는다**
+        # - 앱을 새로 켜면 늘 잠긴 상태로 시작한다("평소에는 닫게").
+        # ⚠️실행 on/off 체크박스는 잠그지 않는다: 그건 계좌 '정보'가 아니라 매일 쓰는
+        #   무장/해제 조작이다. 잠그면 정작 필요한 동작이 막힌다.
+        # readonly는 값이 그대로 읽히고 disabled는 흐려진다 - 입력칸은 읽혀야 하므로 readonly.
+        if not getattr(self, "_acct_edit", False):
+            for _w, _st in ((lbl_e, "readonly"), (bk_cb, "disabled"),
+                            (self._acct_widgets[idx].get("acct_id"), "disabled"),
+                            (pb, "disabled"), (cb, "disabled"), (_del_b, "disabled")):
+                try:
+                    if _w is not None:
+                        _w.config(state=_st)
+                except Exception:
+                    pass
+            try:                       # 1R은 프롭 모드에서 이미 disabled - 덮지 않는다
+                if str(r_e.cget("state")) != "disabled":
+                    r_e.config(state="readonly")
+            except Exception:
+                pass
+
+    def _toggle_acct_edit(self):
+        """계좌 정보 편집 잠금 토글(대표 2026-09-21). 잠글 때는 화면 값을 먼저 저장한다 -
+        고치다 바로 잠그면 마지막 입력이 FocusOut 없이 사라질 수 있다."""
+        if getattr(self, "_acct_edit", False):
+            try:
+                self._save_acct_widgets()
+            except Exception:
+                pass
+        self._acct_edit = not getattr(self, "_acct_edit", False)
+        self._build()
 
     def _save_acct_widgets(self):
         """자산 탭 계좌 위젯값(on, 라벨, 1R) → 이 자산 accounts 반영 + 영속 + 라이브 패널 새로고침."""
@@ -6294,7 +6346,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.21a"
+    _APP_VER = "2026.09.21b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
