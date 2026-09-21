@@ -4892,10 +4892,41 @@ class App:
                 # 60자 자르기는 원인을 통째로 삼켰다(2026-09-21 실사고): Bitget 오류 문자열이
                 # "... HTTP 400: " 까지가 딱 60자라 정작 필요한 code=·msg가 화면에서 날아갔다.
                 # 브로커가 준 원인은 끝까지 보여 준다 - 이 한 줄이 다음 수리의 출발점이다.
-                self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:300]}) — 기존 손절 유지"); return
+                self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:300]}) — 기존 손절 유지")
+                self._stop_move_alert(tgt, cur, r["error"]); return
             self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (본절)" if entry and abs(tgt - entry) < 1e-9 else ""))
         except Exception as e:
             self.log(f"   ⚠ 손절 이동 예외({e}) — 기존 손절 유지")
+            try:
+                self._stop_move_alert(None, None, e)
+            except Exception:
+                pass
+
+    def _stop_move_alert(self, tgt, cur, why):
+        """손절 이동 실패를 **회원에게** 알린다(2026-09-21 실사고).
+
+        왜 로그로는 안 되나: 2026-08-28 R16 P0이 거치 실패에 회원 DM을 붙였는데, 거치
+        **이후**의 이동 실패는 그대로 self.log 한 줄로 남았다. 2026-09-21 아침 Bitget의
+        modify-tpsl이 HTTP 400으로 조용히 실패해 손절이 옛 수준에 머물렀고, 대표가 차트를
+        보다 직접 발견해 수동으로 옮겼다 - 앱은 알고 있었는데 아무에게도 말하지 않았다.
+
+        ⚠️'무방비'가 아니다: 기존 손절은 살아 있고 더 느슨한 자리에 있을 뿐이다. 문안이
+        이걸 흐리면 회원이 과하게 놀라 멀쩡한 포지션을 던진다 - 있는 그대로만 적는다.
+        BTC는 X2+TR 홀드 중이면 세션 마감 자동청산이 건너뛰어(_auto_loop) 며칠을 그 손절로
+        가므로, 이 알림이 유일한 통지 경로다.
+        """
+        _t = f"{tgt:g}" if isinstance(tgt, (int, float)) and tgt else "-"
+        _c = f"{cur:g}" if isinstance(cur, (int, float)) and cur else "-"
+        self._member_alert(
+            "stop_move_fail",
+            f"[EQ Autopilot] 손절을 새 자리로 옮기지 못했습니다 (BTC). 기존 손절 {_c}은(는) "
+            f"그대로 살아 있고, 옮기려던 자리는 {_t}입니다. 포지션은 보호되고 있지만 "
+            f"계획보다 느슨한 손절로 진행됩니다. 브로커 화면에서 직접 옮기셔도 됩니다. "
+            f"원인: {str(why)[:160]}",
+            f"[EQ Autopilot] The stop could not be moved to its new level (BTC). The existing "
+            f"stop at {_c} is still live; the intended level was {_t}. The position is still "
+            f"protected but runs with a looser stop than planned. You can move it yourself at "
+            f"your broker. Cause: {str(why)[:160]}")
 
     # ── BTC 조건부 출구 X2+TR (2026-07-15 챔피언, 대표 아이디어) ────────────────────
     # 규칙: 일 22:00 UTC 진입 → 4H 블록(22-02, 02-06, 06-10, 10-14, 14-18, 18-22)마다 마감 시
@@ -6438,14 +6469,17 @@ class App:
                     return (str(x or "").upper().replace(".P", "")
                             .replace("-", "").replace("/", "").replace("_", ""))
                 _sn = _nrm(_sym)
-                _still = any(
-                    bool(_sn) and bool(_pn) and (_sn in _pn or _pn in _sn)
-                    for _pn in (_nrm(getattr(_p, "symbol", "")) for _p in _poss))
+                _hit = next((_p for _p in _poss
+                             if bool(_sn) and bool(_nrm(getattr(_p, "symbol", "")))
+                             and (_sn in _nrm(getattr(_p, "symbol", ""))
+                                  or _nrm(getattr(_p, "symbol", "")) in _sn)), None)
+                _still = _hit is not None
             except Exception:
                 self._flat_seen.pop(str(_a), None)
                 continue
             if _still:
                 self._flat_seen.pop(str(_a), None)
+                self._check_stop_alive(_a, _hit)
                 continue
             _n = int(self._flat_seen.get(str(_a), 0)) + 1
             self._flat_seen[str(_a)] = _n
@@ -6462,6 +6496,61 @@ class App:
                      f"- \uc11c\ubc84\uc5d0 \uccad\uc0b0\uc744 \ubcf4\uace0\ud569\ub2c8\ub2e4.")
             self._open_ctx.pop(str(_a), None)
             self._send_fill(_a, closed=True)
+
+    def _check_stop_alive(self, asset, pos):
+        """열린 포지션에 **보호 손절이 아직 붙어 있는지** 매 하트비트 확인한다(2026-09-21).
+
+        왜 여기인가: 거치 시점의 실패는 _handle_stop_failure가 막는데(거부=즉시 청산,
+        일시 실패=재시도 후 회원 경보), **거치 이후**는 아무도 안 봤다. 손절이 브로커
+        쪽에서 사라지거나 이동에 실패해도 앱은 로그 한 줄만 남겼고, 2026-09-21 아침
+        Bitget이 정확히 그랬다 - 대표가 차트를 보다 직접 발견했다.
+
+        🚨BTC가 제일 위험하다: X2+TR이 홀드를 판정하면 _auto_loop이 세션 마감 자동청산을
+        건너뛴다(continue). 즉 **백스톱이 없다** - 손절이 사라지면 며칠을 무방비로 간다.
+        NQ/GC는 하루 안에 마감 청산이 있어 노출이 시간 단위로 묶인다.
+
+        범위: 손절을 포지션 속성으로 들고 오는 크립토(Bybit/Bitget)만 이 경로로 판정한다.
+        선물은 손절이 **별도 주문**이라 raw에 안 담기므로 여기서 '없다'고 말하면 전부
+        오경보다 - ProjectX는 _open_orders가 있어 따로 붙일 수 있고, NT8은 주문 조회
+        API 자체가 없다(eqgui.py:5289). 없는 것을 있다고도, 있는 것을 없다고도 안 한다.
+
+        ⚠️읽기 전용이다. 주문을 다시 걸지 않는다 - 조회가 순간적으로 손절을 빠뜨렸을 때
+        옛 손절가를 덮어쓰면 트레일로 좁혀 둔 자리가 느슨해진다. 알리고, 판단은 회원이.
+        조회 흔들림에 대비해 **연속 2회**일 때만 말한다(_flat_seen과 같은 규약).
+        """
+        try:
+            _raw = getattr(pos, "raw", None) or {}
+            if "stopLoss" not in _raw:
+                return                        # 손절을 속성으로 안 주는 어댑터 = 판단 안 함
+            try:
+                _sl = float(_raw.get("stopLoss") or 0)
+            except Exception:
+                _sl = 0.0
+            if not hasattr(self, "_nostop_seen"):
+                self._nostop_seen = {}
+            _k = str(asset)
+            if _sl:
+                self._nostop_seen.pop(_k, None)
+                return
+            _n = int(self._nostop_seen.get(_k, 0)) + 1
+            self._nostop_seen[_k] = _n
+            self.log(f"   · {_k} 보호 손절 미발견 {_n}/2 — 포지션은 살아 있음")
+            if _n < 2:
+                return
+            self._nostop_seen[_k] = -999       # 한 번만 알린다(복구되면 위에서 리셋)
+            self.log(f"\u26a0 {_k} 열린 포지션에 보호 손절이 없습니다 - 회원에게 알립니다.")
+            self._member_alert(
+                "stop_vanished",
+                f"[EQ Autopilot] 열려 있는 {_k} 포지션에 보호 손절이 걸려 있지 않습니다. "
+                f"브로커 화면에서 지금 손절을 직접 걸거나 포지션을 정리하세요."
+                + (" BTC는 홀드 중 세션 마감 자동 청산이 동작하지 않으므로 손절이 유일한 "
+                   "보호 장치입니다." if _k == "BTC" else ""),
+                f"[EQ Autopilot] Your open {_k} position has no protective stop at the broker. "
+                f"Place a stop yourself now, or close the position."
+                + (" For BTC the session-close auto-flatten does not run while the position is "
+                   "held, so the stop is the only protection." if _k == "BTC" else ""))
+        except Exception:
+            pass
 
     def _send_fill(self, asset, closed=False):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
