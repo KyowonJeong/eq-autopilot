@@ -6700,6 +6700,108 @@ class App:
         except (TypeError, ValueError, AttributeError):
             pass
 
+    def _check_stop_size(self, asset, ctx, b, pos, aid, con, stops) -> None:
+        """보호 손절 **주문 수량**이 지금 포지션과 맞는가 - 안 맞으면 맞춘다(2026-09-21).
+
+        왜(대표 "내가 반익을 해도 나머지에 대해선 손절이 잘 작동하게"): 크립토는 손절이
+        포지션 **속성**이라 회원이 일부를 손으로 덜어내면 남은 수량에 그대로 붙는다.
+        선물은 손절이 **별도 주문**이라 원래 수량 그대로 남는다:
+          주문 > 포지션 → 발동하면 남은 것을 닫고 **반대 포지션까지 연다**(reduceOnly 없음)
+          주문 < 포지션 → 남는 만큼이 무방비
+        앞선 수리는 손절이 **사라졌을 때** 다시 거는 수량만 고쳤다. 살아 있는데 수량이
+        어긋난 경우가 빈칸이었고, 반익을 하면 바로 그 상태가 된다.
+
+        ⚠️'수동이 우선'과 충돌하지 않는다: 회원이 고른 것은 손절 **자리**고 여기서 고치는
+        것은 **수량**이다. 자리는 ctx['stop'](회원이 옮겼으면 그 값을 이미 학습해 둔다)을
+        그대로 쓴다. 보호를 되돌리는 것이지 판단을 덮는 것이 아니다.
+
+        ⚠️순서: 큰 주문을 남겨두고 새로 걸면 두 스탑이 동시에 살아 더 위험하다(하나가
+        닫고 다른 하나가 반대 포지션을 연다). **취소 먼저, 즉시 재거치.** 그 사이 몇 초가
+        무방비인데, 어긋난 스탑을 그대로 두는 쪽이 더 나쁘다. 재거치가 실패하면 크게 알린다.
+        조회 흔들림(체결 직후 스냅샷)에 속지 않게 **연속 2회** 어긋날 때만 움직인다.
+        """
+        import time as _t
+        try:
+            _need = abs(int(getattr(pos, "net_qty", 0) or 0))
+            if not _need:
+                return
+            _have = 0
+            for _o in stops:
+                try:
+                    _have += abs(int(_o.get("size") or 0))
+                except (TypeError, ValueError):
+                    return                      # 수량을 못 읽으면 판단하지 않는다
+            if not hasattr(self, "_size_seen"):
+                self._size_seen = {}
+            _k = str(asset)
+            if _have == _need:
+                self._size_seen.pop(_k, None)
+                return
+            _n = int(self._size_seen.get(_k, 0))
+            if _n < 0:
+                return                          # 이미 손봤다(맞아지면 위에서 리셋)
+            _n += 1
+            self._size_seen[_k] = _n
+            self.log(f"   · {_k} 손절 수량 불일치 {_n}/2 — 주문 {_have} vs 포지션 {_need}")
+            if _n < 2:
+                return
+            self._size_seen[_k] = -1
+
+            _lvl = ctx.get("stop")
+            if not _lvl:
+                try:
+                    _lvl = float(stops[0].get("stopPrice"))
+                except (TypeError, ValueError):
+                    _lvl = None
+            if not _lvl:
+                self._member_alert(
+                    "stop_size_bad",
+                    f"[EQ Autopilot] {_k} 보호 손절 수량이 포지션과 다릅니다(주문 {_have}, "
+                    f"포지션 {_need}). 손절 가격을 알 수 없어 앱이 고치지 못했습니다. "
+                    f"브로커 화면에서 직접 맞춰 주세요.",
+                    f"[EQ Autopilot] The {_k} protective stop size does not match the position "
+                    f"(order {_have}, position {_need}). The app could not read the stop price to "
+                    f"fix it. Please correct it at your broker.")
+                return
+
+            _cancelled = 0
+            for _o in stops:
+                try:
+                    b._cancel_order(aid, _o.get("id") or _o.get("orderId"))
+                    _cancelled += 1
+                except Exception as _ce:
+                    self.log(f"   ⚠ {_k} 낡은 손절 취소 실패({str(_ce)[:80]})")
+            _r = {}
+            try:
+                _r = b.place_protective_stop(
+                    aid, con, ctx.get("dir") or "LONG", _need, _lvl,
+                    custom_tag=f"EQ-AP-SZ-{int(_t.time() * 1000)}") or {}
+            except Exception as _pe:
+                _r = {"stop_error": str(_pe)[:160]}
+            if _r.get("stop"):
+                self.log(f"   \u2705 {_k} 손절 수량을 {_have}→{_need}로 맞췄습니다 @{_lvl:g}")
+                self._member_alert(
+                    "stop_size_fixed",
+                    f"[EQ Autopilot] {_k} 보호 손절 수량이 포지션과 달라({_have} vs {_need}) "
+                    f"앱이 {_need}로 다시 걸었습니다(가격 {_lvl:g}). 포지션이 일부만 정리되면 "
+                    f"생기는 상태입니다. 브로커 화면에서 한 번 확인해 주세요.",
+                    f"[EQ Autopilot] The {_k} stop size did not match the position "
+                    f"({_have} vs {_need}); the app re-placed it for {_need} at {_lvl:g}. "
+                    f"This happens after a position is partly closed. Please confirm at your broker.")
+                return
+            self.log(f"   \U0001f534 {_k} 손절 수량 교정 실패 - 취소 {_cancelled}건 뒤 재거치 실패"
+                     f"({str(_r.get('stop_error'))[:120]})")
+            self._member_alert(
+                "stop_size_bad",
+                f"[EQ Autopilot] {_k} 보호 손절 수량을 맞추려다 실패했습니다. 낡은 손절을 "
+                f"{_cancelled}건 취소한 뒤 다시 걸지 못했습니다 - **지금 손절이 없을 수 "
+                f"있습니다.** 브로커 화면에서 즉시 확인하세요.",
+                f"[EQ Autopilot] Failed while correcting the {_k} stop size. {_cancelled} stale "
+                f"stop(s) were cancelled and re-placing failed - **you may have no stop right "
+                f"now.** Check your broker immediately.")
+        except Exception:
+            pass
+
     def _check_stop_alive(self, asset, pos):
         """열린 포지션에 **보호 손절이 아직 붙어 있는지** 확인하고, 없으면 다시 건다(2026-09-21).
 
@@ -6761,6 +6863,8 @@ class App:
                 _seen_px = float(_stops[0].get("stopPrice")) if _stops else None
             except (TypeError, ValueError):
                 _seen_px = None
+            if _alive:
+                self._check_stop_size(_k, _ctx, _b, pos, _aid, _con, _stops)
         if _alive is None:
             return
         if _alive:
@@ -7316,8 +7420,25 @@ class App:
                             acct=f"{getattr(b, 'name', '')}:{sc}")          # 계좌 단위 집계(R38 P1-#8)
             self._send_gap(asset, sig, b, _con,
                            mkt_at_send=_px_at_send)      # 체결 갭+협의 슬리피지 실측(21l)
+            # 🚨수량은 **실제 체결분**(_seen_qty)으로 기억한다(2026-09-21 대표 "클나").
+            # 보호 손절은 주문 수량으로 걸리는데 부분 체결이면 포지션보다 큰 스탑이 남는다 -
+            # 선물은 reduceOnly가 없어 발동하면 남은 것을 닫고 **반대 포지션까지 연다**.
+            # 2026-09-04 NT8 진입 누락과 같은 집안이다. 기억이 주문 수량이면 재거치·수량
+            # 교정까지 같이 틀리므로 여기서 실측을 든다(_check_stop_size가 180초 안에 교정).
             self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
-                                aid=_aid, direction=direction, size=_qty)   # 감지+재거치용
+                                aid=_aid, direction=direction,
+                                size=(_seen_qty or _qty))   # 감지+재거치용
+            if _seen_qty and int(_seen_qty) != int(_qty):
+                self.log(f"   \u26a0 {_sym} 부분 체결 {_seen_qty}/{_qty} — 보호 손절이 주문 "
+                         f"수량({_qty})으로 걸려 있어 포지션보다 큽니다. 교정을 시도합니다.")
+                self._member_alert(
+                    "partial_fill",
+                    f"[EQ Autopilot] {asset} 진입이 부분 체결됐습니다({_seen_qty}/{_qty}). "
+                    f"보호 손절은 주문 수량으로 걸려 포지션보다 큽니다 - 앱이 곧 수량을 "
+                    f"맞춥니다. 맞춰지지 않으면 다시 알려 드립니다.",
+                    f"[EQ Autopilot] The {asset} entry filled only partly ({_seen_qty}/{_qty}). "
+                    f"The protective stop is sized for the full order, larger than the position - "
+                    f"the app will correct it shortly and will tell you if it cannot.")
             _ledger_add(asset, _con, direction, _tag)      # 실제 사용 태그(-rN 포함)로 기록
             # 🛡 판정(대표 2026-09-04): ack의 stop_order_id 또는 NT8 주문 스냅샷의 스탑
             # 존재로 - 오늘 사고에선 정상 계좌도 ack 필드가 비어 🛡 라인이 누락됐었다.

@@ -24,8 +24,9 @@ import textwrap
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eqgui  # noqa: E402
 
-NAMES = ("_check_stop_closed", "_check_stop_alive", "_learn_seen_stop", "_restore_open_ctx",
-         "_persist_open_ctx", "_forget_open_ctx", "_remember_open", "_remember_stop")
+NAMES = ("_check_stop_closed", "_check_stop_alive", "_check_stop_size", "_learn_seen_stop",
+         "_restore_open_ctx", "_persist_open_ctx", "_forget_open_ctx", "_remember_open",
+         "_remember_stop")
 
 
 def _build():
@@ -59,6 +60,30 @@ class _Crypto:
     def set_stop(self, sym, px):
         self.stops.append(px)
         return {}
+
+
+class _Futures:
+    """ProjectX 모양: 손절이 **별도 주문**이라 수량이 포지션과 따로 논다."""
+    name = "projectx"
+
+    def __init__(self, stops, place_ok=True):
+        self.orders = list(stops)
+        self.place_ok = place_ok
+        self.placed, self.cancelled = [], []
+
+    def _open_orders(self, aid):
+        return self.orders
+
+    def _cancel_order(self, aid, oid):
+        self.cancelled.append(oid)
+        self.orders = [o for o in self.orders if o.get("id") != oid]
+
+    def place_protective_stop(self, aid, con, d, n, px, *, custom_tag=None):
+        self.placed.append((n, px))
+        if not self.place_ok:
+            return {"stop_error": "reject"}
+        self.orders.append({"id": 99, "type": 4, "contractId": con, "size": n, "stopPrice": px})
+        return {"stop": {"id": 99}}
 
 
 def _app(T, b, ctx):
@@ -145,7 +170,49 @@ def main():
     ok("재시작 복구", "BTC" in t._open_ctx and b.stops == [80964.2]
        and t.alerts == ["stop_restored"], f"복구={'BTC' in t._open_ctx} 재거치{b.stops}")
 
-    print(f"\n{'전부 통과' if not fails else 'FAIL ' + str(fails)} - 5개 검사")
+    # ⑥ 선물: 손절 주문 수량이 포지션과 같으면 아무 일도 없다
+    fb = _Futures([{"id": 1, "type": 4, "contractId": "CON.F.MNQ", "size": 5,
+                    "stopPrice": 24000.0}])
+    c = {"sym": "CON.F.MNQ", "stop": 24000.0, "app_stop": 24000.0, "dir": "LONG", "aid": 7}
+    t = _app(T, fb, c)
+    t._open_assets = {"NQ"}
+    t._open_ctx = {"NQ": c}
+    t.__dict__.setdefault("_size_seen", {})
+    fb.poss = None
+    p = _Pos({"_accountId": 7, "contractId": "CON.F.MNQ"}, "CON.F.MNQ", 5)
+    t._check_stop_alive("NQ", p)
+    ok("선물 수량 일치=무음", not fb.placed and not fb.cancelled and not t.alerts,
+       f"재거치{fb.placed} 취소{fb.cancelled} 경보{t.alerts}")
+
+    # ⑦ 반익 뒤: 주문 11 vs 포지션 5 → 연속 2회 뒤 취소 + 5로 재거치
+    fb = _Futures([{"id": 1, "type": 4, "contractId": "CON.F.MNQ", "size": 11,
+                    "stopPrice": 24000.0}])
+    c = {"sym": "CON.F.MNQ", "stop": 24150.0, "app_stop": 24000.0, "dir": "LONG", "aid": 7}
+    t = _app(T, fb, c)
+    t._open_assets = {"NQ"}
+    t._open_ctx = {"NQ": c}
+    p = _Pos({"_accountId": 7, "contractId": "CON.F.MNQ"}, "CON.F.MNQ", 5)
+    for _ in range(2):
+        t._stop_chk_at = {}
+        t._check_stop_alive("NQ", p)
+    ok("반익 뒤 수량 교정", (fb.cancelled == [1] and fb.placed == [(5, 24150.0)]
+                             and t.alerts == ["stop_size_fixed"]),
+       f"취소{fb.cancelled} 재거치{fb.placed} 경보{t.alerts}")
+
+    # ⑧ 교정 중 재거치 실패 → 무방비 가능성을 크게 알린다
+    fb = _Futures([{"id": 1, "type": 4, "contractId": "CON.F.MNQ", "size": 11,
+                    "stopPrice": 24000.0}], place_ok=False)
+    c = {"sym": "CON.F.MNQ", "stop": 24000.0, "app_stop": 24000.0, "dir": "LONG", "aid": 7}
+    t = _app(T, fb, c)
+    t._open_assets = {"NQ"}
+    t._open_ctx = {"NQ": c}
+    p = _Pos({"_accountId": 7, "contractId": "CON.F.MNQ"}, "CON.F.MNQ", 5)
+    for _ in range(2):
+        t._stop_chk_at = {}
+        t._check_stop_alive("NQ", p)
+    ok("교정 실패=경보", t.alerts == ["stop_size_bad"], f"경보{t.alerts}")
+
+    print(f"\n{'전부 통과' if not fails else 'FAIL ' + str(fails)} - 8개 검사")
     return 1 if fails else 0
 
 
