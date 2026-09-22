@@ -6169,12 +6169,40 @@ class App:
         except Exception:
             pass
 
-    def _portfolio_risk_weights(self, rledger):   # 반환 dict | None
+    def _planned_one_r(self, ac):   # 반환 float | None(진입 안 하는 계좌)
+        # ⚠️PEP 604 어노테이션(`-> float | None`) 금지 - 앱 파이썬 3.9(아래
+        #   _portfolio_risk_weights 주석에 사고 경위). 감시: test_build_guards_offline.py.
+        """이 계좌가 **지금 신호가 오면 실제로 걸 1R**. 네트워크 없이 설정만으로 푼다.
+
+        왜(대표 2026-09-22 "나스닥 금 비중은 동일해"): 진입 경로(_enter_account)는 프롭 계좌의
+        1R을 설정값이 아니라 **단계별 방패값**(_prop_one_r)으로 바꿔 쓴다. 그런데 비중 계산은
+        원장이 없는 계좌를 설정값(명목)으로 폴백해서, **같은 계좌가 자산마다 다른 1R로 잡혔다** -
+        NQ는 이미 거래해 원장에 방패 $300이 있고 GC는 아직 안 거래해 명목 $600으로 폴백하는 식.
+        그래서 설정이 완전히 같은데도 NQ 25 : GC 28로 어긋났다(실측 로그 2026-09-22 10:41).
+
+        ⚠️신호별 확신 배수(size_mult)는 곱하지 않는다 - 그건 그 신호 한 건에만 붙는 값이라
+          상시 '내 위험이 어떻게 나뉘어 있나'와 무관하고, 넣으면 신호마다 비중이 흔들린다.
+        """
+        pr = ac.get("prop") or {}
+        if not pr.get("on"):
+            return float(_as_float(ac.get("one_r"), 600.0))
+        t = pr.get("type")
+        if t == "live":
+            return float(_as_float(pr.get("r_live"), 100.0))
+        if t != "funded":
+            return float(_as_float(pr.get("r_test"), 1200.0))
+        # 펀디드: 5발 완료 계좌는 진입 자체를 안 한다(_prop_one_r이 None) - 비중에서도 빠져야
+        # 한다. 종전엔 on=True라는 이유로 명목 1R이 그대로 더해져 그 자산을 부풀렸다.
+        if max(0, min(5, int(_as_float(pr.get("payouts"), 0)))) >= 5:
+            return None
+        return float(_as_float(pr.get("r_steady"), 300.0))   # 방패기·Fast-Payout 모두 r_steady
+
+    def _portfolio_risk_weights(self):   # 반환 dict | None
         # ⚠️PEP 604 어노테이션(`-> dict | None`)을 쓰지 마라 - 앱 파이썬은 3.9(Tk 8.6 제약)라
         #   **기동 즉시 TypeError**로 배포 빌드가 안 열린다(2026-08-31 실사고, 2026-09-22 재발).
         #   같은 경고가 _idle_days 위에도 있다. 반환 타입은 이렇게 주석으로 적는다.
         #   감시: executor/test_build_guards_offline.py (빌드 venv 3.9로 돌릴 것).
-        """자산별 포트폴리오 비중 = **켜져 있는 계좌들의 최신 실제 1R 합**의 비(比).
+        """자산별 포트폴리오 비중 = **켜져 있는 계좌들이 지금 걸 1R의 합**의 비(比).
 
         왜(대표 2026-09-22 "포트 비중을 알 방법 없나"): 종전에는 `risk_weights = None`으로
         아예 안 보냈다. "자산 간 비중은 균등"이라는 2026-07-24 전제로 박아 둔 것인데
@@ -6184,25 +6212,31 @@ class App:
 
         ⛔절대 금액은 나가지 않는다 - 최솟값으로 나눈 비율뿐이라 역산이 안 된다
           (회원마다 기준이 달라 상호 비교도 불가). 이 파일의 다른 전송과 같은 규약.
-        프롭은 원장이 발주 순간의 방패값을 기록하므로 자동 반영된다(별도 분기 불필요).
-        원장이 없는 계좌는 설정 1R로 폴백. 자산이 하나뿐이면 '비중'이 성립 안 해 None.
+
+        🚨1R 해석은 **_planned_one_r 하나로 통일**한다(2026-09-22 수리). 종전에는 실제 1R 원장
+          (.r_ledger.json)의 최신값을 쓰고 없으면 설정값으로 폴백했는데, 프롭 계좌는 진입 경로가
+          설정값이 아닌 방패값을 쓰기 때문에 **같은 계좌가 원장 있는 자산에선 $300, 없는 자산에선
+          $600**으로 잡혔다. 설정이 동일한데 NQ 25 : GC 28이 나온 원인이 정확히 이것이다.
+          비중은 '지금 신호가 오면 어떻게 나뉘나'라 과거 체결값이 아니라 **지금 규칙**이 맞다.
+          (원장은 트랙레코드 R 환산에서 계속 쓴다 - 그쪽은 과거 체결이라 과거값이 맞다.)
+        자산이 하나뿐이면 '비중'이 성립 안 해 None.
         """
         try:
             tot, detail = {}, {}
             for a in ("NQ", "GC", "BTC"):
-                s_, n_, fb_ = 0.0, 0, 0
+                s_, n_, pp_, sk_ = 0.0, 0, 0, 0
                 for ac in self._active_accts(a):
-                    aid = (ac.get("id") or "").strip()
-                    rows = (rledger or {}).get(f"{a}|{aid}") or []
-                    if rows:
-                        s_ += float(max(rows, key=lambda x: x[0])[1])
-                    else:
-                        s_ += float(_as_float(ac.get("one_r"), 600.0))
-                        fb_ += 1
+                    r = self._planned_one_r(ac)
+                    if r is None:
+                        sk_ += 1                       # 5발 완료 - 진입 안 하므로 비중에서도 제외
+                        continue
+                    s_ += r
                     n_ += 1
+                    if (ac.get("prop") or {}).get("on"):
+                        pp_ += 1
                 if s_ > 0:
                     tot[a] = s_
-                    detail[a] = {"n": n_, "sum": s_, "fb": fb_}
+                    detail[a] = {"n": n_, "sum": s_, "prop": pp_, "skip": sk_}
             if len(tot) < 2:
                 return None
             base = min(tot.values())
@@ -6210,12 +6244,13 @@ class App:
             self.log("   \u2696 포트폴리오 비중(1R 합 비율) "
                      + " : ".join(f"{k} {v:g}" for k, v in out.items()))
             # 내역도 남긴다(대표 2026-09-22 "나스닥 금 비중은 동일해"): 비율만 보면 왜
-            # 그렇게 나왔는지 알 수 없다. 자산별 **계좌 수와 1R 합**, 그리고 원장이 없어
-            # 설정값으로 폴백한 계좌 수까지 적는다 - 비중이 예상과 다르면 여기서 갈린다.
+            # 그렇게 나왔는지 알 수 없다. 자산별 **계좌 수와 1R 합**, 그중 프롭(방패값 적용)
+            # 계좌 수, 그리고 5발 완료로 빠진 계좌 수까지 적는다 - 예상과 다르면 여기서 갈린다.
             # ⚠️이 줄은 회원 자기 기기 로그에만 남는다(전송하는 것은 비율뿐).
             self.log("      내역 " + " / ".join(
                 f"{k} {detail[k]['n']}계좌 ${detail[k]['sum']:,.0f}"
-                + (f"(설정값 {detail[k]['fb']}개)" if detail[k]["fb"] else "")
+                + (f"(프롭 {detail[k]['prop']}개)" if detail[k]["prop"] else "")
+                + (f"(5발완료 {detail[k]['skip']}개 제외)" if detail[k]["skip"] else "")
                 for k in tot))
             return out
         except Exception:
@@ -6467,7 +6502,7 @@ class App:
             # ⛔절대 금액은 보내지 않는다 - 최솟값으로 나눈 비율뿐이라 역산이 안 된다
             #   (회원마다 기준이 달라 상호 비교도 불가). 이 파일의 다른 전송과 같은 규약.
             # 프롭은 원장이 발주 순간의 방패값을 기록하므로 자동으로 반영된다(별도 분기 불필요).
-            risk_weights = self._portfolio_risk_weights(_rledger)
+            risk_weights = self._portfolio_risk_weights()
             pid = autopilot_crypto.path_id(tok)
             ok_total, srv_handle = None, None
             for i in range(0, len(trades), TR_CHUNK):
