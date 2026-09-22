@@ -1,10 +1,8 @@
-config.yaml
-consent.json
-*.log
-venv/
-.buildvenv/
-build/
-dist/
 __pycache__/
 *.pyc
+build/
+dist/
+venv/
+config.yaml
+*.log
 .DS_Store
