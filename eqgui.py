@@ -6150,7 +6150,11 @@ class App:
         except Exception:
             pass
 
-    def _portfolio_risk_weights(self, rledger) -> dict | None:
+    def _portfolio_risk_weights(self, rledger):   # 반환 dict | None
+        # ⚠️PEP 604 어노테이션(`-> dict | None`)을 쓰지 마라 - 앱 파이썬은 3.9(Tk 8.6 제약)라
+        #   **기동 즉시 TypeError**로 배포 빌드가 안 열린다(2026-08-31 실사고, 2026-09-22 재발).
+        #   같은 경고가 _idle_days 위에도 있다. 반환 타입은 이렇게 주석으로 적는다.
+        #   감시: executor/test_build_guards_offline.py (빌드 venv 3.9로 돌릴 것).
         """자산별 포트폴리오 비중 = **켜져 있는 계좌들의 최신 실제 1R 합**의 비(比).
 
         왜(대표 2026-09-22 "포트 비중을 알 방법 없나"): 종전에는 `risk_weights = None`으로
