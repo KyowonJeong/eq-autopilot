@@ -982,7 +982,17 @@ _LEDGER_PATH = os.path.join(APP_DIR, ".eqtrades.json")
 _LEDGER_SINCE_PATH = os.path.join(APP_DIR, ".eqtrades_since")
 _LEDGER_KEEP_DAYS = 400                 # 조회창(90일)보다 넉넉히 — 원장이 먼저 마르면 안 됨
 # 자산별 최대 보유시간(h): 진입 1건이 커버하는 체결 창. NQ/GC=당일 세션, BTC=4h 홀드 + 여유.
-_LEDGER_HOLD_H = {"NQ": 12.0, "GC": 12.0, "BTC": 6.0}
+# 🚨BTC 30h: X2+TR은 6블록 × 4시간 = **최대 24시간** 보유한다(2026-09-22 수리). 종전 6.0은
+#   그 절반도 못 덮어, 진입 14시간 뒤 부분 청산도 26시간 뒤 최종 청산도 원장 매칭에서 빠졌다
+#   - 그래서 트랙레코드가 한 포지션을 두 건으로 쪼갰다. 24h + 여유 6h.
+_LEDGER_HOLD_H = {"NQ": 12.0, "GC": 12.0, "BTC": 30.0}
+def _nrm_sym(x) -> str:
+    """심볼 비교용 정규화 - 'BTCUSDT.P'와 'BTCUSDT'를 같게 본다(2026-09-22).
+    같은 규약이 _check_stop_closed에도 있다(그쪽은 2026-09-21 가짜 청산 수리)."""
+    return (str(x or "").upper().replace(".P", "")
+            .replace("-", "").replace("/", "").replace("_", ""))
+
+
 _SYM_MATCH_DAYS = 7      # EQ가 연 '그 계약'의 청산 매칭창(일) — 시간창 넘긴 수동 청산 포착(대표 2026-07-29)
 
 
@@ -6003,7 +6013,10 @@ class App:
                 continue
             e = int(r.get("ts_ms") or 0)
             rsym = str(r.get("symbol") or "")
-            _hit = ((fsym and rsym and fsym == rsym and (e - 300_000) <= ts <= (e + sym_win))
+            # 심볼은 **양쪽을 정규화해** 비교한다(2026-09-22): 옛 원장 행에는 'BTCUSDT.P'가
+            # 적혀 있고 체결은 'BTCUSDT'로 온다 - 날것 비교는 그 행들을 영영 못 살린다.
+            _hit = ((fsym and rsym and _nrm_sym(fsym) == _nrm_sym(rsym)
+                     and (e - 300_000) <= ts <= (e + sym_win))
                     or (e - 300_000 <= ts <= e + hold_ms))
             # 여러 진입이 걸리면 **체결에 가장 가까운 직전 진입**이 그 체결의 주인이다.
             if _hit and (best is None or e > int(best.get("ts_ms") or 0)):
@@ -6175,9 +6188,9 @@ class App:
         원장이 없는 계좌는 설정 1R로 폴백. 자산이 하나뿐이면 '비중'이 성립 안 해 None.
         """
         try:
-            tot = {}
+            tot, detail = {}, {}
             for a in ("NQ", "GC", "BTC"):
-                s_ = 0.0
+                s_, n_, fb_ = 0.0, 0, 0
                 for ac in self._active_accts(a):
                     aid = (ac.get("id") or "").strip()
                     rows = (rledger or {}).get(f"{a}|{aid}") or []
@@ -6185,14 +6198,25 @@ class App:
                         s_ += float(max(rows, key=lambda x: x[0])[1])
                     else:
                         s_ += float(_as_float(ac.get("one_r"), 600.0))
+                        fb_ += 1
+                    n_ += 1
                 if s_ > 0:
                     tot[a] = s_
+                    detail[a] = {"n": n_, "sum": s_, "fb": fb_}
             if len(tot) < 2:
                 return None
             base = min(tot.values())
             out = {k: round(v / base, 2) for k, v in tot.items()}
             self.log("   \u2696 포트폴리오 비중(1R 합 비율) "
                      + " : ".join(f"{k} {v:g}" for k, v in out.items()))
+            # 내역도 남긴다(대표 2026-09-22 "나스닥 금 비중은 동일해"): 비율만 보면 왜
+            # 그렇게 나왔는지 알 수 없다. 자산별 **계좌 수와 1R 합**, 그리고 원장이 없어
+            # 설정값으로 폴백한 계좌 수까지 적는다 - 비중이 예상과 다르면 여기서 갈린다.
+            # ⚠️이 줄은 회원 자기 기기 로그에만 남는다(전송하는 것은 비율뿐).
+            self.log("      내역 " + " / ".join(
+                f"{k} {detail[k]['n']}계좌 ${detail[k]['sum']:,.0f}"
+                + (f"(설정값 {detail[k]['fb']}개)" if detail[k]["fb"] else "")
+                for k in tot))
             return out
         except Exception:
             return None
@@ -6518,7 +6542,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.22b"
+    _APP_VER = "2026.09.22c"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -8700,7 +8724,10 @@ class App:
                 # 바로 위에서 이미 _mysym으로 정규화해 쓰고 있었다.
                 self._remember_open(asset, b, _mysym, stop=stop,
                                     direction=direction, size=size)     # 감지+재거치용
-                _ledger_add(asset, sym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
+                # 🚨브로커가 돌려주는 형식으로 적는다(2026-09-22): 여기서 원본 sym
+                # ('BTCUSDT.P')을 적으면 체결 조회가 주는 'BTCUSDT'와 심볼 매칭이 영원히
+                # 실패한다 - 바로 위 _remember_open이 같은 이유로 _mysym을 쓴다.
+                _ledger_add(asset, _mysym, direction, _ctag)   # EQ 원장 — 트랙레코드 필터 근거
         except Exception as e:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
             self._report_error(f"entry:{asset}", e)      # 예외 리포트(대표 2026-07-27)
