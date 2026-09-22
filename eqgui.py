@@ -5975,6 +5975,7 @@ class App:
         return None
 
     @staticmethod
+    @staticmethod
     def _fill_entry(f, asset: str, ledger: list, since_ms: float):
         """이 체결이 나온 **EQ 진입 행**을 돌려준다(없으면 None). 판정 규칙은 _fill_is_eq와
         같고, 반환만 bool → 진입 행으로 바꾼 것이다(2026-09-22).
@@ -6009,6 +6010,11 @@ class App:
                 best = r
         return best
 
+    @staticmethod                     # 🚨self를 안 받는다 - self._fill_is_eq(...)로 부르므로
+    #   staticmethod가 없으면 인자가 하나 밀려 TypeError다. 2026-09-22까지 이 데코레이터가
+    #   없었고, 호출부가 `if not _admin_all and not self._fill_is_eq(...)`라 **admin에서는
+    #   단락 평가로 아예 안 불려** 드러나지 않았다. 즉 admin이 아닌 회원은 트랙레코드 푸시가
+    #   통째로 조용히 실패해 왔다(예외는 푸시 스레드의 try가 삼킨다).
     def _fill_is_eq(f, asset: str, ledger: list, since_ms: float) -> bool:
         """이 체결이 EQ 진입에서 나온 것인가 — 회원의 수동 거래를 트랙레코드에서 배제(대표 2026-07-17).
         원장 시작(since_ms) 이전 체결은 근거가 없으니 포함(옛 방식 유지 — 과거 기록 보존).
@@ -6346,7 +6352,7 @@ class App:
                 # 달력이 평균 23.21로 찍음). 진입이 매칭되면 그 진입 시각으로 묶고,
                 # 못 찾으면(원장 시작 이전 = 과거 기록) **종전 키 그대로** - 안 그러면
                 # 과거 전 구간 tid가 바뀌어 서버 프로필이 통째로 중복된다.
-                _ent = _fill_entry(f, a, _ledger, _since)
+                _ent = self._fill_entry(f, a, _ledger, _since)
                 if _ent:
                     _edt = _dtd.datetime.fromtimestamp((_ent.get("ts_ms") or 0) / 1000,
                                                        _dtd.timezone.utc)
@@ -6481,7 +6487,28 @@ class App:
                 self.log("   🔗 공개 페이지 주소는 서버가 핸들 배정 후 다음 동기화에 표시됩니다.")
             else:
                 self.log("   (비공개 상태 — '공개 동의' 체크 후 다시 푸시하면 페이지가 열립니다)")
-        threading.Thread(target=w, daemon=True).start()
+        def _w_guard():
+            """🚨트랙레코드 동기화 실패를 **화면에 남긴다**(2026-09-22 실사고).
+            종전에는 w()에 상위 예외 처리가 없어 스레드가 조용히 죽었다 - 로그에는
+            '체결 N건 수집'까지만 찍히고 그 뒤가 없었다. 실제로 그 상태에서 원인
+            (self 없는 헬퍼를 self.으로 호출 → TypeError/NameError)을 찾는 데 한 시간이
+            걸렸다. 같은 부류를 2026-09-16에도 겪었다(내부 기록).
+            사고가 나면 **침묵하지 말 것** - 화면 한 줄과 서버 리포트를 남긴다."""
+            try:
+                w()
+            except Exception as _e:
+                import traceback as _tb
+                self.log(f"   \U0001f534 트랙레코드 동기화 실패 - "
+                         f"{type(_e).__name__}: {str(_e)[:200]}")
+                _tail = [x for x in _tb.format_exc().strip().splitlines() if x.strip()]
+                for _ln in _tail[-3:]:
+                    self.log("      " + _ln.strip()[:160])
+                try:
+                    self._report_error("trackrecord_push",
+                                       f"{type(_e).__name__}: {str(_e)[:160]}")
+                except Exception:
+                    pass
+        threading.Thread(target=_w_guard, daemon=True).start()
 
     def _resolve_contract(self, b, symbol):
         """현재(활성) 계약ID를 종목으로 자동 조회. 활성 우선, 없으면 첫 결과."""
@@ -6491,7 +6518,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.22a"
+    _APP_VER = "2026.09.22b"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
