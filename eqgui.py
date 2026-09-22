@@ -6116,6 +6116,43 @@ class App:
         except Exception:
             pass
 
+    def _portfolio_risk_weights(self, rledger) -> dict | None:
+        """자산별 포트폴리오 비중 = **켜져 있는 계좌들의 최신 실제 1R 합**의 비(比).
+
+        왜(대표 2026-09-22 "포트 비중을 알 방법 없나"): 종전에는 `risk_weights = None`으로
+        아예 안 보냈다. "자산 간 비중은 균등"이라는 2026-07-24 전제로 박아 둔 것인데
+        프롭 계좌가 NQ·GC만 거래하면서 균등이 깨졌다. 그 사이 프로필 페이지는
+        "per-asset 1R totals"라고 **자동인 것처럼** 설명하고 서버는 옛 값을 계속 들고
+        있었다 - 설명과 실제가 갈렸고, 회원이 보는 비중이 자기 계좌와 무관해졌다.
+
+        ⛔절대 금액은 나가지 않는다 - 최솟값으로 나눈 비율뿐이라 역산이 안 된다
+          (회원마다 기준이 달라 상호 비교도 불가). 이 파일의 다른 전송과 같은 규약.
+        프롭은 원장이 발주 순간의 방패값을 기록하므로 자동 반영된다(별도 분기 불필요).
+        원장이 없는 계좌는 설정 1R로 폴백. 자산이 하나뿐이면 '비중'이 성립 안 해 None.
+        """
+        try:
+            tot = {}
+            for a in ("NQ", "GC", "BTC"):
+                s_ = 0.0
+                for ac in self._active_accts(a):
+                    aid = (ac.get("id") or "").strip()
+                    rows = (rledger or {}).get(f"{a}|{aid}") or []
+                    if rows:
+                        s_ += float(max(rows, key=lambda x: x[0])[1])
+                    else:
+                        s_ += float(_as_float(ac.get("one_r"), 600.0))
+                if s_ > 0:
+                    tot[a] = s_
+            if len(tot) < 2:
+                return None
+            base = min(tot.values())
+            out = {k: round(v / base, 2) for k, v in tot.items()}
+            self.log("   \u2696 포트폴리오 비중(1R 합 비율) "
+                     + " : ".join(f"{k} {v:g}" for k, v in out.items()))
+            return out
+        except Exception:
+            return None
+
     def _assets_with_open_position(self, assets) -> set:
         """지금 포지션이 살아 있는 자산들. 트랙레코드 푸시 보류 판정용(2026-09-21).
 
@@ -6341,8 +6378,17 @@ class App:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
             self.log(f"   일별 합산 {len(trades)}건 → 푸시 (키, 잔고 무전송)")
-            # 계좌당 단일 1R·자산 등가중(대표 2026-07-24) — 자산 간 포트폴리오 비중은 균등이라 미동봉.
-            risk_weights = None
+            # ── 자산별 포트폴리오 비중(대표 2026-09-22 "포트 비중을 알 방법 없나") ──
+            # 종전에는 `risk_weights = None`으로 아예 안 보냈다. "자산 간 비중은 균등"이라는
+            # 2026-07-24 전제로 박아 둔 것인데, 프롭 계좌가 NQ·GC만 거래하면서 균등이 깨졌다.
+            # 그 사이 화면(프로필 페이지)은 "per-asset 1R totals"라고 **자동인 것처럼** 설명하고
+            # 서버는 옛 값을 계속 들고 있었다 - 설명과 실제가 갈렸다.
+            # 계산: 지금 **켜져 있는** 계좌들의 최신 실제 1R(원장)을 자산별로 합하고, 최솟값으로
+            # 나눠 비(比)만 남긴다. 원장이 없는 계좌는 설정 1R로 폴백.
+            # ⛔절대 금액은 보내지 않는다 - 최솟값으로 나눈 비율뿐이라 역산이 안 된다
+            #   (회원마다 기준이 달라 상호 비교도 불가). 이 파일의 다른 전송과 같은 규약.
+            # 프롭은 원장이 발주 순간의 방패값을 기록하므로 자동으로 반영된다(별도 분기 불필요).
+            risk_weights = self._portfolio_risk_weights(_rledger)
             pid = autopilot_crypto.path_id(tok)
             ok_total, srv_handle = None, None
             for i in range(0, len(trades), TR_CHUNK):
