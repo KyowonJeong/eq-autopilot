@@ -5975,6 +5975,40 @@ class App:
         return None
 
     @staticmethod
+    def _fill_entry(f, asset: str, ledger: list, since_ms: float):
+        """이 체결이 나온 **EQ 진입 행**을 돌려준다(없으면 None). 판정 규칙은 _fill_is_eq와
+        같고, 반환만 bool → 진입 행으로 바꾼 것이다(2026-09-22).
+
+        왜 필요한가(대표 "많이 먹었지만 저렇게 크게 오르진 않았어"): 트랙레코드 수집기는
+        체결을 **체결 날짜·세션**으로 묶었다. 전량 청산만 하던 때는 그게 곧 한 판단이었지만,
+        부분 청산(수동 반익)이 들어오면 **한 포지션이 두 건**으로 쪼개진다. 2026-09-21 BTC가
+        그랬다 - 반익분(r 16.31)과 청산분(r 30.12)이 따로 올라갔고, 달력의 '판단 단위' 접기가
+        둘을 평균 내 +23.21R로 찍었다. 합계도 아니고 한 판단의 R도 아닌 숫자다.
+        진입으로 묶으면 부분 청산이 몇 번이든 한 판단으로 합쳐진다.
+
+        ⚠️매칭이 안 되는 체결(원장 시작 이전 = 과거 기록)은 None을 돌려주고, 호출부는
+        **종전 키(체결 날짜)**를 그대로 쓴다 - 안 그러면 과거 전 구간의 tid가 바뀌어
+        서버 프로필이 통째로 중복된다(서버는 tid로 병합한다).
+        """
+        ts = int(f.get("ts_ms") or 0)
+        if ts < since_ms:
+            return None
+        fsym = str(f.get("symbol") or "")
+        sym_win = _SYM_MATCH_DAYS * 86400 * 1000
+        hold_ms = _LEDGER_HOLD_H.get(asset, 12.0) * 3600 * 1000
+        best = None
+        for r in ledger:
+            if r.get("asset") != asset:
+                continue
+            e = int(r.get("ts_ms") or 0)
+            rsym = str(r.get("symbol") or "")
+            _hit = ((fsym and rsym and fsym == rsym and (e - 300_000) <= ts <= (e + sym_win))
+                    or (e - 300_000 <= ts <= e + hold_ms))
+            # 여러 진입이 걸리면 **체결에 가장 가까운 직전 진입**이 그 체결의 주인이다.
+            if _hit and (best is None or e > int(best.get("ts_ms") or 0)):
+                best = r
+        return best
+
     def _fill_is_eq(f, asset: str, ledger: list, since_ms: float) -> bool:
         """이 체결이 EQ 진입에서 나온 것인가 — 회원의 수동 거래를 트랙레코드에서 배제(대표 2026-07-17).
         원장 시작(since_ms) 이전 체결은 근거가 없으니 포함(옛 방식 유지 — 과거 기록 보존).
@@ -6303,8 +6337,19 @@ class App:
                     _mine += 1
                     continue
                 dt = _dtd.datetime.fromtimestamp((f.get("ts_ms") or 0) / 1000, _dtd.timezone.utc)
-                d = dt.date().isoformat()
-                k = (d, a, _btc_sess(dt) if a == "BTC" else "")
+                # 🚨묶는 기준은 **진입**이다(2026-09-22). 체결 날짜로 묶으면 부분 청산이
+                # 한 판단을 두 건으로 쪼갠다(2026-09-21 BTC: 반익 16.31 + 청산 30.12 →
+                # 달력이 평균 23.21로 찍음). 진입이 매칭되면 그 진입 시각으로 묶고,
+                # 못 찾으면(원장 시작 이전 = 과거 기록) **종전 키 그대로** - 안 그러면
+                # 과거 전 구간 tid가 바뀌어 서버 프로필이 통째로 중복된다.
+                _ent = _fill_entry(f, a, _ledger, _since)
+                if _ent:
+                    _edt = _dtd.datetime.fromtimestamp((_ent.get("ts_ms") or 0) / 1000,
+                                                       _dtd.timezone.utc)
+                else:
+                    _edt = dt
+                d = _edt.date().isoformat()
+                k = (d, a, _btc_sess(_edt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
                                        "accts": {}, "base": {}, "brokers": set()})
                 if f.get("_broker"):
@@ -6442,7 +6487,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.21c"
+    _APP_VER = "2026.09.22a"
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
