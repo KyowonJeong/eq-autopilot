@@ -83,8 +83,9 @@ what happens to your account after a signal arrives.
     our server to your Telegram or Discord (`_member_alert`);
   - on a PIN reset you ask for: your token and the four-digit code (`/eqpin`).
 
-  Error text and alerts can contain a message your broker returned or an account name. No keys,
-  passwords or PIN are ever included.
+  In error text, alerts and status events the app cuts the account IDs you configured to their
+  last four characters and masks long digit runs; a message your broker returned can still contain
+  other identifiers. No keys, passwords or PIN are ever included.
 
 ## Build it yourself
 
