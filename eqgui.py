@@ -2190,6 +2190,37 @@ class App:
             # Operator가 계속 반복 팝업에 시달린다(2026-08-07 리마인드 로직의 함정).
             self._watch_only = True
             self.log("⏹ 자동 진입 권한 상실 → 이제부터는 신호 확인만 합니다(수량 비공개, 자동 발주 없음).")
+        elif getattr(self, "_sig_on", False) and perm_auto and getattr(self, "_watch_only", False):
+            # Operator→Autopilot 승급 또는 14일 체험이 **가동 중에** 들어온 경우(2026-09-23 R44 P0-#1).
+            # 종전에는 _watch_only가 무장 순간에 래치되고 이 방향 분기가 없어, 등급 라벨은 Autopilot으로
+            # 바뀌는데 신호 루프는 확인 카드만 띄우고 주문을 내지 않았다 - 웹 성공 문구·DM은 '자동'이라
+            # 말해 성공처럼 보이는 실패였다. 위 강등 분기와 대칭으로 래치를 푼다: 계좌·키·연결은 Operator
+            # 무장 때 라이브 시작과 같은 검사를 이미 통과했고, _sig_accts에는 계좌별 one_r·prop이 들어
+            # 있다(arm_sig=perm_use). 다음 Signal부터 자동 진입한다. 알림은 상태 전이 때 한 번뿐이다.
+            self._watch_only = False
+            try:
+                if isinstance(getattr(self, "_live_ctx", None), dict) and self._live_ctx:
+                    self._live_ctx["perm_auto"] = True      # 가동 중 자산 추가 무장도 같은 조건으로
+            except Exception:
+                pass
+            _no_r = []
+            try:
+                for _k, _c in (getattr(self, "_sig_accts", None) or {}).items():
+                    if (float(_c.get("one_r") or 0) <= 0 and not (_c.get("prop") or {}).get("on")
+                            and not (_c.get("pct") or {}).get("on") and not _c.get("manual")):
+                        _no_r.append(f"{_k[0]} {_c.get('label') or _k[1]}")
+            except Exception:
+                pass
+            self.log("🔓 자동 진입 권한 반영 → 다음 Signal부터 자동 진입합니다(승급·체험). "
+                     "수량은 계좌별 1R로 계산합니다."
+                     if self.lang == "ko" else
+                     "🔓 Auto-entry permission applied → entries run automatically from the next "
+                     "Signal (upgrade/trial). Quantity comes from each account's 1R.")
+            if _no_r:
+                self.log(("⚠️ 1R 미설정 계좌는 수량을 계산할 수 없어 진입하지 않습니다: " if self.lang == "ko"
+                          else "⚠️ Accounts without 1R cannot size an entry and will not enter: ")
+                         + ", ".join(_no_r))
+            self._notify_unlatched(_no_r)
         if getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self._auto_accts.clear()
@@ -2203,6 +2234,30 @@ class App:
             self._disarmed_reason = ", ".join(_tripped)
             self._notify_disarmed(first=True)
         self._update_gate_label()
+
+    def _notify_unlatched(self, no_r=None):
+        """가동 중 승급·체험으로 자동 진입이 켜졌음을 한 번 알린다(2026-09-23 R44 P0-#1).
+        회원이 볼 수 있는 신호는 등급 라벨이 아니라 이 알림과 로그 줄('자동 진입 권한 반영')이다 -
+        웹 성공 문구와 등급 변경 DM이 이 줄을 이름으로 가리킨다. 반복하지 않는다(상태 전이 1회)."""
+        _extra = ((" 1R 미설정 계좌는 진입하지 않습니다: " + ", ".join(no_r)) if no_r else "")
+        msg = (("자동 진입 권한이 반영됐습니다 - 다음 Signal부터 계좌별 1R로 자동 진입합니다. "
+                "다시 무장할 필요 없습니다." + _extra)
+               if self.lang == "ko" else
+               ("Auto-entry permission applied - from the next Signal the app enters automatically "
+                "using each account's 1R. No need to re-arm."
+                + ((" Accounts without 1R will not enter: " + ", ".join(no_r)) if no_r else "")))
+        try:                                        # macOS 데스크톱 알림(윈도는 아래 창만)
+            import subprocess, sys as _sys
+            if _sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                                  f'display notification "{msg}" with title "EdgeQuant"'])
+        except Exception:
+            pass
+        try:
+            from tkinter import messagebox as _mb
+            self.root.after(100, lambda: _mb.showinfo("EdgeQuant", msg))
+        except Exception:
+            pass
 
     def _notify_disarmed(self, first=False):
         """자동매매 무장 해제 경보 - 데스크톱 알림 + 재무장까지 15분마다 반복(대표 2026-08-07).
@@ -6915,7 +6970,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.23e"
+    _APP_VER = "2026.09.23f"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────

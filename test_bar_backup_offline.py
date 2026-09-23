@@ -53,7 +53,7 @@ posts.clear(); app._gate = {"tier": "admin"}; NT8Broker._BRIDGES = {}
 eqgui.App._bar_backup_tick(app)
 chk("NT8 브리지 없으면 안 보냄", posts == [])
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"), encoding="utf-8").read()
-chk("기동 배선·버전 23e", "root.after(150 * 1000, self._bar_backup_tick)" in src and eqgui.App._APP_VER == "2026.09.23e")
+chk("기동 배선·버전 23e 이상", "root.after(150 * 1000, self._bar_backup_tick)" in src and eqgui.App._APP_VER >= "2026.09.23e")
 cs = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nt8_addon", "EQAutopilotBridge.cs"), encoding="utf-8").read()
 chk("애드온: bars_wanted 조회·/v1/bars 푸시·BarsRequest·버전", all(k in cs for k in ("/v1/bars_wanted", "PostAsync(\"/v1/bars\"", "new BarsRequest(instr, 8)", "BridgeVer = \"2026.09.23a\"", "using NinjaTrader.Data;")))
 print(("실패 %d: %s" % (len(fails), fails)) if fails else "전부 통과")
