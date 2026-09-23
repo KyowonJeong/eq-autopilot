@@ -462,14 +462,16 @@ T = {
     "tr_push": {"ko": "동기화(푸시)", "en": "Sync (push)"},
     "tr_note": {"ko": "※ 실거래 트랙레코드를 자동 생성합니다. EdgeQuant가 실행한 거래만 집계하며, "
                       "같은 계좌에서 직접 하신 거래는 제외됩니다. 앱은 해당 체결만 로컬에서 R 단위로 "
-                      "변환한 후 요약만 서버에 전송합니다. API 키, 계좌번호, 잔고 등 민감 정보는 "
-                      "전송되지 않습니다. 여기서 동의하는 것은 '기록'까지이며, 이 결과를 멤버십 "
+                      "변환한 후 요약만 서버에 전송합니다. 이 요약에는 API 키, 계좌번호, 잔고가 "
+                      "들어가지 않습니다(알림과 오류 보고에는 계좌 끝 4자리와 오류 문구가 갈 수 "
+                      "있습니다). 여기서 동의하는 것은 '기록'까지이며, 이 결과를 멤버십 "
                       "페이지에 공개할지는 홈페이지 대시보드에서 언제든 켜고 끌 수 있습니다.",
                 "en": "※ Builds your real-trading track record automatically. Only trades executed by "
                       "EdgeQuant are counted — trades you place yourself on the same account are "
                       "excluded. The app converts those fills to R units locally and sends only the "
-                      "summary to the server — sensitive data such as API keys, account numbers "
-                      "and balances are never transmitted. This consent covers recording only; "
+                      "summary to the server. This summary contains no API keys, account numbers "
+                      "or balances (alerts and error reports may carry the last 4 characters of an "
+                      "account id and the error text). This consent covers recording only; "
                       "whether to publish it on the membership page is a toggle you control "
                       "anytime in your dashboard."},
     "sec_live": {"ko": "라이브 실행", "en": "Go Live"},
@@ -2942,6 +2944,7 @@ class App:
         """실행 라이프사이클 마커(/eqalive ev, 대표 2026-09-03 "진입 시도 진입 성공 등등").
         서버 증거 원장 전용 단발 - 생존 상태 페이로드는 안 실어(핑 지문 오염 방지) 서버가
         ev 단독 요청으로 처리한다. 실패 무해, 비차단."""
+        extra = {k: (self._mask_ids(v) if isinstance(v, str) else v) for k, v in extra.items()}   # v23d
         def _bg():
             try:
                 import requests as _rq
@@ -6121,7 +6124,7 @@ class App:
                 err = None
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
-            lbl = _broker_label(bk) + (f" [{acct[-6:]}]" if acct else "")
+            lbl = _broker_label(bk) + (f" […{acct[-4:]}]" if acct else "")   # 끝 4자리(v23d)
             if err is None:
                 if rec["alerted"]:
                     self.log(f"   ✅ {lbl} 연결 복구됨.")
@@ -6880,7 +6883,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.23c"
+    _APP_VER = "2026.09.23d"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -7666,7 +7669,7 @@ class App:
         try:
             if _os.environ.get("EQ_ERR_REPORT", "1") == "0":
                 return
-            msg = _re.sub(r"\d{5,}", "#", str(err))[:400]
+            msg = self._mask_ids(str(err))[:400]          # 계좌 ID …끝4 + 5자리+ 숫자열 #(v23d)
             _cs = str(ctx)[:40]
             # ⚠️종료 잔향은 아예 보내지 않는다(2026-09-13). 구버전 Tk는 창을 닫는 동안
             # 남은 after 콜백이 이미 파괴된 위젯을 건드려 "invalid command name
@@ -8180,6 +8183,27 @@ class App:
         self._watch_on = True
         threading.Thread(target=self._watch_loop, daemon=True).start()
 
+    def _mask_ids(self, text) -> str:
+        """나가는 문구의 계좌 식별자 마스킹(2026-09-23 v23d, 마케팅 세션 인벤토리): 설정된 계좌 ID
+        (모든 자산·브로커, 길이 4+)는 '…끝4자리'로, 5자리 이상 숫자열은 '#'로. 회원 알림(_member_alert)·
+        이벤트(_send_ev)·오류 보고(_report_error) 세 초크포인트가 부른다 - 문구를 새로 쓰는 사람이
+        마스킹을 잊어도 덮인다. 본인 DM이라 목적은 정당하지만 서버와 텔레그램·디스코드를 거치므로
+        계좌 원문은 싣지 않는다(종전: 진입 실패 DM에 계좌 ID 원문, 연결 감시는 끝 6자리)."""
+        import re as _re
+        s = str(text or "")
+        try:
+            ids = set()
+            for _c in (getattr(self, "_acfg", {}) or {}).values():
+                for _x in ((_c or {}).get("accounts") or []):
+                    _i = str((_x or {}).get("id") or "").strip()
+                    if len(_i) >= 4:
+                        ids.add(_i)
+            for _i in sorted(ids, key=len, reverse=True):
+                s = s.replace(_i, "…" + _i[-4:])
+        except Exception:
+            pass
+        return _re.sub(r"\d{5,}", "#", s)
+
     def _member_alert(self, kind: str, ko: str, en: str):
         """회원 본인에게 즉시 알림(2026-08-28 R16 P0). 서버가 텔레그램/디스코드로 보낸다.
 
@@ -8189,6 +8213,7 @@ class App:
         조용히 지나가면 안 된다. 앱이 죽었을 때 DM을 보내는 경로는 이미 있는데
         정작 더 위험한 이 상태에는 안 붙어 있었다(서버 헬퍼는 있고 호출부가 0이었다).
         백그라운드 전송이라 매매 경로를 막지 않고, 실패해도 무해하다(로그는 남는다)."""
+        ko, en = self._mask_ids(ko), self._mask_ids(en)   # 계좌 ID 원문 금지(v23d)
         def _bg():
             try:
                 import requests as _rq
