@@ -582,11 +582,12 @@ def _secret_fields(broker: str) -> tuple:
     비밀이 아닌 것(호스트, 포트, 이메일, 사용자명, 테스트넷 플래그)은 평문으로 둔다 -
     옮길 이유가 없고, 키체인이 없는 환경에서 앱이 못 뜨게 만들 이유는 더 없다.
 
-    ✅같은 날 수리 완료(현재 동작): _save_full이 위 필드를 키체인에 넣고 **되읽기 대조가
-    통과한 값만** YAML에서 비운다. 키체인 쓰기가 실패한 기기에서만 평문이 남으며, 그
-    순간(_flash_saved)과 이후 매 기동(_warn_kc_failed)에 경고한다 - 자격을 잃고 라이브가
-    멈추는 것보다 낫다는 선택. 2026-09-23 외부 감사가 위 실사 문단을 '지금도 평문'으로
-    읽었기에 이 줄을 남긴다."""
+    ✅현재 동작(2026-09-23 외부 감사 → 대표 C안): _save_full이 위 필드를 키체인에 넣고 되읽기
+    대조가 통과하면 YAML에서 비운다. **키체인 쓰기가 실패해도 평문은 디스크에 남기지 않는다** -
+    그 값들을 PIN 파생 키로 암호화한 블롭 하나(kc_enc)로 보관하고, 기동 때 PIN을 한 번 물어
+    메모리로 되채운다(재입력 없음). PIN 입력을 취소하면 저장하지 않고(kc_failed) 그 순간
+    (_flash_saved)과 매 기동(_warn_kc_failed)에 재입력을 안내한다. 종전 8/28 판단(가용성 우선,
+    평문 잔존+경고)은 같은 날 A안(fail-closed)을 거쳐 C안으로 - 평문 0과 재입력 0을 같이 잡는다."""
     _sp = _BROKER_SPEC.get(broker) or {}
     out = []
     if _sp.get("f1_secret"):
@@ -721,6 +722,132 @@ def _settings_import_blob(pin: str, raw: bytes) -> dict:
         raise ValueError("wrong PIN or corrupted file")
     pt = bytes(a ^ b for a, b in zip(ct, _exp_stream(ek, nonce, len(ct))))
     return _j.loads(pt.decode())
+
+
+# ── 키체인 대체 보관(대표 2026-09-23 C안) ──────────────────────────────────
+# 외부 감사 지적("키체인 실패 시 평문 YAML") → A안(fail-closed, 3dec0bf2)은 키링이 안 되는
+# 기기(헤드리스 VM·잠긴 키체인·keyring 백엔드 없음)에서 **매 기동 재입력**이 된다. C안: 키체인에
+# 못 넣은 비밀만 **PIN 파생 키로 암호화**해 설정 파일(kc_enc 한 블롭)에 두고, 기동 때 PIN을 한 번
+# 물어 메모리로 되채운다. 암호화 = 설정 내보내기와 같은 포맷(_settings_export_blob: PBKDF2 120만회
+# + AES-GCM/EQSET2, 패키지 없으면 EQSET1). 디스크 평문 0, 재입력 0. PIN을 취소하면 종전 A안
+# (fail-closed: 저장 안 함 + 재입력 안내) 그대로.
+# f2(API secret)는 사용처가 키체인에서 f1 값으로 직접 읽으므로(_f2_load) 세션 메모리 사전에도
+# 둔다 - 키체인이 안 되는 기기에서 f2까지 살리지 못하면 C안은 의미가 없다.
+_ENC_SECRETS = {}       # {"f2|<f1>": secret} - 키체인에 못 넣은 f2(세션 메모리)
+_ENC_PIN = None         # 이번 세션에서 확인된 보관용 PIN(저장마다 다시 묻지 않게)
+_KC_LAST_ENC = []       # 직전 저장에서 PIN 암호화로 보관한 항목(표시용)
+
+
+def _f2_load(f1) -> str:
+    """f2(API secret) 읽기: 키체인 → 없으면 PIN 암호화 보관분(세션 메모리)."""
+    return _kc_load(f1) or _ENC_SECRETS.get("f2|" + str(f1 or ""), "")
+
+
+def _f2_save(f1, key) -> bool:
+    """f2 저장: 키체인 → 실패하면 세션 메모리에 두고 다음 _save_full이 PIN 암호화로 보관.
+    반환 = 키체인 성공 여부."""
+    if _kc_save(f1, key):
+        _ENC_SECRETS.pop("f2|" + str(f1 or ""), None)
+        return True
+    if key:
+        _ENC_SECRETS["f2|" + str(f1 or "")] = str(key)
+    return False
+
+
+def _f2_del(f1):
+    """f2 삭제: 키체인과 세션 메모리 둘 다."""
+    _kc_del(f1)
+    _ENC_SECRETS.pop("f2|" + str(f1 or ""), None)
+
+
+def _enc_pack(pin: str, mapping: dict) -> str:
+    import base64 as _b64
+    return _b64.b64encode(_settings_export_blob(pin, dict(mapping))).decode()
+
+
+def _enc_unpack(pin: str, blob: str) -> dict:
+    import base64 as _b64
+    return _settings_import_blob(pin, _b64.b64decode(blob))
+
+
+def _enc_label(k: str) -> str:
+    """kc_enc 항목 키 → 경고 문구용(기존 kc_failed 형식 a/브로커표시명/필드; f2는 f1 앞자리로)."""
+    parts = str(k).split("|")
+    if parts[0] == "f2" and len(parts) == 2:
+        return f"API secret ({parts[1][:4]}…)"
+    if len(parts) == 3:
+        return f"{parts[0]}/{_broker_label(parts[1])}/{parts[2]}"
+    return str(k)
+
+
+def _enc_restore(acfg: dict, kc_enc, pin: str) -> list:
+    """설정 파일의 kc_enc 블롭을 PIN으로 풀어 메모리(acfg·_ENC_SECRETS)에 되채운다.
+    반환 = 복원한 항목 키 목록. PIN 틀림·손상 = ValueError(호출부가 재시도·안내)."""
+    blob = (kc_enc or {}).get("blob") if isinstance(kc_enc, dict) else None
+    if not blob:
+        return []
+    m = _enc_unpack(pin, blob)
+    out = []
+    for k, v in (m or {}).items():
+        parts = str(k).split("|")
+        if parts[0] == "f2" and len(parts) == 2:
+            _ENC_SECRETS[str(k)] = str(v)
+        elif len(parts) == 3:
+            a, b, f = parts
+            _cr = ((acfg.get(a) or {}).get("creds") or {}).get(b)
+            if _cr is not None and not str(_cr.get(f) or "").strip():
+                _cr[f] = str(v)
+        out.append(str(k))
+    return out
+
+
+def _enc_ask_pin(lang: str, verify_blob=None):
+    """보관용 PIN 확보: 세션 캐시 → 없으면 묻는다(최대 3회). verify_blob이 있으면 그것을 여는
+    PIN이어야 한다(같은 PIN으로 이어 감). 처음 정할 때는 두 번 입력해 확인. 취소 = None."""
+    global _ENC_PIN
+    if _ENC_PIN:
+        return _ENC_PIN
+    _ko = (lang == "ko")
+    _q = ("이 컴퓨터의 보안 저장소를 쓸 수 없어 브로커 키를 PIN으로 암호화해 설정 파일에 보관합니다.\n"
+          "보관용 PIN을 입력하세요(거래소 비밀번호 아님). 다음 실행 때 이 PIN을 묻습니다:"
+          if _ko else
+          "The OS secure store is unavailable, so broker keys will be encrypted with a PIN and kept "
+          "in the config file.\nEnter a PIN for this (not your exchange password). You will be asked "
+          "for it at the next launch:")
+    for _ in range(3):
+        try:
+            p = simpledialog.askstring("PIN", _q, show="*")
+        except Exception:
+            return None
+        if not p:
+            return None
+        if verify_blob:
+            try:
+                _enc_unpack(p, verify_blob)
+            except ValueError:
+                try:
+                    messagebox.showwarning("EQ Autopilot", ("PIN이 틀립니다 - 지난번 보관에 쓴 PIN이어야 합니다."
+                                                            if _ko else
+                                                            "Wrong PIN - it must be the PIN used last time."))
+                except Exception:
+                    pass
+                continue
+        else:
+            try:
+                p2 = simpledialog.askstring("PIN", ("PIN 확인(한 번 더 입력):" if _ko else "Confirm PIN (enter again):"),
+                                            show="*")
+            except Exception:
+                return None
+            if p2 != p:
+                try:
+                    messagebox.showwarning("EQ Autopilot", ("두 입력이 다릅니다. 다시 정하세요." if _ko else
+                                                            "The two entries differ. Try again."))
+                except Exception:
+                    pass
+                continue
+        _ENC_PIN = p
+        return p
+    return None
 
 
 # Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
@@ -858,7 +985,7 @@ def _load():
                 accounts = [_new_acct(one_r, acct_id, True,
                                       acct_id[-4:] if acct_id else _broker_label(bk))]
         # 비밀 필드를 키체인에서 되채운다(2026-08-28). 저장 때 벗겼으므로 파일에는 빈
-        # 값이고, 메모리에는 실값이 있어야 앱 전체(_kc_load(f1) 8곳 포함)가 그대로 돈다.
+        # 값이고, 메모리에는 실값이 있어야 앱 전체(_f2_load(f1) 8곳 포함)가 그대로 돈다.
         # 평문에 값이 남아 있으면(구버전 설정, 또는 키체인 쓰기 실패분) 그대로 쓴다 -
         # 다음 저장 때 옮겨진다. 즉 마이그레이션은 "한 번 저장하면 끝"이고 별도 절차가 없다.
         for _b, _cr in creds.items():
@@ -895,6 +1022,7 @@ def _load():
     # 키체인 쓰기가 실패해 평문으로 남은 필드 목록(2026-08-28) - 앱이 기동 시 경고한다.
     # 조용히 넘기면 회원은 랜딩·약관이 약속한 보안 상태를 받고 있다고 믿게 된다.
     out["kc_failed"] = _kc_failed
+    out["kc_enc"] = d.get("kc_enc") if isinstance(d.get("kc_enc"), dict) else None   # PIN 암호화 보관분(C안)
     out["dry_run"] = bool(d.get("dry_run", True))
     if "cfg_open" in d:
         out["cfg_open"] = bool(d.get("cfg_open"))
@@ -1149,9 +1277,12 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
         # 메모리에서 지우면 f2까지 못 읽는다(이 설계의 최대 함정). 그래서 야머 페이로드
         # 사본에서만 지운다.
         # 순서가 안전의 전부다: **키체인에 쓰고 → 되읽어 대조가 통과했을 때만** 평문을
-        # 비운다. 실패하면 평문을 그대로 남긴다 - 보안을 조금 늦추는 것이 자격을 잃고
-        # 라이브가 멈추는 것보다 낫다(헤드리스 VM·잠긴 키체인이 현실적인 경우다).
+        # 비운다. 실패해도 평문은 디스크에 안 남긴다(대표 2026-09-23 외부 감사 → C안): 실패분은
+        # 필드를 비우고 **PIN 파생 키로 암호화한 블롭(kc_enc)** 하나에 모아 둔다(f2 실패분 포함).
+        # 기동 때 PIN을 한 번 물어 되채우므로 헤드리스 VM·잠긴 키체인에서도 재입력이 없다.
+        # PIN을 취소하면 종전 A안(fail-closed) - 저장하지 않고 kc_failed로 재입력을 안내한다.
         _kept_plain = []
+        _kept_enc = {}
         _assets = {}
         for a, c in (acfg or {}).items():
             _creds = {}
@@ -1164,12 +1295,33 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
                     if _kc_save(_kc_key(a, b, _f), _val):
                         _v[_f] = ""              # 키체인에 안전하게 들어갔다 - 평문 제거
                     else:
-                        _kept_plain.append(f"{a}/{_broker_label(b)}/{_f}")
+                        _v[_f] = ""              # 평문은 절대 안 남긴다 - 아래 kc_enc(PIN 암호화)로
+                        _kept_enc[f"{a}|{b}|{_f}"] = _val
                 _creds[b] = _v
             _assets[a] = {"broker": c.get("broker"), "creds": _creds,
                           "include": bool(c.get("include", True)),
                           "accounts": [dict(x) for x in (c.get("accounts") or [])]}
         payload = {"live": False, "lang": lang, "token": token, "assets": _assets}
+        # f2(API secret) 키체인 실패분(세션 메모리)도 같은 블롭에 싣는다.
+        for _k, _sv in list(_ENC_SECRETS.items()):
+            if _sv:
+                _kept_enc[_k] = _sv
+        if _kept_enc:
+            _prev = None                         # 지난번 블롭 - 같은 PIN으로 이어 가게 검증용
+            try:
+                with open(CFG_PATH) as _pf:
+                    _prev = ((yaml.safe_load(_pf) or {}).get("kc_enc") or {}).get("blob")
+            except Exception:
+                _prev = None
+            _pin = _enc_ask_pin(lang, _prev)
+            if _pin:
+                payload["kc_enc"] = {"blob": _enc_pack(_pin, _kept_enc), "fields": sorted(_kept_enc)}
+                globals()["_KC_LAST_ENC"] = sorted(_kept_enc)
+            else:                                # 취소 = fail-closed(저장 안 함 + 재입력 안내)
+                _kept_plain = [_enc_label(_k) for _k in sorted(_kept_enc)]
+                globals()["_KC_LAST_ENC"] = []
+        else:
+            globals()["_KC_LAST_ENC"] = []
         if _kept_plain:
             payload["kc_failed"] = _kept_plain   # 다음 기동 경고용(영속)
             # ⚠️**그 순간에도 알린다**(2026-08-28 리뷰 P1). 종전에는 다음 기동에만
@@ -1196,7 +1348,7 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
 
 def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None, one_r=None):
     """(레거시 단일 저장 — 호환용) 비밀만 Keychain에, 나머지는 무시(자산별은 _save_full 사용)."""
-    _kc_save(user or f1 or "", key)
+    _f2_save(user or f1 or "", key)
 
 
 class App:
@@ -1257,6 +1409,7 @@ class App:
         # 계좌 중심 설정(대표 2026-07-24 멀티계좌 · 계좌당 1R · 자산 등가중)
         # 자산별 설정(대표 2026-07-24): 계좌는 자산 탭 안에서 관리(자산마다 브로커·계좌 독립).
         self._acfg = _d0["assets"]       # {자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}
+        self._enc_unlock_startup()       # 키체인이 안 되는 기기: PIN 한 번 → 비밀 되채움(C안)
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
         self._broker_name = self._acfg[self._asset]["broker"]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
@@ -1278,6 +1431,7 @@ class App:
         # 키체인 저장 실패 경고(2026-08-28): 평문으로 남은 비밀이 있으면 회원이 알아야 한다.
         # 랜딩과 약관이 "비밀은 OS 보안 저장소에"라고 말하는데 이 기기에서만 아니기 때문.
         self._kc_failed = list(_d0.get("kc_failed") or [])
+        self._kc_enc_pending = _d0.get("kc_enc")     # PIN 암호화 보관분(C안) - 아래에서 되채움
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
                       "caps": {"use": False, "manualentry": False, "autoentry": False},
@@ -1300,7 +1454,7 @@ class App:
     def _async_load_key(self, user):
         """Read the key from Keychain off the main thread, then fill the field — never blocks the GUI."""
         def w():
-            k = _kc_load(user)
+            k = _f2_load(user)
             if k:
                 self.root.after(0, lambda: self._set_key(k))
         threading.Thread(target=w, daemon=True).start()
@@ -2155,7 +2309,7 @@ class App:
             # 하트비트가 한 번이라도 돌면 상시 생존 핑을 띄운다(2026-08-28 R14 P0) -
             # 신호 루프 유무와 무관하게 앱이 떠 있는 동안 심박이 뛰어야 한다.
             try:
-                self.root.after(0, self._warn_kc_failed)   # 평문 잔존 경고(1회)
+                self.root.after(0, self._warn_kc_failed)   # 저장 실패(재입력 필요) 경고(1회)
                 self._hb_start()
                 self._watch_start()      # 표시 전용 피드(등급 무관 - 지연은 서버가 건다)
             except Exception:
@@ -2265,12 +2419,26 @@ class App:
                     self._kc_warn_now(_kcf)
                 except Exception:
                     pass
-            lbl.config(text=(("⚠ 저장됨(평문) " if self.lang == "ko" else "⚠ saved (plain) ")
+            _kce = list(globals().get("_KC_LAST_ENC") or [])
+            if _kce and not _kcf and not getattr(self, "_kc_enc_logged_save", False):
+                self._kc_enc_logged_save = True
+                self.log("🔒 " + (f"보안 저장소를 쓸 수 없어 브로커 키 {len(_kce)}개를 PIN으로 암호화해 설정 파일에 "
+                                  f"보관했습니다(평문 아님). 다음 실행 때 PIN을 묻습니다."
+                                  if self.lang == "ko" else
+                                  f"The OS secure store is unavailable, so {len(_kce)} broker key(s) were kept "
+                                  f"encrypted with your PIN in the config file (not plain text). "
+                                  f"You will be asked for the PIN at the next launch."))
+            _suffix = ("" if _kcf else
+                       ((" - 다음 실행 때 PIN을 묻습니다" if self.lang == "ko" else " - PIN asked at next launch")
+                        if _kce else
+                        (" - 재시작해도 유지됩니다" if self.lang == "ko" else " - kept across restarts")))
+            lbl.config(text=(("⚠ 저장 안 됨(재입력) " if self.lang == "ko" else "⚠ not saved (re-enter) ")
                              if _kcf else
-                             ("✓ 저장됨 " if self.lang == "ko" else "✓ saved "))
-                       + _dtf.datetime.now().strftime("%H:%M:%S")
-                       + (" - 재시작해도 유지됩니다" if self.lang == "ko" else " - kept across restarts"),
-                       foreground=("#b45309" if _kcf else "#15803d"))   # 실패는 주황
+                             (("✓ 저장됨(PIN 암호화) " if self.lang == "ko" else "✓ saved (PIN-encrypted) ")
+                              if _kce else
+                              ("✓ 저장됨 " if self.lang == "ko" else "✓ saved ")))
+                       + _dtf.datetime.now().strftime("%H:%M:%S") + _suffix,
+                       foreground=("#b45309" if _kcf else "#15803d"))   # 실패는 주황(디스크 저장 안 됨)
             # 1.5초 뒤 회색 복귀 - 위젯을 캡처하는 예약 콜백이라, 그 사이 화면이 재구성되면
             # 죽은 라벨을 만져 [tk] invalid command 오류가 실행 기록을 도배했다(9/4 새 기기
             # 셋업 중 브로커 연속 전환 실사고). 생존 확인 후에만 만진다.
@@ -2433,7 +2601,7 @@ class App:
         _sec = _secret_fields(bk)
         if "f1" in _sec and _prev_f1 and not str(cr.get("f1") or "").strip():
             _kc_del(_kc_key(self._asset, bk, "f1"))
-            _kc_del(_prev_f1)               # f2의 레거시 계정 키(=옛 f1 값)도 함께
+            _f2_del(_prev_f1)               # f2의 레거시 계정 키(=옛 f1 값)도 함께
             self.log("🗑 " + ("저장된 자격을 삭제했습니다(보안 저장소 포함)."
                               if self.lang == "ko" else
                               "Deleted the stored credential, including the secret store."))
@@ -2442,9 +2610,9 @@ class App:
         if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
             _f1_now = str(cr.get("f1") or "").strip()
             if _f1_now:
-                _kc_save(_f1_now, self.key.get())
+                _f2_save(_f1_now, self.key.get())
             elif _prev_f1:
-                _kc_del(_prev_f1)           # f1을 지웠으면 f2도 남기지 않는다
+                _f2_del(_prev_f1)           # f1을 지웠으면 f2도 남기지 않는다
             # f1이 비었는데 f2를 저장하면 "default" 계정으로 새 비밀이 생겨 영영 안 지워진다
         # 실행 자산(라이브 패널 체크) → 자산별 include 반영
         for _a, _v in getattr(self, "_live_include", {}).items():
@@ -2633,7 +2801,7 @@ class App:
             for _b, _cr in (_s.get("creds") or {}).items():
                 _f1 = (_cr.get("f1") or "").strip()
                 if _f1:
-                    _kc_del(_f1)                             # 레거시 f2(계정 키=f1 값)
+                    _f2_del(_f1)                             # 레거시 f2(계정 키=f1 값)
                 for _f in _secret_fields(_b):                # 신 스키마 eq:<자산>:<브로커>:<필드>
                     _kc_del(_kc_key(_a, _b, _f))
                     _cr[_f] = ""                             # 메모리도 비워 되채움 차단
@@ -2916,7 +3084,7 @@ class App:
 
         def w():
             try:
-                b = _build_broker("projectx", f1, _kc_load(f1) or "", cr.get("f3", ""), [])
+                b = _build_broker("projectx", f1, _f2_load(f1) or "", cr.get("f3", ""), [])
                 names = [str(a.get("name")) for a in b._accounts()]
             except Exception:
                 names = None
@@ -3031,7 +3199,7 @@ class App:
             for b, cr in (c2.get("creds") or {}).items():
                 _f1 = str(cr.get("f1") or "").strip()
                 if _f1 and _BROKER_SPEC.get(b, {}).get("f2"):
-                    _f2 = _kc_load(_f1)
+                    _f2 = _f2_load(_f1)
                     if _f2:
                         cr["f2"] = _f2
                         n_sec += 1
@@ -3116,12 +3284,12 @@ class App:
                 _f2 = str(cr.pop("f2", "") or "")     # f2는 _acfg에 안 남긴다(키체인 전용)
                 _f1 = str(cr.get("f1") or "").strip()
                 if _f1 and _f2:
-                    if _kc_save(_f1, _f2):
+                    if _f2_save(_f1, _f2):
                         n_sec += 1
                     else:
-                        self.log("⚠ " + (f"{a}/{_broker_label(b)}: 비밀 저장 실패 - 보안 저장소 확인 필요"
+                        self.log("⚠ " + (f"{a}/{_broker_label(b)}: 비밀을 보안 저장소에 넣지 못해 저장 때 PIN 암호화로 보관합니다"
                                           if self.lang == "ko" else
-                                          f"{a}/{_broker_label(b)}: secret store write failed"))
+                                          f"{a}/{_broker_label(b)}: secret store write failed - will be kept PIN-encrypted on save"))
             self._acfg[a] = c
         self.lang = d.get("lang", self.lang)
         self._token = str(d.get("token") or self._token)
@@ -3691,7 +3859,7 @@ class App:
                 f1 = (cr.get("f1") or "").strip()
                 if not f1:
                     raise RuntimeError("no creds")
-                f2 = _kc_load(f1) or ""
+                f2 = _f2_load(f1) or ""
                 f3 = cr.get("f3", "")
                 is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
                 bal, err = self._fetch_balance_diag(bk, f1, f2, f3,
@@ -4424,7 +4592,7 @@ class App:
         cr = self._creds_of(asset, bk)
         f1 = (cr.get("f1") or "").strip()
         try:
-            b = _build_broker(bk, f1, _kc_load(f1) or "", cr.get("f3", ""), [])
+            b = _build_broker(bk, f1, _f2_load(f1) or "", cr.get("f3", ""), [])
             b.healthcheck()
             if bk == "projectx":
                 names = [str(x.get("name")) for x in b._accounts()]
@@ -4502,7 +4670,7 @@ class App:
         cr = self._creds_of(asset, bk)
         f1 = (cr.get("f1") or "").strip()
         aid = (acct.get("id") or "").strip()
-        cred = {"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
+        cred = {"broker": bk, "f1": f1, "f2": (_f2_load(f1) or ""),
                 "f3": cr.get("f3", ""), "acct": aid}
         # 수동 모드 계좌 = 티켓만, 자동 청산 안 함(진입도 청산도 사용자가 직접 — API 없는 프롭 대응).
         jobs = [] if acct.get("manual") else \
@@ -6460,7 +6628,7 @@ class App:
                 _prc = ac.get("prop") or {}
                 _tr_r = (_as_float(_prc.get("r_steady"), 600.0) if _prc.get("on")
                          else _as_float(ac.get("one_r"), 600.0))
-                credlist.append({"broker": bk, "f1": f1, "f2": (_kc_load(f1) or ""),
+                credlist.append({"broker": bk, "f1": f1, "f2": (_f2_load(f1) or ""),
                                  "f3": cr.get("f3", ""), "acct": aid,
                                  "one_r": _tr_r,
                                  "label": ac.get("label", "")})
@@ -6712,7 +6880,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.23b"
+    _APP_VER = "2026.09.23c"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -6968,7 +7136,7 @@ class App:
             _cr = self._creds_of(_k, _bk)
             _f1 = (_cr.get("f1") or "").strip()
             _acct = str(_r.get("aid") or "").strip()
-            _b = _build_broker(_bk, _f1, _kc_load(_f1) or "", _cr.get("f3", ""),
+            _b = _build_broker(_bk, _f1, _f2_load(_f1) or "", _cr.get("f3", ""),
                                [_acct] if _acct else [])
         except Exception as _e:
             self.log(f"   · {_k} 감시 맥락 복구 실패({str(_e)[:80]}) — 5분 뒤 재시도")
@@ -8058,6 +8226,41 @@ class App:
                 pass
             _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
 
+    def _enc_unlock_startup(self):
+        """설정 파일에 PIN 암호화 보관분(kc_enc)이 있으면 기동 직후 PIN을 물어 메모리로 되채운다
+        (대표 2026-09-23 C안). 최대 3회, 취소·실패 = 그 항목들을 kc_failed 경고(재입력)로 넘긴다.
+        여기서는 log 위젯이 아직 없어 결과만 기억하고, 문구는 _warn_kc_failed가 낸다."""
+        global _ENC_PIN
+        _enc = getattr(self, "_kc_enc_pending", None)
+        if not (isinstance(_enc, dict) and _enc.get("blob")):
+            return
+        _ko = self.lang == "ko"
+        _q = ("보안 저장소 대신 PIN으로 암호화해 둔 브로커 키가 있습니다.\n"
+              "보관용 PIN을 입력하세요(거래소 비밀번호 아님):" if _ko else
+              "Broker keys are kept encrypted with a PIN (the OS secure store was unavailable).\n"
+              "Enter that PIN (not your exchange password):")
+        for _ in range(3):
+            try:
+                p = simpledialog.askstring("PIN", _q, show="*", parent=self.root)
+            except Exception:
+                p = None
+            if not p:
+                break
+            try:
+                self._kc_enc_restored = _enc_restore(self._acfg, _enc, p)
+            except ValueError:
+                try:
+                    messagebox.showwarning("EQ Autopilot", ("PIN이 틀립니다." if _ko else "Wrong PIN."),
+                                           parent=self.root)
+                except Exception:
+                    pass
+                continue
+            _ENC_PIN = p
+            return
+        # 취소 또는 3회 실패: 값이 메모리에 없다 → 재입력 안내(기동 경고 경로 재사용)
+        self._kc_failed = list(getattr(self, "_kc_failed", []) or []) + \
+            [_enc_label(k) for k in (_enc.get("fields") or [])]
+
     def _warn_kc_failed(self):
         """평문으로 남은 비밀이 있으면 기동 시 1회 경고(2026-08-28).
         ⚠️문구 주의(리뷰 P1): 회원에게 f1/f3 같은 내부 필드 ID를 보여주면 안 되고,
@@ -8065,6 +8268,13 @@ class App:
         '키체인을 열라'고 하면 없는 것을 열라는 말이 된다). 해결책도 사실이어야 한다 -
         '다시 켜면 자동으로 옮겨진다'는 코드에 없는 동작이었다. 실제 경로는
         '보안 저장소를 쓸 수 있게 만든 뒤 그 값을 다시 입력하고 저장'이다."""
+        _r = list(getattr(self, "_kc_enc_restored", []) or [])
+        if _r and not getattr(self, "_kc_enc_logged", False):
+            self._kc_enc_logged = True
+            self.log("🔒 " + (f"PIN으로 보관한 브로커 키 {len(_r)}개를 복원했습니다(보안 저장소 대신 암호화 보관)."
+                              if self.lang == "ko" else
+                              f"Restored {len(_r)} broker key(s) kept encrypted with your PIN "
+                              f"(instead of the OS secure store)."))
         _f = list(getattr(self, "_kc_failed", []) or [])
         if not _f or getattr(self, "_kc_warned", False):
             return                       # 하트비트는 주기적이라 1회 가드가 필요하다
@@ -8100,26 +8310,29 @@ class App:
         _ko = self.lang == "ko"
         _store = self._kc_label()
         _what = self._kc_pretty(items)
-        self.log("⚠ " + ((f"{_store}에 저장하지 못해 설정 파일에 평문으로 남은 값이 "
-                          f"있습니다: {_what}") if _ko else
-                         (f"Could not store these in {_store}, so they stay in plain text "
-                          f"in the config file: {_what}")))
+        self.log("⚠ " + ((f"{_store}에 저장하지 못해 이 컴퓨터에 저장되지 않은 값이 "
+                          f"있습니다(보안을 위해 평문으로 남기지 않음): {_what}") if _ko else
+                         (f"Could not store these in {_store}, so they were not saved on this "
+                          f"computer (never written in plain text): {_what}")))
         try:
             messagebox.showwarning(
                 "EQ Autopilot",
                 ((f"이 컴퓨터의 {_store}에 저장하지 못했습니다.\n"
-                  f"평문으로 남은 값: {_what}\n\n"
-                  f"{_store}를 쓸 수 있게 만든 뒤(잠금 해제, 원격 세션이면 로그인 세션에서 "
-                  f"실행) 그 값을 다시 입력하고 저장하면 옮겨집니다.\n"
-                  "그 전까지는 전체 디스크 암호화를 켜고, 공용 또는 무인 컴퓨터에서는 "
-                  "실행하지 마세요.")
+                  f"보안을 위해 평문으로 남기지 않았습니다: {_what}\n\n"
+                  f"지금 세션에서는 그대로 작동하지만 저장되지 않았으므로, 다음 실행 때 다시 "
+                  f"입력해야 합니다. {_store}를 쓸 수 있게 만든 뒤(잠금 해제, 원격 세션이면 "
+                  f"로그인 세션에서 실행) 그 값을 다시 입력하고 저장하면 그다음부터는 유지됩니다.\n"
+                  f"{_store}를 쓸 수 없는 컴퓨터라면, 저장할 때 PIN을 정하면 PIN으로 암호화해 "
+                  f"보관합니다(재입력 없음).")
                  if _ko else
                  (f"Could not save to {_store} on this computer.\n"
-                  f"Left in plain text: {_what}\n\n"
-                  f"Make {_store} available (unlock it; in a remote session run inside a "
-                  f"login session), then re-enter and save those values to move them.\n"
-                  "Until then, turn on full-disk encryption and do not run on a shared or "
-                  "unattended machine.")))
+                  f"For safety they were not stored in plain text: {_what}\n\n"
+                  f"They work for this session but were not saved, so you will need to "
+                  f"re-enter them next time you start. Make {_store} available (unlock it; "
+                  f"in a remote session run inside a login session), then re-enter and save "
+                  f"to keep them from then on.\n"
+                  f"If {_store} cannot be used on this computer, set a PIN when saving and the keys "
+                  f"are kept encrypted with it (no re-entry).")))
         except Exception:
             pass
 
@@ -8371,7 +8584,7 @@ class App:
                         rows.append("   " + (f"{lbl}: 키 미설정({_broker_label(bk)})" if ko
                                              else f"{lbl}: no credentials ({_broker_label(bk)})"))
                         continue
-                    f2 = _kc_load(f1) or ""
+                    f2 = _f2_load(f1) or ""
                     f3 = cr.get("f3", "")
                     is_fut = bool(_BROKER_SPEC.get(bk, {}).get("acct"))
                     bal, err = self._fetch_balance_diag(bk, f1, f2, f3, aid, is_fut)
@@ -8467,7 +8680,7 @@ class App:
                     f1 = (cr.get("f1") or "").strip()
                     if not f1:
                         continue
-                    f2 = _kc_load(f1) or ""
+                    f2 = _f2_load(f1) or ""
                     f3 = cr.get("f3", "")
                     key = (bk, f1, aid)
                     if key in seen:

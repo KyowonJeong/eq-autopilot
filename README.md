@@ -55,8 +55,11 @@ what happens to your account after a signal arrives.
   (macOS Keychain, Windows Credential Manager) — never in this repo. The app writes a key to
   the store, reads it back to confirm, and only then removes it from its config file
   (`_save_full` / `_kc_save` in `eqgui.py`). If the store is unavailable on your machine
-  (locked keychain, headless VM, no keyring backend), the key stays in the config file and
-  the app warns you — at save time and at every launch — until it can move it.
+  (locked keychain, headless VM, no keyring backend), the app never writes the key in plain
+  text: it asks you for a PIN and keeps the key encrypted with a PIN-derived key
+  (PBKDF2-HMAC-SHA256, 1.2M rounds, AES-256-GCM) in the config file, then asks for that PIN
+  once at each launch (`_enc_ask_pin` / `_enc_restore`). If you cancel the PIN, the key is
+  not saved at all and the app tells you to re-enter it.
 - Signal and heartbeat files are encrypted per member with AES-256-GCM, key derived from your
   token (`autopilot_crypto.py`). Builds before 2026.09.23b used an HMAC-authenticated stream
   cipher; the server keeps sending that format to those builds, and this build reads both.
