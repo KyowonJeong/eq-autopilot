@@ -65,8 +65,26 @@ what happens to your account after a signal arrives.
   cipher; the server keeps sending that format to those builds, and this build reads both.
 - Keys are sent to your **broker** only. They are never transmitted to EdgeQuant.
   `grep` for the network calls and check for yourself.
-- What the app does send us, and only if you turn it on: a summary of your filled trades for
-  your public record page. No keys, no balances. See `push_profile` in `eqgui.py`.
+- What the app does send to EdgeQuant (`app.edgequant.app`), so you can see exactly what leaves
+  your machine (all in `eqgui.py`):
+  - when it downloads your encrypted signal and status files: a hash of your token in the file
+    name (`_heartbeat`, `_sig_loop`);
+  - a keep-alive while the app runs: your membership token, the app version, a random device ID,
+    which assets are armed, the broker name per asset, and your consent version and time, plus
+    status events such as a failed pre-entry check with its error text (`_alive_ping`, `_send_ev`);
+  - after each automated entry: the instrument, total quantity, number of accounts, and the
+    reference price against the fill price (`_send_fill`, `_send_gap`), plus a one-way hash of
+    the account name so two machines cannot enter twice on one account (`_claim_entry`);
+  - for Autopilot members, an encrypted daily summary of results in R units, no dollar amounts
+    (`push_profile`);
+  - error reports: the app version, the OS name and the error text with long digit runs masked
+    (`_report_error`; set `EQ_ERR_REPORT=0` to turn them off);
+  - alerts meant for you, such as a missed entry or a lost broker connection, relayed through
+    our server to your Telegram or Discord (`_member_alert`);
+  - on a PIN reset you ask for: your token and the four-digit code (`/eqpin`).
+
+  Error text and alerts can contain a message your broker returned or an account name. No keys,
+  passwords or PIN are ever included.
 
 ## Build it yourself
 
