@@ -1,4 +1,5 @@
 requests>=2.31
 PyYAML>=6.0
+cryptography>=42   # signal/heartbeat payloads (AES-256-GCM). Without it the app still runs on the legacy format.
 # IBKR only (broker: ibkr). Skip if you don't use Interactive Brokers.
 # ib_insync>=0.9.86   ; or the maintained fork:  ib_async>=1.0

@@ -52,7 +52,14 @@ what happens to your account after a signal arrives.
 ## How your credentials are handled
 
 - Broker keys are stored in the operating system's own secure store
-  (macOS Keychain, Windows Credential Manager) — never in a plain file, never in this repo.
+  (macOS Keychain, Windows Credential Manager) — never in this repo. The app writes a key to
+  the store, reads it back to confirm, and only then removes it from its config file
+  (`_save_full` / `_kc_save` in `eqgui.py`). If the store is unavailable on your machine
+  (locked keychain, headless VM, no keyring backend), the key stays in the config file and
+  the app warns you — at save time and at every launch — until it can move it.
+- Signal and heartbeat files are encrypted per member with AES-256-GCM, key derived from your
+  token (`autopilot_crypto.py`). Builds before 2026.09.23b used an HMAC-authenticated stream
+  cipher; the server keeps sending that format to those builds, and this build reads both.
 - Keys are sent to your **broker** only. They are never transmitted to EdgeQuant.
   `grep` for the network calls and check for yourself.
 - What the app does send us, and only if you turn it on: a summary of your filled trades for

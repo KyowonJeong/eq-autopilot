@@ -173,6 +173,15 @@ _ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 
 # 낡아도 healthcheck()가 예외를 던지므로, 진입 직전에 한 번 더 밟는 것이 정확히 그 구멍을
 # 메운다. 틱이 5분 주기라 10분 창은 반드시 한 번 걸린다.
 PRECHECK_WINDOWS_MIN = (70, 10)                     # 넓은 창(여유 있게 고치라고) + 직전 창
+# ── 브로커 연결 상시 감시(대표 2026-09-23 "연결 실패면 바로 디엠. 특히 앱이 켜져있는데") ──
+# 왜: 사전점검은 **진입 직전 두 번**만 돈다(T-70·T-10). 그 사이에 브로커가 죽으면 - 특히
+#   포지션을 들고 있는 동안 - 자동 청산도 손절 감시도 안 도는데 아무도 모른다. NinjaTrader는
+#   가끔 조용히 죽고(대표 실측), Topstep은 2026-09-22에 48분 전면 장애가 있었다.
+# 비용: NT8은 로컬 브리지(포트 8377)라 공짜다. REST 브로커는 왕복 1회라 10분 간격이면 무시할
+#   수준이고, 어차피 하트비트가 60초마다 도는 것보다 훨씬 드물다.
+CONN_WATCH_EVERY_S = 600        # 점검 주기 10분
+CONN_WATCH_STRIKES = 2          # 연속 2회 실패부터 알린다(깜빡임에 소리내지 않기)
+CONN_WATCH_DM_EVERY_S = 3600    # 실패가 이어져도 DM은 한 시간에 한 번(대표 지시)
 PRECHECK_WINDOW_MIN = PRECHECK_WINDOWS_MIN[0]       # 하위호환(기존 참조)
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
@@ -571,7 +580,13 @@ def _secret_fields(broker: str) -> tuple:
     실제로는 Bitget Passphrase, Tradovate cid:sec, NT8 Bridge Token, 크립토 API Key가
     전부 평문이었다. 약관 §14.3만 정직했다(그 파일은 암호화 안 됨이라 경고까지 한다).
     비밀이 아닌 것(호스트, 포트, 이메일, 사용자명, 테스트넷 플래그)은 평문으로 둔다 -
-    옮길 이유가 없고, 키체인이 없는 환경에서 앱이 못 뜨게 만들 이유는 더 없다."""
+    옮길 이유가 없고, 키체인이 없는 환경에서 앱이 못 뜨게 만들 이유는 더 없다.
+
+    ✅같은 날 수리 완료(현재 동작): _save_full이 위 필드를 키체인에 넣고 **되읽기 대조가
+    통과한 값만** YAML에서 비운다. 키체인 쓰기가 실패한 기기에서만 평문이 남으며, 그
+    순간(_flash_saved)과 이후 매 기동(_warn_kc_failed)에 경고한다 - 자격을 잃고 라이브가
+    멈추는 것보다 낫다는 선택. 2026-09-23 외부 감사가 위 실사 문단을 '지금도 평문'으로
+    읽었기에 이 줄을 남긴다."""
     _sp = _BROKER_SPEC.get(broker) or {}
     out = []
     if _sp.get("f1_secret"):
@@ -638,9 +653,12 @@ def _pin_ok(pin):
 # 추측 1회 비용을 올린다(그래도 이전 끝나면 파일 삭제가 원칙 - UI가 안내). scrypt를
 # 안 쓰는 이유: LibreSSL 파이썬(맥 시스템 등)엔 hashlib.scrypt가 없어, 내보낸 기기와
 # 가져오는 기기의 파이썬이 다르면 파일을 못 연다(pbkdf2_hmac은 stdlib 어디에나 있다).
-# 암호화 = SHA256-CTR + HMAC-SHA256(encrypt-then-MAC) - autopilot_crypto와 동일 원리,
-# stdlib only(앱 배포 전제). 포맷: MAGIC(6)|salt(16)|nonce(16)|ct|tag(32).
+# 암호화(2026-09-23, 외부 감사 반영): 번들에 cryptography가 있으면 **AES-256-GCM**(EQSET2:
+# MAGIC(6)|salt(16)|nonce(12)|ct+tag(16), AAD=MAGIC|salt|nonce). 없으면 종전 SHA256-CTR +
+# HMAC-SHA256(EQSET1: MAGIC(6)|salt(16)|nonce(16)|ct|tag(32)). 가져오기는 둘 다 연다 -
+# 구 빌드가 만든 파일을 새 빌드가 열고, 새 빌드 파일은 EQSET2를 아는 빌드(2026.09.23b+)가 연다.
 _EXP_MAGIC = b"EQSET1"
+_EXP_MAGIC2 = b"EQSET2"
 
 
 def _exp_keys(pin: str, salt: bytes):
@@ -661,6 +679,15 @@ def _settings_export_blob(pin: str, obj: dict) -> bytes:
     import hmac as _hm
     import json as _j
     pt = _j.dumps(obj, ensure_ascii=False).encode()
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _GCM
+    except Exception:
+        _GCM = None
+    if _GCM is not None:
+        salt, nonce = os.urandom(16), os.urandom(12)
+        ek, _ = _exp_keys(pin, salt)
+        hdr = _EXP_MAGIC2 + salt + nonce
+        return hdr + _GCM(ek).encrypt(nonce, pt, hdr)
     salt, nonce = os.urandom(16), os.urandom(16)
     ek, mk = _exp_keys(pin, salt)
     ct = bytes(a ^ b for a, b in zip(pt, _exp_stream(ek, nonce, len(pt))))
@@ -671,6 +698,20 @@ def _settings_export_blob(pin: str, obj: dict) -> bytes:
 def _settings_import_blob(pin: str, raw: bytes) -> dict:
     import hmac as _hm
     import json as _j
+    if raw[:6] == _EXP_MAGIC2:
+        if len(raw) < 6 + 16 + 12 + 16:
+            raise ValueError("not an EQ settings file")
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _GCM
+        except Exception:
+            raise ValueError("this settings file needs a newer app build (AES-GCM)")
+        salt, nonce, body = raw[6:22], raw[22:34], raw[34:]
+        ek, _ = _exp_keys(pin, salt)
+        try:
+            pt = _GCM(ek).decrypt(nonce, body, raw[:34])
+        except Exception:
+            raise ValueError("wrong PIN or corrupted file")
+        return _j.loads(pt.decode())
     if len(raw) < 6 + 16 + 16 + 32 or raw[:6] != _EXP_MAGIC:
         raise ValueError("not an EQ settings file")
     salt, nonce, ct, tag = raw[6:22], raw[22:38], raw[38:-32], raw[-32:]
@@ -1248,6 +1289,10 @@ class App:
         threading.Thread(target=self._build_watch, daemon=True).start()   # 빌드 교체 감지(#31)
         self._precheck_done = {}                                    # {(asset, entry_iso): True}
         root.after(60 * 1000, self._precheck_tick)                  # 진입 1시간 전 API 사전 점검
+        # 브로커 연결 상시 감시(대표 2026-09-23) - 사전점검이 못 보는 구간을 덮는다.
+        # 라이브가 꺼져 있으면 틱은 즉시 반환하므로 평소에는 비용이 0이다.
+        self._conn_state = {}
+        root.after(90 * 1000, self._conn_watch_tick)
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
         root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
         root.after(120 * 1000, self._unsent_fill_tick)             # 미전송 체결 보고 재시도(2분)
@@ -2078,6 +2123,10 @@ class App:
                         elif hb.get("exp") and _t.time() > hb["exp"]:
                             gate["reason"] = "expired"                        # 명시 만료 = 즉시 잠금
                         else:
+                            # 서버 광고: 서버 venv에 cryptography가 있으면 hb에 aead=True.
+                            # 앱→서버(프로필 푸시)를 v2로 보낼지는 **이 값**으로 정한다 -
+                            # 서버가 못 푸는 포맷을 보내 'bad blob'로 조용히 실패하지 않게.
+                            self._srv_aead = bool(hb.get("aead"))
                             ap = hb.get("autopilot", {})
                             gate = {"ok": True, "tier": hb.get("tier", "—"),
                                     "enabled": bool(ap.get("enabled")),
@@ -5852,6 +5901,90 @@ class App:
             except Exception:
                 pass
 
+    def _conn_watch_tick(self):
+        """라이브 가동 중 브로커 연결 상시 감시(대표 2026-09-23).
+
+        사전점검(_precheck_tick)은 진입 직전 두 번만 돈다. 그 사이 - 특히 **포지션을 들고 있는
+        동안** - 브로커가 죽으면 자동 청산도 손절 감시도 안 도는데 화면은 조용하다.
+        여기서는 라이브가 켜져 있는 동안 10분마다 **모든 무장 브로커**를 왕복 점검한다.
+
+        규약(오늘 세운 경보 원칙 그대로):
+          · 연속 CONN_WATCH_STRIKES회부터 알린다 - 한 번 깜빡이는 걸로 DM하지 않는다.
+          · 실패가 이어져도 DM은 한 시간에 한 번. 시끄러우면 사람이 경보를 끄고, 그때 진짜를 놓친다.
+          · 복구되면 **한 번** 알리고 조용해진다.
+          · 포지션을 들고 있으면 문구를 격상한다 - 그때가 제일 아픈 자리다.
+        ⚠️점검은 백그라운드 스레드에서 한다 - 브로커 왕복이 GUI를 붙잡으면 안 된다.
+        """
+        try:
+            if not getattr(self, "_live_session", False):
+                self._conn_state = {}          # 라이브가 꺼지면 상태도 리셋(재시작 시 오경보 방지)
+                return
+            seen = {}
+            for (_a, _i), _cfg in list(getattr(self, "_sig_accts", {}).items()):
+                seen.setdefault((_cfg.get("broker"), _cfg.get("acct") or ""), (_a, _cfg))
+            for (_a, _i), _jobs in list(getattr(self, "_auto_accts", {}).items()):
+                for _j in _jobs:
+                    seen.setdefault((_j.get("broker"), _j.get("acct") or ""), (_j.get("asset"), _j))
+            if seen:
+                threading.Thread(target=self._conn_watch_run, args=(dict(seen),),
+                                 daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(CONN_WATCH_EVERY_S * 1000, self._conn_watch_tick)
+            except Exception:
+                pass
+
+    def _conn_watch_run(self, seen):
+        """브로커별 왕복 1회 + 실패 판정. _conn_watch_tick이 스레드로 띄운다."""
+        import time as _t
+        ko = self.lang == "ko"
+        st = getattr(self, "_conn_state", None)
+        if st is None:
+            st = self._conn_state = {}
+        for (bk, acct), (asset, cfg) in seen.items():
+            key = f"{bk}|{acct}"
+            rec = st.setdefault(key, {"fails": 0, "dm_at": 0.0, "alerted": False})
+            try:
+                b = _build_broker(bk, cfg.get("f1", ""), cfg.get("f2", ""), cfg.get("f3", ""),
+                                  [acct] if acct else [])
+                b.healthcheck()
+                err = None
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+            lbl = _broker_label(bk) + (f" [{acct[-6:]}]" if acct else "")
+            if err is None:
+                if rec["alerted"]:
+                    self.log(f"   ✅ {lbl} 연결 복구됨.")
+                    self._member_alert(
+                        "conn_ok",
+                        f"[EQ Autopilot] {lbl} 연결이 복구됐습니다. 자동 실행이 다시 정상입니다.",
+                        f"[EQ Autopilot] {lbl} is reachable again. Automated execution is back to normal.")
+                st[key] = {"fails": 0, "dm_at": 0.0, "alerted": False}
+                continue
+            rec["fails"] += 1
+            if rec["fails"] < CONN_WATCH_STRIKES:
+                self.log(f"   ⚠ {lbl} 연결 실패 {rec['fails']}회 - 한 번 더 보고 판단합니다.")
+                continue
+            _now = _t.time()
+            if rec["alerted"] and _now - float(rec.get("dm_at") or 0) < CONN_WATCH_DM_EVERY_S:
+                continue                        # 한 시간에 한 번만
+            _held = asset in self._assets_with_open_position([asset]) if asset else False
+            _tail_ko = (" **지금 포지션이 열려 있습니다** - 이 상태에서는 자동 청산과 손절 감시가 "
+                        "돌지 않습니다. 브로커 화면에서 직접 확인해 주십시오." if _held else
+                        " 이 상태로 두면 다음 신호에서 진입이 안 됩니다.")
+            _tail_en = (" **A position is open right now** - auto-close and stop monitoring are not "
+                        "running in this state. Please check your broker screen directly." if _held else
+                        " If this persists, the next signal will not be entered.")
+            self.log(f"   ❌ {lbl} 연결 실패 {rec['fails']}회 연속 — 회원 알림 발송. ({err[:80]})")
+            self._member_alert(
+                "conn_down",
+                f"[EQ Autopilot] {lbl} 연결이 끊겼습니다(연속 {rec['fails']}회)." + _tail_ko,
+                f"[EQ Autopilot] {lbl} is unreachable ({rec['fails']} checks in a row)." + _tail_en)
+            rec["dm_at"] = _now
+            rec["alerted"] = True
+
     def _precheck_tick(self):
         try:
             from datetime import datetime
@@ -6509,7 +6642,9 @@ class App:
                 payload = {"public": public, "trades": trades[i:i + TR_CHUNK]}
                 if risk_weights:
                     payload["risk_weights"] = risk_weights
-                blob = autopilot_crypto.encrypt(tok, payload)
+                blob = autopilot_crypto.encrypt(
+                    tok, payload,
+                    v2=bool(self._srv_aead) and autopilot_crypto.aead_available())
                 try:
                     r = requests.get(PUSH_BASE + "eqpush",
                                      params={"profile_push": blob, "pid": pid}, timeout=30)
@@ -6577,7 +6712,8 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.22d"
+    _APP_VER = "2026.09.23b"
+    _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
     # 왜 수량만 보내는가: 나머지는 서버가 이미 안다 - 진입가·손절은 발송 카드에, 현재가는
@@ -8121,6 +8257,7 @@ class App:
             with self._ping_lock:
                 try:
                     import requests as _rq      # 모듈 레벨에 requests 없음 - 지역 임포트 필수
+                    import autopilot_crypto as _ac
                     # 종료 경로(sync)는 짧게 - 메인스레드가 락 대기+POST를 동기로 하므로
                     # 불통 네트워크에서 8초 타임아웃은 최악 16초 동결을 만들었다(R20 P2-5).
                     _ok = _rq.post(PUSH_BASE + "eqalive", timeout=(3 if sync else 8),
@@ -8128,6 +8265,11 @@ class App:
                                    "armed": bool(self._sig_accts or self._auto_accts),
                                    "v": self._APP_VER,
                                    "m": _machine_id(),
+                                   # AEAD(v2 AES-GCM) 복호화 가능 광고(2026-09-23): 서버는 이
+                                   # 기기들이 **전부** True인 토큰에만 v2 피드를 쓴다. 번들에
+                                   # cryptography가 빠진 빌드는 False를 보내 v1을 계속 받는다 -
+                                   # 버전 문자열 추정이 아니라 실제 import 결과다.
+                                   "aead": _ac.aead_available(),
                                    # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
                                    # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
                                    # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.

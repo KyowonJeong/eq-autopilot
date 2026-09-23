@@ -7,6 +7,7 @@ hiddenimports = ['autopilot_crypto', 'yaml', 'requests', 'urllib3', 'tzdata', 't
                  'keyring', 'keyring.backends.Windows', 'win32ctypes', 'win32ctypes.pywin32', 'nest_asyncio']
 hiddenimports += collect_submodules('eqexec')
 hiddenimports += collect_submodules('keyring')
+hiddenimports += collect_submodules('cryptography')   # v2 AES-GCM 피드(2026-09-23) - 빠지면 앱이 aead=False를 광고해 v1을 받는다
 hiddenimports += collect_submodules('ib_insync')   # IBKR 어댑터(지연 import) — 번들에 포함
 hiddenimports += collect_submodules('eventkit')
 
