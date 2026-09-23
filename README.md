@@ -82,6 +82,9 @@ what happens to your account after a signal arrives.
   - alerts meant for you, such as a missed entry or a lost broker connection, relayed through
     our server to your Telegram or Discord (`_member_alert`);
   - on a PIN reset you ask for: your token and the four-digit code (`/eqpin`).
+  - backup 5-minute price bars, sent to the server only from the operator's own device; member
+    installations do not send these bars (`_bar_backup_tick` returns unless the tier is `admin`,
+    and the server stores bars only from the owner's token).
 
   In error text, alerts and status events the app cuts the account IDs you configured to their
   last four characters and masks long digit runs; a message your broker returned can still contain
