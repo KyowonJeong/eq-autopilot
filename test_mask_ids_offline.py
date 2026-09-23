@@ -41,6 +41,6 @@ chk("_report_error msg 마스킹", sent and "…3456" in json.dumps(sent[-1][1],
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"), encoding="utf-8").read()
 chk("동의 문구 범위 한정(KO/EN)", "이 요약에는 API 키, 계좌번호, 잔고가" in src and "This summary contains no API keys, account numbers" in src and "are never transmitted" not in src)
 chk("연결 감시 라벨 끝 4자리", "[…{acct[-4:]}]" in src and "acct[-6:]" not in src)
-chk("버전 23d", eqgui.App._APP_VER == "2026.09.23d")
+chk("버전 23d 이상", eqgui.App._APP_VER >= "2026.09.23d")
 print(("실패 %d: %s" % (len(fails), fails)) if fails else "전부 통과")
 sys.exit(1 if fails else 0)

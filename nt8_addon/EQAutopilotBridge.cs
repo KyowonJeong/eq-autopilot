@@ -31,6 +31,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 using NinjaTrader.Cbi;
+using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
 #endregion
 
@@ -43,12 +44,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string Token   = "CHANGE-ME-SHARED-TOKEN";   // 앱 config의 nt8.token
         private const int    PollMs  = 1000;
 
-        private const string BridgeVer = "2026.09.04b";   // 앱이 구/신 애드온 판별(orders 지원)
+        private const string BridgeVer = "2026.09.23a";   // 앱이 구/신 애드온 판별(orders 지원)
 
         private DispatcherTimer timer;
         private static readonly HttpClient http = new HttpClient();
         private readonly HashSet<string> doneTids = new HashSet<string>();
         private bool busy;
+        // ── 백업 5분봉(2026-09-23): 앱이 /v1/bars_wanted로 요청한 심볼의 최근 5분봉을 BarsRequest로
+        //    받아 /v1/bars로 민다(5틱=5초마다). 오너 기기에서만 요청이 오고, 서버는 공급사(ProjectX)가
+        //    죽었을 때 4H 조립의 마지막 보루로 쓴다. 주문·계좌 경로와 완전히 분리 - 여기가 죽어도 매매 무관.
+        private int tickN;
+        private const int BarsEveryTicks = 5;
+        private readonly HashSet<string> barsInFlight = new HashSet<string>();
 
         // ── EQ 주문 장부(2026-09-04 다계좌 진입 누락 수리) ──
         // NT8 Submit은 fire-and-forget: 브로커의 비동기 거절은 OrderUpdate 이벤트로만
@@ -178,6 +185,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 EnsureOrderSubscriptions();
                 await PushStateAsync();
                 await DrainCommandsAsync();
+                if (++tickN % BarsEveryTicks == 0) await PushBarsAsync();
             }
             catch (Exception ex)
             {
@@ -476,6 +484,71 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
             return Ack(true);
+        }
+
+        // ── ③ 백업 5분봉 push ──
+        private async Task PushBarsAsync()
+        {
+            string resp;
+            try { resp = await http.GetStringAsync(BaseUrl + "/v1/bars_wanted"); }
+            catch { return; }
+            var root = MiniJson.Parse(resp) as Dictionary<string, object>;
+            var syms = (root != null ? root.Get("symbols") : null) as List<object> ?? new List<object>();
+            foreach (var so in syms)
+            {
+                string name = so as string;
+                if (string.IsNullOrEmpty(name)) continue;
+                lock (barsInFlight)
+                {
+                    if (barsInFlight.Contains(name)) continue;
+                    barsInFlight.Add(name);
+                }
+                Instrument instr = null;
+                try { instr = Instrument.GetInstrument(name); } catch { }
+                if (instr == null)
+                {
+                    lock (barsInFlight) barsInFlight.Remove(name);
+                    continue;
+                }
+                string symName = name;
+                try
+                {
+                    var req = new BarsRequest(instr, 8)
+                    {
+                        BarsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 5 },
+                        TradingHours = instr.MasterInstrument.TradingHours
+                    };
+                    req.Request((bars, errorCode, errorMessage) =>
+                    {
+                        try
+                        {
+                            if (errorCode != ErrorCode.NoError || bars == null || bars.Bars == null) return;
+                            var list = new List<object>();
+                            int n = bars.Bars.Count;
+                            for (int i = Math.Max(0, n - 8); i < n; i++)
+                            {
+                                DateTime t = bars.Bars.GetTime(i);           // NT8 봉 시각 = 봉 **끝**(로컬 시각)
+                                list.Add(new Dictionary<string, object> {
+                                    { "t",   t.ToString("o", CultureInfo.InvariantCulture) },
+                                    { "off", TimeZoneInfo.Local.GetUtcOffset(t).TotalMinutes },
+                                    { "o",   bars.Bars.GetOpen(i) },  { "h", bars.Bars.GetHigh(i) },
+                                    { "l",   bars.Bars.GetLow(i) },   { "c", bars.Bars.GetClose(i) },
+                                    { "v",   Convert.ToDouble(bars.Bars.GetVolume(i)) } });
+                            }
+                            var body = new Dictionary<string, object> {
+                                { "symbol", symName }, { "period", 5 }, { "bars", list } };
+                            var _ = PostAsync("/v1/bars", body);
+                        }
+                        catch (Exception ex) { Print("[EQBridge] bars error: " + ex.Message); }
+                        finally { lock (barsInFlight) barsInFlight.Remove(symName); }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    lock (barsInFlight) barsInFlight.Remove(symName);
+                    Print("[EQBridge] bars request error: " + ex.Message);
+                }
+            }
         }
 
         private static async Task PostAsync(string path, Dictionary<string, object> body)

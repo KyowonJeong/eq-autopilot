@@ -181,7 +181,38 @@ PRECHECK_WINDOWS_MIN = (70, 10)                     # 넓은 창(여유 있게 �
 #   수준이고, 어차피 하트비트가 60초마다 도는 것보다 훨씬 드물다.
 CONN_WATCH_EVERY_S = 600        # 점검 주기 10분
 CONN_WATCH_STRIKES = 2          # 연속 2회 실패부터 알린다(깜빡임에 소리내지 않기)
-CONN_WATCH_DM_EVERY_S = 3600    # 실패가 이어져도 DM은 한 시간에 한 번(대표 지시)
+CONN_WATCH_DM_EVERY_S = 3600
+# 백업 5분봉(대표 2026-09-23 "NinjaTrader 브리지로 백업 신호"): 오너 토큰(등급 admin)일 때만 열린 NT8
+# 브리지에 NQ/GC 앞월물 5분봉을 요청해 닫힌 봉을 서버 /eqbars로 민다. 서버는 오너 토큰만 받고,
+# 공급사(ProjectX)가 죽었을 때 4H 조립의 마지막 보루로 쓴다. 매매·발송 경로와 완전히 분리.
+BAR_BACKUP_EVERY_S = 60
+BAR_BACKUP_INSTS = ("NQ", "GC")
+
+
+def _bar_end_epoch(b):
+    """애드온 봉의 끝 시각(.NET "o" 문자열, 오프셋 없으면 off 분) → epoch. 못 읽으면 None."""
+    import datetime as _dt
+    try:
+        t = str((b or {}).get("t") or "").strip()
+        if not t:
+            return None
+        if "." in t:                                     # .NET 7자리 소수초 → 6자리
+            head, rest = t.split(".", 1)
+            i = 0
+            while i < len(rest) and rest[i].isdigit():
+                i += 1
+            t = head + "." + rest[:min(i, 6)] + rest[i:]
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        d = _dt.datetime.fromisoformat(t)
+        if d.tzinfo is None:
+            off = (b or {}).get("off")
+            if off is None:
+                return None
+            d = d.replace(tzinfo=_dt.timezone(_dt.timedelta(minutes=int(float(off)))))
+        return d.timestamp()
+    except Exception:
+        return None    # 실패가 이어져도 DM은 한 시간에 한 번(대표 지시)
 PRECHECK_WINDOW_MIN = PRECHECK_WINDOWS_MIN[0]       # 하위호환(기존 참조)
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
@@ -1449,6 +1480,7 @@ class App:
         # 라이브가 꺼져 있으면 틱은 즉시 반환하므로 평소에는 비용이 0이다.
         self._conn_state = {}
         root.after(90 * 1000, self._conn_watch_tick)
+        root.after(150 * 1000, self._bar_backup_tick)              # 백업 5분봉 전송(오너 기기만, 2026-09-23)
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
         root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
         root.after(120 * 1000, self._unsent_fill_tick)             # 미전송 체결 보고 재시도(2분)
@@ -6883,7 +6915,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.23d"
+    _APP_VER = "2026.09.23e"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -8182,6 +8214,77 @@ class App:
             return
         self._watch_on = True
         threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    def _bar_backup_tick(self):
+        """백업 5분봉 전송 1틱(BAR_BACKUP_EVERY_S). 조건: 등급 admin(오너) + 열린 NT8 브리지.
+        애드온에 NQ/GC 앞월물을 요청하고, 받은 봉 중 **닫힌 봉**(NT8 시각=봉 끝 ≤ 지금)만, 마지막으로
+        보낸 봉 이후 것만 서버로 민다. 애드온 푸시가 2분 넘게 멎었으면 낡은 봉은 안 보낸다.
+        전송은 백그라운드, 실패는 조용히 - 매매·발송과 무관한 곁가지(경보 원칙 ④)."""
+        try:
+            self.root.after(BAR_BACKUP_EVERY_S * 1000, self._bar_backup_tick)
+        except Exception:
+            return
+        try:
+            if str((getattr(self, "_gate", {}) or {}).get("tier") or "").lower() != "admin":
+                return
+            if not (self._token or "").strip():
+                return
+            from eqexec.broker.nt8 import NT8Broker
+            if not NT8Broker._BRIDGES:
+                return
+            wanted = [w for w in (NT8Broker._front_month(i) for i in BAR_BACKUP_INSTS) if w]
+            NT8Broker.bars_set_wanted(wanted)
+            got = NT8Broker.bars_take()
+            if not got:
+                return
+            import time as _tm                          # 모듈 레벨에 time 없음 - 지역 임포트(다른 메서드와 동일)
+            now = _tm.time()
+            sent = getattr(self, "_bar_backup_sent", None)
+            if sent is None:
+                sent = self._bar_backup_sent = {}
+            items = {}
+            for sym, pack in got.items():
+                inst = str(sym).split(" ")[0].upper()
+                if inst not in BAR_BACKUP_INSTS:
+                    continue
+                if now - float(pack.get("ts") or 0) > 120:
+                    continue
+                rows = []
+                for b in pack.get("bars") or []:
+                    end = _bar_end_epoch(b)
+                    if end is None or end > now - 1 or end <= float(sent.get(inst) or 0):
+                        continue
+                    rows.append((end, {"t_end": b.get("t"), "off": b.get("off"), "o": b.get("o"),
+                                       "h": b.get("h"), "l": b.get("l"), "c": b.get("c"), "v": b.get("v")}))
+                if rows:
+                    rows.sort(key=lambda x: x[0])
+                    items[inst] = rows[-24:]
+            if not items:
+                return
+
+            def _bg(items=items):
+                import requests as _rq
+                for inst, rows in items.items():
+                    try:
+                        r = _rq.post(PUSH_BASE + "eqbars", timeout=8,
+                                     json={"t": self._token, "inst": inst, "src": "nt8", "period": 5,
+                                           "bars": [x[1] for x in rows]})
+                        if r.ok and str(r.text).startswith("br:ok"):
+                            sent[inst] = max(float(sent.get(inst) or 0), rows[-1][0])
+                            if not getattr(self, "_bar_backup_logged", False):
+                                self._bar_backup_logged = True
+                                _msg = ("📡 백업 5분봉 전송 시작(NinjaTrader → 서버) - 공급사 장애 때 서버가 이 봉으로 판정합니다."
+                                        if self.lang == "ko" else
+                                        "📡 Backup 5-minute bars flowing (NinjaTrader → server) - used only if the primary feed fails.")
+                                self.root.after(0, lambda m=_msg: self.log(m))
+                    except Exception:
+                        pass
+            threading.Thread(target=_bg, daemon=True).start()
+        except Exception as _e:
+            try:                                        # 조용히 죽지 않는다(경보 원칙 ①) - 로그 한 줄, 매매 무관
+                self.log(f"백업 봉 틱 오류(무해): {type(_e).__name__}: {_e}")
+            except Exception:
+                pass
 
     def _mask_ids(self, text) -> str:
         """나가는 문구의 계좌 식별자 마스킹(2026-09-23 v23d, 마케팅 세션 인벤토리): 설정된 계좌 ID

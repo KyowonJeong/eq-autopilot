@@ -49,6 +49,8 @@ class _BridgeState:
         self.seen_tids: set[str] = set()       # 멱등 저널(재시작 복원)
         self.last_state: dict = {}             # 애드온이 push한 최신 스냅샷
         self.last_state_ts: float = 0.0
+        self.bars_wanted: list = []            # 앱이 애드온에 요청하는 백업 5분봉 심볼(2026-09-23)
+        self.bars: dict = {}                   # symbol → {"ts", "period", "bars": [...]} 애드온 푸시
         self.journal_path = journal_path
         self._load_journal()
 
@@ -100,6 +102,9 @@ def _make_handler(state: _BridgeState, token: str):
                 return self._send(401, {"error": "bad token"})
             if self.path == "/v1/ping":
                 return self._send(200, {"ok": True, "ts": time.time()})
+            if self.path == "/v1/bars_wanted":         # 백업 5분봉: 애드온이 5초마다 묻는다
+                with state.lock:
+                    return self._send(200, {"symbols": list(state.bars_wanted), "period": 5})
             if self.path == "/v1/pending":
                 # 명령 TTL 120초(2026-08-20 적대검증 D1): NT8이 죽어 있던 사이 쌓인 명령이
                 # 며칠 뒤 재접속 순간 시장가로 집행되는 지뢰 제거. 결정은 신선할 때만 유효하다.
@@ -133,6 +138,13 @@ def _make_handler(state: _BridgeState, token: str):
                     state.last_state = body
                     state.last_state_ts = time.time()
                 return self._send(200, {"ok": True})
+            if self.path == "/v1/bars":                # 백업 5분봉 수신(애드온 BarsRequest 결과)
+                sym = str(body.get("symbol") or "")
+                if sym:
+                    with state.lock:
+                        state.bars[sym] = {"ts": time.time(), "period": body.get("period"),
+                                           "bars": list(body.get("bars") or [])[:64]}
+                return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
 
     return Handler
@@ -148,6 +160,28 @@ class NT8Broker(BrokerAdapter):
     # 서버·상태를 포트 단위 싱글턴으로 공유하고, 인스턴스는 핸들만 잡는다.
     _BRIDGES: dict = {}                      # {port: (_BridgeState, server, token)}
     _BRIDGES_LOCK = threading.Lock()
+
+    @classmethod
+    def bars_set_wanted(cls, symbols) -> int:
+        """열린 모든 브리지에 백업 5분봉 심볼 목록을 건다(오너 기기 전용, eqgui._bar_backup_tick). 반환 = 브리지 수."""
+        with cls._BRIDGES_LOCK:
+            ents = list(cls._BRIDGES.values())
+        for state, _srv, _tok in ents:
+            with state.lock:
+                state.bars_wanted = list(symbols)
+        return len(ents)
+
+    @classmethod
+    def bars_take(cls) -> dict:
+        """모든 브리지가 받은 최신 봉 묶음 {symbol: {ts, period, bars}} 복사본."""
+        out = {}
+        with cls._BRIDGES_LOCK:
+            ents = list(cls._BRIDGES.values())
+        for state, _srv, _tok in ents:
+            with state.lock:
+                for k, v in state.bars.items():
+                    out[k] = {"ts": v.get("ts"), "period": v.get("period"), "bars": list(v.get("bars") or [])}
+        return out
 
     def __init__(self, cfg):
         # cfg: NT8Cfg(port, token, accounts, symbol_map, journal_path)
