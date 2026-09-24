@@ -6970,7 +6970,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.23f"
+    _APP_VER = "2026.09.23g"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -8676,6 +8676,10 @@ class App:
                                    # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
                                    # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
                                    "arm": self._armed_assets(),
+                                   # 확인 모드(2026-09-24 R44 P0 곁가지, v2026.09.23g): 무장은 맞지만 자동 진입은
+                                   # 하지 않는 상태(Operator 등급·1R 미설정 등). 웹 무장 칩이 라임 '무장'과
+                                   # 구분해 '확인 모드'라고 말하게 한다 - 화면이 사실과 반대를 말하던 자리.
+                                   "wo": bool(getattr(self, "_watch_only", False)),
                                    # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
                                    "bk": self._asset_brokers(),
                                    "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
