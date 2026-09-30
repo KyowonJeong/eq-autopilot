@@ -42,5 +42,22 @@ src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"),
 chk("동의 문구 범위 한정(KO/EN)", "이 요약에는 API 키, 계좌번호, 잔고가" in src and "This summary contains no API keys, account numbers" in src and "are never transmitted" not in src)
 chk("연결 감시 라벨 끝 4자리", "[…{acct[-4:]}]" in src and "acct[-6:]" not in src)
 chk("버전 23d 이상", eqgui.App._APP_VER >= "2026.09.23d")
+# 앱 로그(화면·파일) 계좌 ID 끝 4자리(2026-09-28): 설정 계좌 + 설정 밖 계좌처럼 생긴 토큰, 가격·잔고·신호 ID는 그대로
+L = lambda t: eqgui.App._mask_log(app, t)
+chk("로그: 설정 계좌 → …끝4", L("[50KTC-V2-123456] 잔고 $152,340") == "[…3456] 잔고 $152,340")
+chk("로그: 설정 밖 계좌(연결 테스트 나열)도 원문 없음", "26505604" not in L("계좌 PRAC-V2-26505604 / LFE0501726505604-01")
+    and "…5604" in L("계좌 PRAC-V2-26505604"))
+chk("로그: IBKR DU 계좌 → …끝4", "DU1234567" not in L("acct DU1234567 ok") and "…4567" in L("acct DU1234567 ok"))
+chk("로그: 가격·잔고·수량·신호 ID·버전은 그대로", L("NQ 진입 21505.00 손절 21400 ×2 잔고 $2,009 id 2026-09-28-GC-1 v2026.09.23g")
+    == "NQ 진입 21505.00 손절 21400 ×2 잔고 $2,009 id 2026-09-28-GC-1 v2026.09.23g")
+chk("로그: 짧은 이름·None 안전", L("Sim101 U7") == "Sim101 U7" and L(None) == "")
+_q = []
+app.q = types.SimpleNamespace(put=_q.append)
+_files = []
+eqgui._log_to_file = lambda m: _files.append(m)
+app._mask_log = lambda t: eqgui.App._mask_log(app, t)
+eqgui.App.log(app, "계좌 50KTC-V2-123456 연결 OK")
+chk("log(): 화면·파일 둘 다 마스킹", bool(_files) and _files[-1] == "계좌 …3456 연결 OK" and bool(_q)
+    and "50KTC-V2-123456" not in _q[-1] and "…3456" in _q[-1])
 print(("실패 %d: %s" % (len(fails), fails)) if fails else "전부 통과")
 sys.exit(1 if fails else 0)

@@ -49,15 +49,34 @@ def _now_in(tzname):
 from eqexec.config import ProjectXCfg
 from eqexec.broker.projectx import ProjectXBroker
 
+def _profile_name() -> str:
+    """시연·별도 프로필(대표 2026-09-28 설명회 화면 공유): `--profile 이름` 또는 환경변수 EQ_PROFILE.
+    프로필이 있으면 설정 폴더(EQAutopilot-이름)와 OS 보안 저장소 서비스 이름(EQAutopilot-이름)이 **둘 다** 갈린다 -
+    폴더만 바꾸면 브로커 키는 공용 서비스 'EQAutopilot'에서 실계좌 키가 읽혀 나온다. 이름은 영숫자·_-만 20자까지."""
+    import re as _re
+    v = ""
+    try:
+        if "--profile" in sys.argv:
+            v = sys.argv[sys.argv.index("--profile") + 1]
+    except Exception:
+        v = ""
+    v = v or os.environ.get("EQ_PROFILE", "")
+    v = _re.sub(r"[^A-Za-z0-9_-]", "", str(v or ""))[:20]
+    return v
+
+
+PROFILE = _profile_name()
+
+
 def _app_dir():
-    """Per-OS config dir: Windows %APPDATA%, macOS Application Support, else ~/.config."""
+    """Per-OS config dir: Windows %APPDATA%, macOS Application Support, else ~/.config. 프로필이면 EQAutopilot-프로필."""
     if sys.platform.startswith("win"):
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     elif sys.platform == "darwin":
         base = os.path.expanduser("~/Library/Application Support")
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "EQAutopilot")
+    return os.path.join(base, "EQAutopilot" + (f"-{PROFILE}" if PROFILE else ""))
 
 
 APP_DIR = _app_dir()
@@ -157,7 +176,6 @@ HB_GRACE_MIN = 60      # 네트워크 순단 유예(분) - 서버(홈피) 재시
 # 사용자가 시각을 고르는 게 아니라 시스템 세션 마감에 자동으로 맞춘다(3자산·BTC 2세션).
 #   NQ 10-14 ET → 14:00 ET · GC 02-06 ET → 06:00 ET · BTC 22-02/02-06 UTC → 02:00·06:00 UTC
 _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)],
-                # BTC = X2+BE 조건부 출구(2026-07-15 챔피언): 일 22:00 진입 후 4H 블록마다
                 # 판정(반대봉→청산 / 첫봉 순항→본절 / 24h 만기→청산). 판정 시각 6개.
                 # 옛 E0(02시 무조건 청산)는 마지막 블록(22시)이 대신한다 — 폴백 아님, 규칙이 다름.
                 "BTC": [("UTC", h) for h in (2, 6, 10, 14, 18, 22)]}
@@ -182,6 +200,7 @@ PRECHECK_WINDOWS_MIN = (70, 10)                     # 넓은 창(여유 있게 �
 CONN_WATCH_EVERY_S = 600        # 점검 주기 10분
 CONN_WATCH_STRIKES = 2          # 연속 2회 실패부터 알린다(깜빡임에 소리내지 않기)
 CONN_WATCH_DM_EVERY_S = 3600
+NT8_PROBE_EVERY_S = 60          # NT8 브리지 상태를 생존 핑(n8)에 싣는 확인 주기(2026-09-28, 서버가 5분 끊김을 판정)
 # 백업 5분봉(대표 2026-09-23 "NinjaTrader 브리지로 백업 신호"): 오너 토큰(등급 admin)일 때만 열린 NT8
 # 브리지에 NQ/GC 앞월물 5분봉을 요청해 닫힌 봉을 서버 /eqbars로 민다. 서버는 오너 토큰만 받고,
 # 공급사(ProjectX)가 죽었을 때 4H 조립의 마지막 보루로 쓴다. 매매·발송 경로와 완전히 분리.
@@ -293,7 +312,6 @@ _BROKERS = ["projectx", "ibkr", "bybit", "bitget"]
 
 # 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
-#   ⚠️ BTC를 CME MBTC 선물로 안 함 — MBTC는 주말 휴장인데 BTC 엣지가 주말(일요일)에 몰려 있어
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
 _CONSENT_VER = "golive-4item-2026-08"
 _ASSETS = ["NQ", "GC", "BTC"]
@@ -305,7 +323,6 @@ _ASSET_LABEL = {"NQ": {"ko": "나스닥 (NQ)", "en": "Nasdaq (NQ)"},
                 "BTC": {"ko": "비트코인 (BTC)", "en": "Bitcoin (BTC)"}}
 
 # 선물 시간마감 '지정가 청산' 대상 — 대표 2026-07-27 "청산은 비트 빼고 시장가": 선물(NQ·GC)은
-#   지정가 도전 없이 즉시 시장가 청산. 빈 dict = 전 선물 시장가(백테스트 비용 가정과도 일치).
 #   BTC(크립토)만 지정가 도전 → 시장가 폴백 유지(_exec_close_limit).
 #   (구 GC 지정가 배선은 _exec_close_limit_fut에 보존 — 재개하려면 {"GC": "MGC"}로 복원.)
 _LIMIT_EXIT_FUT = {}
@@ -521,10 +538,12 @@ T = {
                          "hold it for a few minutes rather than seconds. Inactivity rules "
                          "differ by firm, so check the rules of the firm you use.")},
     "live_stopall": {"ko": "⏹ 전체 정지 (포지션 유지)", "en": "⏹ Stop all (positions kept)"},
-    "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk), 시장 국면의 기대값에 따라 최대 3R"
-                           "(maximum risk)까지 — 계좌 여유는 1R의 3배로 잡으세요.",
-                     "en": "1R = typical risk per trade, scales up to 3R (maximum risk) with the "
-                           "expectancy of the market regime — budget 3× your 1R."},
+    # 배수 범위 1R~3R = 서버 web/sizing_canon.min_r_mult()·max_r_mult()와 같은 값(대표 2026-09-28 "브일이 정본." - 금 기본 사이즈 1R·추세 규칙 없음).
+    # 배수가 정해지는 이유는 적지 않는다(결과 사실만).
+    "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk). 신호마다 포지션 배수가 1R~3R(maximum risk) "
+                           "사이로 정해집니다 — 계좌 여유는 1R의 3배로 잡으세요.",
+                     "en": "1R = typical risk per trade. Each signal sets a position multiple between 1R "
+                           "and 3R (maximum risk) — budget 3× your 1R."},
     "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
                         "신호의 방향, 손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리. "
                         "세션 마감 자동 청산을 원하지 않으면 마감 전에 [⏹ 전체 정지]를 누르세요 — 포지션은 "
@@ -552,15 +571,15 @@ T = {
     "sig_on_ind": {"ko": "  ● 신호 대기 ON  ", "en": "  ● Watching ON  "},
     "sig_off_ind": {"ko": "  ○ 정지  ", "en": "  ○ Off  "},
     "sig_note": {"ko": "※ 신호의 방향, 손절가로 자동 진입하고, 계약 수는 위 1R($ 리스크)로 앱이 자동 계산합니다 "
-                       "(신호에 계약 수 없음). ⚠️ EdgeQuant는 시장 국면의 기대값에 따라 포지션을 키워 "
+                       "(신호에 계약 수 없음). ⚠️ 신호마다 포지션 배수가 1R~3R 사이로 정해지며 "
                        "거래당 최대 3R까지 리스크를 감수합니다 — 계좌 여유는 1R의 3배 기준으로 잡으세요. "
                        "자산은 신호의 종목으로 자동 판별(NQ→MNQ, GC→MGC, BTC→BTCUSDT.P). "
                        "'사용 계좌'만 고르면 됩니다. 포지션은 종목별로 독립 관리됩니다 — 같은 종목은 기존 "
                        "포지션이 완전히 청산된 것이 확인된 후에만 새로 진입하여 중복 포지션을 방지하고, 다른 "
                        "종목은 서로 영향을 주지 않으므로 NQ와 GC도 같은 계좌에서 동시에 독립 운용할 수 있습니다.",
                  "en": "※ Enters automatically using the signal's direction and stop; the contract count is computed "
-                       "by the app from your 1R above (the signal carries no contract count). ⚠️ EdgeQuant scales "
-                       "position size with the expectancy of the market regime — up to 3R risk per trade; budget your account for "
+                       "by the app from your 1R above (the signal carries no contract count). ⚠️ Each signal sets a "
+                       "position multiple between 1R and 3R — up to 3R risk per trade; budget your account for "
                        "3× your 1R. The instrument is detected from the signal (NQ→MNQ, GC→MGC, BTC→BTCUSDT.P). "
                        "Just pick the account. Positions are managed independently per symbol — the same "
                        "symbol re-enters only after the previous position is confirmed fully closed (no doubling), "
@@ -571,7 +590,9 @@ T = {
 }
 
 
-KC_SERVICE = "EQAutopilot"   # Keychain / Credential-Manager service name
+KC_SERVICE = "EQAutopilot" + (f"-{PROFILE}" if PROFILE else "")   # Keychain / Credential-Manager service name(프로필별로 분리)
+# 화면 공유 모드(대표 2026-09-28 설명회): 로그의 금액($…)·bal= 값을 가린다. `--share` 또는 EQ_SHARE=1, 프로필 실행이면 기본 켬.
+SHARE_MODE = ("--share" in sys.argv) or os.environ.get("EQ_SHARE") == "1" or bool(PROFILE)
 _IS_MAC = sys.platform == "darwin"
 # 설정 행 라벨 칸 폭: Windows Tk는 같은 width 단위에서 실제 폭이 좁게 잡혀 긴 라벨
 # ("API dedicated password", "TopstepX user email")이 잘렸다(대표 2026-09-04 실기기).
@@ -886,7 +907,7 @@ def _enc_ask_pin(lang: str, verify_blob=None):
 # Topstep funded는 잔고가 $0에서 시작(명목 150K는 트레일링 드로다운 기준일 뿐, balance는
 # 이익만 0부터 적립) → '방패'는 잔고 그 자체다(start_bal 빼기 없음, 대표 2026-07-26 실계좌 확인).
 # payouts = 이 계좌의 지금까지 출금 횟수(0~5). 빅실드 정본(대표 2026-08-02 채택):
-#   펀디드 1R = 전 구간 $300 고정. 출금은 두 단계(계정 합산 기준, 전제="합산 3발 전엔 재량
+#   펀디드 1R = 전 구간 고정(Topstep 프리셋 $450, 2026-09-29 300→450). 출금은 두 단계(계정 합산 기준, 전제="합산 3발 전엔 재량
 #   Live 전환 없음"):
 #   ① 방패기(합산 1~3발): 잔고에 방패 $6,000 상시 유지 — $12,000 도달 시마다 $6,000 출금
 #   ② Fast-Payout기(합산 4~5발, 라이브 초대 전): 방패 해제 — 자격($150+ 익절 5일·직전 출금 후
@@ -908,11 +929,13 @@ _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300
                   "last_bal": None}   # r_live = 라이브 초기 1R(Lucid, +$4,500 락 전. 2026-08-11)   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 # ── 브로커별 프롭 정본 프리셋(대표 2026-08-11 "브로커 자동 감지해서 페이즈별 사이징") ──
-#   projectx(Topstep) = 빅실드 정본 1200/300/방패6000 (2026-08-02 채택)
+#   projectx(Topstep) = 빅실드 정본 평가 1800/펀디드 450/방패6000 (2026-08-02 채택, 평가 1R 1200→1800 대표 2026-09-29 "가보자",
+#                       펀디드 1R 300→450 대표 2026-09-29 "가즈아" - 정수 계약에서 $300은 NQ 한 계약 위험보다 작아 자주 건너뜀)
+#                       - 서버 정본 topstep_rules_mc.RULES와 같은 값. 펀디드 900안은 취소: 잠김 전 MLL $4,500 = 5R)
 #   nt8(Lucid)        = 속도 스윕 정본: 평가 $300 / 펀디드 $150, 방패 없음(락스텝·1발 전환)
 #                       라이브 락 후는 프롭 모드가 아니라 '잔고 %' 모드 2% 권장(e3d03c3)
 _PROP_PRESETS = {
-    "projectx": {"r_test": 1200.0, "r_buffer": 300.0, "r_steady": 300.0, "buffer": 6000.0},
+    "projectx": {"r_test": 1800.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 6000.0},
     "nt8":      {"r_test": 300.0,  "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0,
                  "r_live": 100.0},
 }
@@ -923,8 +946,12 @@ def _prop_preset(broker):
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
 
+_TOPSTEP_R_TEST = _PROP_PRESETS["projectx"]["r_test"]   # 평가 1R 이행 목표(2026-09-29 1800) - 프리셋 한 곳에서
+_TOPSTEP_R_FUNDED = _PROP_PRESETS["projectx"]["r_steady"]   # 펀디드 1R 이행 목표(2026-09-29 450)
+
+
 def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
-              broker=""):
+              broker="", topstep=False):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
@@ -933,11 +960,16 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
-        # 챔피언 마이그레이션(2026-07-27): 구 기본값 그대로인 계좌만 신챔피언으로 자동 이행
-        # (900/300/600·9000 및 1200/300/450·3000 → 1200/300/300·방패 6000). 커스텀 값은 불변.
+        # (900/300/600·9000 및 1200/300/450·3000 → 방패 6000 체제). 커스텀 값은 불변.
         if (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) in (
                 (900.0, 300.0, 600.0, 9000.0), (1200.0, 300.0, 450.0, 3000.0)):
             p["r_test"], p["r_steady"], p["buffer"] = 1200.0, 300.0, 6000.0
+        # 2026-09-29(대표 "가보자"·"가즈아"): **Topstep(projectx) 계좌만** 배포된 직전 기본값 1200/300/300·6000 그대로면
+        # 평가 1R 1800·펀디드 1R 450으로. 1800/300은 배포된 적 없는 조합이라 손으로 고른 값으로 보고 건드리지 않는다(수동 우선).
+        # Lucid(nt8)는 대상 아님 - 같은 1800이 Lucid 평가 MLL $4,500에선 2.5R이다. 브로커는 호출부(설정 로드)가 판정해 넘긴다.
+        if topstep and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (1200.0, 300.0, 300.0, 6000.0):
+            p["r_test"] = _TOPSTEP_R_TEST
+            p["r_buffer"] = p["r_steady"] = _TOPSTEP_R_FUNDED
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
         pc["on"] = bool(pct.get("on"))
@@ -988,7 +1020,7 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"), x.get("pct"), False, bk)
+                                  x.get("prop"), x.get("pct"), False, bk, topstep=(bk == "projectx"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -1009,7 +1041,8 @@ def _load():
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
                                       x.get("prop"), x.get("pct"), False,
-                                      x.get("broker", ""))
+                                      x.get("broker", ""),
+                                      topstep=((x.get("broker") if x.get("broker") in brs else bk) == "projectx"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -1388,7 +1421,7 @@ def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None, one_
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("EQ Autopilot")
+        root.title("EQ Autopilot" + (f"  [{PROFILE}]" if PROFILE else "") + ("  - share mode" if SHARE_MODE else ""))
         # ── 예외 자동 리포트(대표 2026-07-27 "필수") — 회원 머신의 미처리 예외를 서버(/eqerr)로.
         #    키·계좌번호·잔고 무전송(마스킹), EQ_ERR_REPORT=0 으로 끔. 실패해도 앱 무사.
         self._err_sent = {}
@@ -1481,6 +1514,8 @@ class App:
         # 라이브가 꺼져 있으면 틱은 즉시 반환하므로 평소에는 비용이 0이다.
         self._conn_state = {}
         root.after(90 * 1000, self._conn_watch_tick)
+        self._nt8_state = None                  # NT8 브리지 상태(생존 핑 n8) - 첫 확인 전엔 None(미확인)
+        root.after(45 * 1000, self._nt8_probe_tick)
         root.after(150 * 1000, self._bar_backup_tick)              # 백업 5분봉 전송(오너 기기만, 2026-09-23)
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
         root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
@@ -2063,6 +2098,10 @@ class App:
                   foreground="#6b7280").pack(side="left")
         ttk.Button(_logrow, text=("로그 복사" if self.lang == "ko" else "Copy log"),
                    command=self._copy_log).pack(side="right")
+        # [로그 보내기](대표 2026-09-29 "로그 복사 말고 로그 리포트 버튼"): 서버 스위치(log_upload)가 켜질 때만 보인다.
+        self.b_logsend = ttk.Button(_logrow, text=("로그 보내기" if self.lang == "ko" else "Send log"),
+                                    command=self._send_log)
+        self.root.after(0, self._sync_log_btn)
         # 기기 ID 6자를 버전 옆에(2026-09-17 R37 P2-#41): 웹 기기 칸이 같은 6자로 기기를 구분하는데
         # 앱 어디에도 표시가 없어 회원이 어느 칸이 이 기기인지 맞출 수 없었다. 설치별 난수라 개인정보 아님.
         ttk.Label(_logrow,
@@ -2376,6 +2415,10 @@ class App:
                                     "enabled": bool(ap.get("enabled")),
                                     "force_dry_run": bool(ap.get("force_dry_run", True)),
                                     "caps": ap.get("caps", {}) or {}, "brokers": ap.get("brokers", {}) or {},
+                                    # 150K 판별 패턴(서버가 늘린다 - 앱 재빌드 없이, 2026-09-28)
+                                    "p150": ap.get("p150") if isinstance(ap.get("p150"), dict) else None,
+                                    # [로그 보내기] 버튼 스위치(2026-09-29): 서버가 켤 때만 버튼이 보인다(방침 반영일과 맞춤)
+                                    "log_upload": bool(ap.get("log_upload")),
                                     "reason": ""}
                         break
                     except Exception as e:                  # 네트워크 예외(순단) → 1회 재시도
@@ -2396,6 +2439,10 @@ class App:
                 self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
                          f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
             self._gate = gate
+            try:
+                self.root.after(0, self._sync_log_btn)      # [로그 보내기] 버튼 표시 = 서버 스위치
+            except Exception:
+                pass
             # 하트비트가 한 번이라도 돌면 상시 생존 핑을 띄운다(2026-08-28 R14 P0) -
             # 신호 루프 유무와 무관하게 앱이 떠 있는 동안 심박이 뛰어야 한다.
             try:
@@ -2932,6 +2979,104 @@ class App:
         except Exception:
             pass
 
+    def _sync_log_btn(self):
+        """서버 하트비트의 log_upload가 켜졌을 때만 [로그 보내기]를 보인다(fail-closed)."""
+        try:
+            b = getattr(self, "b_logsend", None)
+            if b is None:
+                return
+            on = bool((getattr(self, "_gate", {}) or {}).get("log_upload"))
+            if on and not b.winfo_ismapped():
+                b.pack(side="right", padx=(0, 6))
+            elif not on and b.winfo_ismapped():
+                b.pack_forget()
+        except Exception:
+            pass
+
+    _LOG_SEND_H = 48
+    _LOG_SEND_MAX = 2 * 1024 * 1024
+
+    @staticmethod
+    def _scrub_upload(text: str, amounts: bool) -> str:
+        """보내기 직전 한 번 더 거른다: 키·토큰처럼 생긴 긴 영숫자열, key=/secret=/token=/pin=/password= 값, 이메일.
+        amounts=False면 금액($…, bal=, 잔고)도 가린다(화면 공유 모드와 같은 규칙). 계좌 ID는 기록 때 이미 끝4(_mask_log)."""
+        import re as _re
+        s = str(text or "")
+        s = _re.sub(r"(?i)\b(api[_ -]?key|secret|token|password|passwd|pwd|pin)(\s*[=:]\s*)\S+", r"\1\2[redacted]", s)
+        s = _re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[email]", s)
+        s = _re.sub(r"(?<![A-Za-z0-9…])(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{24,}", "[redacted]", s)
+        if not amounts:
+            s = _re.sub(r"\$\s?-?[\d,]+(?:\.\d+)?", "$•••", s)
+            s = _re.sub(r"(bal(?:ance)?\s*[=:]\s*)-?[\d,.]+", r"\1•••", s, flags=_re.I)
+            s = _re.sub(r"(잔고\s*)-?[\d,.]+", r"\1•••", s)
+        return s
+
+    def _collect_log(self, hours: int = 48) -> str:
+        """최근 hours시간의 앱 로그 파일(날짜별)을 모은다. 오래된 쪽부터, 크기는 호출부가 자른다."""
+        import time as _tm
+        out = []
+        try:
+            cut = _tm.time() - hours * 3600 - 86400          # 날짜 파일 경계 여유 하루
+            fs = sorted(fn for fn in os.listdir(LOG_DIR) if fn.startswith("eq-") and fn.endswith(".log"))
+            for fn in fs:
+                p = os.path.join(LOG_DIR, fn)
+                if os.path.getmtime(p) >= cut:
+                    out.append(f"===== {fn} =====\n" + open(p, encoding="utf-8", errors="replace").read())
+        except Exception:
+            pass
+        return "\n".join(out)
+
+    def _send_log(self):
+        """[로그 보내기]: 확인 → 가림 → 압축 업로드 → 접수 번호. 서버가 없거나 실패하면 그대로 알린다(조용히 삼키지 않음)."""
+        ko = self.lang == "ko"
+        if not messagebox.askyesno(
+                "로그 보내기" if ko else "Send log",
+                (f"최근 {self._LOG_SEND_H}시간의 앱 로그를 EQ 지원팀에 보냅니다.\n\n"
+                 "· 계좌 번호는 끝 4자리만 갑니다\n· API 키·비밀번호·PIN은 담기지 않습니다\n· 금액은 가립니다(다음 질문에서 고를 수 있음)\n\n"
+                 "보낼까요?") if ko else
+                (f"Send the last {self._LOG_SEND_H} hours of app log to EQ support.\n\n"
+                 "· Account numbers go as the last 4 characters only\n· No API keys, passwords or PIN\n· Amounts are hidden (you can choose next)\n\n"
+                 "Send it?")):
+            return
+        amounts = messagebox.askyesno(
+            "금액 포함" if ko else "Include amounts",
+            ("사이징(1R·수량) 문의라면 금액이 필요합니다. 금액(잔고·$)을 포함할까요?\n아니요를 누르면 가려서 보냅니다."
+             if ko else "Amounts are needed only for sizing (1R, quantity) questions. Include amounts (balance, $)?\n"
+             "Choose No to send them hidden."), default="no")
+        raw = self._collect_log(self._LOG_SEND_H)
+        txt = self._scrub_upload(self._mask_log(raw), amounts)
+        hdr = f"[EQ Autopilot v{self._APP_VER} device {MACHINE_ID[:6]} os {sys.platform}]\n"
+
+        def _bg():
+            import base64 as _b64
+            import gzip as _gz
+            try:
+                import requests as _rq
+                body = (hdr + txt).encode("utf-8")
+                z = _gz.compress(body)
+                while len(z) > self._LOG_SEND_MAX and len(body) > 1024:     # 크면 오래된 앞부분부터 자른다
+                    body = body[len(body) // 4:]
+                    z = _gz.compress(body)
+                r = _rq.post(PUSH_BASE + "eqlog", timeout=40,
+                             json={"t": self._token, "m": _machine_id(), "v": self._APP_VER, "amounts": bool(amounts),
+                                   "gz": _b64.b64encode(z).decode("ascii")})
+                d = r.json() if r.ok else {}
+                if d.get("ok") and d.get("no"):
+                    msg = (f"로그를 보냈습니다. 접수 번호 {d['no']}" if ko else f"Log sent. Reference {d['no']}")
+                    self.root.after(0, lambda: messagebox.showinfo("EQ Autopilot", msg + (
+                        "\n문의할 때 이 번호를 알려 주세요." if ko else "\nPlease quote this number when you contact us.")))
+                    self.log(msg)
+                else:
+                    why = str(d.get("error") or f"HTTP {r.status_code}")[:80]
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "EQ Autopilot", (f"로그를 보내지 못했습니다({why}). [로그 복사]로 붙여 넣어 주세요." if ko
+                                         else f"Could not send the log ({why}). Please use [Copy log].")))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "EQ Autopilot", (f"로그를 보내지 못했습니다({type(e).__name__}). [로그 복사]로 붙여 넣어 주세요." if ko
+                                     else f"Could not send the log ({type(e).__name__}). Please use [Copy log].")))
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _copy_log(self):
         """화면 로그 전체를 클립보드로 - 지원 DM에 붙여넣기(2026-08-11 UX 감사)."""
         try:
@@ -2943,7 +3088,38 @@ class App:
         except Exception:
             pass
 
+    # 계좌 식별자처럼 생긴 토큰(영문+숫자, 숫자 5자리 이상 연속, 6자 이상 - 예: 50KTC-V2-26505604, DU1234567).
+    # 설정에 아직 없는 계좌(연결 테스트가 나열한 계좌, 브로커 포지션의 계좌 이름)도 덮으려는 것(2026-09-28).
+    _ACCT_LIKE = None
+
+    def _mask_log(self, text) -> str:
+        """앱 로그(화면·저장 파일)의 계좌 ID를 끝 4자리만 남긴다(대표 2026-09-28 "그거 고치자", 고객 화면 로그에
+        계좌 ID 원문). 설정된 계좌 ID는 '…끝4'로, 그 밖에 계좌처럼 생긴 토큰도 '…끝4'로. 잔고·가격·수량은 그대로 둔다
+        (_mask_ids의 '5자리+ 숫자열 #' 규칙은 로그엔 쓰지 않는다 - 가격·잔고까지 지워 진단이 안 된다)."""
+        import re as _re
+        s = str(text if text is not None else "")
+        try:
+            ids = set()
+            for _c in (getattr(self, "_acfg", {}) or {}).values():
+                for _x in ((_c or {}).get("accounts") or []):
+                    _i = str((_x or {}).get("id") or "").strip()
+                    if len(_i) >= 4:
+                        ids.add(_i)
+            for _i in sorted(ids, key=len, reverse=True):
+                s = s.replace(_i, "…" + _i[-4:])
+            if App._ACCT_LIKE is None:
+                App._ACCT_LIKE = _re.compile(r"(?<![\w…])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d{5})[A-Za-z0-9][A-Za-z0-9_-]{5,}")
+            s = App._ACCT_LIKE.sub(lambda mt: "…" + mt.group(0)[-4:], s)
+            if SHARE_MODE:                               # 화면 공유: 금액만 가림(가격·수량·시각은 그대로 - 흐름은 보이게)
+                s = _re.sub(r"\$\s?-?[\d,]+(?:\.\d+)?", "$•••", s)
+                s = _re.sub(r"(bal(?:ance)?\s*[=:]\s*)-?[\d,.]+", r"\1•••", s, flags=_re.I)
+                s = _re.sub(r"(잔고\s*)-?[\d,.]+", r"\1•••", s)
+        except Exception:
+            pass
+        return s
+
     def log(self, m):
+        m = self._mask_log(m)    # 계좌 ID 끝 4자리(화면·파일 둘 다, 2026-09-28)
         _log_to_file(m)          # 파일에도 영속(타임스탬프 부여) — 대표 2026-07-15
         # 화면 로그에도 시각(2026-08-11 UX 감사: 스샷 한 장 지원의 전제). 빈 줄·구분선은 그대로.
         try:
@@ -3027,6 +3203,24 @@ class App:
         except Exception:
             pass
         return True
+
+    def _entry_skip_ev(self, asset, why: str):
+        """일부러 진입하지 않은 사실을 서버에 한 번 보고(2026-09-28 R47 P1-#6). 종전엔 앱이 entry_skip을 한 번도
+        안 보내, 무장 기기가 게이트로 건너뛴 진입과 조용히 놓친 진입을 서버 카드가 가를 수 없었다(9/21 대표 사례).
+        why = 짧은 사유 코드(sizing·size_cap·adverse_move·prop_done·no_account·stale_signal·qty0) - 화면 문구는 서버가
+        만든다(문턱·수치는 싣지 않는다). 같은 자산·사유는 10분에 한 번만."""
+        try:
+            import time as _t
+            _k = f"{asset}|{why}"
+            _seen = getattr(self, "_skip_ev_at", None)
+            if _seen is None:
+                _seen = self._skip_ev_at = {}
+            if _t.time() - float(_seen.get(_k) or 0) < 600:
+                return
+            _seen[_k] = _t.time()
+            self._send_ev("entry_skip", asset, why=str(why)[:24])
+        except Exception:
+            pass
 
     def _send_ev(self, kind, asset, **extra):
         """실행 라이프사이클 마커(/eqalive ev, 대표 2026-09-03 "진입 시도 진입 성공 등등").
@@ -4825,7 +5019,23 @@ class App:
             messagebox.showwarning(self.t("token"), self.t("gate_none")); return
         self._save_current_asset()
         incl = [a for a in _ASSETS if self._live_include[a].get()]
+        # 키는 있는데 '실행 자산' 체크가 꺼진 자산을 로그에 한 줄씩(대표 2026-09-28 "둘 다 넣어"): 새 설치 기본값이
+        # 꺼짐이라, 연결 테스트까지 마친 자산이 아무 말 없이 시작에서 빠졌다(9/28 고객 BTC 무장 건).
+        for _a in _ASSETS:
+            if _a in incl:
+                continue
+            try:
+                _has_key = any((self._creds_of(_a, self._acct_broker(_a, _ac)).get("f1") or "").strip()
+                               for _ac in ((self._acfg.get(_a) or {}).get("accounts") or []))
+            except Exception:
+                _has_key = False
+            if _has_key:
+                self.log(f"ℹ {_a}: 실행 자산 체크가 꺼져 있어 이번 시작에서 빠졌습니다 - 넣으려면 라이브 패널에서 {_a}를 체크하세요."
+                         if self.lang == "ko" else
+                         f"ℹ {_a}: left out of this start because its execution checkbox is off - check {_a} in the live panel to include it.")
         if not incl:
+            self.log("⛔ 라이브 시작 중단 - 참여 자산이 없습니다(실행 자산 체크)." if self.lang == "ko"
+                     else "⛔ Live start stopped - no assets checked.")
             messagebox.showwarning(self.t("sec_live"),
                                    "참여 자산이 없습니다 — 자산을 체크하세요."
                                    if self.lang == "ko" else "No assets checked."); return
@@ -4856,6 +5066,9 @@ class App:
                         and not (ac.get("id") or "").strip()):
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
         if bad:
+            # 사전점검 실패도 로그에 남긴다(2026-09-28): 종전엔 창만 떠서, 창을 닫으면 무엇이 막았는지 흔적이 없었다.
+            self.log(("⛔ 라이브 시작 중단 - 사전점검: " if self.lang == "ko" else "⛔ Live start stopped - preflight: ")
+                     + "; ".join(bad))
             messagebox.showwarning(self.t("sec_live"), "\n".join(bad)); return
         g = self._gate or {}
         caps = g.get("caps", {})
@@ -5269,7 +5482,6 @@ class App:
             f"protected but runs with a looser stop than planned. You can move it yourself at "
             f"your broker. Cause: {str(why)[:160]}")
 
-    # ── BTC 조건부 출구 X2+TR (2026-07-15 챔피언, 대표 아이디어) ────────────────────
     # 규칙: 일 22:00 UTC 진입 → 4H 블록(22-02, 02-06, 06-10, 10-14, 14-18, 18-22)마다 마감 시
     #   ① 방금 닫힌 블록이 **포지션 반대 방향**으로 마감 → 즉시 청산
     #   ② 블록이 **순항 마감** → 보호 손절을 **그 블록의 시가**로 이동, 계속 홀드
@@ -5278,8 +5490,6 @@ class App:
     #      k≥1은 직전 블록 종가(=순항분)를 손절로 삼아 이익을 조금씩 확정 = 트레일링
     #   ③ 마지막(18-22, 24h) → 무조건 청산
     #   손절은 브로커 스탑이 상시 감시(앱 개입 없음).
-    # 검증: 대안 출구 대비 우위 · MDD 5셀 전부 개선 · 부트스트랩 개선
-    #       · 평일 음성대조군으로 엣지 실재 확인 · 블록0 항등 실측.
     # ⚠판정 불가(봉 누락·API 실패)면 **홀드** — 잘못 닫느니 두고, 24h 만기가 최종 백스톱.
     # ⚠️서버 archive_resolver.btc_x2be_resolve와 **같은 규칙**이어야 트랙레코드가 진실이다
     #   (scripts/x2be_parity_check.py로 3자 대조).
@@ -6127,6 +6337,54 @@ class App:
             except Exception:
                 pass
 
+    # ── NT8 브리지 상태 → 서버(대표 2026-09-28 "둘 다 넣어") ─────────────────────────────
+    # 10분 연결 감시(_conn_watch_tick)는 회원 DM용이라 느리다. 서버가 'NT8로 무장한 기기가 장중 5분 넘게 끊김'을
+    # 운영자에게 알릴 수 있게, NT8로 무장한 동안 1분마다 브리지를 한 번 짚어 상태를 생존 핑(n8)에 싣는다.
+    # 브리지 healthcheck는 로컬 하트비트 파일 확인이라 가볍다. 판정은 서버(소비자) 쪽 - 앱은 사실만 보낸다.
+    def _nt8_probe_tick(self):
+        try:
+            cfg = None
+            for (_a, _i), _c in list(getattr(self, "_sig_accts", {}).items()):
+                if _c.get("broker") == "nt8":
+                    cfg = _c
+                    break
+            if cfg is None:
+                for (_a, _i), _jobs in list(getattr(self, "_auto_accts", {}).items()):
+                    for _j in _jobs:
+                        if _j.get("broker") == "nt8":
+                            cfg = _j
+                            break
+                    if cfg:
+                        break
+            if cfg is None:
+                self._nt8_state = {"st": "off"}
+            else:
+                threading.Thread(target=self._nt8_probe_run, args=(dict(cfg),), daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(NT8_PROBE_EVERY_S * 1000, self._nt8_probe_tick)
+            except Exception:
+                pass
+
+    def _nt8_probe_run(self, cfg):
+        import time as _t
+        prev = dict(getattr(self, "_nt8_state", None) or {})
+        try:
+            _acct = cfg.get("acct") or ""
+            b = _build_broker("nt8", cfg.get("f1", ""), cfg.get("f2", ""), cfg.get("f3", ""), [_acct] if _acct else [])
+            b.healthcheck()
+            self._nt8_state = {"st": "ok", "at": int(_t.time())}
+        except Exception:
+            _since = prev.get("since") if prev.get("st") == "down" else int(_t.time())
+            self._nt8_state = {"st": "down", "at": int(_t.time()), "since": int(_since or _t.time())}
+
+    def _nt8_ping_state(self):
+        """생존 핑에 싣는 NT8 상태 - {'st': 'ok'|'down'|'off', 'at': 마지막 확인, 'since': 끊긴 시각}. 미확인은 None."""
+        s = getattr(self, "_nt8_state", None)
+        return dict(s) if isinstance(s, dict) else None
+
     def _conn_watch_run(self, seen):
         """브로커별 왕복 1회 + 실패 판정. _conn_watch_tick이 스레드로 띄운다."""
         import time as _t
@@ -6673,6 +6931,12 @@ class App:
             fills = []
             # 계좌 id → 1R 맵(설정 계좌). 로테이션으로 빠진 계좌는 여기 없어 폴백(대표 2026-07-29).
             _r_by_acct = {c["acct"]: c["one_r"] for c in credlist if c.get("acct")}
+            # 크립토(Bybit·Bitget)는 계좌 ID가 없어 위 맵에 안 들어가고, R 원장까지 비면 **기본 $600**으로
+            # 나눠 R이 크게 줄었다(2026-09-29 9/20 BTC: 1R $50 두 계좌인데 3.19R로 게시). 계좌 ID 없는 브로커는
+            # 브로커 이름으로 그 계좌의 설정 1R을 찾는다(조회 키 _acct_id = 브로커 이름과 같은 축).
+            for c in credlist:
+                if not c.get("acct") and c.get("broker") and c["broker"] not in _r_by_acct:
+                    _r_by_acct[c["broker"]] = c["one_r"]
             _R_FALLBACK = 600.0
             # 로그인(브로커,f1) 단위로 1회 조회 — closed_fills가 그 로그인의 '전 계좌(비활성 포함)'
             # 체결을 계좌 id 부착해 돌려준다. 계좌별 1R은 위 맵으로, 없으면 폴백(닫힌 계좌).
@@ -6687,8 +6951,9 @@ class App:
                     got = b.closed_fills(start_ms)
                     for f in got:
                         _fa = str(f.get("acct") or "")
-                        f["_one_r"] = _r_by_acct.get(_fa, _R_FALLBACK)   # 닫힌 계좌=폴백 1R
                         f["_acct_id"] = _fa or c["broker"]
+                        f["_one_r"] = _r_by_acct.get(f["_acct_id"], _R_FALLBACK)   # 닫힌 계좌=폴백 1R
+                        f["_r_fb"] = f["_acct_id"] not in _r_by_acct                # 기본값 폴백 여부(행 표시·경고용)
                         # 체결이 어느 브로커에서 났는지는 **이 자리에서만** 알 수 있다
                         # (대표 2026-09-15 "빗겟은 한 번도 안 돌았네" - 원장에 브로커가
                         # 없어서 붙은 날짜로 역산해야 답할 수 있었다). closed_fills는
@@ -6764,6 +7029,9 @@ class App:
                 e["accts"][_aid] = _lookup_real_r(
                     _rledger, a, _aid, (f.get("ts_ms") or 0) / 1000.0, _fb)
                 e.setdefault("base", {})[_aid] = _lookup_baseline_r(_rledger, a, _aid, _fb)
+                # R 원장에도 없고 설정 1R도 못 찾아 **기본 $600**으로 나눈 계좌가 섞이면 그 행 R은 추정이다(2026-09-29).
+                if f.get("_r_fb") and not (_rledger or {}).get(f"{a}|{_aid or ''}"):
+                    e["r_est"] = True
             # R 정규화(대표 2026-07-24 멀티계좌) = **$손익 합 ÷ 참여 계좌 1R 합** — 시그널의 진짜
             # 배수를 보존한다(계좌 A +$1200@1R600 + 계좌 B +$600@1R300 = $1800÷$900 = +2R,
             # 계좌 수만큼 뻥튀기 안 됨). 계좌당 단일 1R·자산 등가중.
@@ -6809,7 +7077,13 @@ class App:
                                # 둘 다. 서버는 행을 통째로 저장하므로 추가 필드는 그대로 남고,
                                # 이 필드가 없는 옛 행·구버전 앱 푸시도 그대로 동작한다.
                                **({"brokers": sorted(v["brokers"])} if v.get("brokers") else {}),
+                               # 분모 추정 표시(2026-09-29): 기본 1R 폴백이 섞인 행 - 서버·공개 페이지가 '추정'으로 구분할 수 있게
+                               **({"r_est": True} if v.get("r_est") else {}),
                                **{k: v[k] for k in ("entry_px", "exit_px") if v.get(k)}})
+            _est = [t for t in trades if t.get("r_est")]
+            if _est:
+                self.log(f"   ⚠ 트랙레코드 {len(_est)}건은 계좌 1R을 찾지 못해 기본값으로 나눴습니다(R 추정) - "
+                         f"{', '.join(t['date'] + ' ' + t['instrument'] for t in _est[:5])}. 계좌 설정의 1R을 확인해 주세요.")
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
             if not trades:
@@ -6903,7 +7177,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.24a"
+    _APP_VER = "2026.09.30a"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -7908,6 +8182,17 @@ class App:
                         _last_why = (_last_why + " / 포지션 조회 실패 — 무포 확신 불가라 "
                                      "재진입 보류(이중 진입 방지)")[:220]
                         break
+                    # (b) 재진입 전 직전 주문 상태 조회(2026-09-28): 포지션 스냅샷이 늦어도 주문이 Filled면 이미 들어간 것 -
+                    # Flatten 뒤 재진입하면 체결가 손해이고, 경합이면 이중 보유가 된다.
+                    if _is_nt8:
+                        try:
+                            _enp = (b.order_status(_aid, _tag) or {}).get("entry") or {}
+                            if str(_enp.get("state") or "") in ("Filled", "PartFilled"):
+                                _placed = True; _res_ok = _res_ok or res
+                                self.log(f"   ✅ {_sym} 직전 주문 체결 확인(주문 상태 {_enp.get('state')}) — 재진입 불필요")
+                                break
+                        except Exception:
+                            pass
                     # ② 손절가 기통과 검사 - 이미 손절 레벨을 지난 트레이드는 죽은 것.
                     if stop is not None:
                         try:
@@ -7946,6 +8231,7 @@ class App:
                     _try += 1
                     continue
                 if res.get("skipped"):
+                    self._entry_skip_ev(asset, "adverse_move")
                     self.log(f"   ⏭ {_sym} 정책 스킵({res.get('note') or '불리 이동'}) — "
                              "재시도, 경보 대상 아님.")
                     _placed = None; break
@@ -7963,29 +8249,67 @@ class App:
                 # ── 확인 창(대표 "체결 확인 안 된 게 왜인지"): NT8=6초(0.5×12, 애드온 push
                 # 1초 주기 감안), 타 브로커=2초(기존). 포지션 잡히면 확정, NT8은 주문 상태로
                 # 거절을 조기 감지해 **사유까지** 확보(신 애드온 orders 스냅샷).
-                _seen_qty = 0; _rej = ""
+                _seen_qty = 0; _rej = ""; _how = ""
+                _t_sub = _t.time()               # 접수 시각 - 확인까지 걸린 초를 로그에(2026-09-28 대표 "빠르게")
                 _rounds = 30 if _is_nt8 else 4   # NT8 15초(2026-09-08: 6초 창에 체결 확인 뒤 재진입 → 이중 진입 위험)
+                _working = False                 # NT8 주문이 아직 살아 있음(Working·Accepted 등) - 재진입 대신 더 기다린다
                 for _i in range(_rounds):
                     try:
                         _seen_qty = abs(int(b.position_qty(_aid, _con) or 0))
                     except Exception:
                         _seen_qty = 0
                     if _seen_qty:
+                        _how = "포지션"
                         break
                     if _is_nt8:
                         try:
                             _os = b.order_status(_aid, _tag) or {}
                             _en0 = _os.get("entry") or {}
-                            if str(_en0.get("state")) in ("Rejected", "Cancelled"):
-                                _rej = str(_en0.get("reason") or _en0.get("state"))[:160]
+                            _st0 = str(_en0.get("state") or "")
+                            if _st0 in ("Rejected", "Cancelled"):
+                                _rej = str(_en0.get("reason") or _st0)[:160]
                                 break
+                            # (a) 주문 상태가 Filled면 포지션 스냅샷을 기다리지 않고 확정(2026-09-28 대표 "빠르게 좀 해 봐"):
+                            # 9/28 NQ에서 NT8 3계좌가 15초 안에 포지션이 안 보여 재진입이 18초 간격으로 이어졌다.
+                            if _st0 in ("Filled", "PartFilled"):
+                                _seen_qty = abs(int(_en0.get("filled") or 0)) or int(_qty)
+                                _how = "주문 상태 " + _st0
+                                break
+                            _working = _st0 in ("Working", "Accepted", "Submitted", "TriggerPending",
+                                                "ChangePending", "ChangeSubmitted", "Initialized")
                         except Exception:
                             pass
                     _t.sleep(0.5)
                 if _seen_qty:
                     _placed = True; _res_ok = res
-                    self.log(f"   ✅ {_sym} 체결 확인 ×{_seen_qty}")
+                    self.log(f"   ✅ {_sym} 체결 확인 ×{_seen_qty} (접수 후 {_t.time() - _t_sub:.1f}초, {_how})")
                     break
+                # (b) 확인 창이 끝났는데 NT8 주문이 아직 살아 있으면(Working 등) Flatten·재진입하지 않는다 - 원 주문이
+                # 곧 체결되면 재진입은 체결가 손해이거나 경합 시 이중 보유가 된다. 예산 안에서 같은 주문을 더 지켜본다.
+                if _is_nt8 and live and _working and _t.time() - _t0 < _budget_s:
+                    self.log(f"   ⏳ {_sym} 주문은 살아 있음(체결 대기) - 재진입하지 않고 계속 확인합니다 "
+                             f"(접수 후 {_t.time() - _t_sub:.1f}초)")
+                    _deadline = _t0 + _budget_s
+                    while _t.time() < _deadline:
+                        try:
+                            _seen_qty = abs(int(b.position_qty(_aid, _con) or 0))
+                        except Exception:
+                            _seen_qty = 0
+                        _st1 = ""
+                        try:
+                            _en1 = (b.order_status(_aid, _tag) or {}).get("entry") or {}
+                            _st1 = str(_en1.get("state") or "")
+                            if not _seen_qty and _st1 in ("Filled", "PartFilled"):
+                                _seen_qty = abs(int(_en1.get("filled") or 0)) or int(_qty)
+                        except Exception:
+                            pass
+                        if _seen_qty or _st1 in ("Rejected", "Cancelled"):
+                            break
+                        _t.sleep(0.5)
+                    if _seen_qty:
+                        _placed = True; _res_ok = res
+                        self.log(f"   ✅ {_sym} 체결 확인 ×{_seen_qty} (접수 후 {_t.time() - _t_sub:.1f}초, 대기 뒤)")
+                        break
                 _last_why = _rej or f"포지션 미확인({'15' if _is_nt8 else '2'}초)"
                 if not _is_nt8:
                     # 타 브로커: 기존 동작 유지(주문은 살아 있을 수 있음 - 보고만 제외)
@@ -8005,6 +8329,7 @@ class App:
                              f"({_try}회 시도, 계좌 [{sc}])")
                     self._report_error(f"entry:{asset}", f"{_sym} {sc} {_whyf} "
                                        f"({_try}tries)")
+                    self._send_ev("entry_fail", asset, why="unfilled", err=str(_last_why or "")[:120])   # 진입 실패 DM 근거(2026-09-29)
                     self._member_alert(
                         "entry_miss",
                         f"⚠️ {asset} 진입 실패 — 계좌 {sc} {_sym} {_try}회 시도 후 미체결. "
@@ -8519,6 +8844,51 @@ class App:
             return {}
         return out
 
+    # 프롭 150K 자동 할인 확인(대표 2026-09-28 "오토파일럿에 계좌 등록 확인되면임. 자동화 해야 해. 오퍼레이터는 아님").
+    # 브로커가 준 **계좌 이름**만 근거(잔고는 못 씀 - Topstep 펀디드는 0에서 시작). 판별 패턴은 서버가 하트비트로 내려주고
+    # (p150 = {브로커: [[정규식, 프롭사]…]}), 없거나 비면 **아무것도 보내지 않는다**(수집 시작 = 서버가 패턴을 켜는 날).
+    # 패턴 항목 = [정규식, 프롭사](프롭사는 서버 정본 topstep·lucid). 앱에 기본값은 없다 - 서버가 켜야 보낸다.
+    _P150_BROKERS = ("projectx", "nt8", "tradovate")
+
+    def _prop150_report(self):
+        """Autopilot 등급일 때만, 켜진 계좌 중 150K로 판별된 것의 [{b: 브로커, f: 프롭사, k: 끝4}]. 계좌 이름 전체·잔고·자격은 안 보낸다.
+        NT8은 원래 계좌 이름(Account.Name - 설정에 저장된 id)만 본다(표시 이름은 사용자가 바꿀 수 있다)."""
+        import re as _re
+        try:
+            g = getattr(self, "_gate", {}) or {}
+            if not (g.get("ok") and str(g.get("tier") or "") == "royal"):
+                return []
+            # 서버가 패턴을 내려줄 때만 보낸다(fail-closed, 2026-09-28): 패턴이 없거나 비면 아무것도 안 보낸다 -
+            # 수집 시작일을 서버가 정한다(개인정보 방침 한 줄과 같은 날). 기본 패턴으로 알아서 보내지 않는다.
+            pats = g.get("p150") if isinstance(g.get("p150"), dict) else {}
+            if not pats:
+                return []
+            out, seen = [], set()
+            for _a in _ASSETS:
+                for _ac in self._accts_of(_a):
+                    if not _ac.get("on"):
+                        continue
+                    _b = str(self._acct_broker(_a, _ac) or "").lower()
+                    _n = str(_ac.get("id") or "").strip()
+                    if _b not in self._P150_BROKERS or len(_n) < 4:
+                        continue
+                    _firm = ""
+                    for _it in (pats.get(_b) or [])[:8]:          # 같은 브로커를 여러 프롭사가 쓴다 - 패턴이 프롭사를 정한다
+                        _rx, _f = (_it[0], _it[1]) if isinstance(_it, (list, tuple)) and len(_it) >= 2 else (_it, "")
+                        if _f and _re.search(str(_rx), _n, _re.I):
+                            _firm = str(_f).lower()[:12]
+                            break
+                    if not _firm:
+                        continue
+                    _k = (_firm, _n[-4:])
+                    if _k in seen:
+                        continue
+                    seen.add(_k)
+                    out.append({"b": _b, "f": _firm, "k": _n[-4:]})
+            return out[:12]
+        except Exception:
+            return []
+
     def _asset_brokers_multi(self):
         """자산→브로커 **목록**(2026-09-16 R34 P2-#15). 계좌 행마다 브로커가 따로이므로
         켜진 계좌들의 브로커를 모은다. 자격이 없는 브로커는 넣지 않는다(연결이 아니다).
@@ -8562,7 +8932,9 @@ class App:
             # _bg가 전송 직전에 다시 읽는 값과도 같은 기준이어야 서명이 뜻을 갖는다.
             _sig = (bool(self._sig_accts or self._auto_accts),
                     tuple(self._armed_assets()), tuple(self._connected_assets()),
-                    tuple(self._included_assets()))
+                    tuple(self._included_assets()),
+                    # NT8 연결 상태가 바뀌면(ok↔down) 4분 스로틀을 기다리지 않고 바로 보고(2026-09-28)
+                    str((getattr(self, "_nt8_state", None) or {}).get("st") or ""))
         except Exception:
             _sig = None
         _changed = _sig is not None and _sig != getattr(self, "_alive_sig", None)
@@ -8616,6 +8988,10 @@ class App:
                                    # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
                                    "bk": self._asset_brokers(),
                                    "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
+                                   # 앱 화면 언어(2026-09-29): 서버가 회원 DM(진입 실패·T-10)을 회원 언어로 쓰게. 서버는 회원 언어를 모른다.
+                                   "lg": "en" if self.lang == "en" else "ko",
+                                   # 프롭 150K 확인(2026-09-28): Autopilot 등급일 때만, 150K로 판별된 계좌의 브로커·끝4만
+                                   "p150": self._prop150_report(),
                                    "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
                                    "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
                                    # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
@@ -8628,6 +9004,8 @@ class App:
                                    # 다운 경보 대상이 맞기 때문이다(R14 P1).
                                    # (옛 "demo" 표식은 모의 모드 폐지(2026-09-07)로 안 싣는다 -
                                    #  서버는 키 없음 = 실무장으로 본다.)
+                                   # NT8 브리지 상태(2026-09-28): ok/down/off + 마지막 확인·끊긴 시각. 서버가 장중 5분 끊김 판정.
+                                   "n8": self._nt8_ping_state(),
                                    "closed": bool(getattr(self, "_closing", False))})
                     if getattr(_ok, "ok", False) and _sig is not None:
                         self._alive_sig = _sig      # **전송 성공 뒤에만** 기억한다
@@ -8891,14 +9269,14 @@ class App:
 
     def _prop_one_r(self, pr, cfg, lbl):
         """프롭 1R 해석 — 빅실드 체제(대표 2026-08-02 채택 "세번 출금은 안전 가정").
-        테스트기=r_test($1,200) 고정. 펀디드=전 구간 $300 고정 + 출금 두 단계:
+        테스트기=r_test 고정(Topstep 프리셋 $1,800, 2026-09-29). 펀디드=전 구간 r_steady 고정(Topstep 프리셋 $450) + 출금 두 단계:
           방패기(계좌 출금 <2 ≈ 계정 합산 1~3발): 방패 $6,000 유지 — 잔고 $12,000+ 도달 시
           $6,000 출금 권장 팝업(방패는 계좌에 남김).
           Fast-Payout기(그 후 ~ 라이브 초대 전): 자격($150+ 익절일 5일·직전 출금 후 순익+)이
           차는 순간 잔고의 절반 즉시 출금(회당 $6,000 한도) — 잔고 $1,500+에서 리마인드.
           5발 완료: 진입 안 함(None — 계정 합산 5발=라이브 전환 대상, 새 계정으로 재시작)
         ⚠ Topstep funded는 balance가 $0에서 이익만 적립(명목 150K는 드로다운 기준) → 잔고=쿠션.
-        잔고 조회 실패 시 펀디드 1R($300) 그대로(사이징에 잔고 불필요)."""
+        잔고 조회 실패 시 펀디드 1R(r_steady) 그대로(사이징에 잔고 불필요)."""
         if pr.get("type") == "live":
             # 라이브 초기(Lucid): $0 시작 최취약 구간 - 가장 얇게. +$4,500 락 확보 후엔
             # 프롭 모드를 끄고 '잔고 %' 모드 2%(절반 수확·절반 성장)로 전환 권장(정본 e3d03c3).
@@ -9026,7 +9404,11 @@ class App:
         브로커 연결 불필요 — 사이징은 순수 계산(1R = 계좌 설정값, 자동 사이징 API 조회 안 함)."""
         from eqexec import sizing
         lbl = cfg.get("label") or _broker_label(cfg.get("broker"))
-        one_r = float(cfg.get("one_r") or 0) * float(mult or 1.0)
+        _base_r = float(cfg.get("one_r") or 0)
+        one_r = _base_r * float(mult or 1.0)
+        # 표기: 배수가 1이 아니면 '1R $600 × 0.50 = $300'으로 - 실효 리스크를 설정 1R로 오독하지 않게(2026-09-25).
+        _r_lbl = (f"1R ${_base_r:g} × {float(mult or 1.0):.2f} = ${one_r:g}" if abs(float(mult or 1.0) - 1.0) > 1e-9
+                  else f"1R ${one_r:g}")
         entry_ref = sig.get("entry_ref")
         _sz = sizing.compute_size(asset, cfg.get("broker"), one_r, entry_ref, stop, direction)
         _ko = self.lang == "ko"
@@ -9046,14 +9428,14 @@ class App:
         self.log(f"     {'방향' if _ko else 'Side'} : {direction}")
         self.log(f"     {'진입 참조' if _ko else 'Entry'} : {entry_ref}")
         self.log(f"     {'손절가' if _ko else 'Stop'}  : {stop}")
-        self.log(f"     {'수량' if _ko else 'Qty'}  : {_qty} {_unit}   (1R ${one_r:g})")
+        self.log(f"     {'수량' if _ko else 'Qty'}  : {_qty} {_unit}   ({_r_lbl})")
         self.log(("     → 브로커 화면에 직접 입력하세요. 자동 진입 안 함(수동 모드)." if _ko else
                   "     → Enter this on your broker manually. No auto-entry (manual mode)."))
         self.log(f"📝 {_bar}")
         # 팝업으로도 띄워 놓쳐도 보이게(수동은 사용자가 즉시 봐야 하므로).
         _title = f"수동 티켓 — {asset} {direction}" if _ko else f"Manual ticket — {asset} {direction}"
         _msg = ((f"[{lbl}]  {asset} {direction}\n\n진입 참조: {entry_ref}\n손절가: {stop}\n"
-                 f"수량: {_qty} {_unit}  (1R ${one_r:g})\n\n브로커 화면에 직접 입력하세요.") if _ko else
+                 f"수량: {_qty} {_unit}  ({_r_lbl})\n\n브로커 화면에 직접 입력하세요.") if _ko else
                 (f"[{lbl}]  {asset} {direction}\n\nEntry: {entry_ref}\nStop: {stop}\n"
                  f"Qty: {_qty} {_unit}  (1R ${one_r:g})\n\nEnter this on your broker manually."))
         self.root.after(0, lambda t=_title, m=_msg: messagebox.showinfo(t, m))
@@ -9073,6 +9455,7 @@ class App:
         if _pr.get("on"):
             one_r = self._prop_one_r(_pr, cfg, lbl)    # 단계별 1R — G정책(대표 2026-07-26)
             if one_r is None:
+                self._entry_skip_ev(asset, "prop_done")   # 서버 카드가 '건너뜀'으로 말하게(R47 #6)
                 return                                  # 5발 졸업 완료 계좌 — 진입 안 함(위에서 로그)
         elif _pc.get("on"):
             # ⚖️ 법적 설계 변경(대표 2026-08-13 "앱이 편한 건 좋지만 법적 위험은 피하게"):
@@ -9088,7 +9471,7 @@ class App:
         _eff_r = one_r * mult
         _sz = sizing.compute_size(asset, _broker, _eff_r, sig.get("entry_ref"), stop, direction)
         if not _sz:
-            self.log(f"   ⏭ [{lbl}] 사이징 불가(진입/손절 확인) — 건너뜀."); return
+            self.log(f"   ⏭ [{lbl}] 사이징 불가(진입/손절 확인) — 건너뜀."); self._entry_skip_ev(asset, "sizing"); return
         size = _sz["size"]; sym = _sz["symbol"]
         _legs = _sz.get("legs") or [(sym, size)]
         if size <= 0:
@@ -9104,11 +9487,22 @@ class App:
                 if _c1 <= 0:
                     raise ValueError("point value unknown")
                 _ratio = (_c1 / _eff_r) if _eff_r > 0 else 0
-                self.log(f"   ⏭ [{lbl}] 진입 안 함 — 오늘 손절거리 {_sz['risk_pts']}pt라 최소 "
-                         f"1계약 리스크가 ${_c1:,.0f} = 설정 1R(${_eff_r:g})의 {_ratio:.1f}배. "
-                         f"과대 사이징 방지 게이트(0.75계약 미만)가 막았습니다.")
+                # 이번 신호 리스크 = 설정 1R × 신호 배수(2026-09-25: 금은 0.5배도 나온다 - 설정 1R로 찍으면
+                # 회원 눈엔 '내 1R은 $600인데 왜 $300?'이 된다).
+                if self.lang == "ko":
+                    self.log(f"   ⏭ [{lbl}] 진입 안 함 — 오늘 손절거리 {_sz['risk_pts']}pt라 최소 "
+                             f"1계약 리스크가 ${_c1:,.0f} = 이번 신호 리스크(1R ${one_r:g} × {mult:.2f} = ${_eff_r:g})의 "
+                             f"{_ratio:.1f}배. 과대 사이징 방지 게이트(0.75계약 미만)가 막았습니다.")
+                else:
+                    self.log(f"   ⏭ [{lbl}] No entry — today's stop distance is {_sz['risk_pts']}pt, so one "
+                             f"contract risks ${_c1:,.0f} = {_ratio:.1f}× this signal's risk (1R ${one_r:g} × "
+                             f"{mult:.2f} = ${_eff_r:g}). The oversizing guard (under 0.75 contracts) blocked it.")
             except Exception:
-                self.log(f"   ⏭ [{lbl}] 1R=${one_r:g}가 손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.")
+                self.log((f"   ⏭ [{lbl}] 이번 신호 리스크(1R ${one_r:g} × {mult:.2f} = ${_eff_r:g})가 "
+                          f"손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.") if self.lang == "ko" else
+                         (f"   ⏭ [{lbl}] This signal's risk (1R ${one_r:g} × {mult:.2f} = ${_eff_r:g}) is too "
+                          f"small for the stop distance ({_sz['risk_pts']}) - quantity 0, skipped."))
+            self._entry_skip_ev(asset, "size_cap")       # 과대 사이징 방지(9/21 대표 사례) - 서버 카드가 '건너뜀'으로 말하게
             return
         self.log(f"   [{lbl}] {asset} {direction} x{size} ({sym}), 손절 {stop}, "
                  f"1R=${one_r:g}×{mult:.2f}=${_eff_r:g}(거리 {_sz['risk_pts']}), "
@@ -9175,6 +9569,7 @@ class App:
                         _adv = ((_cur - float(_ref)) if str(direction).upper() == "LONG"
                                 else (float(_ref) - _cur))
                         if _d_ref > 0 and _adv > 0.75 * _d_ref:
+                            self._entry_skip_ev(asset, "adverse_move")
                             self.log(f"   ⛔ [{lbl}] 진입 스킵 — 참조가 대비 불리 {_adv:+.2f}"
                                      f"({_adv / _d_ref:.2f}R) > 캡 0.75R (광펌핑 방어)")
                             self.root.after(0, lambda a=sym, v=_adv: messagebox.showwarning(
@@ -9205,6 +9600,7 @@ class App:
                 self.log(f"   ❌ [{lbl}] 진입 실패: {res.get('error')}")
                 _em = str(res.get("error"))[:300]; _hint = _entry_fail_hint(_em, self.lang == "ko")
                 self._report_error(f"entry:{asset}", _em)   # 거절 사유도 원장+회원 DM(2026-09-03)
+                self._send_ev("entry_fail", asset, why="rejected", err=_em[:120])   # 진입 실패 DM 근거(2026-09-29, _send_ev가 계좌 ID 마스킹)
                 self.root.after(0, lambda m=_em, a=asset, h=_hint, L=lbl: messagebox.showerror(
                     "진입 실패" if self.lang == "ko" else "Entry failed",
                     (f"[{L}] {a} 진입 주문이 거절되었습니다:\n\n{m}\n\n{h}" if self.lang == "ko"
@@ -9242,6 +9638,7 @@ class App:
             self.log(f"   ❌ [{lbl}] signal entry failed: {e}")
             self._report_error(f"entry:{asset}", e)      # 예외 리포트(대표 2026-07-27)
             _em = str(e)[:300]
+            self._send_ev("entry_fail", asset, why="error", err=_em[:120])   # 진입 실패 DM 근거(2026-09-29)
             self.root.after(0, lambda m=_em, a=asset, L=lbl: messagebox.showerror(
                 "진입 실패" if self.lang == "ko" else "Entry failed",
                 (f"[{L}] {a} 진입 중 오류:\n\n{m}" if self.lang == "ko"
@@ -9297,6 +9694,7 @@ class App:
                            if key[0] == _asset]
                 if not targets:
                     self.log(f"\n➖ 신호 [{sid}] {_asset} — 이 자산 자동진입 미설정(켜진 계좌 없음), 건너뜀.")
+                    self._entry_skip_ev(_asset, "no_account")
                     _t.sleep(SIG_POLL_SECS); continue
                 # (구) 30일 실행 확인 만료 시 새 진입 보류 - 폐지(대표 2026-09-24). 모의 모드 폐지(2026-09-07)로
                 # 시작은 언제나 실거래다.
@@ -9320,6 +9718,7 @@ class App:
                     else:
                         _why = f"발행 {_age / 60:.0f}분 전(오래됨)"
                     self.log(f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 새 신호를 기다립니다.")
+                    self._entry_skip_ev(_asset, "stale_signal")
                     _t.sleep(SIG_POLL_SECS); continue
                 direction, stop = sig.get("direction"), sig.get("stop_price")
                 # size 배수(신뢰도 사이징) — 0~3 클램프(랜딩 '거래당 최대 3R' 캡과 일치).
