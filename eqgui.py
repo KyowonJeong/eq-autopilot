@@ -932,11 +932,12 @@ _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모�
 #   projectx(Topstep) = 빅실드 정본 평가 1800/펀디드 450/방패6000 (2026-08-02 채택, 평가 1R 1200→1800 대표 2026-09-29 "가보자",
 #                       펀디드 1R 300→450 대표 2026-09-29 "가즈아" - 정수 계약에서 $300은 NQ 한 계약 위험보다 작아 자주 건너뜀)
 #                       - 서버 정본 topstep_rules_mc.RULES와 같은 값. 펀디드 900안은 취소: 잠김 전 MLL $4,500 = 5R)
-#   nt8(Lucid)        = 속도 스윕 정본: 평가 $300 / 펀디드 $150, 방패 없음(락스텝·1발 전환)
+#   2026-09-30 확정(정책 88f83243, 대표 "굳!"): Topstep·Lucid 모두 평가 $2,200 / 펀디드 $450(2250→2200 대표 2026-09-30 슬리피지 여유, 서버 정본 topstep_rules_mc.RULES·lucid_v2.CANON과 같은 값).
+#   nt8(Lucid)        = 평가 $2,200 / 펀디드 $450, 방패 없음. 이전 속도 스윕 정본: 평가 $300 / 펀디드 $150
 #                       라이브 락 후는 프롭 모드가 아니라 '잔고 %' 모드 2% 권장(e3d03c3)
 _PROP_PRESETS = {
-    "projectx": {"r_test": 1800.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 6000.0},
-    "nt8":      {"r_test": 300.0,  "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0,
+    "projectx": {"r_test": 2200.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 6000.0},
+    "nt8":      {"r_test": 2200.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 0.0,
                  "r_live": 100.0},
 }
 
@@ -946,12 +947,12 @@ def _prop_preset(broker):
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
 
 
-_TOPSTEP_R_TEST = _PROP_PRESETS["projectx"]["r_test"]   # 평가 1R 이행 목표(2026-09-29 1800) - 프리셋 한 곳에서
+_TOPSTEP_R_TEST = _PROP_PRESETS["projectx"]["r_test"]   # 평가 1R 이행 목표(2026-09-30 2200) - 프리셋 한 곳에서
 _TOPSTEP_R_FUNDED = _PROP_PRESETS["projectx"]["r_steady"]   # 펀디드 1R 이행 목표(2026-09-29 450)
 
 
 def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
-              broker="", topstep=False):
+              broker="", topstep=False, lucid=False):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
@@ -967,9 +968,15 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         # 2026-09-29(대표 "가보자"·"가즈아"): **Topstep(projectx) 계좌만** 배포된 직전 기본값 1200/300/300·6000 그대로면
         # 평가 1R 1800·펀디드 1R 450으로. 1800/300은 배포된 적 없는 조합이라 손으로 고른 값으로 보고 건드리지 않는다(수동 우선).
         # Lucid(nt8)는 대상 아님 - 같은 1800이 Lucid 평가 MLL $4,500에선 2.5R이다. 브로커는 호출부(설정 로드)가 판정해 넘긴다.
-        if topstep and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (1200.0, 300.0, 300.0, 6000.0):
+        # 2026-09-30(정책 88f83243): 배포된 기본값(1200/300/300·6000, 1800/450/450·6000)을 그대로 쓰던 Topstep 계좌 → 2200/450.
+        if topstep and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) in (
+                (1200.0, 300.0, 300.0, 6000.0), (1800.0, 450.0, 450.0, 6000.0)):
             p["r_test"] = _TOPSTEP_R_TEST
             p["r_buffer"] = p["r_steady"] = _TOPSTEP_R_FUNDED
+        # Lucid(nt8): 배포된 프리셋 300/150/150·0을 그대로 쓰던 계좌만 2200/450으로. 손으로 바꾼 값·라이브 1R은 그대로.
+        if lucid and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (300.0, 150.0, 150.0, 0.0):
+            _lp = _PROP_PRESETS["nt8"]
+            p["r_test"], p["r_buffer"], p["r_steady"] = _lp["r_test"], _lp["r_buffer"], _lp["r_steady"]
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
         pc["on"] = bool(pct.get("on"))
@@ -1020,7 +1027,8 @@ def _load():
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
-                                  x.get("prop"), x.get("pct"), False, bk, topstep=(bk == "projectx"))
+                                  x.get("prop"), x.get("pct"), False, bk, topstep=(bk == "projectx"),
+                                  lucid=(bk == "nt8"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -1042,7 +1050,8 @@ def _load():
                 accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
                                       x.get("prop"), x.get("pct"), False,
                                       x.get("broker", ""),
-                                      topstep=((x.get("broker") if x.get("broker") in brs else bk) == "projectx"))
+                                      topstep=((x.get("broker") if x.get("broker") in brs else bk) == "projectx"),
+                                      lucid=((x.get("broker") if x.get("broker") in brs else bk) == "nt8"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
                 one_r = float(s.get("one_r", 600) or 600)
@@ -7177,7 +7186,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.30a"
+    _APP_VER = "2026.09.30b"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
