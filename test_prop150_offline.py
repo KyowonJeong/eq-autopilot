@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # EQ Autopilot - 프롭 150K 자동 할인 확인 보고(p150) 오프라인 테스트(대표 2026-09-28 "오토파일럿에 계좌 등록 확인되면임")
-# ① Autopilot(royal)일 때만 보고, Operator(member)·미확인 게이트는 빈 목록 ② 기본 패턴은 Topstep 평가 150KTC 하나
+# ① 모든 등급 보고(2026-10-02 선적용), 미확인 게이트(ok=False)·패턴 없음은 빈 목록 ② 기본 패턴은 Topstep 평가 150KTC 하나
 # ③ 서버 패턴(p150)으로 XFA·Lucid(NT8) 확장 ④ 보내는 건 {브로커, 끝4}뿐 - 계좌 이름 전체·잔고 없음 ⑤ 꺼진 계좌·50K 제외, 중복 제거
 import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +44,9 @@ chk("서버가 패턴을 안 주면(구 서버·끔) 보내지 않음(fail-close
 chk("서버가 빈 패턴을 주면 보내지 않음", rep(S("royal", {})) == [], rep(S("royal", {})))
 chk("패턴에 프롭사가 없으면 인정 안 함(프롭사 모르는 판정 금지)", rep(S("royal", {"projectx": [r"^150KTC"]})) == [], rep(S("royal", {"projectx": [r"^150KTC"]})))
 chk("① Autopilot + 서버 패턴(Topstep 평가) = 150K 하나", r == [{"b": "projectx", "f": "topstep", "k": "2222"}], r)
-chk("① Operator면 보고 없음", rep(S("member")) == [], rep(S("member")))
+chk("① Operator·Preview도 보고(2026-10-02 선적용 - 할인은 서버가 Autopilot 가격에만)", rep(S("member")) == rep(S("royal")) and rep(S("member")) != [],
+    rep(S("member")))
+chk("① Preview도 같은 보고", rep(S("public")) == rep(S("royal")), rep(S("public")))
 g = S("royal"); g._gate["ok"] = False
 chk("① 게이트 ok=False면 없음", rep(g) == [], rep(g))
 r3 = rep(S("royal", {"projectx": [[r"^150KTC", "topstep"], [r"^EXPRESS-150K", "topstep"]], "nt8": 내부 기록}))

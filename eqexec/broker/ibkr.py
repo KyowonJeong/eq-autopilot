@@ -355,10 +355,10 @@ class IBKRBroker(BrokerAdapter):
         """포지션을 **서버에서 다시 받아**(reqPositions는 동기 - 루프를 돌려 positionEnd까지) 돌려준다.
         ib.positions()만 읽으면 루프가 안 돌아 stale할 수 있다(앱은 호출 사이에 루프를 돌리지 않음)."""
         ib = self._connect()
-        try:
-            ib.reqPositions()
-        except Exception:
-            pass
+        # ⚠️조회 실패를 삼키지 않는다(2026-09-30, 9/14 감사 '다음 차'): 종전엔 reqPositions 예외를 넘기고 캐시(비었을 수 있음)를
+        # 읽어 **조회 실패가 '플랫'으로 둔갑**했다 - 청산이 '포지션 없음'으로 끝나고 잔여 확인도 통과한다(NT8과 같은 함정).
+        # 예외를 올려 호출부가 실패로 다루게 한다(마감 청산은 오류 보고, 진입은 중단).
+        ib.reqPositions()
         poss = ib.positions(str(account_id)) if account_id else ib.positions()
         return [p for p in poss if int(p.position or 0) != 0]
 
@@ -630,23 +630,34 @@ class IBKRBroker(BrokerAdapter):
             aid = self._acct_id(account_id)
             c = self._contract(contract)
             lsym = str(c.localSymbol or contract)
-            cancelled = self._cancel_for(ib, aid, c)
-            qty = 0
-            for p in self._positions(aid):
-                pc = p.contract
-                if int(getattr(pc, "conId", 0) or 0) == int(c.conId or -1) or \
-                        str(getattr(pc, "localSymbol", "")) == lsym:
-                    qty = int(p.position or 0)
-                    break
+            def _qty():
+                for p in self._positions(aid):
+                    pc = p.contract
+                    if int(getattr(pc, "conId", 0) or 0) == int(c.conId or -1) or \
+                            str(getattr(pc, "localSymbol", "")) == lsym:
+                        return int(p.position or 0)
+                return 0
+            qty = _qty()
             if qty == 0:
+                cancelled = self._cancel_for(ib, aid, c)          # 플랫이면 남은 우리 주문(고아 스탑)만 걷는다
                 return {"closed": 0, "cancelled": cancelled, "symbol": lsym}
+            # 순서(2026-09-30, 9/14 감사 money): **청산 먼저 → 플랫 확인 → 그다음 보호 스탑 취소.** 종전엔 스탑을 먼저 지우고
+            # 시장가를 낸 뒤 1초 쉬고 '완료'를 돌려줬다 - 시장가가 안 채워지면 스탑 없는 알몸 포지션이 '완료'로 보고된다.
             o = self._mk(ibi, "MKT", ("SELL" if qty > 0 else "BUY"), abs(qty), account=aid,
                          ref=f"EQ-AP-CLOSE-{int(time.time() * 1000)}", tif="DAY")
             t = ib.placeOrder(c, o)
             rej = self._ack(ib, t)
             if rej:
-                raise RuntimeError(f"IBKR close rejected ({lsym}): {rej}")
-            ib.sleep(1.0)
+                raise RuntimeError(f"IBKR close rejected ({lsym}): {rej} - protective stop kept")
+            left = qty
+            for _ in range(10):                                   # 최대 약 10초 플랫 확인
+                ib.sleep(1.0)
+                left = _qty()
+                if left == 0:
+                    break
+            if left != 0:
+                raise RuntimeError(f"IBKR close unconfirmed ({lsym}): still {left} after 10s - protective stop kept")
+            cancelled = self._cancel_for(ib, aid, c)              # 플랫 확인 뒤에만 우리 스탑을 걷는다
             return {"closed": qty, "cancelled": cancelled, "symbol": lsym, "order": self._odict(t)}
 
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:

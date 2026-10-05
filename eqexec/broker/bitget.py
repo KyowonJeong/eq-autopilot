@@ -374,6 +374,26 @@ class BitgetBroker(BrokerAdapter):
         except Exception:
             return None
 
+    def stop_plans(self, symbol) -> list:
+        """이 심볼에 걸린 손절 플랜 목록 [{orderId, price, triggerType, planType}]. 조회 실패는 예외로 올린다
+        (호출측이 '판단 안 함'으로 처리). 2026-10-05: 앱 손절 감시가 포지션 데이터의 stopLoss 칸만 봐서, 진입 때
+        첨부한 손절(플랜 주문)이 있어도 '미발견'으로 보고 손절을 하나 더 걸었다 - 플랜을 직접 본다."""
+        sym = self._symbol(symbol)
+        pend = self._req("GET", "/api/v2/mix/order/orders-plan-pending",
+                         {"productType": self.product, "symbol": sym, "planType": "profit_loss"}) or {}
+        rows = pend.get("entrustedList") or pend.get("list") or (pend if isinstance(pend, list) else [])
+        out = []
+        for r in rows:
+            if (str(r.get("planType", "")).lower() in ("pos_loss", "loss_plan")
+                    and str(r.get("symbol", "")).upper() == sym):
+                try:
+                    _p = float(r.get("triggerPrice") or 0) or None
+                except (TypeError, ValueError):
+                    _p = None
+                out.append({"orderId": str(r.get("orderId")), "price": _p,
+                            "triggerType": r.get("triggerType"), "planType": r.get("planType")})
+        return out
+
     def set_stop(self, symbol, stop_price):
         """포지션 보호 손절가 이동(X2+TR 트레일용, 대표 2026-08-09 Bitget 병렬 발주).
         Bitget은 Bybit(trading-stop 덮어쓰기)와 달리 포지션 손절이 플랜 주문(pos_loss)이라
@@ -394,14 +414,24 @@ class BitgetBroker(BrokerAdapter):
             return {"error": f"plan query: {e}"}
         _mod_err = None
         if _sl:
+            # 손절 플랜이 둘 이상이면 **전부** 같은 값으로(2026-10-05): 첫 번째만 옮기면 나머지가 옛 자리에 남아
+            # '이동 완료' 로그와 거래소 화면이 갈린다. 하나라도 옮겼으면 성공, 실패분은 오류 문자열로 남긴다.
+            _ok, _errs = 0, []
+            for _row in _sl:
+                try:
+                    self._req("POST", "/api/v2/mix/order/modify-tpsl-order",
+                              body={"orderId": str(_row.get("orderId")), "marginCoin": "USDT",
+                                    "productType": self.product, "symbol": sym,
+                                    "triggerPrice": _px,
+                                    "triggerType": _row.get("triggerType") or "mark_price",
+                                    "executePrice": "0"})          # 0 = 트리거 시 시장가
+                    _ok += 1
+                except Exception as _e1:
+                    _errs.append(str(_e1))
+            if _ok:
+                return {"error": None, "moved": _ok, "partial_errors": _errs[:3]}
             try:
-                self._req("POST", "/api/v2/mix/order/modify-tpsl-order",
-                          body={"orderId": str(_sl[0].get("orderId")), "marginCoin": "USDT",
-                                "productType": self.product, "symbol": sym,
-                                "triggerPrice": _px,
-                                "triggerType": _sl[0].get("triggerType") or "mark_price",
-                                "executePrice": "0"})          # 0 = 트리거 시 시장가
-                return {"error": None}
+                raise RuntimeError("; ".join(_errs)[:300] or "modify failed")
             except Exception as e:
                 # 🚨modify 실패로 끝내지 않는다(2026-09-21 실사고: 대표 BTC 보유 중 4시간 경계마다
                 # "modify-tpsl-order HTTP 400"으로 트레일이 두 번 연속 멈췄고, 대표가 수동으로

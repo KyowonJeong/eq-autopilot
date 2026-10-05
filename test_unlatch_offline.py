@@ -45,6 +45,10 @@ def _app(lang="ko"):
     app.log = lambda m, *a, **k: logs.append(str(m))
     app.root.after = lambda ms, fn: fn()         # 즉시 실행
     app._notify_unlatched = lambda no_r=None: eqgui.App._notify_unlatched(app, no_r)
+    app._killed = False                          # 서버 불통 폴백 판정(2026-09-30)은 실제 메서드로 - MagicMock이면 참이 돼 팝업이 뜬다
+    app._fallback_mode = None
+    app._kill_noted = False
+    app._fallback_kind = lambda g=None: eqgui.App._fallback_kind(app, g)
     return app
 
 

@@ -182,6 +182,22 @@ _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)
 # BTC 조건부 출구가 판정할 블록 인덱스: 마감시각 → k (22:00 진입 기준 0..5)
 _BTC_BLOCK_K = {2: 0, 6: 1, 10: 2, 14: 3, 18: 4, 22: 5}
 AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
+
+
+def _exit_due(due_fixed: int, ovr, now):
+    """마감 청산 시각(분). 서버 지정 시각(ovr=(epoch, 사유))은 **오늘이고 고정 시각보다 이를 때만** 쓴다(2026-09-30 전송 감사:
+    종전엔 늦추는 값도 받아 서버 값 하나로 계좌 전체 청산이 뒤로 밀릴 수 있었다). 값이 이상하면 조용히 고정 시각."""
+    if not ovr:
+        return due_fixed, ""
+    try:
+        import datetime as _dtx
+        _ov_loc = _dtx.datetime.fromtimestamp(float(ovr[0]), _dtx.timezone.utc).astimezone(now.tzinfo)
+        _ov_min = _ov_loc.hour * 60 + _ov_loc.minute
+        if _ov_loc.date() == now.date() and _ov_min < due_fixed:
+            return _ov_min, (ovr[1] or "")
+    except Exception:
+        pass
+    return due_fixed, ""
 # 세션 진입(신호 도착) 시각 — 진입 전 API 사전 점검용(대표 2026-07-13). NQ·GC 주말 스킵.
 _ASSET_ENTRIES = {"NQ": [("America/New_York", 10)], "GC": [("America/New_York", 2)],
                   "BTC": [("UTC", 22)]}       # H22 단독 — 02:00 진입 은퇴(2026-07-14)
@@ -313,7 +329,7 @@ _BROKERS = ["projectx", "ibkr", "bybit", "bitget"]
 # 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
-_CONSENT_VER = "golive-4item-2026-08"
+_CONSENT_VER = "golive-6item-2026-09-30"   # +서버 불통 폴백·킬스위치 두 줄(대표 2026-09-30)
 _ASSETS = ["NQ", "GC", "BTC"]
 _ASSET_BROKERS = {"NQ": ["projectx", "nt8", "ibkr"],
                   "GC": ["projectx", "nt8", "ibkr"],
@@ -482,13 +498,21 @@ T = {
                "(주문이 아니라 계좌 설정 변경입니다. 내리지는 않습니다).\n"
                "- 선물 손절가에 0~6틱을 넓히는 방향으로만 얹습니다. 실제 리스크가 설정 1R을"
                " 손절거리의 0.5% 이내로 넘습니다.\n"
-               "- 진입은 건별 승인 없이 나갑니다. 한 번 무장하면 그 세션 동안 신호마다 자동 발주됩니다."),
+               "- 진입은 건별 승인 없이 나갑니다. 한 번 무장하면 그 세션 동안 신호마다 자동 발주됩니다.\n"
+               "- 서버와 연락이 끊기면 앱이 예정 시각에 포지션을 닫습니다. 비트코인은 다음 4시간 봉이 닫힐 때 닫습니다."
+               " 이 동작을 원하지 않으시면 앱을 끄고 직접 관리하시면 됩니다.\n"
+               "- 저희가 자동매매를 멈추면 앱은 진입도 청산도 하지 않습니다. 열려 있는 포지션은 회원이 직접 관리하십니다."),
         "en": ("- On crypto entries, if the balance is short the app raises the leverage setting on your "
                "exchange account (a settings change, not an order; it is never lowered).\n"
                "- Futures stop prices get a 0-6 tick offset, widening only. Realised risk exceeds your 1R "
                "by up to about 0.5% of the stop distance.\n"
                "- Entries are placed without per-trade approval. Once armed, every signal in that session "
-               "is ordered automatically.")},
+               "is ordered automatically.\n"
+               "- If the app loses contact with our server, it closes your positions at the scheduled time. For bitcoin "
+               "that is the close of the next 4-hour bar. If you do not want this, turn the app off and manage the "
+               "positions yourself.\n"
+               "- If we stop automated trading, the app will neither enter nor exit. You manage any open positions "
+               "yourself.")},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
               "en": "Ready. Enter your key → 'Test connection' → the rest unlocks once it passes."},
     "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산, 자동 진입 기능이 활성화됩니다.",
@@ -952,7 +976,7 @@ _TOPSTEP_R_FUNDED = _PROP_PRESETS["projectx"]["r_steady"]   # 펀디드 1R 이�
 
 
 def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
-              broker="", topstep=False, lucid=False):
+              broker="", topstep=False, one_lim=0.0, lucid=False):
     p = dict(_PROP_DEFAULTS)
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
@@ -986,7 +1010,10 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
     # 동시 발주). ""=자산 기본 브로커 사용(_acct_broker가 해석) — 구 설정 무변경 호환.
     return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
             "label": str(label or ""), "prop": p, "pct": pc, "manual": bool(manual),
-            "broker": str(broker or "")}
+            "broker": str(broker or ""),
+            # 한 계약 허용 한도 $(대표 2026-09-30 "어 그 방식 좋아"): 자기 자본 계좌에서 수량이 0으로 나올 때 한 계약 위험이
+            # 이 한도 안이면 한 계약. **회원이 확정한 상수만** 쓴다(잔고를 발주 경로에서 읽지 않음, 2026-08-13 설계). 0 = 꺼짐(종전과 같음).
+            "one_lim": max(0.0, _as_float(one_lim, 0.0))}
 
 
 def _as_float(v, default=0.0):
@@ -1028,7 +1055,7 @@ def _load():
                      for b in brs if b in creds_all}
             accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
                                   x.get("prop"), x.get("pct"), False, bk, topstep=(bk == "projectx"),
-                                  lucid=(bk == "nt8"))
+                                  one_lim=x.get("one_lim"), lucid=(bk == "nt8"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
             include = bool((d.get("asset_on") or {}).get(a, True))
         else:
@@ -1051,6 +1078,7 @@ def _load():
                                       x.get("prop"), x.get("pct"), False,
                                       x.get("broker", ""),
                                       topstep=((x.get("broker") if x.get("broker") in brs else bk) == "projectx"),
+                                      one_lim=x.get("one_lim"),
                                       lucid=((x.get("broker") if x.get("broker") in brs else bk) == "nt8"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
@@ -2270,12 +2298,45 @@ class App:
                           else "⚠️ Accounts without 1R cannot size an entry and will not enter: ")
                          + ", ".join(_no_r))
             self._notify_unlatched(_no_r)
-        if getattr(self, "_auto_on", False) and not perm_use:
+        _fb = self._fallback_kind(g)
+        if getattr(self, "_auto_on", False) and not perm_use and _fb:
+            # 서버 불통·권한 끝(대표 2026-09-30 "서버 꺼지면 … 무조건 죽여"): 새 진입은 멈추되(신호 루프는 위에서 해제),
+            # 이미 무장한 계좌의 마감 청산은 **로컬 일정대로 계속**한다. 선물 = 계획 세션 마감, BTC = 다음 4시간 봉 마감.
+            if getattr(self, "_fallback_mode", None) != _fb:
+                self._fallback_mode = _fb
+                _m = ("서버에 닿지 못해 예정 시각에 포지션을 닫습니다." if self.lang == "ko"
+                      else "The app cannot reach the server, so it will close positions at the scheduled time.")
+                self.log("⏰ " + _m)
+                try:
+                    self.root.after(0, lambda m=_m: messagebox.showwarning("EQ Autopilot", m))
+                except Exception:
+                    pass
+        elif getattr(self, "_auto_on", False) and not perm_use:
             self._auto_on = False
             self._auto_accts.clear()
             self._set_auto_ind(False)
             self.log("⏹ 자동 청산 권한 상실 → 자동 청산 자동 중지 (fail-closed).")
             _tripped.append("자동 청산")
+        if not _fb and getattr(self, "_fallback_mode", None):
+            self._fallback_mode = None                      # 서버가 돌아옴 - 평소 규칙으로
+            self.log("✅ 서버 연결 복구 - 평소 규칙으로 돌아갑니다." if self.lang == "ko"
+                     else "✅ Server reachable again - back to normal rules.")
+        # 킬스위치(서버가 정상 응답으로 force_dry_run을 켬, 대표 2026-09-30 "아 다 죽여"): 진입도 청산도 멈춘다(_live_now).
+        # 켜지는 순간 한 번 사실만 알린다 - 회원에게 무엇을 하라고 쓰지 않는다(대표 "즉시 닫으라곤 하지 마").
+        _kill = bool(g.get("ok")) and bool(g.get("force_dry_run", True))
+        if _kill and not getattr(self, "_kill_noted", False) and (getattr(self, "_auto_on", False) or getattr(self, "_sig_on", False)):
+            self._kill_noted = True
+            _m = ("자동매매를 멈췄습니다. 지금부터 앱이 진입도 청산도 하지 않습니다. 열려 있는 포지션은 앱이 닫지 않습니다."
+                  if self.lang == "ko" else
+                  "We have stopped automated trading. From now the app will not enter or exit. "
+                  "Open positions will not be closed by the app.")
+            self.log("⛔ " + _m)
+            try:
+                self.root.after(0, lambda m=_m: messagebox.showwarning("EQ Autopilot", m))
+            except Exception:
+                pass
+        elif not _kill:
+            self._kill_noted = False
         # fail-closed로 무장 해제되면 조용히 방치되지 않게 큰 알림 + 재무장까지 반복 리마인드
         # (대표 2026-08-07: 8/5 사고가 2일간 조용했던 근본 원인). 명시 거부가 아닌 순단
         # 유예 소진도 여기로 들어온다 - 사용자는 '왜 진입 안 됐지'를 놓치면 안 된다.
@@ -2441,12 +2502,20 @@ class App:
             # 거부(locked/expired/decrypt)한 경우는 유예 없이 즉시 fail-closed(위에서 처리). ──
             if gate.get("ok"):
                 self._gate_good, self._gate_good_ts = dict(gate), _t.time()
+                self._killed = bool(gate.get("force_dry_run", True))   # 마지막으로 서버가 말한 킬스위치 상태(폴백이 되살리지 않게)
             elif _net_fail and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < HB_GRACE_MIN * 60:
                 _age = int((_t.time() - self._gate_good_ts) // 60)
                 gate = {**self._gate_good,
                         "reason": f"네트워크 순단 — 최근 권한 유지(유예 {_age}/{HB_GRACE_MIN}분)"}
                 self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
                          f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
+            # 서버 불통 폴백(대표 2026-09-30): 유예를 넘긴 '닿지 못함'과 서버의 '명시 거부'(locked/expired)를 구분해 둔다 -
+            # _apply_gating이 이 표시로 자동 청산을 끄지 않고 로컬 일정대로 계속한다(새 진입은 멈춤). 킬스위치(ok + force_dry_run)와 다르다.
+            if not gate.get("ok") and tok:
+                if _net_fail:
+                    gate["offline"] = True
+                else:
+                    gate["revoked"] = True
             self._gate = gate
             try:
                 self.root.after(0, self._sync_log_btn)      # [로그 보내기] 버튼 표시 = 서버 스위치
@@ -3909,16 +3978,7 @@ class App:
                 # 들고 있으면 브로커 규정 위반이라, 그 날만 서버가 시각을 앞당겨 보낸다.
                 # 오늘·이 자산 것일 때만 쓰고, 값이 이상하면 조용히 고정 시각으로 돌아간다.
                 _ovr = (self._exit_override or {}).get(j["asset"])
-                _ovr_why = ""
-                if _ovr:
-                    try:
-                        _ov_dt = _dt.datetime.fromtimestamp(_ovr[0], _dt.timezone.utc)
-                        _ov_loc = _ov_dt.astimezone(now.tzinfo)
-                        if _ov_loc.date() == now.date():
-                            due = _ov_loc.hour * 60 + _ov_loc.minute
-                            _ovr_why = _ovr[1] or ""
-                    except Exception:
-                        pass
+                due, _ovr_why = _exit_due(due, _ovr, now)
                 if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
                     continue
                 if _ovr_why:
@@ -3930,12 +3990,21 @@ class App:
                 # 🛡 오살 방지(연속 세션): 이 자산에 '방금'(발화창 이내) LIVE 새 진입이 있었으면
                 # 이번 마감 청산 스킵 — 신호 루프가 이미 "잔여 청산→확인→진입"을 끝냈다는 뜻이고,
                 # 여기서 flatten하면 방금 들어간 새 세션 포지션을 죽인다. (대표 2026-07-11)
-                _ea = (self._entered_at or {}).get(j["asset"], 0)
+                # 🐞2026-10-04 실사고(회원 30b, BTC): _entered_at은 체결 확인·부분 체결 점검까지 끝난 **뒤**에야 기록돼,
+                # 진입 직후 1~2초 틈에 이 루프가 돌면 방금 들어간 포지션을 '24h 만기'로 닫았다. 진입을 **시작한** 시각
+                # (_entering_at, 발주 전 기록)도 같이 본다.
+                _ent = getattr(self, "_entering_at", None)
+                _ent = _ent if isinstance(_ent, dict) else {}
+                _ea = max((self._entered_at or {}).get(j["asset"], 0), _ent.get(j["asset"], 0))
                 if _t.time() - _ea < AUTO_FIRE_WINDOW_MIN * 60:
                     self.log(f"\n⏭ {j['asset']} 마감 청산 스킵 — {int((_t.time() - _ea) / 60)}분 전 "
                              f"새 세션 진입(신호 루프가 이전 세션 이미 정리).")
                     continue
-                live = self._live_now(j.get("live"))   # 이 자산 LIVE 선택 × 발화 순간 게이트 재판정
+                # BTC 24h 만기(22:00 UTC 잡 = 블록 5)는 **월요일**의 일이다 - 진입이 일요일 22:00 UTC뿐이라, 일요일 22:00 UTC에
+                # 보이는 BTC 포지션은 정의상 방금 들어간 것이다(2026-10-04 사고의 이중 방어, 진입 시각 기록이 실패해도 막는다).
+                if j["asset"] == "BTC" and j["hour"] == 22 and now.weekday() == 6:
+                    continue
+                live, _fb_skip = self._close_mode(j)   # 평소: LIVE 선택 × 게이트(킬스위치면 dry-run) / 폴백: 로컬 일정대로
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
                 try:
                     b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
@@ -3952,12 +4021,22 @@ class App:
                             _bq = "ERR"
                         if _bq != "ERR" and not _bq:
                             continue          # 포지션 확실히 없음 → 무음 스킵
+                    # Operator(대표 2026-09-30 "앱에 정해진 마지노 청산만 오퍼레이터"): BTC는 24시간 만기(블록 5)에만 닫는다.
+                    # 4시간 봉 판정(반대봉 청산·손절 이동)은 회원이 메시지를 받고 직접 한다. 폴백(서버 불통)은 등급과 무관하게 이 블록에서 닫는다.
+                    if (j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K and not _fb_skip and not self._full_exit()
+                            and _BTC_BLOCK_K[j["hour"]] < 5):
+                        self.log(f"\n⏸ {_lab} " + (
+                            "Operator: 4시간 봉 판정은 메시지로 직접 하십시오. 앱은 24시간 만기에 닫습니다."
+                            if self.lang == "ko" else
+                            "Operator: act on the 4h candle message yourself. The app closes at the 24h limit."))
+                        continue
                     self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
                              f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
                     # ── BTC 조건부 출구(X2+TR) — 무조건 청산이 아니라 봉을 보고 판정 ──
-                    if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K:
+                    if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K and not _fb_skip and self._full_exit():
                         if not self._btc_x2be_step(b, j, live, _dt.timezone.utc):
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
+                    # 폴백(서버 불통)에서는 BTC도 조건부 출구 없이 다음 4시간 봉 마감(이 블록)에 닫는다(대표 2026-09-30).
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
                     # 손절은 거래소 첨부 스탑(시장가 트리거)이라 여기 안 옴.
                     # 2026-08-03 전면 시장가(대표): BTC 청산 지정가 도전도 폐지 — flatten_all이
@@ -4193,8 +4272,48 @@ class App:
                 pass
             self._save_acct_widgets(); win.destroy()
 
-        ttk.Button(frm, text=("1R로 적용" if ko else "Use as 1R"), command=_apply).grid(row=5, column=1, sticky="e")
-        ttk.Button(frm, text=("닫기" if ko else "Close"), command=win.destroy).grid(row=5, column=2, padx=(6, 0))
+        # ── 한 계약 허용 한도(대표 2026-09-30 "어 그 방식 좋아"): 선물에서 수량이 0으로 나올 때 한 계약 위험이 이 한도 안이면 한 계약.
+        #    계산기는 자본금의 1%를 **보여 주기만** 하고, 칸에 넣고 저장하는 건 회원이다(잔고를 발주 경로에서 읽지 않음, 2026-08-13 설계).
+        ttk.Label(frm, text=("한 계약 허용 한도 $" if ko else "One-contract limit $")).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        le = ttk.Entry(frm, width=12)
+        if _as_float(acct.get("one_lim"), 0.0) > 0:
+            le.insert(0, f"{_as_float(acct.get('one_lim'), 0.0):g}")
+        le.grid(row=5, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+
+        def _fill_lim():
+            try:
+                cap = float((ce.get() or "").replace(",", ""))
+                if cap <= 0:
+                    raise ValueError
+                le.delete(0, "end"); le.insert(0, f"{cap * 0.01:.0f}")
+            except (TypeError, ValueError):
+                res_v.set("→ 자본금을 먼저 입력하세요" if ko else "→ enter capital first")
+        ttk.Button(frm, text=("자본금의 1%로 채우기" if ko else "Fill with 1% of capital"), command=_fill_lim).grid(
+            row=5, column=2, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                  text=("선물에서 이번 신호 수량이 0으로 나올 때만 씁니다. 한 계약 위험이 이 한도 안이면 한 계약을 넣고, "
+                        "넘으면 그 거래를 건너뜁니다. 비워 두면 꺼짐(종전처럼 건너뜀). 프롭 계좌에는 쓰지 않습니다." if ko else
+                        "Used only when a futures signal sizes to 0 contracts: if one contract's risk is within this limit, "
+                        "one contract is entered; otherwise the trade is skipped. Leave blank to turn it off. Not used on prop accounts.")
+                  ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 8))
+
+        def _lim_val():
+            t = (le.get() or "").replace(",", "").strip()
+            return max(0.0, _as_float(t, 0.0)) if t else 0.0
+
+        def _save_lim():
+            acct["one_lim"] = _lim_val()
+            self._save_acct_widgets(); win.destroy()
+
+        _apply_1r = _apply
+
+        def _apply():
+            acct["one_lim"] = _lim_val()
+            _apply_1r()
+
+        ttk.Button(frm, text=("1R로 적용" if ko else "Use as 1R"), command=_apply).grid(row=7, column=1, sticky="e")
+        ttk.Button(frm, text=("한도만 저장" if ko else "Save limit only"), command=_save_lim).grid(row=7, column=2, sticky="w", padx=(6, 0))
+        ttk.Button(frm, text=("닫기" if ko else "Close"), command=win.destroy).grid(row=8, column=2, sticky="w", padx=(6, 0), pady=(4, 0))
 
     def _prop_btn_text(self, pr):
         if not (pr or {}).get("on"):
@@ -4980,6 +5099,7 @@ class App:
             self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
                                     "prop": dict(acct.get("prop") or {}),
                                     "pct": dict(acct.get("pct") or {}),
+                                    "one_lim": _as_float(acct.get("one_lim"), 0.0),
                                     "manual": bool(acct.get("manual")),   # 수동 모드=티켓만, 자동진입 안 함
                                     "live": live, "label": acct.get("label", "")}
             if not self._sig_on:
@@ -5410,7 +5530,7 @@ class App:
                      + (" (24h 만기)" if k >= 5 else " (반대봉 마감)"))
             return True
         if d == "trail":
-            _lbl = "본절(=블록0 시가)" if k == 0 else f"{o:g}(블록{k} 시가)"
+            _lbl = "진입 기준가(=블록0 시가)" if k == 0 else f"{o:g}(블록{k} 시가)"
             self.log(f"   🛡 X2+TR 블록{k} [{_bar}] {_dir} 순항 → 손절을 **{_lbl}**로 이동, 홀드 유지")
             if live:
                 self._btc_move_stop_be(b, pos, is_long, o)
@@ -5456,7 +5576,7 @@ class App:
                 # 브로커가 준 원인은 끝까지 보여 준다 - 이 한 줄이 다음 수리의 출발점이다.
                 self.log(f"   ⚠ 손절 이동 실패({str(r['error'])[:300]}) — 기존 손절 유지")
                 self._stop_move_alert(tgt, cur, r["error"]); return
-            self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (본절)" if entry and abs(tgt - entry) < 1e-9 else ""))
+            self.log(f"   ✅ 손절 → {tgt:g} 이동 완료" + (" (진입 기준가)" if entry and abs(tgt - entry) < 1e-9 else ""))
             self._remember_stop("BTC", tgt)      # 재거치가 옛 자리를 되살리지 않도록
         except Exception as e:
             self.log(f"   ⚠ 손절 이동 예외({e}) — 기존 손절 유지")
@@ -6569,6 +6689,14 @@ class App:
             return "GC"
         if root in ("MNQ", "ENQ", "NQ"):
             return "NQ"
+        # IB localSymbol = 루트 + 월코드 + 연도(예: MNQZ6·NQZ6·GCZ6, 2026-09-30 IBKR 감사 '다음 차'): 미니 leg 'NQZ6'·'GCZ6'이
+        # 여기서 None이 돼 트랙레코드에서 통째로 빠졌다. 월코드·연도 꼬리를 떼고 루트로 다시 본다.
+        import re as _re_fa
+        _m = _re_fa.match(r"^([A-Z]{1,4}?)[FGHJKMNQUVXZ]\d{1,2}$", s)
+        if _m and _m.group(1) in ("MGC", "GCE", "GC"):
+            return "GC"
+        if _m and _m.group(1) in ("MNQ", "ENQ", "NQ"):
+            return "NQ"
         # 폴백: CON 형식이 아니어도 명확한 티커 토큰이 있으면 매핑
         for _tok, _a in (("MGC", "GC"), ("GCE", "GC"), ("MNQ", "NQ"), ("ENQ", "NQ")):
             if _tok in s:
@@ -7186,7 +7314,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.09.30b"
+    _APP_VER = "2026.10.03b"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -7728,7 +7856,17 @@ class App:
         _alive = None                      # None = 판단 안 함
 
         _seen_px = None                    # 브로커에 실제로 걸려 있는 손절가(알 수 있을 때만)
-        if "stopLoss" in _raw:                                   # ── 크립토
+        if hasattr(_b, "stop_plans"):                            # ── 크립토(Bitget: 손절 = 플랜 주문)
+            # 포지션 데이터의 stopLoss 칸은 진입 때 첨부한 손절 플랜을 담지 않을 수 있다 - 비어 있다고 '없다'고
+            # 보면 손절을 하나 더 건다(2026-10-04 대표 기기 '미발견 → 다시 걸었습니다'). 플랜을 직접 본다.
+            try:
+                _pl = _b.stop_plans(_ctx.get("sym") or getattr(pos, "symbol", "")) or []
+            except Exception:
+                self._nostop_seen.pop(_k, None)      # 조회 실패 = 무판단
+                return
+            _alive = bool(_pl)
+            _seen_px = next((x.get("price") for x in _pl if x.get("price")), None)
+        elif "stopLoss" in _raw:                                 # ── 크립토(Bybit: 손절 = 포지션 속성)
             try:
                 _seen_px = float(_raw.get("stopLoss") or 0) or None
                 _alive = _seen_px is not None
@@ -7779,7 +7917,7 @@ class App:
         _done, _why = False, "기억해 둔 손절 자리가 없습니다"
         if _lvl:
             try:
-                if "stopLoss" in _raw and hasattr(_b, "set_stop"):
+                if (hasattr(_b, "stop_plans") or "stopLoss" in _raw) and hasattr(_b, "set_stop"):
                     _r = _b.set_stop(_ctx.get("sym") or getattr(pos, "symbol", ""), _lvl) or {}
                     _done = not _r.get("error"); _why = str(_r.get("error") or "")[:160]
                 elif hasattr(_b, "place_protective_stop"):
@@ -8055,6 +8193,7 @@ class App:
         잔여정리·손절실패 처리는 leg별로 그대로 재사용한다. 자동청산은 flatten_all이라
         심볼 수와 무관하게 계좌 전체를 비운다(legs 신경 안 씀).
         ⚠️LIVE 경로 — 어느 leg가 실패해도 나머지는 계속(부분 체결 로그로 드러냄)."""
+        self._mark_entering(asset)       # 발주 전 '진입 중' 기록 - 마감 청산 루프가 방금 진입분을 닫지 않게(2026-10-04)
         import time as _t
         import datetime as _dtl
         legs = [(s, int(q)) for s, q in legs if int(q) > 0]
@@ -8104,11 +8243,14 @@ class App:
         # ── 잔여 포지션 정리(leg 계약별) — 연속 세션 순서 보장 ──
         existing = b.list_open_positions()
         _mycons = {c for _, _, c in resolved}
-        others = [p for p in existing if p.symbol not in _mycons]
+        # 롤 당일(2026-09-30, IBKR 감사 '다음 차' - 전 브로커 공통): 이월된 **같은 자산의 옛 월물**(예: 새 신호 NQH7인데 계좌에 NQZ6)은
+        # 종전엔 '다른 심볼'로 보고 건드리지 않은 채 새 월물로 또 진입해 한때 2R이 걸렸다. 같은 자산이면 이전 세션 잔여로 보고 먼저 정리한다.
+        _same = lambda sym: sym in _mycons or self._fill_asset(sym) == asset
+        others = [p for p in existing if not _same(p.symbol)]
         if others:
             self.log(f"   ⚠ 다른 심볼 포지션 {len(others)}개 감지 — 건드리지 않음: "
                      + ", ".join(f"{p.symbol}" for p in others[:3]))
-        mine = [p for p in existing if p.symbol in _mycons]
+        mine = [p for p in existing if _same(p.symbol)]
         if mine and _standby:
             _want = 1 if str(direction).upper() in ("LONG", "BUY", "0") else -1
             if any((1 if int(p.net_qty) > 0 else -1) == _want for p in mine):
@@ -8128,7 +8270,7 @@ class App:
                     _dead = False
                     for _chk in range(6):
                         _t.sleep(1)
-                        if not any(q.symbol in _mycons for q in b.list_open_positions()):
+                        if not any(_same(q.symbol) for q in b.list_open_positions()):
                             _dead = True; break
                     if not _dead:
                         self.log("   🛑 청산 확인 실패 — 진입 중단(순서 보장). 수동 확인 필요!")
@@ -8484,6 +8626,7 @@ class App:
             if ts < _te.time() - 3600:          # 한참 지난 값은 무시
                 return
             why = str((sig or {}).get("exit_early") or "")
+            # 늦추는 값은 여기서 걸러지지 않는다(고정 시각을 모름) - _auto_loop이 고정 시각보다 이른 값만 쓴다(2026-09-30).
             prev = (self._exit_override or {}).get(asset)
             self._exit_override[asset] = (ts, why)
             if why and (not prev or prev[0] != ts):
@@ -8627,7 +8770,11 @@ class App:
                 s = s.replace(_i, "…" + _i[-4:])
         except Exception:
             pass
-        return _re.sub(r"\d{5,}", "#", s)
+        # 가격은 가리지 않는다(2026-10-05 대표 DM "앱이 #.9에 다시 걸었습니다" - 5자리+ 규칙이 손절가 85258.9의
+        # 정수부를 먹었다). 문구의 가격은 {:g}로 찍혀 소수점이 빠질 수 있다(BTC 100250 등) - 그래서 길이로 가른다:
+        # 가격은 7자리를 넘지 않으므로(BTC 1천만 달러 미만) **8자리 이상 정수열**만, 소수·천 단위 구분의 일부가 아닐 때
+        # 가린다. 설정된 계좌 ID는 위에서 이미 끝 4자리로 바뀌었다(길이 무관).
+        return _re.sub(r"(?<![\d.,])\d{8,}(?![\d]|[.,]\d)", "#", s)
 
     def _member_alert(self, kind: str, ko: str, en: str):
         """회원 본인에게 즉시 알림(2026-08-28 R16 P0). 서버가 텔레그램/디스코드로 보낸다.
@@ -8860,12 +9007,14 @@ class App:
     _P150_BROKERS = ("projectx", "nt8", "tradovate")
 
     def _prop150_report(self):
-        """Autopilot 등급일 때만, 켜진 계좌 중 150K로 판별된 것의 [{b: 브로커, f: 프롭사, k: 끝4}]. 계좌 이름 전체·잔고·자격은 안 보낸다.
+        """켜진 계좌 중 150K로 판별된 것의 [{b: 브로커, f: 프롭사, k: 끝4}]. 계좌 이름 전체·잔고·자격은 안 보낸다.
+        모든 등급에서 보낸다(대표 2026-10-02 "선적용으로 해야 해" - Autopilot 결제 **전에** 서버가 할인을 미리 붙이려면 결제 전 등급
+        (Preview·Operator)에서도 계좌가 보여야 한다. 할인 부여는 서버가 Autopilot 가격에만 한다). 종전: Autopilot 등급일 때만.
         NT8은 원래 계좌 이름(Account.Name - 설정에 저장된 id)만 본다(표시 이름은 사용자가 바꿀 수 있다)."""
         import re as _re
         try:
             g = getattr(self, "_gate", {}) or {}
-            if not (g.get("ok") and str(g.get("tier") or "") == "royal"):
+            if not g.get("ok"):
                 return []
             # 서버가 패턴을 내려줄 때만 보낸다(fail-closed, 2026-09-28): 패턴이 없거나 비면 아무것도 안 보낸다 -
             # 수집 시작일을 서버가 정한다(개인정보 방침 한 줄과 같은 날). 기본 패턴으로 알아서 보내지 않는다.
@@ -8999,7 +9148,7 @@ class App:
                                    "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
                                    # 앱 화면 언어(2026-09-29): 서버가 회원 DM(진입 실패·T-10)을 회원 언어로 쓰게. 서버는 회원 언어를 모른다.
                                    "lg": "en" if self.lang == "en" else "ko",
-                                   # 프롭 150K 확인(2026-09-28): Autopilot 등급일 때만, 150K로 판별된 계좌의 브로커·끝4만
+                                   # 프롭 150K 확인(2026-09-28, 2026-10-02부터 전 등급): 150K로 판별된 계좌의 브로커·끝4만
                                    "p150": self._prop150_report(),
                                    "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
                                    "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
@@ -9036,6 +9185,32 @@ class App:
         발주부터 주문을 보류한다 — 시작 때 캡처한 값만 믿으면 킬스위치가 기존 루프에 안 먹는 구멍.
         (회원용 모의 모드는 2026-09-07 폐지 - 이 함수가 유일한 실주문 억제 경로다.)"""
         return bool(live_flag) and not (self._gate or {}).get("force_dry_run", True)
+
+    def _fallback_kind(self, g=None):
+        """서버 불통 폴백 종류: 'offline'(유예 넘긴 닿지 못함) / 'revoked'(명시 거부·만료) / None.
+        마지막으로 서버가 킬스위치를 켜 둔 상태였으면 폴백하지 않는다 - 서버가 멈춘 것을 폴백이 되살리면 안 된다."""
+        g = self._gate if g is None else g
+        if (g or {}).get("ok") or getattr(self, "_killed", False):
+            return None
+        if (g or {}).get("offline"):
+            return "offline"
+        if (g or {}).get("revoked"):
+            return "revoked"
+        return None
+
+    def _full_exit(self) -> bool:
+        """전체 청산 로직(BTC 4시간 봉 판정: 반대봉 청산·손절 이동) 권한 = Autopilot. Operator는 정해진 시각의 마지노선 청산만
+        (선물 세션 마감, BTC 24시간 만기 - 대표 2026-09-30). 서버 하트비트 caps.fullexit, 옛 서버(키 없음)면 caps.autoentry."""
+        caps = (getattr(self, "_gate", None) or {}).get("caps", {}) or {}
+        return bool(caps.get("fullexit", caps.get("autoentry")))
+
+    def _close_mode(self, j):
+        """마감 청산 순간의 (실거래 여부, BTC 조건부 출구 건너뛰기).
+        평소 = _live_now(킬스위치면 dry-run). 폴백(서버 불통·권한 끝) = 무장 때 고른 LIVE 그대로, BTC는 조건부 출구 없이 이 블록에서 청산."""
+        fb = self._fallback_kind()
+        if fb:
+            return bool(j.get("live")), True
+        return self._live_now(j.get("live")), False
 
     def _fetch_balance_diag(self, bk, f1, f2, f3, aid, is_fut):
         """잔고 직접 조회 + 실패 원인 표면화. 반환 (bal|None, err|None).
@@ -9449,10 +9624,18 @@ class App:
                  f"Qty: {_qty} {_unit}  (1R ${one_r:g})\n\nEnter this on your broker manually."))
         self.root.after(0, lambda t=_title, m=_msg: messagebox.showinfo(t, m))
 
+    def _mark_entering(self, asset) -> None:
+        """진입을 시작한 시각(메모리). _auto_loop의 오살 방지가 _entered_at(체결 확인 뒤)과 함께 본다."""
+        import time as _tme
+        if not hasattr(self, "_entering_at") or not isinstance(self._entering_at, dict):
+            self._entering_at = {}
+        self._entering_at[str(asset)] = _tme.time()
+
     def _enter_account(self, cfg, sig, asset, direction, stop, mult):
         """단일 계좌 진입 — cfg(broker,f1,f2,f3,acct,one_r,label,live)로 사이징+발주.
         로그는 계좌 라벨을 앞에 붙여 멀티계좌를 구분한다(대표 2026-07-24). 계좌 실패는
         그 계좌만 스킵 — 다른 계좌 진입은 계속 진행한다."""
+        self._mark_entering(asset)       # 발주 전 '진입 중' 기록 - 마감 청산 루프가 방금 진입분을 닫지 않게(2026-10-04)
         import datetime as _dtl
         from eqexec import sizing
         _broker, user, key = cfg["broker"], cfg["f1"], cfg["f2"]
@@ -9483,6 +9666,21 @@ class App:
             self.log(f"   ⏭ [{lbl}] 사이징 불가(진입/손절 확인) — 건너뜀."); self._entry_skip_ev(asset, "sizing"); return
         size = _sz["size"]; sym = _sz["symbol"]
         _legs = _sz.get("legs") or [(sym, size)]
+        # 한 계약 바닥(대표 2026-09-30): 자기 자본 선물 계좌만, 수량 0일 때 한 계약 위험이 **회원이 확정한 한도**(one_lim) 안이면 한 계약.
+        # 잔고는 읽지 않는다(2026-08-13 법적 설계) - 한도는 1R처럼 회원이 설정에서 정한 상수. 비어 있으면(0) 종전처럼 건너뜀. 프롭은 대상 아님.
+        _lim = _as_float(cfg.get("one_lim"), 0.0)
+        if size <= 0 and _lim > 0 and not _pr.get("on") and _sz.get("kind") == "futures":
+            try:
+                from eqexec import sizing as _szf
+                _c1f = float(_sz.get("risk_pts") or 0) * float(_szf.FUTURES_POINT_VALUE.get(_sz.get("symbol")) or 0)
+            except Exception:
+                _c1f = 0.0
+            if 0 < _c1f <= _lim:
+                size = 1; _legs = [(sym, 1)]
+                self.log((f"   ➕ [{lbl}] 수량 0 → 1계약: 한 계약 위험 ${_c1f:,.0f}이 직접 정한 한 계약 한도 ${_lim:,.0f} 안"
+                          f"(이번 신호 리스크 1R ${one_r:g} × {mult:.2f} = ${_eff_r:g})") if self.lang == "ko" else
+                         (f"   ➕ [{lbl}] qty 0 → 1 contract: one contract risks ${_c1f:,.0f}, within your one-contract limit "
+                          f"${_lim:,.0f} (this signal's risk 1R ${one_r:g} × {mult:.2f} = ${_eff_r:g})"))
         if size <= 0:
             # 왜 쉬는지 한눈에(대표 2026-08-13): 최소 1계약 리스크가 설정 1R의 몇 배인지 명시.
             try:
@@ -9511,6 +9709,9 @@ class App:
                           f"손절거리({_sz['risk_pts']}) 대비 작아 수량 0 — 건너뜀.") if self.lang == "ko" else
                          (f"   ⏭ [{lbl}] This signal's risk (1R ${one_r:g} × {mult:.2f} = ${_eff_r:g}) is too "
                           f"small for the stop distance ({_sz['risk_pts']}) - quantity 0, skipped."))
+            if _lim > 0 and not _pr.get("on"):
+                self.log((f"   ⏭ [{lbl}] 한 계약 위험이 직접 정한 한 계약 한도 ${_lim:,.0f}를 넘어 건너뜁니다.") if self.lang == "ko" else
+                         (f"   ⏭ [{lbl}] One contract's risk exceeds your one-contract limit ${_lim:,.0f} - skipped."))
             self._entry_skip_ev(asset, "size_cap")       # 과대 사이징 방지(9/21 대표 사례) - 서버 카드가 '건너뜀'으로 말하게
             return
         self.log(f"   [{lbl}] {asset} {direction} x{size} ({sym}), 손절 {stop}, "
