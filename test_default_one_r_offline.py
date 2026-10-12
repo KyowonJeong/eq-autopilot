@@ -32,6 +32,6 @@ assert eqgui.CFG_PATH.startswith(_H), eqgui.CFG_PATH
 _d0 = eqgui._load()
 _r0 = {a: [x["one_r"] for x in ((_d0.get("assets") or {}).get(a) or {}).get("accounts", [])] for a in ("NQ", "GC", "BTC")}
 ck("새 설치 _load() 첫 계좌 1R = 500(리뷰 P1-1)", all(v and all(r == 500.0 for r in v) for v in _r0.values()), _r0)
-ck("버전 2026.10.12d", eqgui.App._APP_VER == "2026.10.12d")
+ck("버전 2026.10.12e", eqgui.App._APP_VER == "2026.10.12e")
 print("FAIL %d" % len(FAIL) if FAIL else "ALL PASS")
 sys.exit(1 if FAIL else 0)

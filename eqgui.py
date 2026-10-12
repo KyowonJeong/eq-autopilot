@@ -1668,8 +1668,22 @@ def _load():
             with open(CFG_PATH) as f:
                 _raw_cfg = f.read()
         d = yaml.safe_load(_raw_cfg) or {}
-    except Exception:
+        if not isinstance(d, dict):
+            raise ValueError("config is not a mapping")
+    except Exception as _le:
         d = {}
+        # 파일은 있는데 못 읽으면(NUL·잘림) 첫 저장이 하나뿐인 사본을 덮기 전에 따로 보존하고 기록한다(버그 조사 P2-3).
+        try:
+            _yerr = getattr(sys.modules.get("yaml"), "YAMLError", ())
+            if os.path.exists(CFG_PATH) and isinstance(_le, (ValueError,) + ((_yerr,) if _yerr else ())):
+                import time as _tlc
+                import shutil as _shc
+                _cp = CFG_PATH + f".corrupt-{int(_tlc.time())}"
+                _shc.copyfile(CFG_PATH, _cp)
+                _log_to_file(f"⚠ 설정 파일을 읽지 못해 사본을 남겼습니다: {os.path.basename(_cp)} "
+                             f"(직전 정상본은 config.yaml.bak) - {type(_le).__name__}")
+        except Exception:
+            pass
     out = {"lang": d.get("lang", "ko"), "token": d.get("token", "")}
     assets_raw = d.get("assets") or {}
     _has_accounts = any(isinstance(v, dict) and "accounts" in v for v in assets_raw.values())
@@ -1815,11 +1829,44 @@ def _load_open_ctx() -> dict:
         return {}
 
 
+def _write_text_atomic(path: str, text: str) -> None:
+    """작은 상태 파일 원자 저장(2026-10-12 버그 조사 P2-3): 임시 파일에 쓰고 fsync → os.replace.
+    종전 open(path, 'w')는 파일을 먼저 비우고 써서, 쓰는 도중 꺼지면(윈도 절전·강제 종료) 0바이트·NUL로 남았다
+    (.r_ledger.json과 같은 사고). 바꿔 끼우기가 끝내 안 되면 직접 쓴다(저장이 아예 안 되는 것보다 낫다). 실패는 예외로 올린다."""
+    import time as _tw
+    _tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        try:
+            os.remove(_tmp)
+        except Exception:
+            pass
+        raise                                   # 원본은 손대지 않았다
+    for _i in range(5):
+        try:
+            os.replace(_tmp, path)
+            return
+        except OSError:
+            _tw.sleep(0.05)
+    try:
+        os.remove(_tmp)
+    except Exception:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def _save_open_ctx(d: dict) -> None:
     try:
         import json as _json
-        with open(_OPENCTX_PATH, "w", encoding="utf-8") as f:
-            _json.dump(d, f)
+        _write_text_atomic(_OPENCTX_PATH, _json.dumps(d))
     except Exception:
         pass
 
@@ -1871,8 +1918,7 @@ def _mark_entered(asset: str) -> dict:
     import json as _json
     d[asset] = _t.time()
     try:
-        with open(_ENTERED_PATH, "w", encoding="utf-8") as f:
-            _json.dump(d, f)
+        _write_text_atomic(_ENTERED_PATH, _json.dumps(d))
     except Exception:
         pass
     return d
@@ -1978,7 +2024,63 @@ def _read_json_guarded_nolock(path: str, kind):
             pass
         return v, "restored"
     except Exception:
+        if path == _RLEDGER_PATH:                # 1R 원장을 잃었다 - 이 시각 이전 거래는 다시 올리지 않는다(아래 _rledger_mark_reset)
+            _rledger_mark_reset(_tr.time())
         return kind(), "corrupt"
+
+
+# 1R 원장 초기화 시각(2026-10-12 버그 조사 P1-1): 원장이 손상되고 백업도 없어 빈 원장으로 시작하면, 그 전 거래는 진입 1R 기록이
+# 없어 트랙레코드 동기화가 **지금 설정 1R**로 R을 다시 계산해 서버의 맞는 값을 덮었다(대표 기기 10/04 BTC −0.645R → −0.43R).
+# 서버는 앱이 보내지 않은 행을 지우지 않으므로, 초기화 시각 이전에 진입한 거래는 아예 다시 보내지 않으면 지난 값이 그대로 남는다.
+_RLEDGER_RESET_PATH = os.path.join(APP_DIR, ".r_ledger_reset")
+
+
+def _rledger_mark_reset(ts: float) -> None:
+    """초기화 시각(epoch 초)을 영속 기록. 이미 있으면 더 늦은 시각일 때만 바꾼다(새 손상이 또 났을 때만 앞으로 움직임)."""
+    try:
+        try:
+            with open(_RLEDGER_RESET_PATH, encoding="utf-8") as f:
+                _old = float(f.read().strip())
+        except Exception:
+            _old = 0.0
+        if float(ts) > _old:
+            _write_text_atomic(_RLEDGER_RESET_PATH, str(float(ts)))
+            _log_to_file(f"⚠ 1R 원장 초기화 시각 기록: {float(ts):.0f} - 이 시각 이전 거래는 트랙레코드에 다시 올리지 않습니다")
+    except Exception as _e:
+        _log_to_file(f"⚠ 1R 원장 초기화 시각 기록 실패({_e})")
+
+
+def _rledger_reset_ts(ledger) -> float:
+    """1R 원장 초기화 시각(epoch 초). 없으면 0.
+    기록 파일이 없어도, 12d 이전 빌드가 남긴 손상 사본(.r_ledger.json.corrupt-시각)이 있고 지금 원장에 그 시각 이전 줄이
+    하나도 없으면(= 백업으로 되살리지 못하고 빈 원장으로 시작한 것) 그 시각을 초기화 시각으로 한 번 기록한다."""
+    try:
+        with open(_RLEDGER_RESET_PATH, encoding="utf-8") as f:
+            v = float(f.read().strip())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    try:
+        _pfx = os.path.basename(_RLEDGER_PATH) + ".corrupt-"
+        _cands = []
+        for fn in os.listdir(os.path.dirname(_RLEDGER_PATH)):
+            if not fn.startswith(_pfx):
+                continue
+            try:
+                c = float(fn[len(_pfx):])
+            except ValueError:
+                continue
+            _older = any(float(r[0]) < c - 60 for rows in (ledger or {}).values()
+                         if isinstance(rows, list) for r in rows if isinstance(r, (list, tuple)) and r)
+            if not _older:
+                _cands.append(c)
+        if _cands:
+            _rledger_mark_reset(max(_cands))
+            return max(_cands)
+    except Exception:
+        pass
+    return 0.0
 
 
 def _record_real_r(asset: str, acct: str, one_r: float) -> None:
@@ -2061,8 +2163,10 @@ def _ledger_add(asset: str, symbol: str = "", direction: str = "", tag: str = ""
             cut = (_t.time() - _LEDGER_KEEP_DAYS * 86400) * 1000
             d = [r for r in d if (r.get("ts_ms") or 0) >= cut]
             _write_json_atomic(_LEDGER_PATH, d)
-    except Exception:
-        pass
+    except Exception as _le:
+        # 기록을 못 하면 이 진입의 체결이 트랙레코드에서 '직접 하신 거래'로 빠진다 - 조용히 버리지 않고 남긴다(버그 조사 P2-5).
+        _log_to_file(f"⚠ 거래 원장 기록 실패({type(_le).__name__}: {str(_le)[:120]}) - 이번 진입 기록 건너뜀: "
+                     f"{asset} {symbol} {direction} {tag}")
 
 
 def _idle_days():   # 반환 int | None. ⚠️어노테이션으로 쓰지 마라 - 앱 파이썬은 3.9(Tk 8.6 제약)라 PEP 604가 기동 즉시 TypeError(2026-08-31 실사고: 배포 빌드가 안 열림)
@@ -2111,8 +2215,7 @@ def _ledger_since() -> float:
     import time as _t
     now = _t.time() * 1000
     try:
-        with open(_LEDGER_SINCE_PATH, "w", encoding="utf-8") as f:
-            f.write(str(now))
+        _write_text_atomic(_LEDGER_SINCE_PATH, str(now))     # 원자 저장(버그 조사 P2-3: NUL이 되면 '지금'으로 다시 박혀 수동 거래가 올라감)
     except Exception:
         return 0.0                      # 기록 실패 = 필터 못 씀 → 안전하게 옛 방식
     return now
@@ -2132,12 +2235,12 @@ def _last_pushed() -> float:
 def _mark_pushed() -> None:
     try:
         import time as _t
-        with open(_PUSHED_PATH, "w", encoding="utf-8") as f:
-            f.write(str(_t.time()))
+        _write_text_atomic(_PUSHED_PATH, str(_t.time()))
     except Exception:
         pass
 
 
+_CFG_SAVE_FAILED = False   # 직전 설정 저장(_save_full)이 디스크에 못 썼는가(_flash_saved 표시용)
 _KC_LAST_FAILED = []       # 직전 저장에서 키체인에 못 넣고 평문으로 남은 필드(경고용)
 
 
@@ -2278,8 +2381,12 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
         if profile is not None:
             payload["profile"] = dict(profile)
         _write_cfg_atomic(yaml.safe_dump(payload))
-    except Exception:
-        pass
+        globals()["_CFG_SAVE_FAILED"] = False
+    except Exception as _se:
+        # 저장 실패를 삼키되 표시는 남긴다(2026-10-12 버그 조사 P2-4): 종전엔 디스크 풀·권한 오류에도 초록 '저장됨'이 떠서
+        # 1R을 낮춘 회원이 재시작 뒤 옛 1R로 주문했다. _flash_saved가 이 표식을 보고 '저장 안 됨'을 띄운다.
+        globals()["_CFG_SAVE_FAILED"] = True
+        _log_to_file(f"⚠ 설정 저장 실패: {type(_se).__name__}: {str(_se)[:160]}")
 
 
 _CFG_LOCK = threading.Lock()
@@ -2308,6 +2415,15 @@ def _write_cfg_atomic(text):
             except Exception:
                 pass
             raise                               # 원본은 손대지 않았다
+        try:                                    # 지금 정상본을 .bak로(버그 조사 P2-3) - 읽히는 YAML일 때만(망가진 파일로 백업을 덮지 않게)
+            import yaml as _yb
+            with open(CFG_PATH) as _f0:
+                _cur = _f0.read()
+            if _cur.strip() and isinstance(_yb.safe_load(_cur), dict):
+                import shutil as _sh
+                _sh.copyfile(CFG_PATH, CFG_PATH + ".bak")
+        except Exception:
+            pass
         for _i in range(5):                     # 윈도: 백신·색인기가 원본을 잠깐 잡고 있으면 바꿔 끼우기가 실패한다 - 짧게 재시도
             try:
                 os.replace(_tmp, CFG_PATH)
@@ -4014,6 +4130,22 @@ class App:
         try:
             import datetime as _dtf
             lbl = getattr(self, "_saved_lbl", None)
+            if globals().get("_CFG_SAVE_FAILED"):
+                # 설정 파일 자체를 못 썼다(디스크 풀·권한·백신 잠금, 2026-10-12 버그 조사 P2-4) - 초록 '저장됨'을 띄우지 않는다.
+                if not getattr(self, "_cfg_fail_logged", False):
+                    self._cfg_fail_logged = True
+                    self.log("⚠ " + ("설정을 파일에 저장하지 못했습니다. 디스크 공간과 폴더 권한을 확인한 뒤 다시 저장하세요. "
+                                     "지금 바꾼 값은 앱을 다시 켜면 이전 값으로 돌아갑니다."
+                                     if self.lang == "ko" else
+                                     "Settings could not be written to disk. Check free space and folder permissions, "
+                                     "then save again. Changes made now revert to the previous values after a restart."))
+                if lbl is not None:
+                    lbl.config(text=("⚠ 저장 안 됨 " if self.lang == "ko" else "⚠ not saved ")
+                               + _dtf.datetime.now().strftime("%H:%M:%S")
+                               + (" - 설정 파일을 쓰지 못했습니다" if self.lang == "ko" else " - could not write the settings file"),
+                               foreground="#b45309")
+                return
+            self._cfg_fail_logged = False
             if lbl is None:
                 return
             # ⚠️키체인 저장이 실패했으면 **초록 '저장됨'을 띄우지 않는다**(2026-08-28
@@ -8646,7 +8778,7 @@ class App:
         """계약ID → 포인트 가치($). 미인식이면 None(그 포지션은 계산에서 제외)."""
         s = str(contract_id or "").upper()
         parts = s.split(".")
-        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s.split(" ")[0]   # NT8 'NQ 12-26' → 'NQ'
         if root in _PV_BY_ROOT:
             return _PV_BY_ROOT[root]
         for tok, pv in _PV_BY_ROOT.items():    # 형식이 달라도 티커 토큰 폴백
@@ -9522,7 +9654,9 @@ class App:
         if "BTC" in s:
             return "BTC"
         parts = s.split(".")
-        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s
+        # NT8 표기는 '루트 + 공백 + 만기'(예: 'NQ 12-26', 'GC 12-26'): 공백 앞 토큰이 루트다(2026-10-12 버그 조사 P1-1:
+        # 마이크로 10계약 이상이면 NT8이 풀사이즈 leg를 내는데, 그 체결이 None으로 빠져 트랙레코드 손익이 잘리고 잔여 포지션 정리에서도 빠졌다).
+        root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s.split(" ")[0]
         if root in ("MGC", "GCE", "GC"):
             return "GC"
         if root in ("MNQ", "ENQ", "NQ"):
@@ -9541,8 +9675,7 @@ class App:
                 return _a
         return None
 
-    @staticmethod
-    @staticmethod
+    @staticmethod   # 중복 @staticmethod 제거(2026-10-12): 파이썬 3.9(맥 빌드)에선 'staticmethod object is not callable'로 트랙레코드 동기화가 멈췄다
     def _fill_entry(f, asset: str, ledger: list, since_ms: float):
         """이 체결이 나온 **EQ 진입 행**을 돌려준다(없으면 None). 판정 규칙은 _fill_is_eq와
         같고, 반환만 bool → 진입 행으로 바꾼 것이다(2026-09-22).
@@ -9960,6 +10093,10 @@ class App:
             if _rl_st in ("corrupt", "restored"):
                 self.log("   ⚠ 1R 원장 파일이 손상돼 " + ("백업본으로 되살렸습니다" if _rl_st == "restored" else
                          "빈 원장으로 시작합니다"))
+            # 1R 원장 초기화 시각 이전에 진입한 거래는 다시 올리지 않는다(버그 조사 P1-1): 그 거래의 진입 1R 기록이 없어
+            # 지금 1R로 다시 나누게 되고, 서버는 같은 tid의 맞는 값을 그 값으로 덮는다. 안 보내면 서버 값이 그대로 남는다.
+            _rl_reset = _rledger_reset_ts(_rledger)
+            _rl_skipped = 0
             _mine = 0
             agg = {}
             for f in fills:
@@ -9981,6 +10118,9 @@ class App:
                                                        _dtd.timezone.utc)
                 else:
                     _edt = dt
+                if _rl_reset and _edt.timestamp() < _rl_reset:
+                    _rl_skipped += 1
+                    continue
                 d = _edt.date().isoformat()
                 k = (d, a, _btc_sess(_edt) if a == "BTC" else "")
                 e = agg.setdefault(k, {"pnl": 0.0, "direction": f.get("direction", "LONG"),
@@ -10061,6 +10201,11 @@ class App:
                          f"{', '.join(t['date'] + ' ' + t['instrument'] for t in _est[:5])}. 계좌 설정의 1R을 확인해 주세요.")
             if _mine:
                 self.log(f"   ⊘ EQ 원장에 없는 체결 {_mine}건 제외(직접 하신 거래 — 트랙레코드 미포함)")
+            if _rl_skipped:
+                import datetime as _dtr
+                self.log(f"   ⊘ 1R 원장을 다시 시작한 "
+                         f"{_dtr.datetime.fromtimestamp(_rl_reset).strftime('%Y-%m-%d %H:%M')} 이전 체결 {_rl_skipped}건은 "
+                         f"다시 올리지 않습니다(이미 올라간 기록을 그대로 둡니다)")
             if not trades:
                 self.log("   체결 없음 — 푸시할 내용이 없습니다.")
                 return
@@ -10152,7 +10297,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.10.12d"
+    _APP_VER = "2026.10.12e"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -11405,6 +11550,7 @@ class App:
             _budget_s = 55.0 if (_is_nt8 and live) else 0.0   # "일분 안쪽"
             _t0 = _t.time()
             _try = 0                 # 지금까지의 제출 횟수(루프 끝에서 = 총 시도 수)
+            _hard_rej = False        # ProjectX가 success:false로 확정 거절(주문이 안 들어감) - '접수됐으나 미확인'과 구분(버그 조사 P2-1)
             res = {}
             while True:
                 if _try:
@@ -11469,6 +11615,11 @@ class App:
                                             custom_tag=_tag, dry_run=not live)
                 except Exception as _ee:
                     _last_why = str(_ee)[:160]
+                    # ProjectX의 success:false(일일 손실 한도로 잠긴 계좌, 계약 오류, 수량 한도 등)는 RuntimeError로 온다 - 확정 거절이다.
+                    # 망 오류(requests 예외: 타임아웃·5xx)는 주문이 들어갔을 수 있어 종전대로 미확인으로 다룬다.
+                    if (not _is_nt8 and isinstance(_ee, RuntimeError)
+                            and str(_ee).startswith("ProjectX ") and "errorCode=" in str(_ee)):   # projectx._post 거절 문구
+                        _hard_rej = True
                     self.log(f"   ❌ {_sym} 진입 예외: {_ee}")
                     if _is_nt8 and live:
                         _net_last = self._net_probe()
@@ -11573,7 +11724,7 @@ class App:
             # 그때 주문은 나갔을 수 있는데 ProjectX 손절은 진입 POST가 성공한 다음에만 나가므로 안 나갔다. 종전엔 여기서
             # 손절 거치·손절 실패 처리·감시를 모두 건너뛰어 세션 마감 청산까지(최대 약 4시간) 손절 없이 남을 수 있었다.
             # 포지션을 ENTRY_RECHECK_S초 더 보고, 보이면 아래 확정 경로(손절 확인·_handle_stop_failure·_note_fill)로 보낸다.
-            if live and _placed is False and not _is_nt8:
+            if live and _placed is False and not _is_nt8 and not _hard_rej:
                 _lq = 0
                 _t_end = _t.time() + ENTRY_RECHECK_S
                 while True:
@@ -11629,6 +11780,17 @@ class App:
                                 f"the app could not confirm that the protective stop is in place. The stop "
                                 f"needs checking at your broker.")
                     _res_ok = _r0
+            if live and not _placed and _hard_rej:
+                # 확정 거절: 주문이 들어가지 않았다 - '접수됐으나 미확인'으로 말하지 않고, 원장·갭 보고·미확인 감시도 만들지 않는다.
+                self.log(f"   🚨 {_sym} 진입 거절 — 브로커가 주문을 받지 않았습니다(계좌 [{sc}]): {_last_why}")
+                self._send_ev("entry_fail", asset, why="rejected", err=str(_last_why or "")[:120])
+                self._member_alert(
+                    "entry_miss",
+                    f"⚠️ {asset} 진입 실패 — 계좌 {sc} {_sym} 주문을 브로커가 거절했습니다. "
+                    f"사유: {_last_why or '미상'}. 브로커 화면에서 계좌 상태를 확인해 주세요.",
+                    f"⚠️ {asset} entry failed — the broker rejected the order for account {sc} {_sym}. "
+                    f"Reason: {_last_why or 'unknown'}. Please check the account status at your broker.")
+                continue
             if live and not _placed:
                 if _is_nt8:
                     _whyf = (_last_why or "사유 미상") + (f" | {_net_last}" if _net_last else "")
@@ -12906,7 +13068,10 @@ class App:
             _qty = _sz["size"]
             _unit = "계약" if (_ko and _sz.get("unit") == "contracts") else \
                     ("contracts" if _sz.get("unit") == "contracts" else _sz.get("unit", ""))
-            if _sz["size"] <= 0:
+            if _sz.get("guard") == "stop_too_tight":
+                _qty = ("0 (손절거리가 비정상적으로 짧음 — 진입 보류 권장)" if _ko
+                        else "0 (stop distance abnormally short — skip recommended)")
+            elif _sz["size"] <= 0:
                 _qty = "0 (1R 대비 손절 큼 — 진입 보류 권장)" if _ko else "0 (stop too wide for 1R)"
         _bar = "─" * 34
         self.log(f"\n📝 {_bar}")
@@ -12967,6 +13132,25 @@ class App:
         _sz = sizing.compute_size(asset, _broker, _eff_r, sig.get("entry_ref"), stop, direction)
         if not _sz:
             self.log(f"   ⏭ [{lbl}] 사이징 불가(진입/손절 확인) — 건너뜀."); self._entry_skip_ev(asset, "sizing"); return
+        if _sz.get("guard") == "stop_too_tight":
+            # 안전 바닥(2026-10-12 버그 조사 D P2-3): 손절이 진입가에 비정상적으로 붙은 신호 = 데이터 사고로 보고 진입하지 않는다.
+            # 한 계약 바닥(one_lim)으로도 넘어가지 않게 여기서 끝낸다.
+            self.log((f"   ⏭ [{lbl}] 진입 안 함 — 손절거리 {_sz['risk_pts']}pt가 비정상적으로 짧습니다"
+                      f"(안전 바닥 {_sz.get('min_stop_pts')}pt). 수량이 지나치게 커지는 것을 막으려고 이번 신호는 건너뜁니다.")
+                     if self.lang == "ko" else
+                     (f"   ⏭ [{lbl}] No entry — the stop distance {_sz['risk_pts']}pt is abnormally short "
+                      f"(safety floor {_sz.get('min_stop_pts')}pt). This signal is skipped so the size cannot blow up."))
+            _log_to_file(f"size_guard stop_too_tight {asset} risk_pts={_sz['risk_pts']} floor={_sz.get('min_stop_pts')}")
+            self._entry_skip_ev(asset, "sizing")
+            return
+        if _sz.get("guard") == "size_cap":
+            self.log((f"   ⚠ [{lbl}] 수량 상한 — 계산 수량 {_sz.get('size_uncapped')}계약(마이크로 기준)이 안전 상한 "
+                      f"{_sz.get('cap')}을 넘어 {_sz['size']}계약으로 줄여 진입합니다(손절거리 {_sz['risk_pts']}pt).")
+                     if self.lang == "ko" else
+                     (f"   ⚠ [{lbl}] Size ceiling — the computed {_sz.get('size_uncapped')} contracts (micro basis) exceed "
+                      f"the safety ceiling {_sz.get('cap')}, so the entry is reduced to {_sz['size']} "
+                      f"(stop distance {_sz['risk_pts']}pt)."))
+            _log_to_file(f"size_guard size_cap {asset} {_sz.get('size_uncapped')}->{_sz['size']} risk_pts={_sz['risk_pts']}")
         size = _sz["size"]; sym = _sz["symbol"]
         _legs = _sz.get("legs") or [(sym, size)]
         # 한 계약 바닥(대표 2026-09-30): 자기 자본 선물 계좌만, 수량 0일 때 한 계약 위험이 **회원이 확정한 한도**(one_lim) 안이면 한 계약.
@@ -13224,9 +13408,13 @@ class App:
             self._alive_ping(armed=True)          # 생존 핑(4분 스로틀) - 다운 알림의 심박
             try:
                 _fq0 = _t.time()
-                r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
+                # 주소는 폴마다 **지금 토큰**으로 다시 만든다(2026-10-12 버그 조사 P2-1): 켜 둔 채 토큰을 바꾸면 옛 토큰 피드를
+                # 새 토큰으로 풀다 실패만 반복했다(진입 없음). 주소와 복호화 키를 같은 토큰 한 벌로 맞춘다(감시 루프와 같은 방식).
+                _tok_now = self._token
+                _url_now = _feed_url(_tok_now) if _tok_now else url
+                r = requests.get(_url_now, params={"t": int(_t.time())}, timeout=8)
                 self._note_clock(getattr(r, "headers", None), _fq0, _t.time())   # PC 시계 차이(W) - 폴마다 잰다
-                sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
+                sig = autopilot_crypto.decrypt(_tok_now, r.text) if r.ok else {}
             except Exception as e:
                 self._feed_errs = getattr(self, "_feed_errs", 0) + 1
                 # 일시적 blip(서버 재배포·순간 지연)은 조용히 재시도한다 — 폴 3초라 1~2회 실패는

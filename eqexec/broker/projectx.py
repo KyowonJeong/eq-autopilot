@@ -44,7 +44,7 @@ _LONG = 1                       # position.type: 1=long, 2=short (docs don't sta
 _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1: 1}
 
 # 계약 메타데이터 조회 실패 시 폴백 틱사이즈(우리가 다루는 심볼만).
-_FALLBACK_TICK = {"MNQ": 0.25, "NQ": 0.25, "MGC": 0.1, "GC": 0.1}
+_FALLBACK_TICK = {"MNQ": 0.25, "NQ": 0.25, "ENQ": 0.25, "MGC": 0.1, "GC": 0.1, "GCE": 0.1}   # ENQ, GCE = ProjectX 풀사이즈 루트(버그 조사 P2-2)
 # flatten_all 대기(초, 오픈 준비 버그 조사 2026-10-06 G): closeContract 1회 재시도 전 / 청산 반영 재조회 전.
 _CLOSE_RETRY_WAIT = 1.0
 _RECHECK_WAIT = 1.5
