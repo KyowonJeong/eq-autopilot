@@ -487,7 +487,7 @@ class BitgetBroker(BrokerAdapter):
     def closed_fills(self, start_ms: int) -> list[dict]:
         """청산 완료 포지션의 실현손익(트랙레코드 푸시용, 파생값만).
         GET /api/v2/mix/position/history-position → [{tid, ts_ms, symbol, pnl, direction}].
-        pnl = netProfit 우선(수수료 반영), 없으면 pnl. ⚠ UNTESTED(실키 검증 전)."""
+        pnl = 순손익(_bg_net: netProfit, 없으면 pnl + 수수료·펀딩), fees = 수수료·펀딩 합. ⚠ 실키 대조 전."""
         d = self._req("GET", "/api/v2/mix/position/history-position",
                       {"productType": self.product, "startTime": int(start_ms), "limit": 100})
         rows = d.get("list", d) if isinstance(d, dict) else d
@@ -498,7 +498,8 @@ class BitgetBroker(BrokerAdapter):
                     "tid": str(r.get("positionId") or r.get("orderId") or ""),
                     "ts_ms": int(r.get("utime") or r.get("ctime") or 0),
                     "symbol": str(r.get("symbol") or ""),
-                    "pnl": float(r.get("netProfit") if r.get("netProfit") is not None else (r.get("pnl") or 0)),
+                    "pnl": _bg_net(r),
+                    "fees": _bg_costs(r),
                     "direction": "LONG" if str(r.get("holdSide")).lower() == "long" else "SHORT",
                 })
             except (TypeError, ValueError):
@@ -526,3 +527,29 @@ class BitgetBroker(BrokerAdapter):
     def healthcheck(self) -> bool:
         self.authenticate()
         return True
+
+
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bg_costs(r: dict) -> float:
+    """수수료+펀딩 합(낸 돈 = 음수). history-position의 openFee·closeFee·totalFunding.
+    수수료는 부호와 상관없이 비용으로 뺀다(-|fee|): 응답의 부호 규약을 실키로 대조하기 전이라, 양수로 오면 더해져
+    손익이 부풀던 위험을 막는다(이 앱은 시장가라 리베이트가 없다). 펀딩은 받는 날도 있어 부호 그대로."""
+    fees = sum(-abs(x) for x in (_f(r.get("openFee")), _f(r.get("closeFee"))) if x is not None)
+    fund = _f(r.get("totalFunding"))
+    return fees + (fund or 0.0)
+
+
+def _bg_net(r: dict) -> float:
+    """회원 실제 손익 = 수수료와 펀딩까지 뺀 순손익(대표 2026-10-12 '수수료 넣어').
+    netProfit이 오면 그것(거래소 순손익), 없으면 총손익 pnl + 수수료·펀딩(_bg_costs). 종전엔 netProfit이 없을 때
+    총손익을 그대로 써서 '내 성과'에 수수료가 빠질 수 있었다."""
+    n = _f(r.get("netProfit"))
+    if n is not None:
+        return n
+    return (_f(r.get("pnl")) or 0.0) + _bg_costs(r)

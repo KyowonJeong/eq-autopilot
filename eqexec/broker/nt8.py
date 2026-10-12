@@ -31,7 +31,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .base import BrokerAdapter, FlattenResult, Position
+from .base import BrokerAdapter, FlattenResult, Position, refuse_flatten_without_accounts
 
 log = logging.getLogger("eqexec.nt8")
 
@@ -243,14 +243,27 @@ class NT8Broker(BrokerAdapter):
             return dict(self._state.last_state)
 
     def list_open_positions(self) -> list[Position]:
+        """애드온 스냅샷의 열린 포지션 - **이 인스턴스의 계좌(self.accounts)만**.
+
+        계좌로 거른다(오픈 준비 버그 조사 2026-10-06 M): 애드온은 NT8에 연결된 모든 계좌의 포지션을
+        올린다. 종전엔 거르지 않아, 진입 경로가 손매매 계좌·Sim101·EQ의 다른 계좌가 든 같은 자산을
+        '이전 세션 잔여'로 보고 내 계좌에서 빈 청산만 한 뒤 '청산 확인 실패'로 그 계좌 진입을 멈췄다.
+        ProjectX._accounts와 같은 규칙(casefold)이다. self.accounts가 비면 종전대로 전부(트랙레코드·
+        연결 테스트처럼 계좌를 안 정하고 만든 인스턴스). raw에 _accountId를 실어 close_contract가 그
+        포지션의 계좌를 쓰게 한다(ProjectX와 같은 키) - 스냅샷 dict는 공유 상태라 사본에 싣는다."""
+        want = {str(a).strip().casefold() for a in (self.accounts or []) if str(a).strip()}
         out = []
         for p in self._snapshot().get("positions", []):
             q = int(p.get("net_qty") or 0)
-            if q != 0:
-                out.append(Position(account_id=str(p.get("account", "")),
-                                    account_name=str(p.get("account", "")),
-                                    symbol=str(p.get("instrument", "")),
-                                    net_qty=q, raw=p))
+            if q == 0:
+                continue
+            acct = str(p.get("account", ""))
+            if want and acct.strip().casefold() not in want:
+                continue
+            out.append(Position(account_id=acct,
+                                account_name=acct,
+                                symbol=str(p.get("instrument", "")),
+                                net_qty=q, raw={**p, "_accountId": acct}))
         return out
 
     def order_status(self, account_id, tag) -> dict | None:
@@ -497,6 +510,9 @@ class NT8Broker(BrokerAdapter):
         return out
 
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+        _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
+        if _refuse is not None:
+            return _refuse
         planned = self.list_open_positions()
         res = FlattenResult(dry_run=dry_run, planned=planned)
         if dry_run:

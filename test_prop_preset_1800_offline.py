@@ -20,12 +20,12 @@ def ck(name, cond, detail=""):
 old = {"on": True, "type": "test", "r_test": 1200.0, "r_buffer": 300.0, "r_steady": 300.0, "buffer": 6000.0}
 ck("projectx preset r_test 2200", eqgui._PROP_PRESETS["projectx"]["r_test"] == 2200.0)
 ck("projectx preset funded 450", eqgui._PROP_PRESETS["projectx"]["r_steady"] == 450.0
-   and eqgui._PROP_PRESETS["projectx"]["r_buffer"] == 450.0 and eqgui._PROP_PRESETS["projectx"]["buffer"] == 6000.0)
+   and eqgui._PROP_PRESETS["projectx"]["r_buffer"] == 450.0 and eqgui._PROP_PRESETS["projectx"]["buffer"] == 3000.0)
 ck("nt8 preset 2200/450", eqgui._PROP_PRESETS["nt8"]["r_test"] == 2200.0 and eqgui._PROP_PRESETS["nt8"]["r_steady"] == 450.0
    and eqgui._PROP_PRESETS["nt8"]["r_buffer"] == 450.0 and eqgui._PROP_PRESETS["nt8"]["buffer"] == 0.0)
 a = eqgui._new_acct(600, "x", True, "", dict(old), None, False, "projectx", topstep=True)
 ck("topstep old default -> 2200/450", a["prop"]["r_test"] == 2200.0 and a["prop"]["r_steady"] == 450.0
-   and a["prop"]["r_buffer"] == 450.0 and a["prop"]["buffer"] == 6000.0, str(a["prop"]))
+   and a["prop"]["r_buffer"] == 450.0 and a["prop"]["buffer"] == 3000.0, str(a["prop"]))
 a2 = eqgui._new_acct(600, "x", True, "", dict(old, r_test=1800.0), None, False, "projectx", topstep=True)
 ck("topstep 1800/300 (never shipped = manual) untouched", (a2["prop"]["r_test"], a2["prop"]["r_steady"]) == (1800.0, 300.0),
    str(a2["prop"]))
@@ -44,7 +44,7 @@ ck("custom funded untouched", d["prop"]["r_test"] == 1200.0 and d["prop"]["r_ste
 e = eqgui._new_acct(600, "x", True, "", dict(old, r_test=900.0, r_steady=600.0, buffer=9000.0), None, False,
                     "projectx", topstep=True)
 ck("older champion chain ends at 2200/450", e["prop"]["r_test"] == 2200.0 and e["prop"]["r_steady"] == 450.0
-   and e["prop"]["buffer"] == 6000.0, str(e["prop"]))
+   and e["prop"]["buffer"] == 3000.0, str(e["prop"]))
 lo = {"on": True, "type": "test", "r_test": 300.0, "r_buffer": 150.0, "r_steady": 150.0, "buffer": 0.0, "r_live": 100.0}
 g = eqgui._new_acct(600, "x", True, "", dict(lo), None, False, "nt8", lucid=True)
 ck("lucid deployed 300/150 -> 2200/450, r_live kept", (g["prop"]["r_test"], g["prop"]["r_buffer"], g["prop"]["r_steady"],

@@ -22,7 +22,7 @@ import time
 import requests
 
 from . import futures_cal as _cal
-from .base import BrokerAdapter, FlattenResult, Position
+from .base import BrokerAdapter, FlattenResult, Position, refuse_flatten_without_accounts
 
 _TIMEOUT = (10, 30)          # (connect, read) seconds — never hang forever
 _TOKEN_TTL = 90 * 60         # Tradovate access token lifespan
@@ -473,6 +473,9 @@ class TradovateBroker(BrokerAdapter):
                           {"accountId": int(account_id), "contractId": cid, "admin": False})
 
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+        _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
+        if _refuse is not None:
+            return _refuse
         plan = self.list_open_positions()
         res = FlattenResult(dry_run=dry_run, planned=list(plan))
         if dry_run or not plan:

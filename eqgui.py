@@ -114,6 +114,10 @@ def _machine_id() -> str:
 
 
 MACHINE_ID = _machine_id()
+# 진입 클레임용 프로세스 난수 4자(버그 조사 재검증 2026-10-06 6, O 관련) - 실행마다 새로 뽑고 프로세스 안에서는 그대로다.
+# 선물 진입 클레임에만 붙인다(App._claim_entry 참고). 생존·체결 보고의 기기 id(MACHINE_ID)는 그대로다.
+import uuid as _uuid_nonce  # noqa: E402
+_CLAIM_NONCE = _uuid_nonce.uuid4().hex[:4]
 
 # ── 앱 로그 파일 영속화(대표 2026-07-15): 화면 로그를 일자별 파일에도 기록(타임스탬프 부여).
 #    앱을 닫아도 수신·체결 지연 기록이 남아 사후 감사 가능. 30일 지난 파일은 시작 시 정리. ──
@@ -182,6 +186,7 @@ _ASSET_EXITS = {"NQ": [("America/New_York", 14)], "GC": [("America/New_York", 6)
 # BTC 조건부 출구가 판정할 블록 인덱스: 마감시각 → k (22:00 진입 기준 0..5)
 _BTC_BLOCK_K = {2: 0, 6: 1, 10: 2, 14: 3, 18: 4, 22: 5}
 AUTO_FIRE_WINDOW_MIN = 30                           # 마감 후 이 분 안에서만 발화(놓친 tick 대비)
+AUTO_RETRY_SEC = 60     # 자동 청산이 실패하면 같은 창 안에서 이 간격으로 다시 시도(오픈 준비 버그 조사 2026-10-06 F, 통과 익절 60초와 같은 틀)
 
 
 def _exit_due(due_fixed: int, ovr, now):
@@ -251,11 +256,49 @@ def _bar_end_epoch(b):
 PRECHECK_WINDOW_MIN = PRECHECK_WINDOWS_MIN[0]       # 하위호환(기존 참조)
 STOP_RETRIES = 2                                    # protective stop: retries on a transient miss
 STOP_RETRY_WAIT = 1.5                               # seconds between stop retries
+# 비NT8 진입이 예외·미확인으로 끝났을 때 포지션을 더 지켜보는 초(오픈 준비 버그 조사 2026-10-06 B).
+# 종전엔 2초 창(예외면 0초) 뒤 바로 포기해 손절 거치·손절 실패 처리·감시를 모두 건너뛰었다.
+ENTRY_RECHECK_S = 12.0
 MAX_SIGNAL_AGE_SEC = 60                             # 자동진입: 발행 1분 이내 신호만 진입(오래된 건 대기)
+# ── PC 시계 차이(오픈 준비 버그 조사 2026-10-06 W + ChatGPT 교차 검토 '시계 느림') ──
+# 신호 나이를 PC 시계로 재면, 시계가 1분 넘게 빠른 PC는 모든 신호를 '오래됨'으로 건너뛰고 느린 PC는 오래된 신호도
+# 통과시킨다. 서버 시각은 피드·하트비트 응답의 HTTP Date 헤더로 잰다(응답 순간의 서버 시각, 1초 단위).
+# hb의 server_time은 쓰지 않는다 - hb 파일은 약 5분마다 다시 쓰는 정적 파일이라 그 값은 '파일을 쓴 시각'이고
+# 최대 5분 낡아, 그걸로 재면 오차 자체가 거짓 보류를 만든다(소견 W 반박 검증 메모).
+MAX_CLOCK_SKEW_SEC = 30          # 이보다 PC 시계가 서버와 어긋나면 새 자동 진입을 보류한다(마감 청산 시각도 PC 시계를 따르므로)
+CLOCK_SKEW_FRESH_SEC = 600       # 잰 지 이보다 오래된 차이 값은 안 믿는다(그땐 종전처럼 PC 시계)
+FUTURE_SIGNAL_TOL_SEC = 5        # 발행 시각이 '지금'보다 이만큼 넘게 뒤면(미래 발행) 진입하지 않는다 - Date 1초 단위 오차 여유
+# BTC는 일요일(UTC) 세션만 진입한다 - 서버 signal_trigger._SUNDAY_ONLY와 같은 규칙(오픈 준비 버그 조사 2026-10-06 Y)
+_ENTRY_SUNDAY_ONLY = {"BTC"}
+
+
+def _server_epoch_from_headers(headers):
+    """HTTP 응답의 Date 헤더 → 응답 순간의 서버 시각(epoch 초). 없거나 못 읽으면 None(오픈 준비 버그 조사 2026-10-06 W).
+    Date는 초 아래를 잘라 내므로 +0.5초로 가운데를 잡는다. 캐시가 준 응답(Age > 0, cf-cache-status HIT 등)은 Date가
+    '그때' 시각이라 PC가 빨라 보이게 만든다 - 그런 응답으로는 재지 않는다(None)."""
+    try:
+        _h = headers or {}
+        _d = _h.get("Date")
+        if not _d:
+            return None
+        try:
+            if float(_h.get("Age") or 0) > 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if str(_h.get("cf-cache-status") or "").upper() in ("HIT", "STALE", "UPDATING", "REVALIDATED"):
+            return None
+        from email.utils import parsedate_to_datetime
+        _dt0 = parsedate_to_datetime(str(_d))
+        if _dt0 is None or _dt0.tzinfo is None:
+            return None
+        return _dt0.timestamp() + 0.5
+    except Exception:
+        return None
 
 
 def _next_entry_dt(asset: str):
-    """이 자산의 다음 진입(신호 도착) 시각 — tz-aware datetime. NQ, GC는 주말 건너뜀."""
+    """이 자산의 다음 진입(신호 도착) 시각 — tz-aware datetime. NQ, GC는 주말 건너뜀, BTC는 일요일(UTC)만."""
     from datetime import timedelta
     best = None
     for tzname, hour in _ASSET_ENTRIES.get(asset, []):
@@ -265,6 +308,11 @@ def _next_entry_dt(asset: str):
             d += timedelta(days=1)
         if asset in ("NQ", "GC"):
             while d.weekday() >= 5:                  # 토(5)·일(6) 스킵
+                d += timedelta(days=1)
+        # (오픈 준비 버그 조사 2026-10-06 Y) BTC 진입은 일요일 22:00 UTC뿐이다. 종전엔 매일 22:00을 돌려줘
+        # 월~토에도 T-70·T-10 사전점검이 돌았고, 실패하면 세션이 없는 날 '이번 세션은 진입하지 않습니다' DM이 나갔다.
+        if asset in _ENTRY_SUNDAY_ONLY:
+            while d.weekday() != 6:                  # 일(6)만 - BTC 시각은 UTC라 UTC 요일
                 d += timedelta(days=1)
         if best is None or d < best:
             best = d
@@ -290,6 +338,24 @@ def _entry_fail_hint(msg: str, ko: bool) -> str:
                 "Insufficient available margin — add funds or raise the symbol's leverage.")
     return ("잔고(마진), 레버리지, API 키 권한을 확인하세요."
             if ko else "Check margin balance, leverage and API key permissions.")
+
+
+def _entry_err_unknown(msg: str) -> bool:
+    """크립토 진입 오류가 '거래소가 주문을 받았는지 모르는' 종류인가(오픈 준비 버그 조사 2026-10-06 B).
+
+    Bybit·Bitget 어댑터는 주문 POST 예외를 전부 {"error": str(e)}로 돌려줘, 응답만 잃은 타임아웃·연결
+    끊김·5xx도 '진입 주문이 거절되었습니다'로 보고됐다 - 주문이 들어갔다면 손절이 붙은 포지션이 열려 있다.
+    거래소가 처리하고 답한 거절(retCode=, failed: code=, HTTP 4xx)과 앱 쪽 입력 오류만 거절로 보고,
+    그 밖은 모른다고 본다(모르는 오류를 '거절'로 말하는 쪽이 회원의 수동 재진입·이중 노출로 이어진다)."""
+    import re as _re
+    m = str(msg or "")
+    if "retCode=" in m or "failed: code=" in m:
+        return False
+    if _re.search(r"HTTP 4\d\d\b|\b4\d\d Client Error", m):
+        return False
+    if m.startswith(("invalid side", "qty<=0")):
+        return False
+    return True
 
 
 def _cross_basis_bitget() -> float:
@@ -329,7 +395,7 @@ _BROKERS = ["projectx", "ibkr", "bybit", "bitget"]
 # 자산 탭 + 자산별 브로커 매트릭스(대표 2026-07-10):
 #   Topstep(projectx)·IBKR = MNQ·MGC (선물) · Bybit·Bitget = BTC만(BTCUSDT.P, 크립토)
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토(주말 거래) 전용.
-_CONSENT_VER = "golive-6item-2026-09-30"   # +서버 불통 폴백·킬스위치 두 줄(대표 2026-09-30)
+_CONSENT_VER = "golive-6item-2026-10-09f"   # 주의 사항 접이식 문안 다시 씀(실질 같음, 대표 2026-10-09 11e) / 9-30: +서버 불통 폴백·킬스위치 두 줄
 _ASSETS = ["NQ", "GC", "BTC"]
 _ASSET_BROKERS = {"NQ": ["projectx", "nt8", "ibkr"],
                   "GC": ["projectx", "nt8", "ibkr"],
@@ -347,7 +413,7 @@ _LIMIT_EXIT_FUT = {}
 _BROKER_SPEC = {
     "projectx":    {"label": "Topstep (ProjectX)", "f1": "TopstepX user email", "f2": "ProjectX API Key",
                     "f3": None, "acct": True, "futures": True},
-    "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (예: 127.0.0.1)", "f2": None,
+    "ibkr":        {"label": "IBKR (TWS/Gateway)", "f1": "Host (127.0.0.1)", "f2": None,
                     "f3": "Port (7497/7496)", "acct": True, "futures": True, "status": "unverified"},
     "bybit":       {"label": "Bybit (USDT perp)", "f1": "API Key", "f2": "API Secret",
                     "f3": "Testnet (1=on)", "acct": False, "futures": False,
@@ -430,8 +496,6 @@ def _resource(name):
     return os.path.join(base, name)
 
 T = {
-    "subtitle": {"ko": "본인 기기에서 본인 키로 실행. EdgeQuant는 키를 받지도, 대신 거래하지도 않습니다.",
-                 "en": "Runs on your machine with your key. EdgeQuant never receives your key or trades for you."},
     "broker": {"ko": "브로커", "en": "Broker"},
     "broker_preview": {"ko": "(검증 전 — 테스트넷/Sim 먼저)", "en": "(unverified — testnet/Sim first)"},
     "broker_beta": {"ko": "(베타 — 일부 경로 검증 중)", "en": "(beta — some paths still verifying)"},
@@ -448,10 +512,41 @@ T = {
     "gate_ok": {"ko": "멤버십: {tier}, 자동청산 {u}, 자동진입 {a}{dry}",
                 "en": "Membership: {tier}, auto-close {u}, auto-entry {a}{dry}"},
     "gate_dry": {"ko": ", 라이브 잠금(서버)", "en": ", LIVE locked (server)"},
-    "warn_mix": {"ko": "⚠ 청산 시 사용 계좌의 모든 포지션이 일괄 청산됩니다. "
-                       "그 계좌에 다른 거래를 섞지 말고 전용 계좌를 사용하세요.",
-                 "en": "⚠ Closing flattens EVERY position on the chosen account. "
-                       "Don't mix in other trades — use a dedicated account."},
+    # 11e(대표 2026-10-09 확정 문안): 로그 바로 아래 빨간 굵은 줄. 라이브 시작 로그·[모든 포지션 청산] 확인창에도 같이 쓴다.
+    "warn_mix": {"ko": "⚠ 청산하면 그 계좌의 포지션이 모두 닫힙니다. 다른 거래는 섞지 말고 전용 계좌를 쓰세요.",
+                 "en": "⚠ Closing flattens every position on that account. Keep other trades off it and use a dedicated account."},
+    # 주의 사항(동의한 내용) - 로그 아래 접이식 하나(대표 2026-10-09 확정 문안, 11e). 옛 consent_detail·live_note·
+    # live_1r_note·subtitle을 실질 그대로 다시 쓴 것. 실질을 바꾸면 _CONSENT_VER도 올릴 것.
+    # 1R~3R = 서버 web/sizing_canon.min_r_mult()·max_r_mult()와 같은 값. 배수가 정해지는 이유는 적지 않는다(결과 사실만).
+    "caut_head": {"ko": "주의 사항(동의한 내용)", "en": "Cautions (what you agreed to)"},
+    "caut_auto_h": {"ko": "자동으로 하는 일", "en": "What the app does on its own"},
+    "caut_auto_1": {"ko": "- 체크한 자산은 연결 테스트를 통과하면 한꺼번에 시작합니다. 하나라도 실패하면 시작하지 않습니다.",
+                    "en": "- Checked markets start together once their connection tests pass. If one fails, nothing starts."},
+    "caut_auto_2": {"ko": "- 시작하면 Autopilot은 신호마다 따로 묻지 않고 주문합니다. 세션이 끝나면 자동으로 청산합니다.",
+                    "en": "- Once started, Autopilot orders every signal without asking you. Positions close automatically at session end."},
+    "caut_stop_h": {"ko": "멈출 때", "en": "When you stop"},
+    "caut_stop_1": {"ko": "- [전체 정지]를 누르거나 앱을 끄면 앱은 더 주문하지 않습니다. 포지션과 브로커에 걸린 손절 주문은 그대로 남습니다.",
+                    "en": "- Press [Stop all] or quit the app and it places no further orders. Your positions and the stop orders at your broker stay in place."},
+    "caut_stop_2": {"ko": "- 그때부터 청산은 직접 하셔야 합니다. 다시 시작해도 지나간 마감 청산은 하지 않습니다.",
+                    "en": "- From then on, closing is up to you. Restarting does not run a session close you missed."},
+    "caut_conn_h": {"ko": "연결이 끊기거나 저희가 멈출 때", "en": "If the connection drops or we stop"},
+    "caut_conn_1": {"ko": "- 서버와 연결이 끊기면 앱이 예정된 청산 시각에 포지션을 닫습니다. 비트코인은 다음 4시간 봉이 끝날 때 닫습니다. "
+                          "원하지 않으면 앱을 끄고 직접 관리하세요.",
+                    "en": "- If the app loses contact with our server, it closes positions at the scheduled time (bitcoin: when the next "
+                          "4-hour bar closes). If you don't want that, quit the app and manage them yourself."},
+    "caut_conn_2": {"ko": "- 저희가 자동매매를 멈추면 앱은 진입도 청산도 하지 않습니다. 열린 포지션은 직접 관리하세요.",
+                    "en": "- If we stop automated trading, the app neither enters nor exits. Manage any open positions yourself."},
+    "caut_risk_h": {"ko": "리스크", "en": "Risk"},
+    "caut_risk_1": {"ko": "- 1R은 거래 한 번의 기본 리스크입니다. 신호마다 1R에서 3R 사이로 정해지니, 계좌 여유는 1R의 3배로 잡으세요.",
+                    "en": "- 1R is your typical risk per trade. Each signal sets 1R to 3R, so keep 3× your 1R available."},
+    # 상한 = _jitter_stop의 jmax = max(1, min(6, 거리×0.5%÷틱)) 틱 → 넓히는 폭 ≤ max(1틱, 거리의 0.5%), 6틱 이하(11f 사실 대조).
+    "caut_risk_2": {"ko": "- 선물 손절은 0~6틱 넓게 걸립니다. 넓히는 폭은 손절 거리의 0.5%와 1틱 중 큰 쪽을 넘지 않아, 실제 손실이 1R보다 그만큼 클 수 있습니다.",
+                    "en": "- Futures stops are placed 0-6 ticks wider. The widening never exceeds the larger of 0.5% of the stop distance or one tick, so a loss can exceed 1R by that much."},
+    "caut_risk_3": {"ko": "- 크립토 잔고가 모자라면 앱이 거래소의 레버리지 설정을 올립니다. 주문이 아니라 계좌 설정이며, 내리지는 않습니다.",
+                    "en": "- If your crypto balance is short, the app raises the leverage setting on your exchange account. "
+                          "This changes a setting, not an order, and it is never lowered."},
+    "caut_foot": {"ko": "본인 기기에서 본인 키로 실행합니다. EdgeQuant는 키를 받지 않고, 대신 거래하지도 않습니다.",
+                  "en": "Runs on your computer with your own keys. EdgeQuant never receives your keys and never trades for you."},
     "lang": {"ko": "Language", "en": "Language"},   # 언어 선택 라벨은 언어 무관 고정(대표 2026-07-12)
     "btn_home": {"ko": "홈페이지", "en": "Website"},
     "btn_join": {"ko": "멤버십 가입", "en": "Join membership"},
@@ -493,26 +588,6 @@ T = {
     # - 서버 원장에 "어느 버전 문안에 동의했나"가 이 값으로 남는다.
     "consent": {"ko": "동의: 본인 키, 본인 기기, 본인 계좌, 본인 책임. EdgeQuant는 거래하지 않음 (실행 동작에 필요)",
                 "en": "I agree: my key, my device, my account, my responsibility. EdgeQuant does not trade. (required to act)"},
-    "consent_detail": {
-        "ko": ("- 크립토 진입 시 잔고가 부족하면 앱이 거래소 계좌의 레버리지 설정을 올립니다"
-               "(주문이 아니라 계좌 설정 변경입니다. 내리지는 않습니다).\n"
-               "- 선물 손절가에 0~6틱을 넓히는 방향으로만 얹습니다. 실제 리스크가 설정 1R을"
-               " 손절거리의 0.5% 이내로 넘습니다.\n"
-               "- 진입은 건별 승인 없이 나갑니다. 한 번 무장하면 그 세션 동안 신호마다 자동 발주됩니다.\n"
-               "- 서버와 연락이 끊기면 앱이 예정 시각에 포지션을 닫습니다. 비트코인은 다음 4시간 봉이 닫힐 때 닫습니다."
-               " 이 동작을 원하지 않으시면 앱을 끄고 직접 관리하시면 됩니다.\n"
-               "- 저희가 자동매매를 멈추면 앱은 진입도 청산도 하지 않습니다. 열려 있는 포지션은 회원이 직접 관리하십니다."),
-        "en": ("- On crypto entries, if the balance is short the app raises the leverage setting on your "
-               "exchange account (a settings change, not an order; it is never lowered).\n"
-               "- Futures stop prices get a 0-6 tick offset, widening only. Realised risk exceeds your 1R "
-               "by up to about 0.5% of the stop distance.\n"
-               "- Entries are placed without per-trade approval. Once armed, every signal in that session "
-               "is ordered automatically.\n"
-               "- If the app loses contact with our server, it closes your positions at the scheduled time. For bitcoin "
-               "that is the close of the next 4-hour bar. If you do not want this, turn the app off and manage the "
-               "positions yourself.\n"
-               "- If we stop automated trading, the app will neither enter nor exit. You manage any open positions "
-               "yourself.")},
     "ready": {"ko": "준비됨. 키 입력 → '연결 테스트' → 통과하면 나머지 기능이 켜집니다.",
               "en": "Ready. Enter your key → 'Test connection' → the rest unlocks once it passes."},
     "conn_first": {"ko": "※ 먼저 '연결 테스트'를 통과해야 청산, 자동 진입 기능이 활성화됩니다.",
@@ -562,25 +637,6 @@ T = {
                          "hold it for a few minutes rather than seconds. Inactivity rules "
                          "differ by firm, so check the rules of the firm you use.")},
     "live_stopall": {"ko": "⏹ 전체 정지 (포지션 유지)", "en": "⏹ Stop all (positions kept)"},
-    # 배수 범위 1R~3R = 서버 web/sizing_canon.min_r_mult()·max_r_mult()와 같은 값(대표 2026-09-28 "브일이 정본." - 금 기본 사이즈 1R·추세 규칙 없음).
-    # 배수가 정해지는 이유는 적지 않는다(결과 사실만).
-    "live_1r_note": {"ko": "1R = 거래당 기본 리스크(typical risk). 신호마다 포지션 배수가 1R~3R(maximum risk) "
-                           "사이로 정해집니다 — 계좌 여유는 1R의 3배로 잡으세요.",
-                     "en": "1R = typical risk per trade. Each signal sets a position multiple between 1R "
-                           "and 3R (maximum risk) — budget 3× your 1R."},
-    "live_note": {"ko": "체크된 자산을 연결 테스트 후 한 번에 시작합니다(하나라도 실패하면 시작 안 함). "
-                        "신호의 방향, 손절로 자동 진입, 세션 마감엔 자동 청산. 포지션은 종목별 독립 관리. "
-                        "세션 마감 자동 청산을 원하지 않으면 마감 전에 [⏹ 전체 정지]를 누르세요 — 포지션은 "
-                        "그대로 유지되고 앱은 어떤 주문도 내지 않습니다(앱을 꺼도 같습니다. 브로커에 "
-                        "걸어둔 손절 주문은 계좌에 남습니다). 그 순간부터 그 포지션의 청산은 본인 "
-                        "몫입니다 — 다시 시작해도 지나간 세션의 청산을 소급 실행하지 않습니다.",
-                  "en": "Starts every checked asset at once after connection tests (one failure = nothing "
-                        "starts). Auto-enters with the signal's direction & stop, auto-closes at session "
-                        "end. Positions are managed independently per symbol. If you do not want the "
-                        "session-end auto-close, press [⏹ Stop all] before the close — positions are "
-                        "kept and the app places no orders (quitting the app works too; broker-side "
-                        "stop orders remain on your account). From that moment closing that position "
-                        "is on you — restarting does not retroactively run a missed session close."},
     "sec_auto": {"ko": "자산별 자동 청산 (세션 마감 자동)", "en": "Per-asset auto-close (at session close)"},
     "auto_sched": {"ko": "청산 시각: NQ 14:00 ET, GC 06:00 ET, BTC 02:00 UTC (자동)",
                    "en": "Close times: NQ 14:00 ET, GC 06:00 ET, BTC 02:00 UTC (auto)"},
@@ -814,6 +870,17 @@ def _settings_import_blob(pin: str, raw: bytes) -> dict:
 _ENC_SECRETS = {}       # {"f2|<f1>": secret} - 키체인에 못 넣은 f2(세션 메모리)
 _ENC_PIN = None         # 이번 세션에서 확인된 보관용 PIN(저장마다 다시 묻지 않게)
 _KC_LAST_ENC = []       # 직전 저장에서 PIN 암호화로 보관한 항목(표시용)
+_ENC_DROPPED = set()    # [연결 지우기]로 지운 kc_enc 항목 키 - 저장 때 지난 블롭에서 되살리지 않는다(2026-10-07)
+
+
+def _enc_field_name(k) -> str:
+    """kc_enc.fields(설정 파일 평문 목록)에 쓰는 이름(2026-10-07 (나) 수리). 'f2|<f1>'은 f1 원문 대신 해시로 -
+    Bybit·Bitget은 f1이 API Key(비밀)라, 원문을 쓰면 키체인이 안 되는 기기에서 config.yaml 평문에 키가 남았다.
+    블롭 안(암호화)의 키 이름은 그대로 원문이다(_enc_restore가 f1으로 되채운다)."""
+    k = str(k)
+    if k.startswith("f2|") and not k.startswith("f2|#"):
+        return "f2|#" + hashlib.sha256(k[3:].encode()).hexdigest()[:10]
+    return k
 
 
 def _f2_load(f1) -> str:
@@ -852,6 +919,8 @@ def _enc_label(k: str) -> str:
     """kc_enc 항목 키 → 경고 문구용(기존 kc_failed 형식 a/브로커표시명/필드; f2는 f1 앞자리로)."""
     parts = str(k).split("|")
     if parts[0] == "f2" and len(parts) == 2:
+        if parts[1].startswith("#"):         # 해시 이름(2026-10-07 (나) 수리) - f1 원문이 없다
+            return "API secret"
         return f"API secret ({parts[1][:4]}…)"
     if len(parts) == 3:
         return f"{parts[0]}/{_broker_label(parts[1])}/{parts[2]}"
@@ -873,7 +942,12 @@ def _enc_restore(acfg: dict, kc_enc, pin: str) -> list:
         elif len(parts) == 3:
             a, b, f = parts
             _cr = ((acfg.get(a) or {}).get("creds") or {}).get(b)
-            if _cr is not None and not str(_cr.get(f) or "").strip():
+            if _cr is None and a in acfg and b in _ASSET_BROKERS.get(a, []):
+                # 창고 항목이 YAML에 없어도(옛 저장이 빼먹은 경우) 만들어 되채운다(반박 리뷰 P3, 2026-10-07)
+                _cr = acfg[a].setdefault("creds", {}).setdefault(b, {"f1": "", "f3": ""})
+            if _cr is None:
+                continue                     # 놓을 곳이 없다 - '복원'으로 세지 않는다
+            if not str(_cr.get(f) or "").strip():
                 _cr[f] = str(v)
         out.append(str(k))
     return out
@@ -960,7 +1034,7 @@ _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모�
 #   nt8(Lucid)        = 평가 $2,200 / 펀디드 $450, 방패 없음. 이전 속도 스윕 정본: 평가 $300 / 펀디드 $150
 #                       라이브 락 후는 프롭 모드가 아니라 '잔고 %' 모드 2% 권장(e3d03c3)
 _PROP_PRESETS = {
-    "projectx": {"r_test": 2200.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 6000.0},
+    "projectx": {"r_test": 2200.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 3000.0},   # 방패 6000→3000(대표 2026-10-10 "권고대로", 새 정본 재최적화 ts1)
     "nt8":      {"r_test": 2200.0, "r_buffer": 450.0, "r_steady": 450.0, "buffer": 0.0,
                  "r_live": 100.0},
 }
@@ -975,9 +1049,35 @@ _TOPSTEP_R_TEST = _PROP_PRESETS["projectx"]["r_test"]   # 평가 1R 이행 목�
 _TOPSTEP_R_FUNDED = _PROP_PRESETS["projectx"]["r_steady"]   # 펀디드 1R 이행 목표(2026-09-29 450)
 
 
-def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
+_PROP_SIG_KEYS = ("r_test", "r_buffer", "r_steady", "buffer")
+# 앱이 스스로 앉혀 온 프롭 값 묶음(r_test, r_buffer, r_steady, buffer) - 새 계좌 기본값과 그 기동 이행 결과(Topstep 1800/450·2200/450).
+# 프롭 창이 '아직 안 정한 계좌'를 가리는 데만 쓴다(오픈 준비 버그 조사 2026-10-06 Q). 숫자 자체는 위 정본 그대로.
+_PROP_SHIPPED_DEFAULTS = {
+    tuple(float(_PROP_DEFAULTS[k]) for k in ("r_test", "r_buffer", "r_steady", "buffer")),
+    (1800.0, 450.0, 450.0, 6000.0),
+    (2200.0, 450.0, 450.0, 6000.0),     # 11f까지 배포된 Topstep 기본값(방패 6000)
+    (_TOPSTEP_R_TEST, _TOPSTEP_R_FUNDED, _TOPSTEP_R_FUNDED, _PROP_PRESETS["projectx"]["buffer"]),
+}
+# 이행된 프롭 값 기록(오픈 준비 버그 조사 2026-10-06 Q) - {(계좌 id, 전, 후): 로그 남겼나}. _new_acct는 모듈 함수라
+# 화면 로그를 못 쓰므로 여기 모아 두고 App이 기동 때 한 줄씩 남긴다(_build가 _load를 여러 번 불러도 한 번만).
+_PROP_MIGRATED = {}
+
+
+DEFAULT_ONE_R = 500.0   # 새 계좌 기본 1R(대표 2026-10-09 "1R을 500으로" - 서버 engine/costs.R_USD와 같은 값). 새로 만드는 계좌에만 쓴다.
+_LEGACY_ONE_R = 600.0   # 옛 기본값 - 기존 설정에 1R 칸이 없을 때 읽는 값·옛 설정 이행·R 원장 추정. 기존 계좌 1R은 바꾸지 않는다(대표 10/9).
+
+
+def _new_acct(one_r=DEFAULT_ONE_R, acct_id="", on=True, label="", prop=None, pct=None, manual=False,
               broker="", topstep=False, one_lim=0.0, lucid=False):
     p = dict(_PROP_DEFAULTS)
+    # 프롭 값 출처 표식 "set"(오픈 준비 버그 조사 2026-10-06 Q): True = 회원이 프롭 창에서 저장한 값,
+    # False = 새 계좌(아직 안 정함 - 창이 1R 칸을 0으로 연다), 키 없음 = 이 표식 전에 저장된 옛 값.
+    # 종전엔 새 계좌도 옛 기본값 1200/300/300·6000을 그대로 들고 다녀 창에 1200/300이 미리 채워졌고, 그대로
+    # 저장하면 다음 재시작 때 아래 이행에 걸려 말없이 2200/450이 됐다. 숫자(기본값·프리셋)는 그대로 둔다(9/30 동결).
+    if not isinstance(prop, dict):
+        p["set"] = False
+        if topstep:                              # 새 Topstep 계좌 방패 = 프리셋(3000, 대표 10/10) - 옛 기본 6000이 남아 이행에서 빠지던 것(리뷰 P2-2)
+            p["buffer"] = _PROP_PRESETS["projectx"]["buffer"]
     if isinstance(prop, dict):
         p.update({k: prop[k] for k in _PROP_DEFAULTS if k in prop})
         p["on"] = bool(p["on"])
@@ -985,6 +1085,11 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
+        if "set" in prop:
+            p["set"] = bool(prop.get("set"))
+        _before = tuple(p[k] for k in _PROP_SIG_KEYS)
+    if isinstance(prop, dict) and p.get("set") is not True:
+        # ↓ 이행은 회원이 창에서 저장한 값(set=True)에는 걸지 않는다 - 손으로 고른 1200/300이 재시작에 바뀌면 안 된다.
         # (900/300/600·9000 및 1200/300/450·3000 → 방패 6000 체제). 커스텀 값은 불변.
         if (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) in (
                 (900.0, 300.0, 600.0, 9000.0), (1200.0, 300.0, 450.0, 3000.0)):
@@ -993,14 +1098,20 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         # 평가 1R 1800·펀디드 1R 450으로. 1800/300은 배포된 적 없는 조합이라 손으로 고른 값으로 보고 건드리지 않는다(수동 우선).
         # Lucid(nt8)는 대상 아님 - 같은 1800이 Lucid 평가 MLL $4,500에선 2.5R이다. 브로커는 호출부(설정 로드)가 판정해 넘긴다.
         # 2026-09-30(정책 88f83243): 배포된 기본값(1200/300/300·6000, 1800/450/450·6000)을 그대로 쓰던 Topstep 계좌 → 2200/450.
+        # 2026-10-10(대표 "권고대로"): 방패 6000→3000. 배포된 기본값(2200/450/450·6000 포함)을 그대로 쓰던 Topstep 계좌만 새 방패로.
         if topstep and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) in (
-                (1200.0, 300.0, 300.0, 6000.0), (1800.0, 450.0, 450.0, 6000.0)):
+                (1200.0, 300.0, 300.0, 6000.0), (1800.0, 450.0, 450.0, 6000.0), (2200.0, 450.0, 450.0, 6000.0)):
             p["r_test"] = _TOPSTEP_R_TEST
             p["r_buffer"] = p["r_steady"] = _TOPSTEP_R_FUNDED
+            p["buffer"] = _PROP_PRESETS["projectx"]["buffer"]
         # Lucid(nt8): 배포된 프리셋 300/150/150·0을 그대로 쓰던 계좌만 2200/450으로. 손으로 바꾼 값·라이브 1R은 그대로.
         if lucid and (p["r_test"], p["r_buffer"], p["r_steady"], p["buffer"]) == (300.0, 150.0, 150.0, 0.0):
             _lp = _PROP_PRESETS["nt8"]
             p["r_test"], p["r_buffer"], p["r_steady"] = _lp["r_test"], _lp["r_buffer"], _lp["r_steady"]
+        # 켜진 프롭 계좌의 값이 이행으로 바뀌면 기록한다 - App이 기동 때 로그 한 줄로 남긴다(Q, 종전엔 말없이 바뀜).
+        _after = tuple(p[k] for k in _PROP_SIG_KEYS)
+        if p["on"] and _after != _before:
+            _PROP_MIGRATED.setdefault((str(acct_id or ""), _before, _after), False)
     pc = dict(_PCT_DEFAULTS)
     if isinstance(pct, dict):
         pc["on"] = bool(pct.get("on"))
@@ -1008,7 +1119,7 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
         pc["floor"] = _as_float(pct.get("floor"), _PCT_DEFAULTS["floor"])
     # broker: 계좌별 브로커(대표 2026-08-09 "계좌 추가에서 브로커 선택" — BTC Bybit+Bitget
     # 동시 발주). ""=자산 기본 브로커 사용(_acct_broker가 해석) — 구 설정 무변경 호환.
-    return {"id": str(acct_id or ""), "one_r": float(one_r or 600), "on": bool(on),
+    return {"id": str(acct_id or ""), "one_r": float(one_r or DEFAULT_ONE_R), "on": bool(on),
             "label": str(label or ""), "prop": p, "pct": pc, "manual": bool(manual),
             "broker": str(broker or ""),
             # 한 계약 허용 한도 $(대표 2026-09-30 "어 그 방식 좋아"): 자기 자본 계좌에서 수량이 0으로 나올 때 한 계약 위험이
@@ -1017,11 +1128,533 @@ def _new_acct(one_r=600.0, acct_id="", on=True, label="", prop=None, pct=None, m
 
 
 def _as_float(v, default=0.0):
-    """관대한 float 파싱(콤마 허용). 실패 시 default — 위젯/설정값 방어."""
+    """관대한 float 파싱(콤마 허용). 실패 시 default — 위젯/설정값 방어.
+    ⚠️회원이 손으로 치는 금액 칸에는 쓰지 않는다 - 그쪽은 _parse_amount(엄격)."""
     try:
         return float(str(v).replace(",", "").strip())
     except (TypeError, ValueError):
         return default
+
+
+def _key_changed(cr, armed) -> bool:
+    """지금 설정의 키(f1·f3)가 무장 사본의 키와 다른가(버그 조사 재검증 2026-10-06 1). 신호 때 진입을 건너뛰는
+    _live_acct_cfg와 화면의 '다시 무장해야 적용'(_rearm_needs)이 이 한 비교를 같이 쓴다 - 표시와 동작이 갈리지 않게.
+    앞뒤 공백만 다른 값은 같은 키로 본다(저장 경로가 공백을 걷어내므로, 공백 차이로 진입을 놓치지 않게)."""
+    cr, armed = cr or {}, armed or {}
+    return (str(cr.get("f1") or "").strip() != str(armed.get("f1") or "").strip()
+            or str(cr.get("f3") or "").strip() != str(armed.get("f3") or "").strip())
+
+
+def _parse_amount(v):
+    """회원이 손으로 치는 금액 칸(1R, 프롭 1R·통과 목표, 한 계약 한도, 계산기 자본금) 전용 엄격 파서
+    (오픈 준비 버그 조사 2026-10-06 R). 종전 _as_float는 쉼표를 지워 '600,00'→60000, '62,5'→625(유럽식 소수
+    쉼표가 10~100배 위험으로), '1.000'→1로 읽었다. 받는 꼴: 숫자(600), 점 하나 소수(62.5), 세 자리씩 묶은 쉼표
+    (1,800 / 1,800.5). 앞의 $와 공백은 무시. 그 밖(쉼표 소수, '1.000'처럼 점 천 단위로도 읽히는 꼴, 음수, 글자)은 None.
+    0은 숫자로 돌려준다 - 0을 받을지는 칸마다 호출부가 정한다. _as_float는 설정 로드·브로커 응답용으로 그대로 둔다."""
+    import re as _re
+    s = str(v if v is not None else "").strip().replace(" ", "")
+    if s.startswith("$"):
+        s = s[1:]
+    if not s:
+        return None
+    if _re.fullmatch(r"[0-9]{1,3}(\.[0-9]{3})+", s):        # '1.000', '2.200': 천 단위인지 소수인지 갈리지 않음
+        return None
+    if _re.fullmatch(r"[0-9]+(\.[0-9]+)?", s):
+        return float(s)
+    if _re.fullmatch(r"[1-9][0-9]{0,2}(,[0-9]{3})+(\.[0-9]+)?", s):
+        return float(s.replace(",", ""))
+    return None
+
+
+def _amount_why(v, ko=True):
+    """_parse_amount가 받지 않은(또는 0 이하인) 입력의 이유 한 마디 - KO/EN(오픈 준비 버그 조사 2026-10-06 R)."""
+    s = str(v if v is not None else "").strip()
+    if not s:
+        return "빈 칸" if ko else "empty"
+    _p = _parse_amount(s)
+    if _p is not None or (s.startswith("-") and _parse_amount(s[1:]) is not None):   # 0 또는 음수
+        return "0보다 커야 함" if ko else "must be above 0"
+    import re as _re
+    _s2 = s.replace(" ", "").lstrip("$")
+    if _re.fullmatch(r"[0-9]{1,3}(\.[0-9]{3})+", _s2):
+        return ("점 뒤 세 자리는 천 단위인지 소수인지 갈리지 않음" if ko
+                else "three digits after the point could be thousands or decimals")
+    if "," in _s2:
+        return ("쉼표를 소수점으로 읽지 않음(소수점은 점)" if ko
+                else "a comma is not read as a decimal point (the decimal point is '.')")
+    return "숫자로 읽지 못함" if ko else "not a number"
+
+
+def _mask_email(v: str) -> str:
+    """이메일 화면 가림(대표 2026-10-12): 첫 글자와 '@도메인'만 남기고 나머지는 별표. 예: kyowon@gmail.com → k*****@gmail.com."""
+    _loc, _dom = str(v).split("@", 1)
+    return (_loc[:1] + "*" * max(3, len(_loc) - 1)) + "@" + _dom
+
+
+def _looks_email(v) -> bool:
+    import re as _re
+    return bool(_re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(v or "").strip()))
+
+
+class _MaskEmailEntry(ttk.Entry):
+    """브로커 연결의 이메일 칸(TopstepX 로그인 이메일 등): 칸을 떠나 있으면 가려 보이고(_mask_email), 누르면 원문.
+    get()은 늘 원문을 준다 - 저장·연결·복사 경로는 그대로다. 이메일 모양이 아닌 값(아이디·토큰)은 가리지 않는다.
+    화면 공유·스크린샷에서 회원 이메일이 그대로 보이던 것(대표 2026-10-12)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._real = None
+        self.bind("<FocusIn>", lambda e: self._unmask(), add="+")
+        self.bind("<FocusOut>", lambda e: self._apply_mask(), add="+")
+        # 가린 채로 키·붙여넣기가 오면(포커스 이벤트 없이) 먼저 원문으로 - 위젯 바인딩이 클래스 바인딩(ttk::entry::Insert)보다 먼저 돈다
+        for _ev in ("<KeyPress>", "<<Paste>>", "<Button-1>", "<<TraverseIn>>"):   # Tab으로 들어올 때도(리뷰 P2-A)
+            self.bind(_ev, lambda e: self._unmask(), add="+")
+
+    def _set_raw(self, text):
+        _st = str(self.cget("state"))
+        if _st != "normal":
+            ttk.Entry.config(self, state="normal")
+        ttk.Entry.delete(self, 0, "end")
+        ttk.Entry.insert(self, 0, text)
+        if _st != "normal":
+            ttk.Entry.config(self, state=_st)
+
+    def _apply_mask(self):
+        try:
+            if self._real is not None or self.focus_get() is self:
+                return
+        except Exception:
+            pass
+        try:                                     # 전체 선택 상태 기억(가림이 선택을 지움 - 돌아와 붙여넣기가 이어 붙던 것, 리뷰 P2-A)
+            self._sel_all = bool(self.selection_present()) and self.index("sel.first") == 0 and self.index("sel.last") == self.index("end")
+        except Exception:
+            self._sel_all = False
+        v = ttk.Entry.get(self)
+        if _looks_email(v):
+            self._real = v
+            self._set_raw(_mask_email(v.strip()))
+
+    def _unmask(self):
+        if self._real is not None:
+            v, self._real = self._real, None
+            self._set_raw(v)
+            if getattr(self, "_sel_all", False):
+                self.selection_range(0, "end"); self.icursor("end")
+
+    def get(self):
+        _shown = ttk.Entry.get(self)
+        if self._real is not None:
+            if _shown == _mask_email(self._real.strip()):
+                return self._real
+            self._real = None          # 가린 글자가 Tk 쪽에서 바뀌었다(지우기·키 입력) = 이제 화면 글자가 진짜 값
+        return _shown
+
+    def delete(self, first, last=None):
+        self._unmask()
+        ttk.Entry.delete(self, first, last)
+
+    def insert(self, index, string):
+        # 프로그램이 넣는 값(자동 저장의 되채우기·붙여넣기)은 가리지 않는다 - 되채운 칸의 '전부 선택' 상태를 가림이 깨면
+        # 다음 키 입력이 이어 붙는다(test_global_creds RV). 가림은 칸을 떠날 때(FocusOut)와 화면을 처음 그릴 때만.
+        self._unmask()
+        ttk.Entry.insert(self, index, string)
+
+
+def _entry_set_text(e, text):
+    """입력 칸 글자를 바꾼다 - 잠김(readonly·disabled) 상태면 잠깐 풀었다 되돌린다(오픈 준비 버그 조사 2026-10-06 R)."""
+    try:
+        _st = str(e.cget("state"))
+        if _st != "normal":
+            e.config(state="normal")
+        e.delete(0, "end")
+        e.insert(0, text)
+        if _st != "normal":
+            e.config(state=_st)
+    except Exception:
+        pass
+
+
+def _prop_is_unset(saved):
+    """프롭 창이 1R 칸을 0으로 열어야 하는가 = 아직 회원이 정하지 않은 계좌인가(오픈 준비 버그 조사 2026-10-06 Q).
+    set=False(새 계좌)거나, 표식 전 옛 값이면서 꺼져 있고 앱이 앉혀 온 기본값 묶음 그대로일 때."""
+    s = saved or {}
+    if not s or s.get("set") is False:
+        return True
+    if "set" in s or s.get("on"):
+        return False
+    return tuple(_as_float(s.get(k), -1.0) for k in _PROP_SIG_KEYS) in _PROP_SHIPPED_DEFAULTS
+
+
+def _prop_parse_fields(raw, labels, ko=True):
+    """프롭 창 칸 글자 {키: 글자} → ({키: 값}, [못 읽은 칸 설명])(오픈 준비 버그 조사 2026-10-06 R).
+    엄격 파서로 읽고, 빈 칸은 0(종전엔 기본값 1200 등이 몰래 앉았다 - 켜져 있으면 호출부의 >0 검사가 막는다)."""
+    vals, bad = {}, []
+    for k, v in (raw or {}).items():
+        _raw = str(v if v is not None else "").strip()
+        if not _raw:
+            vals[k] = 0.0
+            continue
+        _pv = _parse_amount(_raw)
+        if _pv is None:
+            bad.append(f"{str((labels or {}).get(k, k)).rstrip(' $')}: '{_raw}' - {_amount_why(_raw, ko)}")
+        else:
+            vals[k] = _pv
+    return vals, bad
+
+
+# ── 브로커 연결 공용(대표 2026-10-07 "저장 방식 그대로. 자산별 말고 브로커별") ──────────────────────
+# 디스크는 그대로다: config.yaml assets[a].creds[b], 키체인 eq:<a>:<b>:<f>, f2는 f1 값이 계정 이름, kc_enc, .eqset v1.
+# 메모리에서만 같은 브로커를 쓰는 자산(NQ·GC의 projectx·nt8·ibkr)의 creds[b]를 **같은 dict 하나**로 묶는다(별칭).
+# 그래서 직접 읽는 곳(_live_acct_cfg·_rearm_needs·_master_arm·_restore_open_ctx…)은 고치지 않아도 공용 값을 본다.
+# 값이 달라 판별이 안 되면 묶지 않는다(split = 종전 자산별 그대로). 키체인 항목은 이 과정에서 하나도 지우지 않는다.
+# 저장은 '미러 대상' 쌍에만 쓴다(_mirror_pairs) - 옛 빌드(03b·06a·09.30b)로 되돌려도 서버 연결 표시가 이주 전과 같게.
+_SCRUB_FIELDS = {"projectx": ("f1",), "ibkr": ("f1", "f3"), "nt8": ("f3",)}   # 비밀이 아닌 칸(평문 저장)
+_BRIDGE_CS = "EQAutopilotBridge.cs"
+
+
+def _panel_asset_of(app) -> str:
+    """패널 칸이 고치는 창고의 자산(패널 상태가 없으면 계좌 탭 자산 - 옛 호출·시험 호환)."""
+    _pa = getattr(app, "_panel_asset", None)
+    return _pa if _pa in _ASSETS else app._asset
+
+
+def _panel_brokers() -> list:
+    """브로커 연결 설정 패널 드롭다운에 나오는 브로커 전부(자산 순서대로 처음 나온 순)."""
+    return list(dict.fromkeys(b for a in _ASSETS for b in _ASSET_BROKERS.get(a, [])))
+
+
+def _bk_holders(bk) -> list:
+    """그 브로커를 쓸 수 있는 자산(_ASSETS 순서 = NQ 먼저)."""
+    return [a for a in _ASSETS if bk in _ASSET_BROKERS.get(a, [])]
+
+
+def _bk_shared(bk) -> bool:
+    """자산 둘 이상이 같이 쓰는 브로커인가(지금은 projectx·nt8·ibkr = NQ·GC. BTC 거래소 키는 원래 하나)."""
+    return len(_bk_holders(bk)) > 1
+
+
+def _cr_has(cr) -> bool:
+    """창고에 값이 있는가(f1·f3·가용 계좌 중 하나라도)."""
+    cr = cr if isinstance(cr, dict) else {}
+    return bool(str(cr.get("f1") or "").strip() or str(cr.get("f3") or "").strip()
+                or any(str(x).strip() for x in (cr.get("avail") or [])))
+
+
+def _crypto_default_bk(acfg, asset, unique=True) -> str:
+    """크립토 전용 자산(BTC)의 브로커 빈 행 해석(재리뷰 P2, 2026-10-08): 키가 있는 거래소가 정확히 하나면 그 거래소.
+    Bitget만 쓰는 새 회원의 기본 행이 Bybit(자산 기본)로 해석돼 라이브 시작 전체가 'Bybit 키 미설정'으로 멈췄다. 아니면 ''.
+    unique=False면 늘 ''(자산 기본 브로커로) - 보이는 키가 전부가 아닌 세션(PIN 취소·키 저장 실패)에서는 '유일한 키'가 거짓일 수 있다."""
+    if not unique:
+        return ""
+    _bs = _ASSET_BROKERS.get(asset, [])
+    if not _bs or any(_BROKER_SPEC.get(b, {}).get("acct") for b in _bs):
+        return ""
+    _c = ((acfg.get(asset) or {}).get("creds")) or {}
+    _have = [b for b in _bs if str(((_c.get(b) or {}).get("f1")) or "").strip()]
+    return _have[0] if len(_have) == 1 else ""
+
+
+def _row_broker_of(acfg, asset, row, unique=True) -> str:
+    """App._acct_broker와 같은 해석(행 브로커가 비거나 못 쓰는 값이면 자산 기본 브로커, 크립토는 키가 있는 유일한 거래소) - App 없이."""
+    bk = str((row or {}).get("broker") or "").strip()
+    if bk in _ASSET_BROKERS.get(asset, []):
+        return bk
+    return _crypto_default_bk(acfg, asset, unique) or ((acfg.get(asset) or {}).get("broker")) or _ASSET_BROKERS[asset][0]
+
+
+def _row_uses(acfg, asset, bk) -> bool:
+    """그 자산의 켜진 비수동 행이 bk를 쓰는가. 선물(계좌 ID가 있는 브로커)은 계좌 ID까지 있어야 한다 -
+    _load가 만드는 기본 빈 행(on=True, id '')을 '쓴다'로 세면 손대지 않은 GC가 연결로 잡힌다(판정 (마))."""
+    for x in ((acfg.get(asset) or {}).get("accounts") or []):
+        if not isinstance(x, dict) or not x.get("on") or x.get("manual"):
+            continue
+        if _row_broker_of(acfg, asset, x) != bk:
+            continue
+        if _BROKER_SPEC.get(bk, {}).get("acct") and not str(x.get("id") or "").strip():
+            continue
+        return True
+    return False
+
+
+def _creds_seed(acfg) -> set:
+    """기동 때(되채움 뒤) 값이 있던 (자산, 브로커) 쌍 - 저장 미러 대상 ①."""
+    out = set()
+    for a in _ASSETS:
+        for b, cr in (((acfg.get(a) or {}).get("creds")) or {}).items():
+            if _cr_has(cr):
+                out.add((a, b))
+    return out
+
+
+def _mirror_pairs(acfg, seed, split) -> set:
+    """저장(YAML·키체인·kc_enc)에 쓸 (자산, 브로커) 쌍. 공용 브로커는 ①seed ②켜진 비수동 행이 쓰고 선물은 계좌 ID
+    있음 ③둘 다 없으면 첫 holder(NQ). split 브로커는 값이 있는 자산 전부(+seed). 공용이 아닌 브로커는 전부."""
+    seed = seed or set()
+    split = split or set()
+    out = set()
+    for a in _ASSETS:
+        for b in (((acfg.get(a) or {}).get("creds")) or {}):
+            if not _bk_shared(b):
+                out.add((a, b))
+    for b in dict.fromkeys(b for a in _ASSETS for b in _ASSET_BROKERS.get(a, [])):
+        if not _bk_shared(b):
+            continue
+        hs = [a for a in _bk_holders(b) if a in acfg]
+        _has = [a for a in hs if b in (((acfg.get(a) or {}).get("creds")) or {})]
+        if b in split:
+            t = {(a, b) for a in _has
+                 if (a, b) in seed or _cr_has(acfg[a]["creds"].get(b))}
+        else:
+            t = {(a, b) for a in _has if (a, b) in seed or _row_uses(acfg, a, b)}
+            if not t and _has:
+                t = {(_has[0], b)}
+        out |= t
+    return out
+
+
+def _broker_short(bk) -> str:
+    """안내 문구용 짧은 브로커 이름."""
+    return {"projectx": "Topstep", "nt8": "Lucid / Tradovate", "ibkr": "IBKR"}.get(bk) or _broker_label(bk)
+
+
+def _looks_token(v) -> bool:
+    """토큰·API Key 모양인가(영숫자·-·_ 12자 이상, '@' 없음). 이메일·호스트·포트는 아니다."""
+    import re as _re
+    return bool(v) and bool(_re.fullmatch(r"[A-Za-z0-9_\-]{12,}", str(v)))
+
+
+def _looks_app_bridge_token(v) -> bool:
+    """앱이 만든 Bridge Token 모양인가 - secrets.token_urlsafe(18) = 정확히 24자 URL 안전 문자.
+    TopstepX 아이디는 이메일이 아닌 사용자명일 수 있어(숫자·밑줄 섞인 긴 이름), '12자 이상 토큰 모양'만으로는
+    Bridge Token 칸의 값을 비밀로 단정하지 않는다(2026-10-07 재리뷰 사전 지적)."""
+    import re as _re
+    return bool(v) and bool(_re.fullmatch(r"[A-Za-z0-9_\-]{24}", str(v)))
+
+
+def _is_bridge_secret(v, btok) -> bool:
+    """Bridge Token 칸 값이 진짜 브리지 비밀인가: 설치된 .cs 토큰과 같거나, .cs를 못 읽었을 때 앱 생성 모양."""
+    v = str(v or "").strip()
+    if not v or "@" in v:
+        return False
+    if btok:
+        return v == btok
+    return _looks_app_bridge_token(v)
+
+
+def _field_short(bk, f, ko=True) -> str:
+    """안내 문구용 칸 이름(값은 절대 넣지 않는다)."""
+    _m = {("projectx", "f1"): ("TopstepX 로그인 이메일", "TopstepX user email"),
+          ("ibkr", "f1"): ("Host", "Host"), ("ibkr", "f3"): ("포트 번호(7497 또는 7496)", "port number (7497 or 7496)"),
+          ("nt8", "f1"): ("Bridge Token", "Bridge Token"), ("nt8", "f3"): ("포트 번호(기본 8377)", "port number (default 8377)")}
+    _v = _m.get((bk, f))
+    if _v:
+        return _v[0] if ko else _v[1]
+    return str((_BROKER_SPEC.get(bk) or {}).get(f) or f)
+
+
+def _nt8_custom_dirs(profile=None) -> list:
+    """NinjaTrader 8 bin/Custom 후보 폴더(_nt8_install_bridge와 공용, 2026-10-07):
+    ①지난번 성공 경로(프로필 기억) ②윈도 레지스트리의 실제 '문서' 위치 ③기본·OneDrive 후보."""
+    dirs = []
+    _saved = str((profile or {}).get("nt8_custom_dir") or "")
+    if _saved:
+        dirs.append(_saved)
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion"
+                            r"\Explorer\User Shell Folders") as _k:
+            _docs = winreg.QueryValueEx(_k, "Personal")[0]
+            _docs = os.path.expandvars(_docs)
+            dirs.append(os.path.join(_docs, "NinjaTrader 8", "bin", "Custom"))
+    except Exception:
+        pass                          # 맥/리눅스 또는 레지스트리 접근 실패 - 후보로 계속
+    _home = os.path.expanduser("~")
+    dirs.append(os.path.join(_home, "Documents", "NinjaTrader 8", "bin", "Custom"))
+    _od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer") or ""
+    if _od:
+        dirs.append(os.path.join(_od, "Documents", "NinjaTrader 8", "bin", "Custom"))
+        dirs.append(os.path.join(_od, "문서", "NinjaTrader 8", "bin", "Custom"))
+    return dirs
+
+
+def _installed_bridge(profile=None):
+    """설치된 NT8 애드온의 (Token, 포트)(읽기만). 못 읽거나 배포 기본값(CHANGE-ME…)이면 ('', '')."""
+    import re as _re
+    for d in _nt8_custom_dirs(profile):
+        p = os.path.join(d, "AddOns", _BRIDGE_CS)
+        try:
+            if not os.path.isfile(p):
+                continue
+            with open(p, encoding="utf-8") as f:
+                txt = f.read()
+            m = _re.search(r'private const string Token\s*=\s*"([^"]*)"', txt)
+            tok = (m.group(1) if m else "").strip()
+            if not tok or tok.startswith("CHANGE-ME"):
+                continue
+            mp = _re.search(r'private const string BaseUrl\s*=\s*"http://127\.0\.0\.1:(\d+)"', txt)
+            return tok, (mp.group(1) if mp else "")
+        except Exception:
+            continue
+    return "", ""
+
+
+def _installed_bridge_token(profile=None) -> str:
+    return _installed_bridge(profile)[0]
+
+
+def _unify_creds(acfg, profile=None, enc_locked=False, only=None, bridge=None):
+    """브로커 자격을 자산 공용으로 묶는다(메모리만, 대표 2026-10-07). 반환 (split:set, notes:list).
+    1) enc_locked(kc_enc가 있는데 이번 기동에 PIN으로 열지 못함) = 아무것도 묶지 않는다(블롭 안 값이 메모리에 없다).
+    2) 오염 걸러내기(only 없을 때): 비밀이 아닌 칸에 메모리의 비밀·설치된 브리지 토큰이 들어 있으면 메모리에서만 비운다.
+       Bridge Token 자리의 이메일·Topstep 아이디도 비운다. 키체인은 지우지 않는다.
+    3) 필드 단위 비교: 같거나 한쪽이 비면 합친다(빈 칸 채움, NQ 먼저, 가용 계좌 = 순서 지킨 합집합).
+    4) 충돌: projectx는 API Key(f2)가 있는 아이디가 정확히 하나면 그것, nt8은 설치된 브리지 토큰과 같은 것.
+       그 밖은 split(종전 자산별 그대로). notes에는 값을 넣지 않는다."""
+    split, notes = set(), []
+    bks = [only] if only else list(dict.fromkeys(b for a in _ASSETS for b in _ASSET_BROKERS.get(a, [])))
+    bks = [b for b in bks if _bk_shared(b)]
+
+    def _s(v):
+        return str(v or "").strip()
+
+    def _cr(a, b):
+        _c = (acfg.get(a) or {}).get("creds") or {}
+        _x = _c.get(b)
+        return _x if isinstance(_x, dict) else None
+
+    if bridge is None:
+        bridge = _installed_bridge(profile)
+    btok, bport = (bridge or ("", ""))[:2]
+    force_split = set()
+    if only is None:
+        # 값의 모양으로 어느 쪽이 섞였는지 정한다(2026-10-07 반박 리뷰 P1): '@'가 든 값 = 이메일(Topstep 아이디 자리가 맞다),
+        # 토큰 모양(영숫자·-·_ 12자 이상, '@' 없음) = 비밀(Bridge Token·API Key 자리가 맞다). 이메일은 비밀 집합에 넣지 않는다 -
+        # Bridge Token 칸에 남은 이메일 때문에 진짜 Topstep 이메일이 지워지던 것을 막는다. 모양으로 못 정하면 지우지 않고 split.
+        # 비밀 집합: 크립토 비밀은 토큰 모양만, Bridge Token(nt8 f1)은 _is_bridge_secret(655fa4ae)이고 그 이름으로 Topstep API Key가
+        # 저장되지 않은 값만(= 진짜 Topstep 아이디는 빼고). 설치된 .cs 토큰은 늘 넣는다.
+        secrets = set()
+        for a in _ASSETS:
+            for b, cr in (((acfg.get(a) or {}).get("creds")) or {}).items():
+                for f in _secret_fields(b):
+                    _sv = _s(cr.get(f)) if isinstance(cr, dict) else ""
+                    if not _sv:
+                        continue
+                    if b == "nt8" and f == "f1":
+                        # 지우는 쪽은 좁게 둔다(655fa4ae): .cs 토큰과 같거나 .cs가 없을 때 앱 생성 모양만. 거절(쓰기 가드)은 넓게.
+                        if _is_bridge_secret(_sv, btok) and not _f2_load(_sv):
+                            secrets.add(_sv)
+                    elif _looks_token(_sv):
+                        secrets.add(_sv)
+        if btok:
+            secrets.add(btok)
+        _nt8v = {_s((_cr(a, "nt8") or {}).get("f1")) for a in _ASSETS} - {""}
+        _ambv, _ambn = set(), []
+        for a in _ASSETS:
+            for b, fs in _SCRUB_FIELDS.items():
+                cr = _cr(a, b)
+                if cr is None:
+                    continue
+                for f in fs:
+                    _v = _s(cr.get(f))
+                    if not _v or "@" in _v:
+                        continue                          # 이메일은 Topstep 아이디 자리 - 그대로
+                    if b == "projectx" and _f2_load(_v):
+                        # 이 아이디 이름으로 Topstep API Key가 저장돼 있다 = 진짜 Topstep 아이디 - 지우지 않는다(1b 반박 리뷰 P3).
+                        if _v == btok:
+                            continue                      # Bridge Token과 Topstep 아이디가 같은 값으로 둘 다 정상인 설정(재리뷰 P2)
+                        if _v in _nt8v:
+                            _ambn.append((a, b, f, _v))   # 아래 nt8 정리 뒤에도 남으면 모호
+                        continue
+                    if _v in secrets:
+                        cr[f] = ""
+                        notes.append(("scrub", a, b, f, "token"))
+                    elif b == "projectx" and _v in _nt8v:
+                        _ambn.append((a, b, f, _v))
+        for a in _ASSETS:
+            cr = _cr(a, "nt8")
+            _v = _s((cr or {}).get("f1"))
+            if _v and _v != btok and "@" in _v:      # Bridge Token 자리의 이메일(설치된 브리지와 같은 값은 진짜 토큰)
+                cr["f1"] = ""
+                notes.append(("scrub", a, "nt8", "f1", "email"))
+            elif (_v and btok and _v != btok
+                  and any(_v == _s((_cr(_x, "projectx") or {}).get("f1")) for _x in _ASSETS)):
+                # Bridge Token 자리의 Topstep 아이디(설치된 브리지 토큰과 다르고 Topstep 아이디와 같음) - 메모리에서만 뺀다
+                cr["f1"] = ""
+                notes.append(("scrub", a, "nt8", "f1", "id"))
+        # 모호: 같은 값이 Topstep 아이디와 Bridge Token 두 자리에 남았을 때만(.cs로 판별되면 위에서 nt8 쪽을 이미 뺐다 - 재리뷰 P3)
+        _nt8_left = {_s((_cr(a, "nt8") or {}).get("f1")) for a in _ASSETS} - {""}
+        for (a, b, f, _v) in _ambn:
+            if _v in _nt8_left:
+                force_split.update({"projectx", "nt8"})
+                notes.append(("ambig", a, b, f))
+                _ambv.add(_v)
+    if enc_locked:
+        # PIN을 열지 못한 기동: 오염 걸러내기(메모리 값과 .cs만)는 돌리고 합치기만 건너뛴다(재리뷰 P3 - 토큰이 YAML 평문에 남았다)
+        return set(bks), notes
+    for bk in bks:
+        hs = [a for a in _bk_holders(bk) if a in acfg]
+        if len(hs) < 2:
+            continue
+        if bk in force_split:
+            split.add(bk)
+            continue
+        dicts = []
+        for a in hs:
+            cr = _cr(a, bk)
+            if cr is not None and not any(cr is d for _, d in dicts):
+                dicts.append((a, cr))
+        cands = [(a, cr) for a, cr in dicts if _s(cr.get("f1")) or _s(cr.get("f3"))]
+        merged, conflict = {}, False
+
+        def _fv(cr, f, _bk=bk):
+            # Bridge Port 빈 칸 = 기본 8377(_build_broker가 int(f3 or 8377)로 듣는다) - '값 없음'으로 보고 다른 자산의 포트로
+            # 채우면 .cs와 어긋났다(1b 반박 리뷰 P2-2, 2026-10-08)
+            _x = _s(cr.get(f))
+            if _x or f != "f3" or not _s(cr.get("f1")):
+                return _x
+            return "8377" if _bk == "nt8" else ("7497" if _bk == "ibkr" else "")
+        for f in ("f1", "f3"):
+            vals = list(dict.fromkeys(_fv(cr, f) for _, cr in cands if _fv(cr, f)))
+            conflict = conflict or len(vals) > 1
+            merged[f] = vals[0] if vals else ""
+        dropped = []
+        if conflict:
+            win = None
+            if bk == "projectx":
+                ok = list(dict.fromkeys(_s(cr.get("f1")) for _, cr in cands
+                                        if _s(cr.get("f1")) and _f2_load(_s(cr.get("f1")))))
+                if len(ok) == 1:
+                    win = next(cr for _, cr in cands if _s(cr.get("f1")) == ok[0])
+            elif bk == "nt8" and btok:
+                hit = [cr for _, cr in cands if _s(cr.get("f1")) == btok]
+                if len({_fv(cr, "f3") for cr in hit} - {""}) > 1:
+                    hit = [cr for cr in hit if _fv(cr, "f3") == (bport or "8377")]
+                if hit:
+                    win = hit[0]
+            if win is None:
+                split.add(bk)
+                notes.append(("split", bk, [a for a, _ in cands]))
+                continue
+            for f in ("f1", "f3"):
+                merged[f] = _fv(win, f) or next((_fv(cr, f) for _, cr in cands if _fv(cr, f)), "")
+            if bk == "nt8" and btok and bport and _s(win.get("f1")) == btok:
+                merged["f3"] = bport                    # .cs 토큰으로 고른 승자는 .cs 포트를 쓴다(진 쪽 포트로 채우지 않음)
+            dropped = [a for a, cr in cands
+                       if any(_fv(cr, f) and _fv(cr, f) != merged[f] for f in ("f1", "f3"))]
+        base = dicts[0][1] if dicts else {"f1": "", "f3": ""}
+        av = []
+        for _, cr in dicts:
+            for n in (cr.get("avail") or []):
+                if str(n).strip() and n not in av:
+                    av.append(n)
+        base["f1"], base["f3"] = merged["f1"], merged["f3"]
+        base["avail"] = av
+        for a in hs:
+            acfg[a].setdefault("creds", {})[bk] = base         # 같은 객체(별칭)
+        if cands:
+            notes.append(("merged", bk, dropped))
+    return split, notes
 
 
 def _load():
@@ -1031,8 +1664,10 @@ def _load():
     (asset_broker/accounts{broker}) ③flat 키. 비밀(f2)은 브로커 f1을 키로 Keychain async 로드."""
     try:
         import yaml
-        with open(CFG_PATH) as f:
-            d = yaml.safe_load(f) or {}
+        with _CFG_LOCK:                       # 저장(os.replace)과 겹치지 않게(오픈 준비 버그 조사 2026-10-06 V - 윈도는 열린 파일을 못 바꿔 끼운다)
+            with open(CFG_PATH) as f:
+                _raw_cfg = f.read()
+        d = yaml.safe_load(_raw_cfg) or {}
     except Exception:
         d = {}
     out = {"lang": d.get("lang", "ko"), "token": d.get("token", "")}
@@ -1053,7 +1688,7 @@ def _load():
             creds = {b: {"f1": (creds_all.get(b) or {}).get("f1", ""),
                          "f3": (creds_all.get(b) or {}).get("f3", "")}
                      for b in brs if b in creds_all}
-            accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
+            accounts = [_new_acct(x.get("one_r") or _LEGACY_ONE_R, x.get("id"), x.get("on", True), x.get("label"),
                                   x.get("prop"), x.get("pct"), False, bk, topstep=(bk == "projectx"),
                                   one_lim=x.get("one_lim"), lucid=(bk == "nt8"))
                         for x in ((d.get("accounts") or {}).get(bk) or [])]
@@ -1074,7 +1709,7 @@ def _load():
                       and not (d.get("f1") or "").strip())
             include = bool(s.get("include", not _fresh))
             if s.get("accounts"):                      # ③ 새 자산중심(현행)
-                accounts = [_new_acct(x.get("one_r"), x.get("id"), x.get("on", True), x.get("label"),
+                accounts = [_new_acct(x.get("one_r") or _LEGACY_ONE_R, x.get("id"), x.get("on", True), x.get("label"),
                                       x.get("prop"), x.get("pct"), False,
                                       x.get("broker", ""),
                                       topstep=((x.get("broker") if x.get("broker") in brs else bk) == "projectx"),
@@ -1082,7 +1717,8 @@ def _load():
                                       lucid=((x.get("broker") if x.get("broker") in brs else bk) == "nt8"))
                             for x in s["accounts"]]
             else:                                      # ① 옛 assets: 단일 acct → 계좌 1개
-                one_r = float(s.get("one_r", 600) or 600)
+                # 새 설치(빈 설정 s)는 새 기본 500, 옛 설정에 1R 칸이 없으면 옛 기본 600(리뷰 P1-1 10/12: 새 설치 첫 계좌가 600이던 것)
+                one_r = float(s.get("one_r") or (_LEGACY_ONE_R if s else DEFAULT_ONE_R))
                 _crbk = (s.get("creds") or {}).get(bk) or {}
                 acct_id = (_crbk.get("acct") or s.get("acct") or "").strip()
                 accounts = [_new_acct(one_r, acct_id, True,
@@ -1108,7 +1744,7 @@ def _load():
             _duniq.append(_x)
         accounts = _duniq
         if not accounts:
-            accounts = [_new_acct(600.0, "", True, _broker_label(bk))]
+            accounts = [_new_acct(DEFAULT_ONE_R, "", True, _broker_label(bk))]
         creds.setdefault(bk, {"f1": "", "f3": ""})
         acfg[a] = {"broker": bk, "creds": creds, "include": include, "accounts": accounts}
     # flat(단일) 키 — 자산 설정 전무할 때만
@@ -1119,7 +1755,7 @@ def _load():
                 acfg[a]["broker"] = fb
                 acfg[a]["creds"][fb] = {"f1": d.get("f1", ""), "f3": d.get("f3", "")}
                 facct = ((d.get("projectx", {}) or {}).get("accounts") or [""])[0]
-                acfg[a]["accounts"] = [_new_acct(d.get("one_r", 600), facct, True, _broker_label(fb))]
+                acfg[a]["accounts"] = [_new_acct(d.get("one_r") or _LEGACY_ONE_R, facct, True, _broker_label(fb))]
                 break
     out["assets"] = acfg
     # 키체인 쓰기가 실패해 평문으로 남은 필드 목록(2026-08-28) - 앱이 기동 시 경고한다.
@@ -1188,6 +1824,47 @@ def _save_open_ctx(d: dict) -> None:
         pass
 
 
+# 미확인 진입 감시(버그 조사 재검증 2026-10-06 2): 진입 결과를 끝내 확인하지 못한 **leg 하나**마다 한 칸
+# {"자산|계좌id|계약": {asset, broker, aid, con, stop, app_stop, dir, size, sc, ts, seen, manual}}.
+# 자산당 하나뿐인 _open_ctx와 따로 둔다 - 거기에 넣으면 미니+마이크로 두 leg 중 마지막 leg만 남고, 같은 자산을 다른
+# 계좌가 확정했으면 그 계좌의 감시까지 이 leg로 바뀌었다. 브로커 객체·비밀은 담지 않는다(복구 때 설정+키체인으로 다시 짓는다).
+_UNCONF_PATH = os.path.join(APP_DIR, ".unconf_watch.json")
+_UNCONF_LOCK = threading.Lock()          # 계좌 스레드 여럿이 동시에 넣어도 파일 읽기-쓰기가 서로 덮지 않게
+# 신호 루프의 '이 신호를 누가 맡았나'(App._sig_seen) 확인·기록을 한 번에 - 옛 세대·새 세대 루프가 잠깐 같이 돌 때(재검증 3)
+_SIG_SEEN_LOCK = threading.Lock()
+_UNCONF_FIELDS = ("asset", "broker", "aid", "con", "leg", "stop", "app_stop", "dir", "size", "sc", "ts", "seen", "manual")
+# 감시 수명: 선물 진입은 그날 세션 마감(NQ 14 ET, GC 06 ET - 진입 뒤 4시간)에 계좌째 닫힌다. 그보다 훨씬 오래된 기록은
+# 그 주문의 포지션이 아니라 나중에 생긴 다른 포지션을 잡을 수 있어 믿지 않는다(재시작 복구 포함).
+_UNCONF_MAX_AGE = 12 * 3600
+
+
+def _load_unconf_watch() -> dict:
+    try:
+        import json as _json
+        import time as _t
+        with open(_UNCONF_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        if not isinstance(d, dict):
+            return {}
+        _now = _t.time()
+        return {str(k): dict(v, _wkey=str(k), unconf=True) for k, v in d.items()
+                if isinstance(v, dict) and _now - float(v.get("ts") or 0) < _UNCONF_MAX_AGE}
+    except Exception:
+        return {}
+
+
+def _save_unconf_watch(d: dict) -> None:
+    try:
+        import json as _json
+        _tmp = _UNCONF_PATH + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            _json.dump({str(k): {_f: v.get(_f) for _f in _UNCONF_FIELDS}
+                        for k, v in (d or {}).items() if isinstance(v, dict)}, f)
+        os.replace(_tmp, _UNCONF_PATH)
+    except Exception:
+        pass
+
+
 def _mark_entered(asset: str) -> dict:
     d = _load_entered()
     import time as _t
@@ -1208,25 +1885,119 @@ def _mark_entered(asset: str) -> dict:
 _RLEDGER_PATH = os.path.join(APP_DIR, ".r_ledger.json")
 
 
+_JSON_LOCK = threading.RLock()   # 원장 JSON 읽기~쓰기 한 덩어리(리뷰 P1-2 10/12: 계좌별 진입 스레드 동시 저장에 새 항목 손실)
+
+
+def _write_json_atomic(path: str, obj) -> None:
+    with _JSON_LOCK:
+        _write_json_atomic_nolock(path, obj)
+
+
+def _write_json_atomic_nolock(path: str, obj) -> None:
+    """작은 원장 JSON 원자 저장(대표 2026-10-12): 임시 파일에 쓰고 fsync → 직전 정상본을 .bak로 → os.replace.
+    종전 open(path, 'w')는 파일을 먼저 비우고 써서, 쓰는 도중 꺼짐(윈도 절전·강제 종료)이면 파일이 0바이트·NUL로
+    남았다 - 실제로 대표 기기의 .r_ledger.json이 246바이트 전부 NUL이 돼, 지난 거래 R이 바뀐 지금 1R로 다시 계산됐다
+    (10/04 BTC −0.645R → −0.43R). 실패는 예외로 올린다(호출부가 조용히 삼킨다 - 진입을 막지 않게)."""
+    import json as _json
+    import time as _tw
+    _tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"     # 스레드마다 따로(잠금 밖 다른 프로세스와도 안 겹치게)
+    with open(_tmp, "w", encoding="utf-8") as f:
+        _json.dump(obj, f)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    try:                                        # 지금 정상본을 .bak로(망가진 파일은 백업하지 않는다)
+        with open(path, encoding="utf-8") as _f0:
+            _json.load(_f0)
+        import shutil as _sh
+        _sh.copyfile(path, path + ".bak")
+    except Exception:
+        pass
+    for _i in range(5):                         # 윈도: 백신·색인기가 잠깐 잡고 있으면 재시도
+        try:
+            os.replace(_tmp, path)
+            return
+        except OSError:
+            _tw.sleep(0.05)
+    # 끝내 못 바꿔 끼우면 직접 쓴다(리뷰 P2-2: 종전엔 기록이 로그 없이 사라지고 .tmp가 남았다) - _write_cfg_atomic과 같은 대신 저장.
+    try:
+        os.remove(_tmp)
+    except Exception:
+        pass
+    _log_to_file(f"⚠ 원장 바꿔 끼우기 실패 - 직접 저장으로 대신함: {os.path.basename(path)}")
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump(obj, f)
+
+
+def _read_json_guarded(path: str, kind):
+    with _JSON_LOCK:
+        return _read_json_guarded_nolock(path, kind)
+
+
+def _read_json_guarded_nolock(path: str, kind):
+    """원장 JSON 읽기: 본 파일이 깨졌으면(NUL·잘림) .bak로 되살리고, 깨진 파일은 .corrupt-시각으로 옮겨 둔다
+    (다음 쓰기가 덮어 증거가 사라지지 않게). 둘 다 없거나 깨졌으면 kind()(빈 dict/list). 반환 (값, 상태)
+    상태 = 'ok' | 'missing' | 'restored' | 'corrupt'."""
+    import json as _json
+    import time as _tr
+
+    def _rd(p):
+        with open(p, encoding="utf-8") as f:
+            v = _json.load(f)
+        if not isinstance(v, kind):
+            raise ValueError("type")
+        return v
+    if not os.path.exists(path):
+        try:
+            return _rd(path + ".bak"), "restored"
+        except Exception:
+            return kind(), "missing"
+    # 손상(ValueError: JSON·인코딩·형식)만 손상으로 본다(리뷰 P2-1). OSError(윈도 공유 잠금·권한)는 파일이 멀쩡할 수 있어
+    # 옮기거나 .bak으로 되돌리면 최신 줄을 잃고 증거도 사라진다 - 짧게 재시도하고 끝내 안 되면 예외(호출부가 쓰지 않고 넘어감).
+    import time as _tr2
+    for _i in range(5):
+        try:
+            return _rd(path), "ok"
+        except ValueError:
+            break
+        except OSError:
+            if _i == 4:
+                raise
+            _tr2.sleep(0.05)
+    try:
+        os.replace(path, path + f".corrupt-{int(_tr.time())}")
+    except Exception:
+        pass
+    try:
+        v = _rd(path + ".bak")
+        try:
+            _write_json_atomic(path, v)
+        except Exception:
+            pass
+        return v, "restored"
+    except Exception:
+        return kind(), "corrupt"
+
+
 def _record_real_r(asset: str, acct: str, one_r: float) -> None:
     """실제 진입 1R 기록: {asset|acct: [[entry_epoch, one_r], ...]} (계좌당 최근 500건 유지)."""
     import time as _t
     import json as _json
-    try:
-        with open(_RLEDGER_PATH, encoding="utf-8") as f:
-            d = _json.load(f)
-        if not isinstance(d, dict):
-            d = {}
-    except Exception:
-        d = {}
-    k = f"{asset}|{acct or ''}"
-    d.setdefault(k, []).append([_t.time(), float(one_r)])
-    d[k] = d[k][-500:]
-    try:
-        with open(_RLEDGER_PATH, "w", encoding="utf-8") as f:
-            _json.dump(d, f)
-    except Exception:
-        pass
+    with _JSON_LOCK:
+        try:
+            d, _st = _read_json_guarded(_RLEDGER_PATH, dict)
+        except OSError as _e:                    # 읽지 못하면 쓰지 않는다(덮어써 지난 1R을 지우지 않게)
+            _log_to_file(f"⚠ 1R 원장 읽기 실패({_e}) - 이번 1R 기록 건너뜀")
+            return
+        k = f"{asset}|{acct or ''}"
+        d.setdefault(k, []).append([_t.time(), float(one_r)])
+        d[k] = d[k][-500:]
+        try:
+            _write_json_atomic(_RLEDGER_PATH, d)
+        except Exception:
+            pass
 
 
 def _lookup_real_r(ledger: dict, asset: str, acct: str, fill_ts: float, fallback: float) -> float:
@@ -1271,10 +2042,9 @@ _SYM_MATCH_DAYS = 7      # EQ가 연 '그 계약'의 청산 매칭창(일) — �
 
 def _ledger_load() -> list:
     try:
-        import json as _json
-        with open(_LEDGER_PATH, encoding="utf-8") as f:
-            d = _json.load(f)
-        return d if isinstance(d, list) else []
+        return _read_json_guarded(_LEDGER_PATH, list)[0]
+    except OSError:
+        raise
     except Exception:
         return []
 
@@ -1284,13 +2054,13 @@ def _ledger_add(asset: str, symbol: str = "", direction: str = "", tag: str = ""
     try:
         import json as _json
         import time as _t
-        d = _ledger_load()
-        d.append({"ts_ms": int(_t.time() * 1000), "asset": asset, "symbol": str(symbol or ""),
-                  "direction": str(direction or ""), "tag": str(tag or "")})
-        cut = (_t.time() - _LEDGER_KEEP_DAYS * 86400) * 1000
-        d = [r for r in d if (r.get("ts_ms") or 0) >= cut]
-        with open(_LEDGER_PATH, "w", encoding="utf-8") as f:
-            _json.dump(d, f)
+        with _JSON_LOCK:                     # 읽기~쓰기 한 덩어리(리뷰 P1-2)
+            d = _ledger_load()
+            d.append({"ts_ms": int(_t.time() * 1000), "asset": asset, "symbol": str(symbol or ""),
+                      "direction": str(direction or ""), "tag": str(tag or "")})
+            cut = (_t.time() - _LEDGER_KEEP_DAYS * 86400) * 1000
+            d = [r for r in d if (r.get("ts_ms") or 0) >= cut]
+            _write_json_atomic(_LEDGER_PATH, d)
     except Exception:
         pass
 
@@ -1371,9 +2141,37 @@ def _mark_pushed() -> None:
 _KC_LAST_FAILED = []       # 직전 저장에서 키체인에 못 넣고 평문으로 남은 필드(경고용)
 
 
-def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acct_open=None):
+def _enc_carry_out(prev_enc) -> dict:
+    """carry로 다시 싣는 지난 kc_enc - 블롭은 그대로, fields 이름만 해시로 다시 쓴다(옛 빌드가 쓴 f1 원문 이름을 지운다).
+    블롭 안 키 이름은 원문이라 복원에는 영향이 없다(반박 리뷰 P3, 2026-10-07)."""
+    out = dict(prev_enc or {})
+    out["fields"] = sorted(_enc_field_name(k) for k in (out.get("fields") or []))
+    return out
+
+
+def _enc_in_memory(acfg, k) -> bool:
+    """kc_enc 항목 키의 값이 지금 메모리(또는 f2면 키체인·세션)에 있는가 - 블롭 병합 판단용."""
+    parts = str(k).split("|")
+    try:
+        if parts[0] == "f2" and len(parts) == 2:
+            return bool(_f2_load(parts[1]))
+        if len(parts) == 3:
+            a, b, f = parts
+            return bool(str((((acfg.get(a) or {}).get("creds") or {}).get(b) or {}).get(f) or "").strip())
+    except Exception:
+        return True                       # 판단 못 하면 되살리지 않는 쪽(이미 있는 것으로)
+    return True
+
+
+def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acct_open=None, targets=None, carry=None):
     """자산별 설정(acfg={자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}) + lang/token/전역
-    dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음."""
+    dry_run + 공개프로필을 yaml에 저장. 비밀(f2)은 여기서 안 씀 — 크레덴셜 저장 시 Keychain에 이미 넣음.
+    targets = 쓸 (자산, 브로커) 쌍(브로커 연결 공용, 2026-10-07 - None이면 전부). carry = 기동 PIN을 열지 못한
+    세션의 지난 kc_enc·kc_failed(블롭 유지 - 메모리에 없는 값이 이번 저장으로 사라지지 않게)."""
+    if not isinstance(targets, (set, frozenset)):
+        targets = None
+    if not isinstance(carry, dict):
+        carry = None
     try:
         import yaml
         # ⚠️비밀 필드를 **디스크에 쓰기 직전에 벗긴다**(2026-08-28). 메모리(acfg)는 손대지
@@ -1391,7 +2189,10 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
         for a, c in (acfg or {}).items():
             _creds = {}
             for b, v in (c.get("creds") or {}).items():
+                if targets is not None and (a, b) not in targets:
+                    continue                     # 공용 브로커의 미러 대상이 아닌 쌍 - 메모리 별칭으로만 둔다
                 _v = dict(v)
+                _v["avail"] = list(v.get("avail") or [])   # 별칭 공유 리스트 사본 - YAML 앵커(&id) 0
                 for _f in _secret_fields(b):
                     _val = str(_v.get(_f) or "")
                     if not _val:
@@ -1407,27 +2208,59 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
                           "accounts": [dict(x) for x in (c.get("accounts") or [])]}
         payload = {"live": False, "lang": lang, "token": token, "assets": _assets}
         # f2(API secret) 키체인 실패분(세션 메모리)도 같은 블롭에 싣는다.
+        # 되채움(기동 PIN)으로 메모리에 올라온 f2는 이번에 키체인으로 다시 옮겨 본다 - 성공한 항목은 블롭에서
+        # 빠지고, 남은 게 없으면 kc_enc도 사라진다(2026-10-07 재리뷰: 키체인이 되는 기기에서도 블롭이 남아 PIN 창이 매번 떴다).
         for _k, _sv in list(_ENC_SECRETS.items()):
-            if _sv:
-                _kept_enc[_k] = _sv
+            if not _sv:
+                continue
+            if _k.startswith("f2|") and _kc_save(_k[3:], _sv):
+                _ENC_SECRETS.pop(_k, None)
+                continue
+            _kept_enc[_k] = _sv
+        _prev_enc, _prev_failed = None, []       # 지금 디스크의 kc_enc·kc_failed
+        try:
+            with open(CFG_PATH) as _pf:
+                _pd = yaml.safe_load(_pf) or {}
+            _prev_enc = _pd.get("kc_enc") if isinstance(_pd.get("kc_enc"), dict) else None
+            _prev_failed = [str(x) for x in (_pd.get("kc_failed") or [])]
+        except Exception:
+            _prev_enc, _prev_failed = None, []
+        if carry and not (_prev_enc or {}).get("blob"):
+            _prev_enc = carry.get("kc_enc") if isinstance(carry.get("kc_enc"), dict) else None
+            _prev_failed = _prev_failed or [str(x) for x in (carry.get("kc_failed") or [])]
+        _prev = (_prev_enc or {}).get("blob")    # 지난번 블롭 - 같은 PIN으로 이어 가게 검증용
+        _carry_failed = list(_prev_failed) if carry else []
         if _kept_enc:
-            _prev = None                         # 지난번 블롭 - 같은 PIN으로 이어 가게 검증용
-            try:
-                with open(CFG_PATH) as _pf:
-                    _prev = ((yaml.safe_load(_pf) or {}).get("kc_enc") or {}).get("blob")
-            except Exception:
-                _prev = None
             _pin = _enc_ask_pin(lang, _prev)
             if _pin:
-                payload["kc_enc"] = {"blob": _enc_pack(_pin, _kept_enc), "fields": sorted(_kept_enc)}
-                globals()["_KC_LAST_ENC"] = sorted(_kept_enc)
+                _all = dict(_kept_enc)
+                # 블롭 병합(2026-10-07): 지난 블롭에 있는데 메모리에 없는 항목(PIN을 열지 못한 기동 등)은 그대로 싣는다.
+                # 메모리에 값이 있거나(이번 저장이 키체인·블롭에 이미 넣음) [연결 지우기]로 지운 항목은 싣지 않는다.
+                if _prev:
+                    try:
+                        _old = _enc_unpack(_pin, _prev) or {}
+                    except Exception:
+                        _old = {}
+                    for _k, _ov in _old.items():
+                        if _k in _all or _k in _ENC_DROPPED or not _ov or _enc_in_memory(acfg, _k):
+                            continue
+                        _all[_k] = _ov
+                payload["kc_enc"] = {"blob": _enc_pack(_pin, _all),
+                                     "fields": sorted(_enc_field_name(_k) for _k in _all)}
+                globals()["_KC_LAST_ENC"] = sorted(_enc_field_name(_k) for _k in _all)
+                _carry_failed = []
             else:                                # 취소 = fail-closed(저장 안 함 + 재입력 안내)
-                _kept_plain = [_enc_label(_k) for _k in sorted(_kept_enc)]
+                _kept_plain = [_enc_label(_enc_field_name(_k)) for _k in sorted(_kept_enc)]
                 globals()["_KC_LAST_ENC"] = []
+                if carry and _prev_enc:
+                    payload["kc_enc"] = _enc_carry_out(_prev_enc)   # 열지 못한 블롭은 그대로 둔다(키 손실 0)
         else:
             globals()["_KC_LAST_ENC"] = []
+            if carry and _prev_enc:
+                payload["kc_enc"] = _enc_carry_out(_prev_enc)   # 블롭 유지: 새로 보관할 것이 없어도 지난 블롭을 다시 싣는다
+        if _kept_plain or _carry_failed:
+            payload["kc_failed"] = list(dict.fromkeys(_carry_failed + _kept_plain))   # 다음 기동 경고용(영속)
         if _kept_plain:
-            payload["kc_failed"] = _kept_plain   # 다음 기동 경고용(영속)
             # ⚠️**그 순간에도 알린다**(2026-08-28 리뷰 P1). 종전에는 다음 기동에만
             # 경고해서, 키체인 저장이 실패한 바로 그 순간 회원이 보는 것은 초록색
             # "✓ 저장됨"뿐이었다 - 랜딩과 약관이 "보안 저장소가 없으면 앱이 알려
@@ -1444,10 +2277,51 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
             payload["acct_open"] = bool(acct_open)
         if profile is not None:
             payload["profile"] = dict(profile)
-        with open(CFG_PATH, "w") as f:
-            yaml.safe_dump(payload, f)
+        _write_cfg_atomic(yaml.safe_dump(payload))
     except Exception:
         pass
+
+
+_CFG_LOCK = threading.Lock()
+
+
+def _write_cfg_atomic(text):
+    """설정 파일 원자 저장(오픈 준비 버그 조사 2026-10-06 V). 임시 파일에 다 쓰고 fsync한 뒤 os.replace로 바꿔 끼운다.
+    종전 open(CFG_PATH, 'w')는 파일을 먼저 비우고 썼다 - 쓰는 도중 종료·디스크 풀, 또는 계좌별 진입 스레드 두 개의
+    동시 저장(길이가 다르면 꼬리가 남아 YAML이 깨짐)이면 다음 기동에 설정이 통째로 비고 토큰이 사라졌다
+    ('no token' → 신호·자동 청산 꺼짐). 이제 임시 파일 쓰기가 실패하면(디스크 풀 등) 원본은 그대로 남는다.
+    잠금은 이 프로세스 안의 저장·읽기(_load)끼리 줄 세운다."""
+    import time as _tw
+    _tmp = CFG_PATH + ".tmp"
+    with _CFG_LOCK:
+        try:
+            with open(_tmp, "w") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                os.remove(_tmp)
+            except Exception:
+                pass
+            raise                               # 원본은 손대지 않았다
+        for _i in range(5):                     # 윈도: 백신·색인기가 원본을 잠깐 잡고 있으면 바꿔 끼우기가 실패한다 - 짧게 재시도
+            try:
+                os.replace(_tmp, CFG_PATH)
+                return
+            except OSError:
+                _tw.sleep(0.05)
+        # 바꿔 끼우기가 끝내 안 되면(다른 프로그램이 원본을 놓지 않음) 종전 방식으로 직접 쓴다 - 저장이 아예 안 되는
+        # 것이 더 나쁘다(종전 코드가 저장하던 경우는 계속 저장된다). 임시 파일은 다 써졌으니 공간은 있다.
+        try:
+            os.remove(_tmp)
+        except Exception:
+            pass
+        with open(CFG_PATH, "w") as f:
+            f.write(text)
 
 
 def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None, one_r=None):
@@ -1484,6 +2358,11 @@ class App:
         root.geometry(f"{_w}x{_h}")
         root.minsize(860, 700)
         self.q = queue.Queue()
+        # 화면 로그 보존(대표 2026-10-12 "로그 창 지속되게"): _build가 화면을 통째로 다시 만들 때(자산 탭, 언어, 브로커 전환 등)
+        # 로그 창도 새로 생겨 그때까지 줄이 사라졌다 - 04:00 손절 이동 줄이 안 보여 손절로 오해하고 수동 청산(10/12).
+        # 화면에 찍은 줄을 여기 쌓고, 새 로그 창에 그대로 다시 채운다. 파일 로그(eq-YYYYMMDD.log)는 원래 그대로.
+        import collections as _col
+        self._log_ring = _col.deque(maxlen=5000)
         self.lang = _load()["lang"]
         self.frm = None
         self._auto_on = False
@@ -1502,6 +2381,21 @@ class App:
         # 테스트가 끝난 done()은 자기 번호가 낡았으면 무장을 **버린다**. 안 그러면
         # 정지가 취소되고 신호 루프가 하나 더 떠서 같은 신호에 이중 진입까지 간다.
         self._arm_seq = 0
+        # 루프 세대(오픈 준비 버그 조사 2026-10-06 A): 정지는 _sig_on/_auto_on만 내리고 옛 스레드를
+        # 기다리지 않는다. 그 스레드가 한 바퀴를 끝내기 전에 다시 무장하면 루프가 둘이 되어 같은 신호에
+        # 계좌마다 두 번 진입했다. 새 루프를 띄울 때마다 번호를 올리고, 루프는 자기 번호가 아니면 빠진다.
+        self._sig_gen = 0
+        self._auto_gen = 0
+        # 루프가 아니라 앱이 드는 처리 기록(버그 조사 재검증 2026-10-06 3·5): 새 세대 루프가 이어받는다.
+        #   _sig_seen = (마지막으로 맡은 신호 id, 맡은 세대) - 같은 신호를 새 루프가 다시 처리하지 않게
+        #   _sig_entered_day = {((자산, 행), 세션 키): 발행 날짜} - 계좌·세션별 하루 1회 재진입 금지
+        #   _auto_fired / _auto_retry = 마감 청산의 '오늘 끝냄'·실패 재시도 기록(중복 실패 알림 방지, 성공 후속 보고 유지)
+        self._sig_seen = None
+        self._sig_entered_day = {}
+        self._auto_fired = {}
+        self._auto_retry = {}
+        # 서버 불통으로 꺼진 신호 대기의 무장 사본(오픈 준비 버그 조사 2026-10-06 E) - 서버가 돌아오면 되살린다.
+        self._sig_parked = {}
         self._ping_lock = threading.Lock()   # 핑 직렬화(2026-08-28: 두 경로가 서로 덮었다)
         self._hb_on = False          # 상시 하트비트 스레드(아래 _hb_loop) 기동 여부
         self._watch_on = False       # 표시 전용 피드 스레드(_watch_loop) 기동 여부
@@ -1513,10 +2407,30 @@ class App:
         # 계좌 중심 설정(대표 2026-07-24 멀티계좌 · 계좌당 1R · 자산 등가중)
         # 자산별 설정(대표 2026-07-24): 계좌는 자산 탭 안에서 관리(자산마다 브로커·계좌 독립).
         self._acfg = _d0["assets"]       # {자산:{broker,creds{broker:{f1,f3}},include,accounts[]}}
+        # 키체인 저장 실패 경고(2026-08-28): 평문으로 남은 비밀이 있으면 회원이 알아야 한다.
+        # 랜딩과 약관이 "비밀은 OS 보안 저장소에"라고 말하는데 이 기기에서만 아니기 때문.
+        # ⚠️순서(2026-10-07 리뷰 P2): 두 값은 _enc_unlock_startup **앞**에서 정해야 한다 - 종전엔 호출 뒤에
+        # 대입해 되채움이 늘 '보관분 없음'으로 끝났고(9/23 C안 이후 한 번도 작동 안 함), 실패 목록도 덮였다.
+        self._kc_failed = list(_d0.get("kc_failed") or [])
+        self._kc_enc_pending = _d0.get("kc_enc")     # PIN 암호화 보관분(C안) - 바로 아래에서 되채움
+        self._enc_locked = False         # PIN 보관분을 이번 기동에 열지 못했나(_enc_unlock_startup이 정한다)
         self._enc_unlock_startup()       # 키체인이 안 되는 기기: PIN 한 번 → 비밀 되채움(C안)
         self._asset = "NQ"               # 현재 편집 중인 자산 탭
-        self._broker_name = self._acfg[self._asset]["broker"]
         self._profile = _d0["profile"]   # 공개 트랙레코드 {handle,name,public}
+        # 브로커 연결 공용(대표 2026-10-07 "자산별 말고 브로커별"): 순서 = _load(자산별 키체인 되채움) → PIN 되채움 →
+        # seed(저장 미러 대상 ①) → 오염 걸러내기·합침. PIN을 열지 못했으면 합치지 않고(블롭 안 값이 메모리에 없다)
+        # 저장 때 지난 블롭·kc_failed를 그대로 다시 싣는다(carry).
+        self._kc_enc_carry = ({"kc_enc": _d0.get("kc_enc"), "kc_failed": list(_d0.get("kc_failed") or [])}
+                              if self._enc_locked else None)
+        self._mirror_seed = _creds_seed(self._acfg)
+        self._bridge_inst = _installed_bridge(self._profile)
+        self._creds_split, self._creds_notes = _unify_creds(self._acfg, self._profile, enc_locked=self._enc_locked,
+                                                            bridge=self._bridge_inst)
+        # 브로커 연결 설정 패널(대표 2026-10-07 "오픈 전에 해야 해"): 패널 브로커(_broker_name)와 그 칸이 고치는 창고의
+        # 자산(_panel_asset)은 계좌 설정 자산 탭(_asset)과 따로다. 패널에서 브로커를 골라도 자산·행 실행 브로커는 안 바뀐다.
+        self._broker_name = self._panel_default_bk()
+        self._panel_asset = None
+        self._panel_fix()
         # 이 앱이 연 포지션 흔적(청산 버튼 노출 근거) - 재시작에도 유지(2026-08-11)
         self._open_assets = set(self._profile.get("open_assets") or [])
         # 손절 청산 감지용(2026-09-02): 진입 때 쓴 브로커·심볼을 기억해 두고, 포지션이
@@ -1524,6 +2438,8 @@ class App:
         # 앱의 청산 보고 경로(_send_fill(closed=True))가 시간 청산에서만 불렸고, 그래서
         # 서버 버킷이 영구 open으로 남아 회원 화면에 '내 계좌 확인 필요'가 36시간 떴다.
         self._open_ctx = {}          # {asset: {"b": broker, "sym": 심볼조각}}
+        # 진입 결과를 확인하지 못한 leg 감시 - leg마다 한 칸, 재시작을 넘긴다(버그 조사 재검증 2026-10-06 2).
+        self._unconf_watch = _load_unconf_watch()
         self._flat_seen = {}         # {asset: 연속 flat 관측 횟수} - 1회는 안 믿는다
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         # 서버가 지정한 계획 청산 시각(exit_ts) — {asset: (epoch, 사유)}. 고영향 지표
@@ -1532,15 +2448,13 @@ class App:
         # 신호 수신 때 채우고 그날 발화하면 지운다. 없으면 기존 고정 시각(_ASSET_EXITS) 그대로.
         self._exit_override = {}
         self._token = _d0.get("token", "")
-        # 키체인 저장 실패 경고(2026-08-28): 평문으로 남은 비밀이 있으면 회원이 알아야 한다.
-        # 랜딩과 약관이 "비밀은 OS 보안 저장소에"라고 말하는데 이 기기에서만 아니기 때문.
-        self._kc_failed = list(_d0.get("kc_failed") or [])
-        self._kc_enc_pending = _d0.get("kc_enc")     # PIN 암호화 보관분(C안) - 아래에서 되채움
         # 멤버십 게이트(하트비트). 기본 = fail-closed(권한 전부 막힘).
         self._gate = {"ok": False, "tier": "—", "enabled": False, "force_dry_run": True,
                       "caps": {"use": False, "manualentry": False, "autoentry": False},
                       "brokers": {}, "reason": "no token"}
         self._build()
+        self._log_prop_migrated()        # 기동 이행으로 바뀐 프롭 1R을 로그 한 줄로(오픈 준비 버그 조사 2026-10-06 Q)
+        self._log_creds_notes()          # 브로커 연결 공용 기동 로그(1회)
         root.after(120, self._drain)
         root.after(800, lambda: self._heartbeat(periodic=True))   # 시작 직후 + 주기 권한 갱신
         root.after(5 * 60 * 1000, self._autopush_tick)             # 일일 자동 트랙레코드 동기화
@@ -1574,6 +2488,7 @@ class App:
         self.key.delete(0, "end"); self.key.insert(0, text)
         if not self._unlocked:
             self.key.config(state="readonly")
+        self._key_shown = text            # 앱이 채운 값 - 이것과 다르면 회원이 키 칸을 고친 것(_save_creds_fields ⑤)
 
     def t(self, k):
         return T[k][self.lang]
@@ -1653,6 +2568,7 @@ class App:
             except Exception:
                 pass
         frm.bind("<Configure>", _fit_canvas)
+        self._fit_canvas = _fit_canvas            # 접이식을 접고 펼 때 다시 맞춘다(창 높이가 고정이라 Configure가 안 올 수 있음)
         _cv.bind("<Configure>", lambda e: (_cv.itemconfigure(_win, width=e.width),
                                            _fit_canvas()))
 
@@ -1683,9 +2599,14 @@ class App:
         ttk.Button(links, text=self.t("btn_home"), command=lambda: webbrowser.open(URL_HOME)).pack(side="left")
         ttk.Button(links, text=self.t("btn_join"), command=lambda: webbrowser.open(URL_JOIN)).pack(side="left", padx=6)
         ttk.Button(links, text=self.t("btn_free"), command=self._open_free).pack(side="left")
-        ttk.Label(frm, text=self.t("subtitle"), foreground="#666").pack(anchor="w", pady=(6, 4))
-        tk.Label(frm, text=self.t("warn_mix"), foreground="#b00020", wraplength=660,
-                 justify="left", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        # 머리 설명 둘은 로그 아래로(대표 2026-10-09 "텍스트며 성과 공유며 다 로그 창 아래") - 틀만 만들고 pack은 로그 뒤에서.
+        # warn_mix는 라이브 시작 때 로그에도 찍힌다.
+        # 11e(대표 2026-10-09 "일괄 청산 그거를 로그 바로 아래, 그 아래 트랙레코드, 그 아래 주의사항"):
+        # warn_mix = 로그 바로 아래 한 묶음. 옛 subtitle은 주의 사항 맨 끝 회색 줄(caut_foot)로.
+        _hdrnote = ttk.Frame(frm)
+        self._hdr_note_box = _hdrnote
+        tk.Label(_hdrnote, text=self.t("warn_mix"), foreground="#b00020", wraplength=660,
+                 justify="left", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(6, 4))
 
         # 멤버십 토큰(게이팅) + 권한 상태
         rt = ttk.Frame(frm); rt.pack(fill="x", pady=3)
@@ -1721,12 +2642,9 @@ class App:
         if not hasattr(self, "consent"):
             self.consent = tk.IntVar()
         ttk.Checkbutton(frm, variable=self.consent, text=self.t("consent"),
-                        command=self._update_tr_status).pack(anchor="w", pady=(2, 2))
-        # 앱이 회원 확인 없이 하는 일 중 **계좌에 쓰기가 일어나는 것**을 체크박스 바로 아래
-        # 고지한다(2026-08-15 사실기술서 감사). 지금까지 어디에도 안 적혀 있었다.
-        # 둘 다 의도된 설계이고 끄는 스위치가 없으므로, 최소한 알고 켜야 한다.
-        ttk.Label(frm, text=self.t("consent_detail"), foreground="#6b7280",
-                  wraplength=760, justify="left").pack(anchor="w", pady=(0, 4))
+                        command=lambda: (self._update_tr_status(), self._refresh_next_action())).pack(anchor="w", pady=(2, 2))
+        # 동의 상세(계좌에 쓰기가 일어나는 것, 2026-08-15 고지)는 문구 그대로 맨 아래 주의 사항 첫 줄로
+        # 옮겼다(대표 2026-10-09 "버튼은 위·가운데, 글은 아래"). 체크박스와 버튼 사이엔 설명 글이 없다.
         # 자산별 실행 행 — [자산] 상태 [연결테스트] [정지] ●
         self._live_include = {}
         self._live_rows = {}       # {asset: (status_lbl, dot)}
@@ -1754,12 +2672,10 @@ class App:
                        command=lambda a=_a: self._panel_stop(a)).pack(side="right", padx=(4, 0))
             ttk.Button(row, text=self.t("btn_conn"), width=11,
                        command=lambda a=_a: self._panel_conn_test(a)).pack(side="right", padx=(6, 0))
-            lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888")
+            lbl = tk.Label(row, text="", anchor="w", justify="left", foreground="#888", wraplength=600)   # 길면 줄바꿈(잘림 대신)
             lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
             self._live_rows[_a] = (lbl, dot)
-        ttk.Label(frm, text=self.t("live_1r_note"), foreground="#888",
-                  wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
-        lc = ttk.Frame(frm); lc.pack(fill="x", pady=(4, 0))
+        lc = ttk.Frame(frm); lc.pack(fill="x", pady=(6, 0))
         # 시작 버튼은 [라이브 시작] 하나(대표 2026-09-07 모의 모드 폐지): 9/4 밤 모의 무장을
         # 라이브로 오인한 실사고의 근본 해결 - 오인할 모드 자체를 없앤다. 실주문 억제는 오직
         # 서버 게이트(force_dry_run = 라이브 잠금)가 _live_now()로 발주 순간에 건다.
@@ -1784,15 +2700,48 @@ class App:
         # 보여준다. 네트워크 조회 = 상시 표시 불가 = 버튼이 정당한 자리.
         ttk.Button(lc, text=("전 계좌 1R 조회" if self.lang == "ko" else "Check 1R (all)"),
                    command=self._preview_one_r_all).pack(side="left", padx=(6, 0))
-        ttk.Label(frm, text=self.t("live_note"), foreground="#888", wraplength=760,
-                  justify="left").pack(anchor="w", pady=(2, 0))
+        # 버튼 줄 옆에는 한 줄만: 지금 상태와 다음 할 일(계좌 설정의 '다음:' 안내와 같은 문장, 2026-10-07)
+        self._live_next_lbl = ttk.Label(frm, text="", foreground="#1d4ed8", font=("Helvetica", 11, "bold"),
+                                        wraplength=880, justify="left")   # 길면 줄바꿈(잘림 대신, 2026-10-08b P3(c))
+        self._live_next_lbl.pack(anchor="w", pady=(4, 0))
+        # 설명과 주의 사항은 지우지 않고 로그 아래로(대표 2026-10-07 "맨 아래로 내리던가", 2026-10-09 "로그 아래에다").
+        # 11e(대표 2026-10-09 확정 문안): 주의 사항(동의한 내용) = 접이식 하나, 소제목 넷 + 줄. 동의 체크가 꺼져 있으면
+        # 펼친 채로(동의 전에 읽게), 켜져 있으면 접어서 시작한다. 회원이 한 번 접거나 펴면 그 세션 동안은 그대로.
+        # 맨 끝 회색 한 줄(caut_foot)은 접이식 밖. 만들기만 하고 pack은 로그보다 먼저(아래 참고).
+        if not getattr(self, "_caut_user_set", False):
+            self._caut_open = not bool(self.consent.get()) if hasattr(self, "consent") else True
+        _nb = ttk.Frame(frm)
+        self._caut_box = _nb
+        self._caut_hdr = tk.Button(
+            _nb, text=("▾ " if self._caut_open else "▸ ") + self.t("caut_head"),
+            command=self._toggle_caut, relief="flat", anchor="w",
+            font=("Helvetica", 12, "bold"), padx=0)
+        self._caut_hdr.pack(fill="x", anchor="w")
+        self._caut_body = ttk.Frame(_nb)
+        for _h, _ls in (("caut_auto_h", ("caut_auto_1", "caut_auto_2")),
+                        ("caut_stop_h", ("caut_stop_1", "caut_stop_2")),
+                        ("caut_conn_h", ("caut_conn_1", "caut_conn_2")),
+                        ("caut_risk_h", ("caut_risk_1", "caut_risk_2", "caut_risk_3"))):
+            ttk.Label(self._caut_body, text=self.t(_h), font=("Helvetica", 10, "bold"),
+                      foreground="#4b5563").pack(anchor="w", pady=(6, 0))
+            for _k in _ls:
+                ttk.Label(self._caut_body, text=self.t(_k), foreground="#888", font=("Helvetica", 10),
+                          wraplength=760, justify="left").pack(anchor="w", pady=(2, 0))
+        if self._caut_open:
+            self._caut_body.pack(fill="x", after=self._caut_hdr)
+        self._caut_foot = ttk.Label(frm, text=self.t("caut_foot"), foreground="#666",
+                                    wraplength=760, justify="left")
         self._refresh_live_panel()
 
         # ── 공개 트랙레코드 (Autopilot 전용) — 로컬 계산 요약만 서버로 푸시(키·잔고 무접촉) ──
-        ttk.Separator(frm).pack(fill="x", pady=8)
-        ttk.Label(frm, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        # 자리는 로그 아래(대표 2026-10-09 "트랙 레코드 기록도 아래로", "유저한테 중요한 게 브로커 계좌 설정이지") -
+        # 묶음 틀만 만들고 pack은 로그 뒤에서. 위에는 라이브 버튼, 브로커·계좌 설정만.
+        _trbox = ttk.Frame(frm)
+        self._tr_box = _trbox
+        ttk.Separator(_trbox).pack(fill="x", pady=8)
+        ttk.Label(_trbox, text=self.t("sec_tr"), font=("Helvetica", 12, "bold")).pack(anchor="w")
         # 핸들·이름 입력 제거(대표 2026-07-11) — 서버가 회원 계정(텔레그램/디스코드)에서 자동 설정.
-        tr = ttk.Frame(frm); tr.pack(fill="x", pady=3)
+        tr = ttk.Frame(_trbox); tr.pack(fill="x", pady=3)
         _prof = self._profile
         self.tr_public = tk.IntVar(value=1 if _prof.get("public") else 0)
         # 토글 즉시 _profile 반영+영속 — 저장 없이 탭 바꾸면 옛 값으로 되살아나던 버그(대표 2026-07-12)
@@ -1810,7 +2759,7 @@ class App:
         if not hasattr(self, "consent"):      # 동의 var가 아직 없을 수 있음(아래서 생성) — 선생성
             self.consent = tk.IntVar()
         self._update_tr_status()
-        ttk.Label(frm, text=self.t("tr_note"), foreground="#888", wraplength=660,
+        ttk.Label(_trbox, text=self.t("tr_note"), foreground="#888", wraplength=660,
                   justify="left").pack(anchor="w")
         ttk.Separator(frm).pack(fill="x", pady=8)
 
@@ -1823,8 +2772,7 @@ class App:
             self._cfg_open = bool(d.get("cfg_open", _unset))
         self._cfg_hdr = tk.Button(
             frm, text=("▾ " if self._cfg_open else "▸ ")
-            + ("자산별 브로커 설정 (NQ, GC, BTC)" if self.lang == "ko"
-               else "Per-asset broker setup (NQ, GC, BTC)"),
+            + self._cfg_title(),
             command=self._toggle_cfg, relief="flat", anchor="w",
             font=("Helvetica", 12, "bold"), padx=0)
         self._cfg_hdr.pack(fill="x", anchor="w")
@@ -1849,24 +2797,20 @@ class App:
                              "one PIN-locked file; import it on the new machine"),
                   foreground="#9ca3af").pack(side="left", padx=(8, 0))
 
-        # ── 자산 탭 (NQ/GC/BTC) — 클릭 시 그 자산의 브로커·키·1R로 스왑 ──
-        atab = ttk.Frame(frm); atab.pack(fill="x", pady=(2, 6))
-        for _a in _ASSETS:
-            _lbl = _ASSET_LABEL[_a]["ko" if self.lang == "ko" else "en"]
-            tk.Button(atab, text=_lbl, command=lambda a=_a: self._on_asset(a),
-                      relief=("sunken" if _a == self._asset else "raised"),
-                      font=("Helvetica", 11, "bold" if _a == self._asset else "normal"),
-                      bg=("#eaf7ee" if _a == self._asset else "#e2e8f0"),
-                      fg=("#178a3a" if _a == self._asset else "#333"),   # 선택=초록(흰색 안 보임, 대표 2026-07-11)
-                      padx=14, pady=4).pack(side="left", padx=(0, 4))
+        # 자산 탭 폐지(대표 2026-10-07 "오픈 전에 해야 해"): 브로커 연결은 브로커마다 한 곳에서 넣는다.
+        # 계좌(1R·켜기)는 아래 계좌 설정의 자산 탭에서 자산별로. 패널 브로커를 골라도 자산·행 실행 브로커는 안 바뀐다.
+        self._panel_fix()
         spec = _BROKER_SPEC.get(self._broker_name, _BROKER_SPEC["projectx"])
+        self._fields_bk = self._broker_name       # 아래 칸을 그리는 브로커(저장 때 칸 출처 가드, 2026-10-07)
+        self._fields_pa = _panel_asset_of(self)   # 아래 칸이 고치는 창고의 자산(split이면 NQ 또는 GC)
+        self._key_shown = ""                      # 키 칸은 빈 채로 그려지고 _async_load_key가 채운다
         # ①/② 섹션 분리(대표 2026-08-11 "브로커 설정이랑 계좌 추가랑 따로"): 브로커 연결은
         # 브로커당 한 번, 계좌는 그 아래서 여러 개 - 개념이 달라 화면도 가른다.
         # (①/② 번호 라벨 제거 - 접이식 제목 두 개가 유닛 분리를 이미 말한다, 2026-08-11)
         # 브로커 선택 — 이 자산이 지원하는 브로커만 (NQ·GC=Topstep/IBKR · BTC=Bybit/Bitget)
         rb = ttk.Frame(frm); rb.pack(fill="x", pady=3)
         ttk.Label(rb, text=self.t("broker"), width=_LBL_W).pack(side="left")
-        self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _ASSET_BROKERS[self._asset]],
+        self.brokerbox = ttk.Combobox(rb, values=[_broker_label(b) for b in _panel_brokers()],
                                       state="readonly", width=22)
         self.brokerbox.set(_broker_label(self._broker_name)); self.brokerbox.pack(side="left")
         self.brokerbox.bind("<<ComboboxSelected>>", self._on_broker)
@@ -1884,14 +2828,50 @@ class App:
                                  if self.lang == "ko" else
                                  "Full setup guide: website → EQ Autopilot → Broker Setup"),
                       foreground="#8a8f98").pack(anchor="w", pady=(2, 2))
+        # split(NQ·GC가 서로 다른 로그인): 숨기는 값 없이 자산별로 보이고, 자산별로 고치고 지운다(2026-10-07).
+        if self._panel_split() and getattr(self, "_enc_locked", False) is not True:
+            ttk.Label(frm, text=self._split_text(self._broker_name), foreground="#b45309", wraplength=740,
+                      justify="left").pack(anchor="w", pady=(2, 2))
+            _spec0 = _BROKER_SPEC.get(self._broker_name, {})
+            for _ha in _bk_holders(self._broker_name):
+                _hcr = self._creds_of(_ha, self._broker_name)
+                _hv = str(_hcr.get("f1") or "").strip()
+                if _hv and _spec0.get("f1_secret"):
+                    _hv = "•••• " + ("저장됨" if self.lang == "ko" else "saved")
+                elif not _hv:
+                    _hv = "(비어 있음)" if self.lang == "ko" else "(empty)"
+                _h3 = str(_hcr.get("f3") or "").strip()
+                if _spec0.get("f3") and "f3" not in _secret_fields(self._broker_name) and self._broker_name in ("ibkr", "nt8"):
+                    # 포트만 다른 split도 보이게(1b 반박 리뷰 P3) - IBKR 'Host : Port', Lucid '포트 8390'
+                    _pt = _h3 or ("8377" if self._broker_name == "nt8" else "")
+                    if _pt:
+                        _hv = (f"{_hv} : {_pt}" if self._broker_name == "ibkr" else
+                               (f"{_hv}, 포트 {_pt}" if self.lang == "ko" else f"{_hv}, port {_pt}"))
+                _hr = ttk.Frame(frm); _hr.pack(fill="x", pady=1)
+                ttk.Label(_hr, text=f"{_ha}: {_hv}", width=36).pack(side="left")
+                if _ha == _panel_asset_of(self):
+                    ttk.Label(_hr, text=("아래 칸에서 고치는 중" if self.lang == "ko" else "editing below"),
+                              foreground="#15803d").pack(side="left", padx=(4, 0))
+                else:
+                    ttk.Button(_hr, text=("고치기" if self.lang == "ko" else "Edit"),
+                               command=lambda a=_ha: self._on_panel_asset(a)).pack(side="left", padx=(4, 0))
+                if _cr_has(_hcr):
+                    ttk.Button(_hr, text=(f"{_ha} 연결 지우기" if self.lang == "ko" else f"Remove {_ha} connection"),
+                               command=lambda a=_ha: self._clear_broker_conn(asset=a)).pack(side="left", padx=(4, 0))
+            ttk.Label(frm, text=(f"아래 칸은 {_panel_asset_of(self)}의 {_broker_short(self._broker_name)} 연결입니다."
+                                 if self.lang == "ko" else
+                                 f"The fields below are {_panel_asset_of(self)}'s {_broker_short(self._broker_name)} connection."),
+                      foreground="#6b7280").pack(anchor="w", pady=(2, 0))
         # f1 (브로커별 1번 필드)
         r1 = ttk.Frame(frm); r1.pack(fill="x", pady=3)
         ttk.Label(r1, text=spec["f1"], width=_LBL_W).pack(side="left")
         _f1sec = bool(spec.get("f1_secret"))          # 크립토 API Key = 비밀 취급(대표 2026-07-12)
         self._f1_unlocked = False
-        self.user = ttk.Entry(r1, show=("•" if _f1sec else ""))
+        self.user = (ttk.Entry(r1, show="•") if _f1sec else _MaskEmailEntry(r1))   # 이메일은 칸 밖에선 가림(10/12)
         self.user.pack(side="left", fill="x", expand=True)
         self.user.insert(0, c.get("f1", ""))
+        if isinstance(self.user, _MaskEmailEntry):
+            self.user._apply_mask()
         if _f1sec:
             self.user.config(state="readonly")        # 잠금해제 후에만 편집, 붙여넣기
             self.b_lock_f1 = ttk.Button(r1, text=self.t("unlock"), width=11, command=self._unlock_f1)
@@ -1902,6 +2882,8 @@ class App:
         # 복사 버튼(대표 2026-08-10 "잠금 해제하면 카피") - 기기 이전용. 비밀 f1은 PIN 게이트
         ttk.Button(r1, text=self.t("copy_btn"), width=6,
                    command=self._copy_f1).pack(side="left", padx=(4, 0))
+        self._kept_lbls = {"f1": ttk.Label(r1, text="", foreground="#6b7280")}   # '저장된 키 유지 중'(빈 칸, 자동 저장)
+        self._kept_lbls["f1"].pack(side="left", padx=(6, 0))
         # f2 (비밀 — PIN 잠금) — 있는 브로커만
         if spec.get("f2"):
             r2 = ttk.Frame(frm); r2.pack(fill="x", pady=3)
@@ -1913,6 +2895,8 @@ class App:
             ttk.Button(r2, text=self.t("paste"), width=8, command=self._paste_key).pack(side="left", padx=(4, 0))
             ttk.Button(r2, text=self.t("copy_btn"), width=6,
                        command=self._copy_key).pack(side="left", padx=(4, 0))
+            self._kept_lbls["f2"] = ttk.Label(r2, text="", foreground="#6b7280")
+            self._kept_lbls["f2"].pack(side="left", padx=(6, 0))
             # '보기' 체크박스 폐지(대표 2026-08-09) — 키는 열람 불가·교체만 가능(write-only).
             # 덕분에 PIN 재설정 시 키를 지킬 필요가 없어졌다(_pin_forgot 코드 인증 참조).
         # f3 (추가 필드) — 있는 브로커만
@@ -1924,20 +2908,46 @@ class App:
             self.f3.insert(0, c.get("f3", ""))
             ttk.Button(r3e, text=self.t("paste"), width=8,
                        command=lambda: self._paste_into(self.f3)).pack(side="left", padx=(4, 0))
+            self._kept_lbls["f3"] = ttk.Label(r3e, text="", foreground="#6b7280")
+            self._kept_lbls["f3"].pack(side="left", padx=(6, 0))
         # 저장·테스트 버튼 폐지(대표 2026-08-11 "버튼 최소화, 유저 경험 최고로" - 자동 저장
         # 확정): 입력이 멈추면 자동 저장(+Keychain), 키가 완성되면 자동 연결 확인까지.
         # 사람이 할 일은 입력뿐 - 스텝 0.
         _svrow = ttk.Frame(frm); _svrow.pack(fill="x", pady=(6, 2))
-        ttk.Label(_svrow, text=("입력하면 자동으로 저장, 연결 확인됩니다 (자산마다 한 번, 재시작해도 유지)"
-                                if self.lang == "ko" else
-                                "Everything saves & verifies automatically as you type (once per asset)"),
-                  foreground="#9ca3af").pack(side="left")
+        # 괄호 문구는 지금 화면 브로커의 실제 상태대로(반박 리뷰 P3): 공용일 때만 'NQ와 GC가 같이 씁니다'.
+        _pan = _panel_asset_of(self)
+        # 괄호는 '(재시작해도 유지)'만(1b 반박 리뷰 P3) - 공용·split 사실은 바로 아래 안내 줄이 말한다.
+        _svt = ("입력하면 자동으로 저장, 연결 확인됩니다 (재시작해도 유지)" if self.lang == "ko" else
+                "Saves and verifies as you type (kept after restart)")
+        ttk.Label(_svrow, text=_svt, foreground="#9ca3af").pack(side="left")
         self._saved_lbl = ttk.Label(_svrow, text="", foreground="#6b7280")
         self._saved_lbl.pack(side="left", padx=(10, 0))
         for _w in (getattr(self, "user", None), getattr(self, "key", None),
                    getattr(self, "f3", None)):
             if _w is not None:
                 _w.bind("<KeyRelease>", lambda e: self._schedule_autosave())
+        # 브로커 연결 공용 안내(대표 2026-10-07): NQ·GC 선물 브로커는 한 연결을 같이 쓴다. split이면 그 사실과 할 일.
+        _bkn = self._broker_name
+        _cr_now = self._creds_of(_pan, _bkn)
+        _sp_now = getattr(self, "_creds_split", None)
+        _sp_now = _sp_now if isinstance(_sp_now, (set, frozenset)) else set()
+        if _bk_shared(_bkn) and getattr(self, "_enc_locked", False) is not True:
+            if _bkn in _sp_now:
+                pass                                  # split 안내·자산별 값·자산별 [연결 지우기]는 칸 위에 이미 있다
+            else:
+                ttk.Label(frm, text=("이 연결은 NQ와 GC가 같이 씁니다. 여기서 바꾸면 두 자산에 함께 적용됩니다."
+                                     if self.lang == "ko" else
+                                     "NQ and GC share this connection. Changes here apply to both."),
+                          foreground="#6b7280", wraplength=740, justify="left").pack(anchor="w", pady=(2, 0))
+            _cnt = self._conn_row_counts(_bkn, self._conn_users(_bkn, _cr_now))
+            if _cnt:
+                ttk.Label(frm, text=(("이 연결을 쓰는 켜진 계좌: " if self.lang == "ko" else "Active accounts using this connection: ")
+                                     + self._fmt_counts(_cnt)),
+                          foreground="#9ca3af").pack(anchor="w")
+        if _cr_has(_cr_now) and getattr(self, "_enc_locked", False) is not True and not self._panel_split():
+            _rmrow = ttk.Frame(frm); _rmrow.pack(fill="x", pady=(2, 0))
+            ttk.Button(_rmrow, text=("연결 지우기" if self.lang == "ko" else "Remove connection"),
+                       command=self._clear_broker_conn).pack(side="left")
         # 가용 계좌(대표 2026-08-11 확정): 브로커 설정의 일부다 - Topstep은 연결되면 자동으로
         # 차고, Lucid처럼 API 목록이 없는 브로커는 여기서 수동 등록해야 ② 드롭다운에 뜬다.
         if not spec.get("acct"):
@@ -1952,7 +2962,7 @@ class App:
                       ).pack(anchor="w", pady=(4, 0))
         if spec.get("acct"):
             _avrow = ttk.Frame(frm); _avrow.pack(fill="x", pady=(4, 0))
-            _av = self._avail_of(self._asset, self._broker_name)
+            _av = self._avail_of(_pan, self._broker_name)
             _avtxt, _avcol = self._avail_text_color(_av)
             self._avail_lbl = tk.Label(
                 _avrow, text=_avtxt, foreground=_avcol, wraplength=700, justify="left", anchor="w",
@@ -1997,27 +3007,8 @@ class App:
                 ttk.Label(_mrow, text=("계좌 이름 그대로" if self.lang == "ko"
                                        else "exact account name"),
                           foreground="#9ca3af").pack(side="left", padx=(8, 0))
-        if spec.get("acct"):
-            # ① 브로커 키 전수 가져오기(대표 2026-09-04 "전 브로커 세팅을 다 복사해오게" -
-            #    자산 단위 복사는 자산마다 브로커가 다르면 브로커 선택까지 갈아쳐
-            #    엉뚱한 필드 값으로 보였다). 소스 선택 없이 버튼 하나로 브로커별 병합.
-            _has_src = any(
-                str((cr2 or {}).get("f1") or "").strip()
-                for a2 in _ASSETS if a2 != self._asset
-                for bk2, cr2 in (self._acfg.get(a2, {}).get("creds") or {}).items()
-                if bk2 in _ASSET_BROKERS.get(self._asset, []))
-            if _has_src:
-                _bcp = ttk.Frame(frm); _bcp.pack(fill="x", pady=(2, 0))
-                ttk.Button(_bcp, text=("다른 자산의 브로커 키 전부 가져오기"
-                                       if self.lang == "ko"
-                                       else "Pull all broker keys from other assets"),
-                           command=self._pull_broker_keys).pack(side="left")
-                ttk.Label(_bcp, text=("다른 자산에 저장된 키를 브로커별로 채워 넣습니다. "
-                                      "이미 있는 키는 안 덮습니다."
-                                      if self.lang == "ko" else
-                                      "Fills in keys saved on other assets, per broker. "
-                                      "Existing keys are never overwritten."),
-                          foreground="#9ca3af").pack(side="left", padx=(6, 0))
+        # [NQ 설정 복사하기]·[다른 자산의 브로커 키 전부 가져오기] 폐지(대표 2026-10-07 "복사 버튼을 다 없앱니다") -
+        # 브로커 연결은 이제 NQ·GC가 같이 쓴다(_creds_of 별칭). 10/7 키 섞임 세 경로 중 둘이 이 버튼이었다.
 
         # ── 둘째 접이식: 자산별 계좌 설정(대표 2026-08-11 "브로커 설정 드롭다운, 그 아래
         #    계좌 설정 드롭다운" - 두 유닛을 독립 접이식으로). 자산 탭은 공유(_asset 하나).
@@ -2051,16 +3042,25 @@ class App:
         #   b_acc(계좌 목록 불러오기)는 항상 생성 — 게이팅(_action_btns)이 참조. 크립토는 계좌
         #   개념이 없어(API키=계좌) 리스트/추가/불러오기 UI를 숨기고 계좌 1개(id="")만 두되
         #   1R 입력은 보여준다(사이징).
-        self.b_acc = ttk.Button(frm, text=self.t("btn_accts"), command=self.healthcheck)
+        self.b_acc = ttk.Button(frm, text=self.t("btn_accts"), command=self._load_accounts_for_asset)
         self._acct_widgets = {}                     # {idx: {on,label,one_r}} — 현재 자산 계좌 위젯
         _accts = self._accts_of(self._asset)
-        if spec.get("acct"):
+        # 계좌 설정 모양(선물/크립토)은 계좌 탭 자산이 정한다 - 패널 브로커가 아니다(1b 반박 리뷰 P0, 2026-10-08:
+        # 패널이 Bybit이면 NQ·GC 단일 행이 크립토 모양으로 그려져 꺼 둔 행이 저장 한 번에 켜지고 무장됐다).
+        _acct_is_fut = any(_BROKER_SPEC.get(b, {}).get("acct") for b in _ASSET_BROKERS.get(self._asset, []))
+        _aspec = _BROKER_SPEC.get(self._broker_of(self._asset), {})       # 행 그리기용 - 계좌 탭 자산 브로커 spec
+        if _acct_is_fut:
             ttk.Label(frm, text=("사용 계좌 — 목록에서 골라 추가 (계좌별 1R, 실행 여부)"
                                  if self.lang == "ko"
                                  else "Accounts — pick from the list (per-account 1R & on/off)"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(10, 1))
             for _i, _ac in enumerate(_accts):
-                self._acct_edit_row(frm, _i, _ac, spec, deletable=True, show_on=True)
+                self._acct_edit_row(frm, _i, _ac, _aspec, deletable=True, show_on=True)
+            if any(not self._bk_configured(self._asset, _b) for _b in _ASSET_BROKERS.get(self._asset, [])):
+                # 행 브로커 드롭다운은 연결된 브로커만 보인다(대표 2026-10-07) - 왜 없는지 한 줄로(반박 리뷰 P3)
+                ttk.Label(frm, text=("다른 브로커는 위 브로커 연결 설정에서 연결하면 여기에 나옵니다" if self.lang == "ko" else
+                                     "Other brokers appear here once connected in Broker connections above"),
+                          foreground="#9ca3af").pack(anchor="w")
             addr = ttk.Frame(frm); addr.pack(fill="x", pady=(3, 2))
             # 행 중심 등록(대표 2026-08-11 "추가 누르면 빈 칸 등장, 행에서 브로커 고르고
             # 가용 목록에서 선택"): 하단 통합 드롭다운 폐지 - [계좌 추가]가 빈 행을 만든다.
@@ -2076,23 +3076,13 @@ class App:
             self.b_acc.pack(in_=addr, side="left", padx=(4, 0))
             # 가용 계좌 자동 로드 - 행의 계좌 콤보가 이 목록을 쓴다.
             # Topstep=API, Lucid=브리지 tick(2026-08-12부터 자동 - NT8 켜져 있을 때).
-            if self._broker_of(self._asset) == "projectx":
+            if self._broker_of(self._asset) == "projectx" or any(
+                    self._acct_broker(self._asset, _x) == "projectx" for _x in _accts):
                 self._autoload_topstep_scope(self._asset)
             if "nt8" in _ASSET_BROKERS.get(self._asset, []):
                 self._autoload_nt8_avail(self._asset)
             ttk.Label(frm, text=self.t("scope_note"), foreground="#888").pack(anchor="w")
-            # 선물 자산 간 계좌 설정 복사(대표 2026-07-26 #20) — NQ·GC는 같은 프롭 계좌로 운용
-            _srcs = [a for a in _ASSETS if a != self._asset
-                     and _BROKER_SPEC.get(self._broker_of(a), {}).get("acct")]
-            if _srcs:
-                cprow = ttk.Frame(frm); cprow.pack(fill="x", pady=(2, 2))
-                ttk.Label(cprow, text=("계좌 설정 복사 ←" if self.lang == "ko"
-                                       else "Copy account setup ←"),
-                          foreground="#888").pack(side="left")
-                for _src in _srcs:
-                    ttk.Button(cprow, text=_src, width=5,
-                               command=lambda a=_src: self._copy_acct_setup(a)
-                               ).pack(side="left", padx=(4, 0))
+            # [계좌 설정 복사 ←] 폐지(대표 2026-10-07 "복사 버튼을 다 없앱니다") - 10/7 키 섞임의 시작 경로였다.
         else:
             # 크립토(Bybit/Bitget) — 계좌ID 개념 없음(API키=계좌). 계좌 리스트 개방(대표
             # 2026-08-09 "계좌 추가 이런 식으로 모든 자산"): 행마다 브로커 선택 + 1R + on/off
@@ -2103,7 +3093,7 @@ class App:
                                  else "② Accounts — per-exchange 1R & on/off"),
                       foreground="#555", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(6, 1))
             for _i, _ac in enumerate(_accts):
-                self._acct_edit_row(frm, _i, _ac, spec,
+                self._acct_edit_row(frm, _i, _ac, _aspec,
                                     deletable=len(_accts) > 1, show_on=len(_accts) > 1)
             _addr = ttk.Frame(frm); _addr.pack(fill="x", pady=(3, 2))
             ttk.Button(_addr, text=("계좌 추가" if self.lang == "ko" else "Add"), width=8,
@@ -2146,7 +3136,26 @@ class App:
                   foreground="#6b7280").pack(
             side="right", padx=(0, 8))   # 지원 DM에 버전 필수(2026-08-11 UX 감사)
         self.out = scrolledtext.ScrolledText(frm, height=10, font=("Menlo", 11), wrap="word")
+        try:                                       # 다시 그린 화면에도 지난 로그 그대로(위 _log_ring)
+            if self._log_ring:
+                self.out.insert("end", "\n".join(self._log_ring) + "\n"); self.out.see("end")
+        except Exception:
+            pass
+        # 로그 아래 순서(위→아래, 대표 2026-10-09 11e): 일괄 청산 경고(warn_mix) → 트랙레코드 → 주의 사항(접이식) → 회색 한 줄.
+        # 아래쪽(side=bottom)으로 **로그보다 먼저** 싼다 - 로그가 남은 칸을 다 먹으면(expand) 뒤에 싼 묶음이
+        # 칸을 못 받아 안 보이는 일이 있었다(KO 시험에서 미표시). side=bottom은 먼저 싼 것이 맨 아래.
+        self._caut_foot.pack(side="bottom", fill="x", pady=(8, 0))
+        _nb.pack(side="bottom", fill="x", pady=(10, 0))
+        _trbox.pack(side="bottom", fill="x")
+        _hdrnote.pack(side="bottom", fill="x", pady=(4, 0))
         self.out.pack(fill="both", expand=True, pady=(0, 0))
+        # 안쪽 프레임 높이는 캔버스 창 높이로 고정돼 있어, 글이 늘어도(접이식 펼침·줄바꿈) 프레임 Configure가 안 올 수 있다 -
+        # 그러면 로그가 눌린다. 로그 크기가 바뀌거나 사라지면 다시 맞춘다(11e, 아래 묶음 잘림 방지 안전망).
+        try:
+            self.out.bind("<Configure>", lambda _e: self.root.after_idle(self._fit_canvas), add="+")
+            self.out.bind("<Unmap>", lambda _e: self.root.after_idle(self._fit_canvas), add="+")
+        except Exception:
+            pass
 
         # 연결 테스트 통과 전엔 비활성화할 '실행' 버튼들. 계좌 버튼(연결 테스트 겸)은 항상 활성.
         self._action_btns = [self.b_acc, self.b_tr]
@@ -2158,7 +3167,7 @@ class App:
             self.log(self.t("ready"))
         else:
             _ok = self._conn_by_broker.get(self._broker_name)
-            self.log(f"▸ {self._asset}, {_broker_label(self._broker_name)} — "
+            self.log(f"▸ {_broker_label(self._broker_name)} — "
                      + (("연결됨 ✓ (테스트 통과, 재연결 불필요)" if self.lang == "ko"
                          else "connected ✓ (test passed, no retest needed)") if _ok else
                         ("연결 테스트 필요" if self.lang == "ko" else "connection test required")))
@@ -2202,7 +3211,6 @@ class App:
         auto = bool(master and caps.get("autoentry"))
         live_ok = not g.get("force_dry_run", True)
 
-        topstep = self._broker_name == "projectx"
 
         def en(b, ok):
             try:
@@ -2212,7 +3220,7 @@ class App:
         # 계좌 버튼은 연결 테스트 겸용이라 항상 활성(Topstep) — 'conn and'를 걸면 연결해야
         # 계좌 버튼이 켜지는데 연결이 곧 이 버튼이라 신규 설정이 영영 못 나감(테스터 실사고
         # 2026-07-14 GC 데드락). 자격 미입력은 healthcheck 초입 _creds_ok()가 안내.
-        en(self.b_acc, topstep)
+        en(self.b_acc, True)                  # 계좌 설정 자산의 연결된 브로커 목록을 불러온다(패널 브로커와 무관, 2026-10-07)
         # 루프 '정지'는 어느 탭에서든 항상 가능해야 함(미연결 탭에서 버튼이 죽으면 돌던 루프를
         # 못 세움 — 대표 2026-07-12). 시작 조건은 기존대로(연결+권한), 도는 중엔 무조건 활성.
 
@@ -2254,6 +3262,19 @@ class App:
         perm_auto = bool(g.get("ok") and g.get("enabled") and caps.get("autoentry"))
         _tripped = []
         if getattr(self, "_sig_on", False) and not (perm_auto or perm_use):
+            # 서버에 닿지 못해 꺼지는 것(유예를 넘긴 순단·하트비트 갱신 멈춤)이면 무장 사본을 남긴다(오픈 준비 버그
+            # 조사 2026-10-06 E). 종전에는 복구돼도 다시 켜는 길이 [전체 정지]→[라이브 시작]뿐이었고, 화면·서버 칩은
+            # '가동 중'이라 이틀씩 조용히 진입을 놓칠 수 있었다(8/5 사고와 같은 래치). 회원이 켜 둔 무장을 우리 쪽
+            # 불통이 끄는 것이므로, 서버가 돌아오면 아래에서 되살린다. 명시 거부(잠금·만료)·마스터 OFF·킬스위치 뒤 불통은 남기지 않는다.
+            if self._fallback_kind(g) == "offline":
+                try:
+                    # 덮어쓰지 않고 합친다(버그 조사 재검증 2026-10-06 4): 불통 중 회원이 다른 자산을 체크해 무장하면
+                    # 이 분기가 다시 돌아, 종전엔 앞서 남긴 자산의 사본이 사라져 복구 때 그 자산만 되살아나지 않았다
+                    # (경보창은 '서버가 돌아오면 다시 켭니다'라고 약속한다). 같은 키는 지금 무장이 이긴다.
+                    _pk0 = getattr(self, "_sig_parked", None)
+                    self._sig_parked = {**(_pk0 if isinstance(_pk0, dict) else {}), **self._sig_accts}
+                except Exception:
+                    pass
             self._sig_on = False
             self._sig_accts.clear()
             self._set_sig_ind(False)
@@ -2321,6 +3342,20 @@ class App:
             self._fallback_mode = None                      # 서버가 돌아옴 - 평소 규칙으로
             self.log("✅ 서버 연결 복구 - 평소 규칙으로 돌아갑니다." if self.lang == "ko"
                      else "✅ Server reachable again - back to normal rules.")
+        # 서버 불통으로 꺼졌던 신호 대기 되살리기(오픈 준비 버그 조사 2026-10-06 E).
+        _pk = getattr(self, "_sig_parked", None)
+        if isinstance(_pk, dict) and _pk and not getattr(self, "_sig_on", False):
+            if (g.get("revoked") or (g.get("ok") and not (perm_auto or perm_use))
+                    or not getattr(self, "_live_session", False)):
+                # 서버가 명시적으로 거부했거나(잠금·만료) 권한이 없어졌다, 또는 회원이 전체 정지했다 - 저절로 켜지 않는다.
+                _pk.clear()
+                if getattr(self, "_live_session", False):
+                    self.log("ℹ 서버가 권한을 거부해 신호 대기를 저절로 다시 켜지 않습니다. 권한이 돌아오면 "
+                             "[라이브 시작]으로 다시 켤 수 있습니다." if self.lang == "ko" else
+                             "ℹ The server refused permission, so signal watch will not turn back on by itself. "
+                             "Once permission returns, [Go Live] turns it back on.")
+            elif (perm_auto or perm_use) and g.get("ok") and not g.get("force_dry_run", True):
+                self._resume_parked_sig(perm_auto, perm_use)
         # 킬스위치(서버가 정상 응답으로 force_dry_run을 켬, 대표 2026-09-30 "아 다 죽여"): 진입도 청산도 멈춘다(_live_now).
         # 켜지는 순간 한 번 사실만 알린다 - 회원에게 무엇을 하라고 쓰지 않는다(대표 "즉시 닫으라곤 하지 마").
         _kill = bool(g.get("ok")) and bool(g.get("force_dry_run", True))
@@ -2344,6 +3379,61 @@ class App:
             self._disarmed_reason = ", ".join(_tripped)
             self._notify_disarmed(first=True)
         self._update_gate_label()
+        try:                                     # 확인 모드 전환·킬스위치는 위 새로고침 뒤에 정해진다 - 라이브 줄을 다시 맞춘다(P2-4)
+            self._refresh_live_panel()
+        except Exception:
+            pass
+
+    def _resume_parked_sig(self, perm_auto, perm_use):
+        """서버 불통으로 꺼졌던 신호 대기를 서버가 돌아온 뒤 되살린다(오픈 준비 버그 조사 2026-10-06 E).
+        '회원이 켜 둔 건 회원 책임' - 회원이 켜 둔 무장을 우리 쪽 불통이 끈 것이라 확인을 다시 묻지 않고 되돌리고,
+        사실만 한 번 알린다. 되살리는 계좌 = 불통 동안 회원이 해제하지 않은 것(마감 청산 무장이 남아 있고 자산 체크가
+        켜진 것)만. 키·계좌는 무장 때 연결 테스트를 거친 그대로이고, 1R 등은 신호 때 지금 설정으로 다시 읽는다(C).
+        오래된 신호는 MAX_SIGNAL_AGE_SEC 가드가 막는다 - 불통 동안 지나간 신호를 뒤늦게 따라 들어가지 않는다."""
+        _pk = dict(getattr(self, "_sig_parked", None) or {})
+        try:
+            self._sig_parked.clear()
+        except Exception:
+            self._sig_parked = {}
+        _keep = {k: c for k, c in _pk.items()
+                 if k in (getattr(self, "_auto_accts", None) or {})
+                 and (self._acfg.get(k[0]) or {}).get("include", True)}
+        if not _keep:
+            return
+        self._watch_only = bool(perm_use and not perm_auto)
+        try:
+            if isinstance(getattr(self, "_live_ctx", None), dict) and self._live_ctx:
+                self._live_ctx["perm_auto"] = bool(perm_auto)     # 가동 중 자산 추가 무장도 같은 조건으로
+                self._live_ctx["perm_use"] = bool(perm_use)
+        except Exception:
+            pass
+        for k, c in _keep.items():
+            self._sig_accts[k] = c
+        self._start_sig_loop()
+        _assets = sorted({k[0] for k in self._sig_accts})
+        self._set_sig_ind(True, _assets)
+        self._disarmed_reason = None                 # 15분 반복 경보 종료(_notify_disarmed가 무장을 보고도 멈춘다)
+        ko = self.lang == "ko"
+        msg = ((f"서버 연결이 돌아와 신호 대기를 다시 켰습니다({', '.join(_assets)}). 다음 신호부터 "
+                + ("계좌별 1R로 자동 진입합니다." if perm_auto else "신호 확인만 합니다(자동 발주 없음)."))
+               if ko else
+               (f"The server connection is back, so signal watch is on again ({', '.join(_assets)}). "
+                "From the next signal the app "
+                + ("enters automatically using each account's 1R." if perm_auto
+                   else "shows signals only (no automatic orders).")))
+        self.log("🔁 " + msg)
+        try:                                        # macOS 데스크톱 알림(윈도는 아래 창만)
+            import subprocess, sys as _sys
+            if _sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                                  f'display notification "{msg}" with title "EdgeQuant"'])
+        except Exception:
+            pass
+        try:
+            from tkinter import messagebox as _mb
+            self.root.after(100, lambda: _mb.showinfo("EdgeQuant", msg))
+        except Exception:
+            pass
 
     def _notify_unlatched(self, no_r=None):
         """가동 중 승급·체험으로 자동 진입이 켜졌음을 한 번 알린다(2026-09-23 R44 P0-#1).
@@ -2375,11 +3465,23 @@ class App:
         g = getattr(self, "_gate", {}) or {}
         _still = not (g.get("ok") and g.get("enabled")
                       and (g.get("caps", {}) or {}).get("autoentry"))
+        # 신호 대기가 다시 켜졌으면(서버 복구 뒤 되살림·회원 재무장) 끝낸다(오픈 준비 버그 조사 2026-10-06 E) -
+        # docstring의 '재개' 조건. 종전에는 autoentry만 봐서, 되살린 뒤에도 '다시 켜라'가 15분마다 울릴 수 있었다.
+        _sa = getattr(self, "_sig_accts", None)
+        if isinstance(_sa, dict) and _sa:
+            _still = False
         if not _still:
             self._disarmed_reason = None
             return                                  # 권한 회복 → 리마인드 종료
         reason = getattr(self, "_disarmed_reason", None) or "자동매매"
         msg = f"EdgeQuant: {reason}이(가) 중지됨 (fail-closed). 앱에서 다시 켜주세요(Go Live)."
+        _pk = getattr(self, "_sig_parked", None)
+        if isinstance(_pk, dict) and _pk:
+            # 서버 불통으로 꺼진 경우는 앱이 복구 뒤 스스로 다시 켠다(E) - 따를 수 없는 'Go Live' 안내 대신 사실만.
+            msg = ("EdgeQuant: 서버에 닿지 못해 신호 대기를 멈췄습니다(새 진입 없음, fail-closed). "
+                   "서버 연결이 돌아오면 앱이 신호 대기를 다시 켭니다." if self.lang == "ko" else
+                   "EdgeQuant: the app cannot reach the server, so signal watch has stopped (no new entries, "
+                   "fail-closed). The app turns signal watch back on when the server connection returns.")
         try:                                        # macOS 데스크톱 알림(로그·배너와 별개로 튐)
             import subprocess, sys as _sys
             if _sys.platform == "darwin":
@@ -2441,6 +3543,76 @@ class App:
         except Exception:
             pass
 
+    def _note_clock(self, headers, t0, t1):
+        """응답 Date 헤더로 PC 시계 차이(PC - 서버, 초)를 잰다(오픈 준비 버그 조사 2026-10-06 W). t0/t1 = 요청 앞뒤 PC 시각 -
+        서버가 Date를 찍은 순간은 그 사이라 가운데로 잡는다. 헤더가 없으면 아무것도 바꾸지 않는다."""
+        try:
+            _srv = _server_epoch_from_headers(headers)
+            if _srv is None or float(t1) - float(t0) > 10:      # 느린 응답은 Date가 찍힌 순간이 흐려 재지 않는다
+                return
+            self._clock_skew = ((float(t0) + float(t1)) / 2.0) - _srv
+            self._clock_skew_ts = float(t1)
+            self._clock_warn_check()
+        except Exception:
+            pass
+
+    def _clock_skew_now(self):
+        """최근(CLOCK_SKEW_FRESH_SEC 안)에 잰 PC 시계 차이(초, +면 PC가 빠름). 잰 적 없거나 낡았으면 None."""
+        import time as _tc
+        try:
+            _sk = getattr(self, "_clock_skew", None)
+            if _sk is None or _tc.time() - float(getattr(self, "_clock_skew_ts", 0) or 0) > CLOCK_SKEW_FRESH_SEC:
+                return None
+            return float(_sk)
+        except Exception:
+            return None
+
+    def _clock_skew_text(self, sk):
+        ko = self.lang == "ko"
+        if ko:
+            return f"이 PC 시계가 서버 시각보다 {abs(sk):.0f}초 {'빠름' if sk > 0 else '느림'}"
+        return f"this PC's clock is {abs(sk):.0f} s {'ahead of' if sk > 0 else 'behind'} the server"
+
+    def _clock_warn_check(self):
+        """시계 차이가 허용치(MAX_CLOCK_SKEW_SEC)를 넘으면 로그(한 시간에 한 번)와 창(넘어설 때 한 번)으로 사실을 알린다.
+        자동 진입 보류 자체는 신호 루프가 한다(W). 다시 맞으면 한 줄 남기고 다음 어긋남에 또 알린다."""
+        import time as _tc
+        try:
+            sk = self._clock_skew_now()
+            if sk is None:
+                return
+            ko = self.lang == "ko"
+            if abs(sk) <= MAX_CLOCK_SKEW_SEC:
+                if getattr(self, "_clock_bad", False):
+                    self._clock_bad = False
+                    self._clock_popped = False
+                    self.log(f"✓ PC 시계 차이 {abs(sk):.0f}초 - 허용 범위({MAX_CLOCK_SKEW_SEC}초) 안으로 돌아왔습니다."
+                             if ko else
+                             f"✓ PC clock difference {abs(sk):.0f} s - back within the {MAX_CLOCK_SKEW_SEC} s limit.")
+                return
+            _first = not getattr(self, "_clock_bad", False)
+            self._clock_bad = True
+            _msg = ((f"{self._clock_skew_text(sk)}(허용 {MAX_CLOCK_SKEW_SEC}초). 차이가 이보다 큰 동안 새 자동 진입은 "
+                     "보류됩니다 - 세션 마감 청산 시각도 PC 시계를 따르기 때문입니다. 운영체제 날짜·시간 설정의 "
+                     "자동 동기화로 맞출 수 있습니다.")
+                    if ko else
+                    (f"{self._clock_skew_text(sk)[0].upper()}{self._clock_skew_text(sk)[1:]} (limit {MAX_CLOCK_SKEW_SEC} s). "
+                     "While the gap is larger than that, new automatic entries are held - session-close exits also "
+                     "follow the PC clock. The operating system's automatic date & time sync sets it right."))
+            # 창은 자동 진입이 무장돼 있을 때, 어긋남 한 번에 한 번만(무장 전엔 로그만 - 진입이 없으면 보류할 것도 없다)
+            if getattr(self, "_sig_accts", None) and not getattr(self, "_clock_popped", False):
+                self._clock_popped = True
+                try:
+                    self.root.after(0, lambda m=_msg: messagebox.showwarning("EQ Autopilot", m))
+                except Exception:
+                    pass
+            if not _first and _tc.time() - float(getattr(self, "_clock_warn_at", 0) or 0) < 3600:
+                return
+            self._clock_warn_at = _tc.time()
+            self.log("⚠ " + _msg)
+        except Exception:
+            pass
+
     def _heartbeat(self, periodic=False):
         """멤버십 토큰으로 hb-<token>.json을 읽어 권한(_gate) 갱신. 실패/만료/철회 = fail-closed.
         하드닝(2026-07-11): timeout 8→15 + 네트워크 일시 오류 1회 재시도 — 경로 순단으로
@@ -2456,12 +3628,15 @@ class App:
                     "caps": {"use": False, "manualentry": False, "autoentry": False},
                     "brokers": {}, "reason": "no token"}
             _net_fail = False                               # 네트워크성 실패(서버 무응답/5xx/타임아웃)
+            _stale = False                                  # 서버 하트비트 갱신 멈춤(exp 경과) - 유예 대상(E)
             if tok:
                 import requests
                 import autopilot_crypto
                 for attempt in (1, 2):                      # 1회 재시도(총 2회)
                     try:
+                        _hq0 = _t.time()
                         r = requests.get(_hb_url(tok), params={"t": int(_t.time())}, timeout=15)
+                        self._note_clock(getattr(r, "headers", None), _hq0, _t.time())   # PC 시계 차이(W)
                         try:
                             hb = autopilot_crypto.decrypt(tok, r.text) if r.ok else {}
                         except Exception:
@@ -2473,8 +3648,15 @@ class App:
                             gate["reason"] = f"server {r.status_code}"
                         elif not hb.get("ok"):
                             gate["reason"] = hb.get("reason") or "locked"     # 명시 거부 = 즉시 잠금
-                        elif hb.get("exp") and _t.time() > hb["exp"]:
-                            gate["reason"] = "expired"                        # 명시 만료 = 즉시 잠금
+                        elif hb.get("exp") and (_t.time() - (self._clock_skew_now() or 0.0)) > hb["exp"]:
+                            # 만료 판정은 서버 시각 기준(W: 서버가 자기 시각으로 찍은 exp를 PC 시계로 재면, 시계가 15~20분
+                            # 빠른 PC는 늘 '만료'로 잠겨 자동 청산까지 멈췄다). 시계 차이를 못 잰 경우는 종전처럼 PC 시계.
+                            # exp 경과 = 서버 스케줄러가 하트비트를 20분 넘게 다시 쓰지 못한 것(실행 실패·걸림)이지
+                            # 명시 거부가 아니다 - 거부는 서버가 ok:false로 쓴다(autopilot_hb.write). 종전에는 즉시 잠가
+                            # 유예 없이 전 회원 신호 대기가 한꺼번에 꺼졌다. 순단과 같은 유예·폴백 경로로 보낸다
+                            # (오픈 준비 버그 조사 2026-10-06 E).
+                            gate["reason"] = "expired"
+                            _stale = True
                         else:
                             # 서버 광고: 서버 venv에 cryptography가 있으면 hb에 aead=True.
                             # 앱→서버(프로필 푸시)를 v2로 보낼지는 **이 값**으로 정한다 -
@@ -2503,16 +3685,23 @@ class App:
             if gate.get("ok"):
                 self._gate_good, self._gate_good_ts = dict(gate), _t.time()
                 self._killed = bool(gate.get("force_dry_run", True))   # 마지막으로 서버가 말한 킬스위치 상태(폴백이 되살리지 않게)
-            elif _net_fail and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < HB_GRACE_MIN * 60:
+            elif (_net_fail or _stale) and getattr(self, "_gate_good", None) and                     (_t.time() - getattr(self, "_gate_good_ts", 0)) < HB_GRACE_MIN * 60:
                 _age = int((_t.time() - self._gate_good_ts) // 60)
                 gate = {**self._gate_good,
                         "reason": f"네트워크 순단 — 최근 권한 유지(유예 {_age}/{HB_GRACE_MIN}분)"}
-                self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
-                         f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
+                if _stale:                                  # 하트비트 갱신 멈춤(E) - 순단과 문장만 다르다
+                    self.log(f"⚠ 서버 권한 정보가 갱신되지 않고 있습니다 — 마지막 정상 권한으로 "
+                             f"{HB_GRACE_MIN - _age}분 유예 중" if self.lang == "ko" else
+                             f"⚠ The server has not refreshed your permission data — keeping the last valid "
+                             f"permission for {HB_GRACE_MIN - _age} more min")
+                else:
+                    self.log(f"⚠ 하트비트 네트워크 순단 — 마지막 정상 권한으로 {HB_GRACE_MIN - _age}분 "
+                             f"유예 중 (서버가 명시 거부하면 즉시 잠금)")
             # 서버 불통 폴백(대표 2026-09-30): 유예를 넘긴 '닿지 못함'과 서버의 '명시 거부'(locked/expired)를 구분해 둔다 -
             # _apply_gating이 이 표시로 자동 청산을 끄지 않고 로컬 일정대로 계속한다(새 진입은 멈춤). 킬스위치(ok + force_dry_run)와 다르다.
+            # 하트비트 갱신 멈춤(exp 경과)도 '닿지 못함' 쪽이다 - 서버가 거부한 게 아니다(E).
             if not gate.get("ok") and tok:
-                if _net_fail:
+                if _net_fail or _stale:
                     gate["offline"] = True
                 else:
                     gate["revoked"] = True
@@ -2569,9 +3758,150 @@ class App:
         return self._acfg[asset]["broker"] or _ASSET_BROKERS[asset][0]
 
     def _creds_of(self, asset, broker=None):
-        """자산 탭의 (현재 또는 지정) 브로커 크레덴셜 {f1,f3}. 계좌는 자산별이라 크레덴셜도 자산 내."""
+        """자산 탭의 (현재 또는 지정) 브로커 크레덴셜 {f1,f3}.
+        브로커 연결 공용(대표 2026-10-07): 같은 브로커를 쓰는 자산(NQ·GC)은 split이 아니면 **같은 dict 하나**를 쓴다 -
+        없을 때 만들면 다른 holder의 dict에 별칭으로 걸고, 새 dict도 holder 전원에 건다. 서명은 그대로."""
         bk = broker or self._acfg[asset]["broker"]
-        return self._acfg[asset].setdefault("creds", {}).setdefault(bk, {"f1": "", "f3": ""})
+        c = self._acfg[asset].setdefault("creds", {})
+        cr = c.get(bk)
+        if isinstance(cr, dict):
+            return cr
+        _sp = getattr(self, "_creds_split", None)
+        _sp = _sp if isinstance(_sp, (set, frozenset)) else set()
+        _sh = bk not in _sp and asset in _bk_holders(bk) and _bk_shared(bk)
+        cr = None
+        if _sh:
+            for _a in _bk_holders(bk):
+                _o = (((self._acfg.get(_a) or {}).get("creds")) or {}).get(bk)
+                if isinstance(_o, dict):
+                    cr = _o
+                    break
+        if cr is None:
+            cr = {"f1": "", "f3": ""}
+        c[bk] = cr
+        if _sh:
+            for _a in _bk_holders(bk):
+                if _a in self._acfg:
+                    self._acfg[_a].setdefault("creds", {}).setdefault(bk, cr)
+        return cr
+
+    def _creds_peek(self, asset, bk):
+        """읽기 전용 _creds_of(아무것도 만들지 않는다 - 핑처럼 백그라운드에서 부르는 곳용)."""
+        try:
+            _cr = (((self._acfg.get(asset) or {}).get("creds")) or {}).get(bk)
+            if isinstance(_cr, dict):
+                return _cr
+            _sp = getattr(self, "_creds_split", None)
+            _sp = _sp if isinstance(_sp, (set, frozenset)) else set()
+            if bk not in _sp and asset in _bk_holders(bk) and _bk_shared(bk):
+                for _a in _bk_holders(bk):
+                    _o = (((self._acfg.get(_a) or {}).get("creds")) or {}).get(bk)
+                    if isinstance(_o, dict):
+                        return _o
+        except Exception:
+            pass
+        return {}
+
+    def _conn_users(self, bk, cr=None):
+        """그 연결(dict)을 같이 쓰는 자산 목록. split이면 그 자산 하나."""
+        cr = cr if cr is not None else self._creds_of(_panel_asset_of(self), bk)
+        return [a for a in _ASSETS if (((self._acfg.get(a) or {}).get("creds")) or {}).get(bk) is cr]
+
+    def _conn_row_counts(self, bk, users, active_only=True):
+        """이 연결을 쓰는 계좌 행 수 {자산: n} - 행 브로커가 bk인 행(선물은 계좌 ID 있는 행). active_only = 켜진 비수동 행만."""
+        out = {}
+        for a in users:
+            if active_only and not (self._acfg.get(a) or {}).get("include", True):
+                out[a] = 0                            # 실행 체크가 꺼진 자산의 행은 '켜진 계좌'로 세지 않는다(재리뷰 P3)
+                continue
+            n = 0
+            for x in (((self._acfg.get(a) or {}).get("accounts")) or []):
+                if active_only and (not x.get("on") or x.get("manual")):
+                    continue
+                if _row_broker_of(self._acfg, a, x, self._crypto_unique_ok(a)) != bk:
+                    continue
+                if _BROKER_SPEC.get(bk, {}).get("acct") and not str(x.get("id") or "").strip():
+                    continue
+                n += 1
+            out[a] = n
+        return out
+
+    def _armed_on_conn(self, bk, cr):
+        """이 연결(dict)로 무장된 자산 목록(신호 대기·마감 청산 무장 사본의 브로커가 bk이고 그 자산 창고가 cr)."""
+        out = []
+        try:
+            for d in (getattr(self, "_sig_accts", None) or {}, getattr(self, "_auto_accts", None) or {}):
+                for k, v in list(d.items()):
+                    _a = k[0]
+                    _v = v[0] if isinstance(v, list) and v else v
+                    if not isinstance(_v, dict) or _v.get("broker") != bk:
+                        continue
+                    if (((self._acfg.get(_a) or {}).get("creds")) or {}).get(bk) is cr and _a not in out:
+                        out.append(_a)
+        except Exception:
+            pass
+        return out
+
+    def _mirror_targets(self):
+        """저장 미러 대상 쌍(_mirror_pairs). 공용 상태가 없으면(None) 종전처럼 전부 쓴다."""
+        try:
+            if getattr(self, "_enc_locked", False) is True:
+                return None                   # PIN을 열지 못한 세션 = 별칭 0(전부 split) - 종전처럼 전부 쓴다(블롭에만 값이 있는 창고 보존)
+            seed = getattr(self, "_mirror_seed", None)
+            if not isinstance(seed, set):
+                return None
+            _sp = getattr(self, "_creds_split", None)
+            return _mirror_pairs(self._acfg, seed, _sp if isinstance(_sp, (set, frozenset)) else set())
+        except Exception:
+            return None
+
+    def _panel_default_bk(self):
+        """기동 때 패널 브로커(1b 반박 리뷰 P2-5, 2026-10-08): ①실행 체크된 자산의 켜진 행 중 계좌 ID가 있거나 크립토인 행의 브로커
+        ②연결이 설정된 첫 브로커 ③NQ 자산 브로커. 종전 'NQ 첫 켜진 행'은 빈 기본 행(Topstep)을 집어, 새 Lucid 회원이 앱을 다시
+        열면 빈 Topstep 칸이 떠 연결이 사라진 것처럼 보였다."""
+        try:
+            for _a in _ASSETS:
+                if not (self._acfg.get(_a) or {}).get("include", True):
+                    continue
+                for _ac in (self._acfg.get(_a, {}).get("accounts") or []):
+                    if not _ac.get("on"):
+                        continue
+                    _b = self._acct_broker(_a, _ac)
+                    if str(_ac.get("id") or "").strip() or not _BROKER_SPEC.get(_b, {}).get("acct"):
+                        if self._bk_configured(_a, _b):
+                            return _b
+            for _b in _panel_brokers():
+                if any(self._bk_configured(_a, _b) for _a in _bk_holders(_b)):
+                    return _b
+            return self._broker_of("NQ")
+        except Exception:
+            return _panel_brokers()[0]
+
+    def _panel_split(self, bk=None) -> bool:
+        """패널 브로커가 자산별로 따로(split·PIN 잠김)인가."""
+        bk = bk or self._broker_name
+        _sp = getattr(self, "_creds_split", None)
+        _sp = _sp if isinstance(_sp, (set, frozenset)) else set()
+        return _bk_shared(bk) and bk in _sp
+
+    def _panel_fix(self):
+        """패널 브로커·패널 자산을 맞춘다(브로커가 목록 밖이면 기본값, 자산은 그 브로커 holder 중 하나 -
+        공용이면 첫 holder(같은 dict), split이면 지금 고르던 자산을 유지)."""
+        if self._broker_name not in _panel_brokers():
+            self._broker_name = _panel_brokers()[0]
+        _hs = _bk_holders(self._broker_name)
+        _pa = getattr(self, "_panel_asset", None)
+        if not (self._panel_split() and _pa in _hs):
+            _pa = _hs[0] if _hs else "NQ"
+        self._panel_asset = _pa
+        return _pa
+
+    def _enc_carry(self):
+        """PIN을 열지 못한 기동이면 지난 블롭을 다시 싣는다(_save_full carry)."""
+        if getattr(self, "_enc_locked", False) is True:
+            _c = getattr(self, "_kc_enc_carry", None)
+            return _c if isinstance(_c, dict) else {"kc_enc": None, "kc_failed": []}
+        return None
 
 
     def _register_avail(self):
@@ -2583,7 +3913,7 @@ class App:
             _v = ""
         if not _v:
             return
-        _av = self._avail_of(self._asset, self._broker_name)
+        _av = self._avail_of(_panel_asset_of(self), self._broker_name)
         if _v not in _av:
             _av.append(_v)
             self._save_cfg()
@@ -2598,23 +3928,85 @@ class App:
         """계좌의 실행 브로커(대표 2026-08-09 계좌별 브로커 — BTC Bybit+Bitget 동시 발주).
         계좌에 broker가 없거나 이 자산에서 못 쓰는 값이면 자산 기본 브로커(구 동작)."""
         bk = (acct.get("broker") or "").strip()
-        return bk if bk in _ASSET_BROKERS.get(asset, []) else self._broker_of(asset)
+        if bk in _ASSET_BROKERS.get(asset, []):
+            return bk
+        return _crypto_default_bk(self._acfg, asset, self._crypto_unique_ok(asset)) or self._broker_of(asset)
+
+    def _crypto_unique_ok(self, asset) -> bool:
+        """'키가 있는 유일한 거래소' 해석을 써도 되는가(최종 반박 리뷰 2026-10-08 P2-5). PIN 보관분을 이번 기동에 열지 못했거나
+        (_enc_locked) 그 자산 키가 저장 실패 목록(kc_failed)에 있으면 보이는 키가 전부가 아니다 - 그때는 자산 기본 브로커로
+        해석하고(키가 없으면 사전점검에서 멈춤, 03b와 같은 fail-closed) 빈 행을 박지 않는다."""
+        if getattr(self, "_enc_locked", False) is True:
+            return False
+        _kf = getattr(self, "_kc_failed", None)
+        if isinstance(_kf, (list, tuple, set)):
+            _lb = {_broker_label(b): b for b in _ASSET_BROKERS.get(asset, [])}
+            _c = ((self._acfg.get(asset) or {}).get("creds")) or {}
+            for _x in _kf:
+                _p = str(_x).split("/")
+                # 'BTC/Bybit (USDT perp)/f1' 꼴 - 그 거래소 아이디(API Key)가 지금 메모리에 없을 때만(PIN을 열어 되채웠으면 보이는 키가 전부)
+                if len(_p) == 3 and _p[0] == asset and _p[2] == "f1" and _p[1] in _lb \
+                        and not str(((_c.get(_lb[_p[1]]) or {}).get("f1")) or "").strip():
+                    return False
+        return True
 
     def _accts_of(self, asset):
         """자산의 계좌 리스트(없으면 빈 슬롯 1개 보장)."""
         accts = self._acfg[asset].setdefault("accounts", [])
         if not accts:
-            accts.append(_new_acct(600.0, "", True, _broker_label(self._acfg[asset]["broker"])))
+            accts.append(_new_acct(DEFAULT_ONE_R, "", True, _broker_label(self._acfg[asset]["broker"])))
         return accts
 
     def _active_accts(self, asset):
         """on=True인 계좌만(실제 진입/조회 대상)."""
         return [a for a in self._accts_of(asset) if a.get("on")]
 
+    def _dup_crypto_rows(self, asset):
+        """같은 자산에 같은 크립토 브로커(acct=False) 행이 둘 이상 켜져 있으면 [(브로커, 행 수)](오픈 준비 버그 조사 2026-10-06 D).
+        크립토 행에는 계좌 ID가 없고 키는 자산·브로커당 하나라, 같은 브로커 행 둘 = 같은 키로 같은 신호에 주문 두 번
+        (서버 진입 클레임도 같은 기기·같은 라벨이라 둘 다 허가한다). 무장 프리플라이트가 이걸로 막는다."""
+        cnt = {}
+        for ac in self._active_accts(asset):
+            if ac.get("manual"):
+                continue
+            bk = self._acct_broker(asset, ac)
+            if _BROKER_SPEC.get(bk, {}).get("acct"):
+                continue
+            cnt[bk] = cnt.get(bk, 0) + 1
+        return [(b, n) for b, n in cnt.items() if n > 1]
+
+    def _dup_crypto_msg(self, asset, bk, n):
+        if self.lang == "ko":
+            return (f"{asset} {_broker_label(bk)}: 같은 거래소 행 {n}개가 켜져 있음 - API 키가 하나라 "
+                    f"주문이 {n}번 나가므로 무장하지 않음(한 행만 켜져 있어야 함)")
+        return (f"{asset} {_broker_label(bk)}: {n} rows are on for the same exchange - they share one API key, "
+                f"so each order would go out {n} times; not armed (only one row may be on)")
+
+    def _log_prop_migrated(self):
+        """켜진 프롭 계좌의 1R이 설정 로드 때 이행으로 바뀌었으면 로그 한 줄씩(오픈 준비 버그 조사 2026-10-06 Q).
+        종전엔 재시작 뒤 말없이 바뀌어, 회원이 저장 화면에서 본 숫자와 실제 발주 1R이 달랐다. 같은 건은 한 번만."""
+        try:
+            ko = self.lang == "ko"
+            for _k, _done in list(_PROP_MIGRATED.items()):
+                if _done:
+                    continue
+                _PROP_MIGRATED[_k] = True
+                _id, _b, _a = _k
+                _nm = ("…" + _id[-4:]) if _id else "-"
+                self.log(f"ℹ 프롭 1R 이행(설정 로드) {_nm}: 챌린지 ${_b[0]:g} → ${_a[0]:g}, 펀디드 ${_b[2]:g} → ${_a[2]:g}"
+                         " - 배포 기본값 그대로이던 값이라 현행 기준값으로 바꿨습니다(회원이 프롭 창에서 저장한 값은 바꾸지 않음)."
+                         if ko else
+                         f"ℹ Prop 1R migrated on settings load {_nm}: challenge ${_b[0]:g} → ${_a[0]:g}, "
+                         f"funded ${_b[2]:g} → ${_a[2]:g} - the values were an old shipped default, so they now follow "
+                         "the current baseline (values saved in the prop window are never changed).")
+        except Exception:
+            pass
+
     def _save_cfg(self, **kw):
         """_save_full 래퍼 — 현재 앱 상태를 yaml로 영속화 + 저장 확인 표시(2026-08-11 UX:
         '적용됐는지 안 보인다' - 저장이 일어날 때마다 상태 라벨이 ✓와 시각으로 답한다)."""
-        _save_full(self.lang, self._token, self._acfg, self._profile, **kw)
+        _save_full(self.lang, self._token, self._acfg, self._profile,
+                   targets=self._mirror_targets(), carry=self._enc_carry(), **kw)
         self._flash_saved()
 
     def _flash_saved(self):
@@ -2677,31 +4069,237 @@ class App:
             a = self._asset
             armed = any(k[0] == a for k in (set(self._sig_accts) | set(self._auto_accts)))
             cr = self._creds_of(a)
-            accts = [x for x in self._accts_of(a) if (x.get("id") or "").strip()]
+            # (오픈 준비 버그 조사 2026-10-06 D) 크립토(acct=False)는 API 키가 곧 계좌라 행 자체가 등록이다. 종전엔 id가
+            # 있는 행만 세어 BTC 안내가 '[계좌 추가]로 계좌 이름 등록'에 영영 멈췄고, 그걸 따르면 같은 키 행이 하나 더
+            # 생겨 BTC 주문이 행마다 나갔다.
+            accts = [x for x in self._accts_of(a)
+                     if (x.get("id") or "").strip()
+                     or not _BROKER_SPEC.get(self._acct_broker(a, x), {}).get("acct")]
             if not (self._token or "").strip():
                 t = "다음: 맨 위에 멤버십 토큰을 붙여넣으세요" if ko else "Next: paste your membership token at the top"
-            elif not (cr.get("f1") or "").strip():
+            elif not any(self._bk_configured(a, _b) for _b in _ASSET_BROKERS.get(a, [])):
                 t = "다음: 브로커를 고르고 API 키(또는 브리지 토큰)를 입력하세요" if ko else "Next: pick a broker and enter its API key / bridge token"
+            elif armed and not any(k[0] == a for k in self._sig_accts) and self._kill_on():
+                t = self._close_held_line()
+            elif armed and not any(k[0] == a for k in self._sig_accts):
+                # 신호 대기가 꺼지고 마감 청산만 남은 상태(오픈 준비 버그 조사 2026-10-06 E) - '자동으로 실행' 아님
+                t = ("마감 청산만 가동 중 - 신호 대기는 꺼져 있어 새 신호에 진입하지 않습니다" if ko
+                     else "Session-close only - signal watch is off, so new signals are not entered")
+            elif armed:                               # 무장은 연결 확인 기록(_test_ok)보다 앞(1b 반박 리뷰 P2-6)
+                t = self._armed_line(None, [a])
             elif not accts:
                 t = "다음: [계좌 추가]로 계좌 이름을 등록하세요" if ko else "Next: add your account with [Add]"
+            elif self._asset_not_ready(a):          # '준비 완료'는 사전점검이 통과할 때만(연결 확인 기록과 상관없이, 2026-10-08b P2-1)
+                t = self._next_not_ready(a)
+            elif self._gate_line():                  # 서버·등급 때문에 시작 버튼이 꺼졌으면 그 이유(라이브 줄과 같은 문장, 2026-10-11a)
+                t = self._gate_line()
             elif a not in getattr(self, "_test_ok", set()):
-                t = "다음: 키, 계좌를 입력하세요 - 저장, 연결 확인은 자동입니다" if ko else "Next: enter key & account - saving & verification are automatic"
-            elif armed:
-                t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Armed - runs automatically on the next signal"
+                # 설정은 다 됐는데 이번 실행에서 아직 연결 확인 전(재시작 뒤 등, 확인 재리뷰 P3)
+                t = ("연결 확인 전 - [▶ 라이브 시작]이 연결을 확인합니다" if ko else
+                     "Connection not checked yet - [▶ Go Live] checks it")
             else:
                 t = "준비 완료 - [▶ 라이브 시작]" if ko else "Ready - press [▶ Go Live]"
             lbl.config(text="👉 " + t)
         except Exception:
             pass
+        try:
+            _ll = getattr(self, "_live_next_lbl", None)
+            if _ll is not None:
+                _ll.config(text=self._live_next_text())   # 라이브 패널 줄은 라이브 상태로 따로(1b 반박 리뷰 P2-6)
+        except Exception:
+            pass
+
+    def _next_not_ready(self, a):
+        """계좌 칸 '다음:' 줄 - 사전점검이 막히는 이유대로(2026-10-11a). 키·계좌 미입력은 종전 안내, 크립토 키 미설정은
+        사전점검과 같은 할 일, 그 밖(켜진 계좌 없음·같은 거래소 행 중복·브로커 지원 꺼짐)은 이유를 그대로."""
+        ko = self.lang == "ko"
+        for x in ((self._acfg.get(a) or {}).get("accounts") or []):
+            if not x.get("on") or x.get("manual"):
+                continue
+            _b = self._acct_broker(a, x)
+            if not str(self._creds_peek(a, _b).get("f1") or "").strip() and not _BROKER_SPEC.get(_b, {}).get("acct"):
+                return ("다음: " if ko else "Next: ") + self._crypto_keymiss_hint(a, _b)[3:]
+        _why = self._asset_not_ready(a)
+        if _why in ("키 미설정", "계좌 미선택", "key missing", "no account picked"):
+            return "다음: 키, 계좌를 입력하세요 - 저장, 연결 확인은 자동입니다" if ko else "Next: enter key & account - saving & verification are automatic"
+        return (f"다음: 준비 안 됨 - {_why}" if ko else f"Next: not ready - {_why}")
+
+    def _asset_not_ready(self, a):
+        """그 자산이 라이브 시작 사전점검을 통과하지 못하는 첫 이유(없으면 '') - 라이브 줄과 계좌 설정 '다음:'이 같이 쓴다."""
+        ko = self.lang == "ko"
+        _act = [x for x in ((self._acfg.get(a) or {}).get("accounts") or []) if x.get("on") and not x.get("manual")]
+        if not _act:
+            return "켜진 계좌 없음" if ko else "no account on"
+        for x in _act:
+            _b = self._acct_broker(a, x)
+            if not str(self._creds_peek(a, _b).get("f1") or "").strip():
+                return "키 미설정" if ko else "key missing"
+            if not self._broker_allowed(_b):
+                return "브로커 지원 꺼짐(서버)" if ko else "broker disabled (server)"
+            if _BROKER_SPEC.get(_b, {}).get("acct") and not str(x.get("id") or "").strip():
+                return "계좌 미선택" if ko else "no account picked"
+        if self._dup_crypto_rows(a):
+            return "같은 거래소 행 중복" if ko else "duplicate exchange rows"
+        return ""
+
+    def _live_next_text(self):
+        """라이브 패널 버튼 아래 한 줄(1b 반박 리뷰 P2-6, 2026-10-08) - 계좌 탭 자산 하나가 아니라 실행 체크된 자산 전체로:
+        ①무장 중 ②서버 잠금·등급 ③동의 ④자산별 준비(안 된 자산 이름 먼저) ⑤준비 완료."""
+        ko = self.lang == "ko"
+        _sig = sorted({k[0] for k in (getattr(self, "_sig_accts", None) or {})})
+        _auto = sorted({k[0] for k in (getattr(self, "_auto_accts", None) or {})})
+        if _sig:
+            _nm = []
+            for _a in _sig:                       # 크립토는 무장한 거래소 이름을 붙인다(확인 재리뷰 P1: 거래소가 바뀌면 보이게)
+                _cx = sorted({str(v.get("broker")) for k, v in (self._sig_accts or {}).items()
+                              if k[0] == _a and isinstance(v, dict) and not _BROKER_SPEC.get(v.get("broker"), {}).get("acct")})
+                _nm.append(f"{_a}({', '.join(_broker_short(b).split(' (')[0] for b in _cx)})" if _cx else _a)
+            return self._armed_line(", ".join(_nm), _sig)
+        if _auto and self._kill_on():
+            return self._close_held_line(", ".join(_auto))
+        if _auto:
+            return (f"마감 청산만 가동 중 - {', '.join(_auto)}. 신호 대기는 꺼져 있습니다" if ko else
+                    f"Session-close only - {', '.join(_auto)}. Signal watch is off")
+        if not (self._token or "").strip():
+            return "다음: 맨 위에 멤버십 토큰을 붙여넣으세요" if ko else "Next: paste your membership token at the top"
+        _gt = self._gate_line()
+        if _gt:
+            return _gt
+        try:
+            if not self.consent.get():
+                return "다음: 위 동의에 체크하세요" if ko else "Next: tick the agreement above"
+        except Exception:
+            pass
+        return self._live_ready_tail()
+
+    def _gate_line(self):
+        """서버·등급 때문에 [라이브 시작]이 꺼진 이유(없으면 '') - 라이브 줄과 계좌 칸 '다음:' 줄이 같이 쓴다(2026-10-11a)."""
+        ko = self.lang == "ko"
+        g = getattr(self, "_gate", None) or {}
+        if not g.get("ok"):
+            # 시작 버튼이 꺼진 이유를 그대로(확인 재리뷰 P3, 2026-10-08: 버튼이 꺼졌는데 '준비 완료'라고 했다)
+            if g.get("offline"):
+                return ("서버에 연결되지 않아 지금은 라이브를 시작할 수 없습니다 - 인터넷 연결을 확인하세요" if ko else
+                        "Can't reach the server, so Go Live is unavailable right now - check your internet connection")
+            if g.get("revoked"):
+                return ("멤버십 권한이 확인되지 않아 라이브를 시작할 수 없습니다 - 토큰과 구독을 확인하세요" if ko else
+                        "Membership is not active, so Go Live is unavailable - check your token and subscription")
+            return ("서버에서 멤버십을 확인하는 중입니다" if ko else "Checking your membership with the server")
+        if g.get("ok"):
+            if g.get("force_dry_run"):
+                return ("서버가 라이브를 잠갔습니다 - 공지를 확인하세요" if ko else
+                        "Live is locked by the server - check the announcements")
+            _c = g.get("caps") or {}
+            if not (g.get("enabled") and (_c.get("use") or _c.get("autoentry"))):
+                return ("자동 실행은 Operator 등급부터입니다" if ko else
+                        "Automated execution starts at the Operator tier")
+        return ""
+
+    def _live_ready_tail(self):
+        """라이브 줄 끝부분: 실행 체크된 자산의 준비 상태."""
+        ko = self.lang == "ko"
+        incl = [a for a in _ASSETS
+                if (self._live_include[a].get() if a in getattr(self, "_live_include", {}) else
+                    (self._acfg.get(a) or {}).get("include"))]
+        if not incl:
+            return "다음: 시작할 자산을 체크하세요" if ko else "Next: check the assets to start"
+        bad = []
+        for a in incl:
+            _why = self._asset_not_ready(a)
+            if _why:
+                bad.append(f"{a}({_why})" if ko else f"{a} ({_why})")
+        if bad:
+            return ("준비 안 됨: " if ko else "Not ready: ") + ", ".join(bad)
+        return "준비 완료 - [▶ 라이브 시작]" if ko else "Ready - press [▶ Go Live]"
+
+    def _row_nm(self, nm, bk):
+        """사전점검 줄의 행 이름 - 행 이름이 거래소 이름과 같으면 괄호로 한 번 더 쓰지 않는다(2026-10-11a)."""
+        _lb = _broker_label(bk)
+        return nm if (not nm or nm == _lb) else f"{nm} ({_lb})"
+
+    def _crypto_keymiss_hint(self, a, bk, rearm=False):
+        """크립토 행 '키 미설정'의 할 일(최종 반박 리뷰 2026-10-08b P2-2, 2026-10-11a 재리뷰 P2·P3).
+        순서: PIN 보관분을 못 연 세션 → 다른 거래소가 연결돼 있으면 행 거래소 바꾸기 → 행이 둘 이상이면 그 행 지우기·끄기 →
+        행 하나면 키 넣기 또는 체크 끄기. rearm=True(가동 중 체크 경로)는 앱이 체크를 이미 되돌렸으니 '키를 넣은 뒤 다시 체크'."""
+        ko = self.lang == "ko"
+        _x = _broker_short(bk).split(" (")[0]
+        # PIN 갈래: 블롭을 못 연 세션이고 **그 자산의** 거래소 API Key가 블롭(kc_failed)에 있을 때만(2026-10-11a 재확인 3).
+        # 행 거래소 단위로 보지 않는다 - 행 브로커가 비어 '유일한 키' 해석을 끈 세션에서는 해석(Bybit)과 블롭 키(Bitget)가 다르다.
+        _kf = getattr(self, "_kc_failed", None)
+        if getattr(self, "_enc_locked", False) is True and isinstance(_kf, (list, tuple, set)) and any(
+                str(_k).startswith(f"{a}/") and str(_k).endswith("/f1") for _k in _kf):
+            return (" - PIN으로 보관한 키를 이번 실행에서 열지 못했습니다. 다시 시작해 PIN을 넣으세요" if ko else
+                    " - keys kept with your PIN were not unlocked this session. Restart and enter the PIN")
+        # 바꿔 갈 거래소: 키가 있고, 서버가 지원을 끄지 않았고, 다른 켜진 행이 이미 쓰지 않는 것(재확인 1·2 - 따르면 같은 거래소 행 중복·
+        # '브로커 지원 꺼짐'으로 다시 막혔다). 없으면 행 수 갈래로.
+        _inuse = {self._acct_broker(a, _r) for _r in ((self._acfg.get(a) or {}).get("accounts") or [])
+                  if _r.get("on") and not _r.get("manual")}
+        _oth = [b for b in _ASSET_BROKERS.get(a, []) if b != bk and not _BROKER_SPEC.get(b, {}).get("acct")
+                and self._bk_configured(a, b) and self._broker_allowed(b) and b not in _inuse]
+        if _oth:
+            _y = _broker_short(_oth[0]).split(" (")[0]
+            return (f" - [계좌 수정]에서 이 행 거래소를 {_y}으로 바꾸거나 {_x} 키를 브로커 연결 설정에 넣으세요" if ko else
+                    f" - switch this row to {_y} with [Edit accounts], or add your {_x} key in Broker connections")
+        if len(((self._acfg.get(a) or {}).get("accounts")) or []) > 1:
+            return (" - 이 행을 지우거나 끄세요(행 거래소는 [계좌 수정]에서 바꿉니다)" if ko
+                    else " - remove or turn off this row (change its exchange with [Edit accounts])")
+        if rearm:
+            return (f" - {_x} 키를 브로커 연결 설정에 넣은 뒤 {a}를 다시 체크하세요" if ko else
+                    f" - add your {_x} key in Broker connections, then check {a} again")
+        return (f" - {_x} 키를 브로커 연결 설정에 넣거나 라이브 패널에서 {a} 체크를 끄세요" if ko else
+                f" - add your {_x} key in Broker connections, or uncheck {a} in the live panel")
+
+    def _kill_on(self) -> bool:
+        """서버 킬스위치(정상 응답 + force_dry_run) - 발주 순간 _live_now가 진입·청산을 다 막는다."""
+        g = getattr(self, "_gate", None) or {}
+        return bool(g.get("ok")) and bool(g.get("force_dry_run"))
+
+    def _close_held_line(self, names=None):
+        """마감 청산만 남은 무장 + 킬스위치 = 마감 청산도 보류(최종 반박 리뷰 2026-10-08b P2-3)."""
+        _nm = f" - {names}" if names else ""
+        return (f"마감 청산 보류(서버 잠금){_nm}. 지금은 청산하지 않습니다" if self.lang == "ko" else
+                f"Session-close held (server lock){_nm}. No exits right now")
+
+    def _armed_line(self, names, assets):
+        """무장 중 한 줄을 상태대로(최종 반박 리뷰 2026-10-08 P2-4): 서버 잠금(킬스위치)·확인 모드(Operator, 체험 만료)·
+        다시 무장해야 적용되는 계좌가 있으면 '자동으로 실행됩니다'라고 하지 않는다. names=None이면 계좌 칸 '다음:' 줄 꼴."""
+        ko = self.lang == "ko"
+        g = getattr(self, "_gate", None) or {}
+        _nm = f" - {names}" if names else ""
+        if g.get("ok") and g.get("force_dry_run"):
+            return (f"가동 중(주문 보류: 서버 잠금){_nm}. 지금은 진입도 청산도 하지 않습니다" if ko else
+                    f"Running (orders held: server lock){_nm}. No entries or exits right now")
+        _need = []
+        for _a in assets or []:
+            try:
+                _n = self._rearm_needs(_a)
+            except Exception:
+                _n = []
+            if _n:
+                _need.append(f"{_a}({', '.join(_n)})" if names else ", ".join(_n))
+        if getattr(self, "_watch_only", False) is True:
+            t = (f"가동 중(확인 모드){_nm}. 신호가 오면 표시만 하고 자동 진입은 하지 않습니다" if ko else
+                 f"Running (confirm mode){_nm}. Signals shown, no auto-entry")
+        elif names:
+            t = (f"가동 중{_nm}. 신호가 오면 자동으로 실행됩니다" if ko else
+                 f"Running{_nm}. Runs automatically on the next signal")
+        else:
+            t = "가동 중 - 신호가 오면 자동으로 실행됩니다" if ko else "Running - runs automatically on the next signal"
+        if _need:
+            t += (f". 다시 무장해야 적용: {', '.join(_need)}" if ko else f". Re-arm to apply: {', '.join(_need)}")
+        return t
 
     def _acur(self):
         """현재 자산 탭의 브로커 + 그 자산 브로커 크레덴셜 {broker,f1,f3}."""
-        cr = self._creds_of(self._asset)
+        # 출처 하나(2026-10-07 리뷰 P2): 화면 칸 spec이 _broker_name을 따르므로 값도 그 브로커 창고에서 읽는다 -
+        # 종전 _creds_of(자산)은 _acfg 브로커를 봐서, 둘이 어긋나면 남의 브로커 값(예: Bridge Token)이 칸에 들어갔다.
+        cr = self._creds_of(_panel_asset_of(self), self._broker_name)
         return {"broker": self._broker_name, "f1": cr.get("f1", ""), "f3": cr.get("f3", "")}
 
     def _collect_acct_widgets(self):
         """현재 자산 탭 계좌 위젯값(on, 라벨, 1R) → self._acfg[자산]['accounts'] 반영(저장은 호출부가)."""
         accts = self._accts_of(self._asset)
+        _bad_r = []                                    # 못 읽은 1R 칸(오픈 준비 버그 조사 2026-10-06 R)
         for idx, w in getattr(self, "_acct_widgets", {}).items():
             if idx >= len(accts):
                 continue
@@ -2713,9 +4311,22 @@ class App:
                 accts[idx]["label"] = str(w["label"].get()).strip()
             except Exception:
                 pass
-            _v = _as_float(w["one_r"].get(), 0.0)
-            if _v > 0:
-                accts[idx]["one_r"] = _v
+            # 1R 칸(오픈 준비 버그 조사 2026-10-06 R): 엄격 파서로 읽는다 - 종전 _as_float는 '600,00'→60000,
+            # '62,5'→625로 읽어 그대로 발주 1R이 됐다. 못 읽거나 0 이하면 저장하지 않고, 칸도 저장된 값으로
+            # 되돌린 뒤(틀린 글자가 칸에 남아 저장된 것처럼 보이지 않게) 아래에서 한 번에 알린다.
+            try:
+                _prev_r = _as_float(accts[idx].get("one_r"), _LEGACY_ONE_R)
+                _raw_r = str(w["one_r"].get()).strip()
+                if _raw_r != f"{_prev_r:g}":
+                    _v = _parse_amount(_raw_r)
+                    if _v is not None and _v > 0:
+                        accts[idx]["one_r"] = _v
+                    else:
+                        _entry_set_text(w["one_r"], f"{_prev_r:g}")
+                        _bad_r.append((accts[idx].get("label") or (accts[idx].get("id") or "")[-4:] or f"#{idx + 1}",
+                                       _raw_r, _prev_r))
+            except Exception:
+                pass
             try:                                       # 계좌별 브로커(대표 2026-08-09)
                 if w.get("broker") is not None:
                     _lbl2bk = {_broker_label(b): b for b in _ASSET_BROKERS.get(self._asset, [])}
@@ -2725,7 +4336,12 @@ class App:
                         # 화면 잠금(_acct_edit_row)이 1차 방어, 여기는 2차 - 남은 ID로 조용히
                         # 연결 안 된 행이 되는 대신 '계좌 선택'으로 되돌리고 알린다.
                         _prev = self._acct_broker(self._asset, accts[idx])
-                        if _prev != _bv and (accts[idx].get("id") or "").strip():
+                        # 회원이 콤보를 바꿨는가는 '그릴 때 보인 값'과 비교한다(재리뷰 2026-10-08). 그린 뒤 해석이 바뀐 행(키가 생김·
+                        # 무장 전 박기)의 낡은 표시값은 회원 선택이 아니다 - 그 값으로 행 브로커를 덮거나 계좌 ID를 지우지 않는다
+                        # (최종 반박 리뷰 2026-10-08 P1: BTC 탭을 Bitget 키 전에 그려 두면 박아 둔 Bitget이 Bybit로 덮였다).
+                        _shown_bk = w.get("broker_shown") or _prev
+                        _changed = _bv != _shown_bk
+                        if _changed and _prev != _bv and (accts[idx].get("id") or "").strip():
                             accts[idx]["id"] = ""
                             _icb0 = w.get("acct_id")
                             if _icb0 is not None:
@@ -2734,7 +4350,31 @@ class App:
                                 except Exception:
                                     pass
                             self._bk_switch_warn = True
-                        accts[idx]["broker"] = _bv
+                        # 계좌 ID도 브로커도 비어 있는 행은 콤보 표시값(자산 기본 브로커로 해석된 값)을 박지 않는다
+                        # (brokermix 9, 2026-10-07): 새 설치 GC에서 Lucid만 고르고 시작하면 박힌 Topstep 때문에 막혔다.
+                        # 크립토 행(계좌 ID 개념 없음)은 늘 박는다(반박 리뷰 P2-1): 안 박으면 위 브로커 콤보만 바꿔도 BTC 실행 거래소가 바뀐다.
+                        # 회원이 콤보를 바꿨는가는 '그릴 때 보인 값'과 비교한다(재리뷰 2026-10-08): 그린 뒤 키가 생겨 해석이 바뀐
+                        # 크립토 빈 행을 낡은 표시값(Bybit)으로 박아 Bitget 회원 라이브 시작이 멈췄다.
+                        if _changed:
+                            accts[idx]["broker"] = _bv
+                            w["broker_shown"] = _bv
+                            # 기본 라벨(거래소 이름)은 새 거래소 이름으로(2026-10-11a 재확인 4: 잠그지 않고 바로 다시 체크하면 진입 로그가
+                            # 옛 거래소 이름으로 남았다). 회원이 붙인 라벨은 그대로.
+                            _bl = {_broker_label(b) for b in _ASSET_BROKERS.get(self._asset, [])}
+                            if str(accts[idx].get("label") or "").strip() in _bl and accts[idx].get("label") != _broker_label(_bv):
+                                accts[idx]["label"] = _broker_label(_bv)
+                                try:
+                                    _entry_set_text(w["label"], _broker_label(_bv))
+                                except Exception:
+                                    pass
+                        elif (not str(accts[idx].get("broker") or "").strip()
+                              and ((accts[idx].get("id") or "").strip()
+                                   or (not _BROKER_SPEC.get(_prev, {}).get("acct") and self._bk_configured(self._asset, _prev)))):
+                            accts[idx]["broker"] = _prev        # 안 바꿨으면 지금 해석값으로만 박는다(표시값 아님)
+                            if _prev != _shown_bk:
+                                self._sync_row_widget(w, self._asset, _prev)
+                                if accts[idx].get("label") == _broker_label(_shown_bk):
+                                    accts[idx]["label"] = _broker_label(_prev)
             except Exception:
                 pass
             try:
@@ -2746,6 +4386,24 @@ class App:
                         accts[idx]["id"] = _v
                         if not (accts[idx].get("label") or "").strip():
                             accts[idx]["label"] = _v[-4:]
+            except Exception:
+                pass
+        if _bad_r:                                     # R: 저장 안 한 1R을 사실대로(칸은 이미 저장된 값으로 돌림)
+            try:
+                _ko_r = self.lang == "ko"
+                _lines = [f"· {_n}: '{_raw}' - {_amount_why(_raw, _ko_r)} → ${_pv:g} {'유지' if _ko_r else 'kept'}"
+                          for _n, _raw, _pv in _bad_r]
+                self.log(("⚠ 1R 저장 안 함: " if _ko_r else "⚠ 1R not saved: ")
+                         + "; ".join(f"{_n} '{_raw}'" for _n, _raw, _pv in _bad_r))
+                messagebox.showwarning(
+                    "EQ Autopilot",
+                    (("1R을 저장하지 않았습니다. 칸은 저장된 값으로 돌렸습니다.\n\n" if _ko_r else
+                      "1R was not saved. The field is back to the saved value.\n\n")
+                     + "\n".join(_lines)
+                     + ("\n\n금액은 숫자만 받습니다(소수점은 점, 천 단위 쉼표는 1,800처럼 세 자리씩. 예: 500, 62.5, 1,800)."
+                        if _ko_r else
+                        "\n\nAmounts accept plain numbers ('.' is the decimal point; thousands commas group three "
+                        "digits. e.g. 500, 62.5, 1,800).")))
             except Exception:
                 pass
         if getattr(self, "_bk_switch_warn", False):
@@ -2793,42 +4451,206 @@ class App:
         except Exception:
             pass
 
-    def _save_current_asset(self):
-        """현재 탭 크레덴셜(f1,f3) → 이 자산 브로커 창고, 비밀(f2) → Keychain, 실행자산, 계좌위젯
-        반영, 영속화. 계좌ID, 1R, on, 라벨은 자산 탭 계좌 위젯이 관리(자산별 accounts)."""
+    def _f1_shared(self, f1):
+        """f1 값을 쓰는 브로커 칸이 (지금 메모리 기준) 하나라도 있는가 - f2(API Key 등)는 키체인에 **f1 값을
+        계정 키로** 저장돼 자산을 가리지 않고 같은 아이디면 한 항목을 같이 쓴다(2026-10-07 대표 실측 "톱스텝 api key는
+        지워져버려": GC 칸을 비운 자동 저장이 NQ가 같은 아이디로 쓰던 키까지 지웠다). 쓰는 곳이 남아 있으면 안 지운다."""
+        _v = str(f1 or "").strip()
+        if not _v:
+            return False
+        try:
+            for _a in _ASSETS:
+                for _cr in (self._acfg.get(_a, {}).get("creds") or {}).values():
+                    if str((_cr or {}).get("f1") or "").strip() == _v:
+                        return True
+        except Exception:
+            return True                      # 판단 못 하면 지우지 않는 쪽
+        return False
+
+    def _pin_crypto_rows(self, assets=None):
+        """크립토 전용 자산의 브로커 빈 행을 지금 해석값으로 박는다 - 해석된 거래소에 키가 있을 때만(확인 재리뷰 P1, 2026-10-08:
+        Bitget만 쓰던 회원이 Bybit 키를 더하면 '키 있는 유일한 거래소' 해석이 자산 기본(Bybit)으로 돌아가 다음 라이브 시작이
+        회원 선택 없이 Bybit로 무장했다). 키를 넣기 직전과 무장 직전에 부른다."""
+        for _a in (assets or _ASSETS):
+            _bs = _ASSET_BROKERS.get(_a, [])
+            if not _bs or any(_BROKER_SPEC.get(b, {}).get("acct") for b in _bs):
+                continue
+            if not self._crypto_unique_ok(_a):
+                continue                          # 보이는 키가 전부가 아닌 세션 - 박지 않는다(P2-5)
+            for _ac in ((self._acfg.get(_a) or {}).get("accounts") or []):
+                if str(_ac.get("broker") or "").strip():
+                    continue
+                _rb = self._acct_broker(_a, _ac)
+                if self._bk_configured(_a, _rb):
+                    _ac["broker"] = _rb
+                    _lb = str(_ac.get("label") or "").strip()     # 기본 라벨(거래소 이름)은 박은 거래소 이름으로
+                    if _lb in {_broker_label(b) for b in _bs} and _lb != _broker_label(_rb):
+                        _ac["label"] = _broker_label(_rb)
+                    self._sync_row_bk_widget(_a, _ac, _rb)
+
+    def _sync_row_bk_widget(self, asset, acct, bk):
+        """박은 행 브로커를 지금 그려진 계좌 행 콤보에도 반영한다(최종 반박 리뷰 2026-10-08 P1) - 표시값과 '그릴 때 보인 값'을
+        같이 바꿔, 다음 _collect_acct_widgets가 낡은 표시값을 회원 선택으로 읽지 않게."""
+        if asset != getattr(self, "_asset", None):
+            return
+        idx = next((i for i, x in enumerate((self._acfg.get(asset) or {}).get("accounts") or []) if x is acct), None)
+        if idx is None:
+            return
+        w = (getattr(self, "_acct_widgets", None) or {}).get(idx)
+        if w:
+            self._sync_row_widget(w, asset, bk)
+
+    def _sync_row_widget(self, w, asset, bk):
+        """계좌 행 위젯 하나를 행 브로커 bk에 맞춘다: 콤보 표시·'그릴 때 보인 값', 그리고 라벨 칸이 브로커 기본 이름이면 그 이름도."""
+        w["broker_shown"] = bk
+        cb = w.get("broker")
+        if cb is not None:
+            try:
+                _st = str(cb.cget("state"))
+                cb.config(state="normal")
+                # 목록도 그릴 때와 같은 규칙(이 행 브로커 + 연결된 브로커)으로 다시(P3(a))
+                cb.config(values=[_broker_label(b) for b in _ASSET_BROKERS.get(asset, [])
+                                  if b == bk or self._bk_configured(asset, b)])
+                cb.set(_broker_label(bk))
+                cb.config(state=_st)
+            except Exception:
+                pass
+        le = w.get("label")
+        if le is not None:
+            try:
+                _cur = str(le.get()).strip()
+                if _cur in {_broker_label(b) for b in _ASSET_BROKERS.get(asset, [])} and _cur != _broker_label(bk):
+                    _entry_set_text(le, _broker_label(bk))
+            except Exception:
+                pass
+
+    def _set_kept_marks(self, held):
+        """빈 칸 옆 '저장된 키 유지 중' 줄(최종 반박 리뷰 2026-10-08 P2-1). held = _save_creds_fields의 _cleared 목록('f1:held' 꼴)."""
+        _txt = "저장된 키 유지 중" if self.lang == "ko" else "Saved key kept"
+        _sec = set(_secret_fields(getattr(self, "_broker_name", ""))) | {"f2"}   # 키(비밀) 칸만 - 이메일·아이디·포트 칸에는 안 붙인다(P3(d))
+        for _f, _l in (getattr(self, "_kept_lbls", None) or {}).items():
+            try:
+                _l.config(text=(_txt if (f"{_f}:held" in held and _f in _sec) else ""))
+            except Exception:
+                pass
+
+    def _golive_busy_mark(self, on, token=None, conns=None):
+        """[라이브 시작]·가동 중 체크의 연결 테스트가 도는 동안 표시. 테스트마다 표 하나(최대 120초 - 스레드가 끝내 안 돌아와도 풀린다).
+        on=True면 표를 돌려주고, 끝날 때 그 표로 푼다. 겹친 테스트(라이브 시작 중 가동 중 체크)는 **둘 다 끝나야** 풀린다
+        (최종 반박 리뷰 2026-10-08 P0 (d): 종전 시각값 하나는 먼저 끝난 쪽이 풀어 다른 쪽 테스트 중에 키를 바꿀 수 있었다).
+        token=None으로 끄면 표를 전부 버린다. conns = 이번 테스트가 시험하는 연결 {(브로커, f1)} - 키 편집 거절은 이 연결만
+        (최종 반박 리뷰 2026-10-08b P3(b): 시작과 무관한 브로커의 첫 키 붙여넣기까지 거절하고 칸을 비웠다). None이면 전부."""
+        import time as _tg
+        _d = getattr(self, "_golive_tok", None)
+        if not isinstance(_d, dict):
+            _d = self._golive_tok = {}
+        if on:
+            _t = object()
+            _d[_t] = (_tg.time() + 120.0, None if conns is None else frozenset(conns))
+            return _t
+        if token is None:
+            _d.clear()
+        else:
+            _d.pop(token, None)
+        return None
+
+    def _golive_busy(self) -> bool:
+        import time as _tg
+        _d = getattr(self, "_golive_tok", None)
+        if not isinstance(_d, dict):
+            return False
+        _now = _tg.time()
+        for _t in [t for t, u in _d.items() if (u[0] if isinstance(u, tuple) else u) <= _now]:
+            _d.pop(_t, None)
+        return bool(_d)
+
+    def _golive_busy_conn(self, bk, f1) -> bool:
+        """지금 도는 연결 테스트가 이 연결(브로커, 아이디)을 시험하는가 - 연결 정보 편집 거절은 이 경우만."""
+        if not App._golive_busy(self):
+            return False
+        _k = (str(bk or ""), str(f1 or "").strip())
+        for _u in (getattr(self, "_golive_tok", None) or {}).values():
+            _c = _u[1] if isinstance(_u, tuple) else None
+            if _c is None or _k in _c:
+                return True
+        return False
+
+    def _golive_conns(self, assets):
+        """assets의 켜진 비수동 행이 쓰는 연결 {(브로커, f1)} - 연결 테스트 대상."""
+        out = set()
+        for _a in assets:
+            for _ac in ((self._acfg.get(_a) or {}).get("accounts") or []):
+                if not _ac.get("on") or _ac.get("manual"):
+                    continue
+                _b = self._acct_broker(_a, _ac)
+                out.add((_b, str(self._creds_peek(_a, _b).get("f1") or "").strip()))
+        return out
+
+    def _golive_refuse(self, warn=True) -> bool:
+        """라이브 시작·가동 중 체크의 연결 테스트가 도는 동안 계좌 설정을 바꾸는 조작을 거절한다(최종 반박 리뷰 2026-10-08 P0).
+        테스트를 거치지 않은 행이 그 끝에 무장되지 않게 - [계좌 추가]·[계좌 수정]·행 브로커·계좌 고르기·삭제·[설정 가져오기].
+        반환 True = 거절함(호출부는 그대로 돌아간다)."""
+        if not App._golive_busy(self):
+            return False
+        if warn:
+            try:
+                messagebox.showwarning(
+                    "EQ Autopilot",
+                    ("연결 테스트 중이라 계좌 설정을 바꾸지 않았습니다. 끝난 뒤에 바꾸세요."
+                     if self.lang == "ko" else
+                     "A connection test is running, so account settings were not changed. "
+                     "Change them after it finishes."))
+            except Exception:
+                pass
+        return True
+
+    def _known_secrets(self) -> set:
+        """메모리의 비밀 값 전부(모든 자산·브로커의 비밀 칸) + 설치된 브리지 토큰 - 쓰기 시점 오염 가드용."""
+        out = set()
+        try:
+            for _a in _ASSETS:
+                for _b, _cr in ((((self._acfg.get(_a) or {}).get("creds")) or {}).items()):
+                    for _f in _secret_fields(_b):
+                        _v = str((_cr or {}).get(_f) or "").strip()
+                        if _b == "nt8" and _f == "f1":
+                            # 쓰기 가드는 거절이라 지우는 것보다 안전 - 저장된 nt8 토큰은 모양과 상관없이 넣되(.cs를 못 읽는 기기에서
+                            # 회원이 정한 토큰도 거절), 그 값 이름으로 Topstep API Key가 저장돼 있으면 뺀다(1b 반박 리뷰 P3)
+                            if _v and "@" not in _v and not _f2_load(_v):
+                                out.add(_v)
+                        elif _looks_token(_v):       # 이메일 모양은 비밀로 보지 않는다(반박 리뷰 P1과 같은 기준)
+                            out.add(_v)
+            _bi = getattr(self, "_bridge_inst", None)
+            if isinstance(_bi, tuple) and _bi and _bi[0]:
+                out.add(str(_bi[0]))
+        except Exception:
+            pass
+        return out
+
+    def _save_current_asset(self, transient=False):
+        """현재 탭 크레덴셜(f1,f3) → 그 브로커 창고(NQ·GC 공용이면 같은 dict), 비밀(f2) → Keychain, 실행자산,
+        계좌위젯 반영, 영속화. 계좌ID, 1R, on, 라벨은 자산 탭 계좌 위젯이 관리(자산별 accounts).
+        브로커 연결 공용(대표 2026-10-07)과 함께 넣은 가드:
+          ① 칸 출처: 화면 칸을 그린 브로커(_fields_bk)와 지금 브로커가 다르면 칸 값을 어느 창고에도 쓰지 않는다
+          ② 쓰기 시점 오염: 비밀이 아닌 칸(Topstep 아이디·IBKR Host/Port·Bridge Port)에 알려진 비밀이 들어 있으면 그 칸은 안 씀
+          ③ 무장: 이 연결로 무장된 자산이 있으면 아이디·키를 바꾸지 않고 칸을 되돌린다(NQ 무장 중 GC 탭 편집 포함)
+          ④ 빈 칸은 저장된 아이디·비밀을 지우지 않는다 - 삭제는 [연결 지우기] 하나로(키체인 삭제 경로 0)
+          ⑤ 아이디만 바뀌고 키 칸은 손대지 않았으면, 새 아이디에 키가 이미 있을 때 그 키를 덮지 않는다
+        transient(자동 저장 디바운스) 인자는 호환용으로 남긴다(삭제 경로가 없어 차이 없음)."""
         bk = self._broker_name
-        self._acfg[self._asset]["broker"] = bk
-        cr = self._creds_of(self._asset, bk)
-        # ⚠️**삭제 경로**(2026-08-28 리뷰 P0). v2026.08.28h가 비밀을 키체인으로 옮기면서
-        # 저장만 옮기고 삭제를 안 옮겨, 자격을 지워도 다음 기동에 되살아났다 - 회원이
-        # "이 거래소는 끊었다"고 믿는 계좌로 실주문이 다시 나가는 상태였다(대표 맥이
-        # 이미 그랬다: config.yaml은 빈 값인데 키체인에 값이 살아 있었다).
-        # ⚠️판정은 "지금 비어 있다"가 아니라 **"값이 있었는데 비워졌다"**여야 한다.
-        # 키체인 읽기가 실패한 기동(잠긴 키체인, 헤드리스, keyring 백엔드 없음)에서는
-        # _load 되채우기가 비어 메모리도 빈 값이 되는데, 그때 "비어 있으니 지운다"를
-        # 하면 첫 자동저장이 자격을 영구 파괴한다.
-        _prev_f1 = str(cr.get("f1") or "").strip()
-        _prev_f3 = str(cr.get("f3") or "").strip()
-        if hasattr(self, "user"):
-            cr["f1"] = self.user.get().strip()
-        if hasattr(self, "f3"):
-            cr["f3"] = self._f3()
-        _sec = _secret_fields(bk)
-        if "f1" in _sec and _prev_f1 and not str(cr.get("f1") or "").strip():
-            _kc_del(_kc_key(self._asset, bk, "f1"))
-            _f2_del(_prev_f1)               # f2의 레거시 계정 키(=옛 f1 값)도 함께
-            self.log("🗑 " + ("저장된 자격을 삭제했습니다(보안 저장소 포함)."
-                              if self.lang == "ko" else
-                              "Deleted the stored credential, including the secret store."))
-        if "f3" in _sec and _prev_f3 and not str(cr.get("f3") or "").strip():
-            _kc_del(_kc_key(self._asset, bk, "f3"))
-        if hasattr(self, "key"):                 # 비밀(f2) → Keychain (f1 키로)
-            _f1_now = str(cr.get("f1") or "").strip()
-            if _f1_now:
-                _f2_save(_f1_now, self.key.get())
-            elif _prev_f1:
-                _f2_del(_prev_f1)           # f1을 지웠으면 f2도 남기지 않는다
-            # f1이 비었는데 f2를 저장하면 "default" 계정으로 새 비밀이 생겨 영영 안 지워진다
+        _fb = getattr(self, "_fields_bk", None)
+        _fpa = getattr(self, "_fields_pa", None)
+        if (isinstance(_fb, str) and _fb != bk) or (isinstance(_fpa, str) and _fpa != _panel_asset_of(self)):
+            self.log(("화면 칸이 지금 고른 브로커와 달라 칸 값을 저장하지 않았습니다. 화면을 저장된 브로커에 맞춰 다시 그립니다. "
+                      "필요하면 값을 다시 넣으세요." if self.lang == "ko" else
+                      "The fields on screen belong to a different broker, so they were not saved. The screen is redrawn "
+                      "for the saved broker; enter the value again if needed."))
+            try:                                  # 저장 중에 다시 그리지 않는다(재진입) - 다음 틱에 맞춘다
+                self.root.after(0, lambda: (self._sync_tab_broker(), self._build()))
+            except Exception:
+                pass
+        else:
+            # 패널 브로커는 자산 실행 브로커를 바꾸지 않는다(2026-10-07 브로커 연결 설정 패널) - 칸 값만 창고에 쓴다.
+            self._save_creds_fields(bk, transient)
         # 실행 자산(라이브 패널 체크) → 자산별 include 반영
         for _a, _v in getattr(self, "_live_include", {}).items():
             try:
@@ -2839,34 +4661,228 @@ class App:
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True)
         self._refresh_live_panel()
 
+    def _save_creds_fields(self, bk, transient=False):
+        """_save_current_asset의 칸 → 창고 쓰기(가드 ②~⑤). 키체인·f2를 지우는 경로는 없다."""
+        ko = self.lang == "ko"
+        cr = self._creds_of(_panel_asset_of(self), bk)
+        _sec = _secret_fields(bk)
+        _prev_f1 = str(cr.get("f1") or "").strip()
+        _prev_f3 = str(cr.get("f3") or "").strip()
+
+        def _txt(w):
+            try:
+                _v = w.get()
+            except Exception:
+                return None
+            return _v.strip() if isinstance(_v, str) else None
+        _u = _txt(self.user) if hasattr(self, "user") else None
+        _new_f1 = _prev_f1 if _u is None else _u
+        _t3 = None
+        if hasattr(self, "f3"):
+            try:
+                _t3 = self._f3()
+            except Exception:
+                _t3 = None
+        _new_f3 = _t3.strip() if isinstance(_t3, str) else _prev_f3
+        _kv = None
+        if hasattr(self, "key"):
+            try:
+                _kv = self.key.get()
+            except Exception:
+                _kv = None
+            if not isinstance(_kv, str):
+                _kv = None
+        # ④ 빈 칸은 저장된 아이디(f1)·비밀 f3을 덮지 않는다(비밀이 아닌 f3 - 포트·테스트넷 - 은 빈 값 허용)
+        _cleared = []                            # 비웠지만 저장값을 지키는 칸 - 화면도 저장값으로 다시 채운다
+        if not _new_f1 and _prev_f1:
+            _new_f1 = _prev_f1
+            _cleared.append("f1")
+        if not _new_f3 and _prev_f3 and "f3" in _sec:
+            _new_f3 = _prev_f3
+            _cleared.append("f3")
+        # ② 쓰기 시점 오염 가드
+        _bad = []
+        _scr = _SCRUB_FIELDS.get(bk, ())
+        if ("f1" in _scr and _new_f1 != _prev_f1) or ("f3" in _scr and _new_f3 != _prev_f3):
+            _known = self._known_secrets()
+            if ("f1" in _scr and _new_f1 != _prev_f1 and "@" not in _new_f1 and _new_f1 in _known
+                    and not (bk == "projectx" and _f2_load(_new_f1))):   # 그 아이디로 API Key가 있으면 진짜 아이디
+                _new_f1 = _prev_f1
+                _bad.append("f1")
+            if "f3" in _scr and _new_f3 != _prev_f3 and _new_f3 and _new_f3 in _known:
+                _new_f3 = _prev_f3
+                _bad.append("f3")
+        _shown = getattr(self, "_key_shown", None)
+        _kdirty = _kv is not None and (not isinstance(_shown, str) or _kv != _shown)
+        # ③ 무장 가드: 이 연결(같은 dict)로 무장된 자산이 있으면 아이디·키를 바꾸지 않는다
+        _armed = self._armed_on_conn(bk, cr)
+        _gl = App._golive_busy_conn(self, bk, _prev_f1)
+        if _gl and not _armed:
+            _armed = ["__golive__"]                  # 라이브 시작 연결 테스트 중 - 시험하지 않은 새 키로 무장되지 않게(1b 반박 리뷰 P3)
+        if _armed and not (_new_f1 != _prev_f1 or _new_f3 != _prev_f3
+                           or (_kdirty and bool(_kv) and _kv != _f2_load(_prev_f1))):
+            _armed = []                              # 바뀐 것이 없다 - 그대로 저장(같은 값)
+        if _armed:
+            if hasattr(self, "user"):
+                _entry_set_text(self.user, _prev_f1)
+            if hasattr(self, "f3"):
+                _entry_set_text(self.f3, _prev_f3)
+            if _kv is not None:
+                try:
+                    self._set_key(_f2_load(_prev_f1) if _prev_f1 else "")
+                except Exception:
+                    pass
+            _an = ", ".join(_armed)
+            if _armed == ["__golive__"]:
+                _m = ("연결 테스트 중이라 연결 정보를 바꾸지 않았습니다. 끝난 뒤에 바꾸세요." if ko else
+                      "A connection test is running, so the connection was not changed. Change it after it finishes.")
+            else:
+                _m = (f"{_an} 계좌가 이 연결로 가동 중이라 연결 정보를 바꾸지 않았습니다. 전체 정지 뒤에 바꾸세요." if ko else
+                      f"{_an} is running on this connection, so the connection was not changed. Stop all first.")
+            self.log(_m)
+            if getattr(self, "_armed_edit_warned", False) is not True:   # 창은 세션 1회, 이후는 로그만
+                self._armed_edit_warned = True
+                try:
+                    messagebox.showwarning("EQ Autopilot", _m)
+                except Exception:
+                    pass
+            return
+        if not _BROKER_SPEC.get(bk, {}).get("acct") and (_new_f1 != _prev_f1 or _new_f3 != _prev_f3):
+            self._pin_crypto_rows(_bk_holders(bk))     # 해석이 바뀌기 전에(키를 더하기 전에) 빈 크립토 행을 지금 거래소로
+        cr["f1"] = _new_f1
+        cr["f3"] = _new_f3
+        if _bad:
+            for _f in _bad:
+                _w = self.user if _f == "f1" else getattr(self, "f3", None)
+                if _w is not None:
+                    _entry_set_text(_w, _prev_f1 if _f == "f1" else _prev_f3)
+            _fn = _field_short(bk, _bad[0], ko)
+            _m = (f"이 칸에 다른 브로커의 키가 들어 있어 저장하지 않았습니다. 여기에는 {_fn} 값을 넣으세요." if ko else
+                  f"This field holds another broker's key, so it was not saved. Enter the {_fn} here.")
+            self.log(_m)
+            try:
+                messagebox.showwarning("EQ Autopilot", _m)
+            except Exception:
+                pass
+        if _kv is not None and not _kv.strip() and isinstance(_shown, str) and _shown.strip():
+            _cleared.append("f2")                # 키 칸을 비움 - 저장된 키는 그대로(지우지 않는다)
+        _kept_ok = False
+        if _cleared:
+            # 반박 리뷰 P2(2026-10-07): 비운 칸이 빈 채로 남으면 지운 줄 안다 - 칸을 저장값으로 다시 채우고(비밀은 ••• 마스킹
+            # 그대로) 저장된 키가 남아 있다고 알린다. 창은 세션 1회, 로그는 매번.
+            # 자동 저장(디바운스)에서는 포커스와 상관없이 다시 채우지 않는다(최종 반박 리뷰 2026-10-08 P2-1): 다시 채운 뒤 '전부 선택'은
+            # 마우스 클릭 한 번에 풀려, 칸을 눌러 붙여넣으면 옛 값과 새 값이 이어 붙어 NQ·GC 공용 키를 덮었다. 저장값은 그대로 지키고
+            # 칸 옆에 '저장된 키 유지 중'만 띄운다. 다시 채우기는 자동 저장이 아닌 저장(탭·패널 전환, 라이브 시작)에서만.
+            def _hold(w):
+                return transient is True and w is not None
+            if "f1" in _cleared and hasattr(self, "user") and not _hold(self.user):
+                _entry_set_text(self.user, _prev_f1)
+            elif "f1" in _cleared:
+                _cleared.remove("f1"); _cleared.append("f1:held")
+            if "f3" in _cleared and hasattr(self, "f3") and not _hold(self.f3):
+                _entry_set_text(self.f3, _prev_f3)
+            elif "f3" in _cleared:
+                _cleared.remove("f3"); _cleared.append("f3:held")
+            if "f2" in _cleared and not _hold(getattr(self, "key", None)):
+                try:
+                    self._set_key(_shown)
+                except Exception:
+                    pass
+            elif "f2" in _cleared:
+                _cleared.remove("f2"); _cleared.append("f2:held")
+            self._set_kept_marks(_cleared); _kept_ok = True
+            # 되채운 칸은 전부 선택해 둔다(1b 반박 리뷰 P2-1, 2026-10-08): 키를 지우고 새 키를 복사하러 1.2초 넘게 비운 뒤 붙여넣으면
+            # '옛 키+새 키'가 이어 붙어 공용 키를 덮었다. 선택해 두면 다음 입력·붙여넣기가 값을 통째로 바꿔 끼운다.
+            for _cw, _cf in ((getattr(self, "user", None), "f1"), (getattr(self, "f3", None), "f3"),
+                             (getattr(self, "key", None), "f2")):
+                if _cw is not None and _cf in _cleared:
+                    try:
+                        _st0 = str(_cw.cget("state"))
+                        if _st0 == "readonly" or _st0 == "normal":
+                            _cw.selection_range(0, "end")
+                            _cw.icursor("end")
+                    except Exception:
+                        pass
+            if getattr(self, "_enc_locked", False) is True:
+                _m = ("칸을 비워도 저장된 키는 지워지지 않습니다. 이번 실행에서는 PIN 보관분을 열지 않아 지울 수 없습니다. "
+                      "다시 시작해 PIN을 넣은 뒤 [연결 지우기]를 누르세요." if ko else
+                      "Clearing the field doesn't delete the saved key. Keys kept with your PIN were not unlocked this "
+                      "session, so it can't be removed now. Restart, enter the PIN, then use [Remove connection].")
+            elif not any(":held" not in c for c in _cleared):
+                _m = ("칸을 비워도 저장된 키는 지워지지 않습니다. 새 값을 넣으면 그 값으로 바뀝니다. 지우려면 [연결 지우기]를 누르세요."
+                      if ko else
+                      "Clearing the field doesn't delete the saved key. Enter a new value to replace it, or use "
+                      "[Remove connection] to delete it.")
+            else:
+                _m = ("칸을 비워도 저장된 키는 지워지지 않습니다. 칸에는 저장된 값을 다시 채웠습니다. 지우려면 [연결 지우기]를 누르세요."
+                      if ko else
+                      "Clearing the field doesn't delete the saved key, so the saved value is back in the field. "
+                      "Use [Remove connection] to delete it.")
+            self.log(_m)
+            if getattr(self, "_clear_hint_logged", False) is not True and any(":held" not in c for c in _cleared):
+                self._clear_hint_logged = True
+                try:
+                    messagebox.showinfo("EQ Autopilot", _m)
+                except Exception:
+                    pass
+        if not _kept_ok:
+            self._set_kept_marks([])
+        # ⑤ 비밀(f2) → Keychain(f1 값이 계정 이름). 지우지 않는다.
+        if _kv is not None and _new_f1:
+            if _new_f1 == _prev_f1:
+                if _kdirty and _kv:
+                    _f2_save(_new_f1, _kv)
+            elif _kdirty and _kv:
+                _f2_save(_new_f1, _kv)               # 아이디와 키를 같이 넣었다
+            else:
+                _have = _f2_load(_new_f1)
+                if _have:
+                    try:
+                        self._set_key(_have)         # 새 아이디에 이미 있는 키를 보여 준다(옛 키로 덮지 않음)
+                    except Exception:
+                        pass
+                elif _kv:
+                    _f2_save(_new_f1, _kv)           # 새 아이디에 키가 없을 때만 옮긴다(덮을 것이 없다)
+            try:
+                self._key_shown = self.key.get()
+            except Exception:
+                pass
+
     def _persist(self):
         self._save_current_asset()
 
     def _on_asset(self, asset):
-        """자산 탭 전환 — 현재 탭 저장 → 자산 바꿈 → 그 자산 브로커로 → 재빌드."""
+        """계좌 설정 자산 탭 전환 — 화면 값 저장 → 자산 바꿈 → 재빌드. 브로커 연결 설정 패널(브로커·칸)은 그대로다
+        (2026-10-07: 패널은 자산 탭과 따로 - 브로커 연결은 브로커마다 한 곳에서)."""
         if asset == self._asset or asset not in _ASSETS:
             return
         self._save_current_asset()
         self._asset = asset
-        self._broker_name = self._broker_of(asset)
-        # 탭 전환 = 보기 전환일 뿐 — 연결은 브로커별 기억 복원, 돌던 루프는 안 건드림.
-        self._connected = bool(self._conn_by_broker.get(self._broker_name, False))
         self._unlocked = False
         self._build()
 
     def _on_broker(self, *_):
-        # 전환 전, 지금 화면 값을 '이전 브로커' 창고에 먼저 저장(안 하면 유실)
+        """브로커 연결 설정 패널에서 브로커를 고름 - 그 브로커의 칸을 보여 줄 뿐, 어느 자산의 실행 브로커도 어느 행의
+        브로커도 바꾸지 않는다(대표 2026-10-07 화면 개편). 전환 전 지금 칸 값을 이전 브로커 창고에 먼저 저장."""
         self._save_current_asset()
         sel = self.brokerbox.get()
-        for b in _ASSET_BROKERS[self._asset]:    # 이 자산의 브로커 중에서
+        for b in _panel_brokers():
             if _broker_label(b) == sel:
                 self._broker_name = b
                 break
-        self._acfg[self._asset]["broker"] = self._broker_name
+        self._panel_fix()
         # 새 브로커는 연결 테스트를 다시 통과해야 함(브로커별 크레덴셜 분리).
         self._connected = bool(self._conn_by_broker.get(self._broker_name, False))
         self._unlocked = False
-        self._save_cfg()
+        self._build()
+
+    def _on_panel_asset(self, asset):
+        """split(NQ·GC가 서로 다른 로그인)일 때 패널 칸이 고칠 자산을 고른다."""
+        if asset not in _bk_holders(self._broker_name) or asset == _panel_asset_of(self):
+            return
+        self._save_current_asset()
+        self._panel_asset = asset
+        self._unlocked = False
         self._build()
 
     def _set_lang(self, *_):
@@ -3044,6 +5060,8 @@ class App:
             entry.delete(0, "end")
             entry.insert(0, self.root.clipboard_get().strip())
             self._schedule_autosave()        # 붙여넣기도 자동 저장·검증(2026-08-11 버튼 제로)
+            if isinstance(entry, _MaskEmailEntry):   # [붙여넣기] 버튼 뒤 원문이 보이던 것(리뷰 P2-C) - 칸에 포커스가 있으면 건너뜀
+                entry._apply_mask()
         except Exception:
             pass
 
@@ -3150,9 +5168,11 @@ class App:
                         "EQ Autopilot", (f"로그를 보내지 못했습니다({why}). [로그 복사]로 붙여 넣어 주세요." if ko
                                          else f"Could not send the log ({why}). Please use [Copy log].")))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "EQ Autopilot", (f"로그를 보내지 못했습니다({type(e).__name__}). [로그 복사]로 붙여 넣어 주세요." if ko
-                                     else f"Could not send the log ({type(e).__name__}). Please use [Copy log].")))
+                _en = type(e).__name__           # except가 끝나면 e가 풀린다 - 람다가 읽기 전에 잡아 둔다(반박 리뷰 P3)
+                self.log(f"로그 보내기 실패: {_en}" if ko else f"Log send failed: {_en}")
+                self.root.after(0, lambda _en=_en: messagebox.showwarning(
+                    "EQ Autopilot", (f"로그를 보내지 못했습니다({_en}). [로그 복사]로 붙여 넣어 주세요." if ko
+                                     else f"Could not send the log ({_en}). Please use [Copy log].")))
         threading.Thread(target=_bg, daemon=True).start()
 
     def _copy_log(self):
@@ -3218,7 +5238,9 @@ class App:
     def _drain(self):
         while not self.q.empty():
             try:
-                self.out.insert("end", self.q.get() + "\n"); self.out.see("end")
+                _ln = self.q.get()
+                self._log_ring.append(_ln)
+                self.out.insert("end", _ln + "\n"); self.out.see("end")
             except Exception:
                 pass
         self.root.after(120, self._drain)
@@ -3285,7 +5307,8 @@ class App:
     def _entry_skip_ev(self, asset, why: str):
         """일부러 진입하지 않은 사실을 서버에 한 번 보고(2026-09-28 R47 P1-#6). 종전엔 앱이 entry_skip을 한 번도
         안 보내, 무장 기기가 게이트로 건너뛴 진입과 조용히 놓친 진입을 서버 카드가 가를 수 없었다(9/21 대표 사례).
-        why = 짧은 사유 코드(sizing·size_cap·adverse_move·prop_done·no_account·stale_signal·qty0) - 화면 문구는 서버가
+        why = 짧은 사유 코드(sizing·size_cap·adverse_move·prop_done·no_account·stale_signal·qty0, 2026-10-06 W·size_mult0:
+        clock_skew·future_signal·size_mult0) - 화면 문구는 서버가
         만든다(문턱·수치는 싣지 않는다). 같은 자산·사유는 10분에 한 번만."""
         try:
             import time as _t
@@ -3347,7 +5370,7 @@ class App:
         (일시 연결 문제 오살 방지). asset/broker 명시 = 백그라운드 로더가 탭 전환 뒤
         도착해도 자기 자산 avail만 만진다(예전엔 현재 탭 avail을 오염시킬 수 있었다)."""
         try:
-            _a, _b = asset or self._asset, broker or self._broker_name
+            _a, _b = asset or _panel_asset_of(self), broker or self._broker_name
             fresh = list(dict.fromkeys(str(n) for n in (names or []) if str(n).strip()))
             if fresh:
                 cr = self._creds_of(_a, _b)
@@ -3364,15 +5387,24 @@ class App:
                         self.log(("🧾 가용 계좌 정리(브로커에 더 없음): " if self.lang == "ko"
                                   else "🧾 Accounts removed (no longer at broker): ")
                                  + ", ".join(_gone))
-            if _a == self._asset and _b == self._broker_name:   # UI는 그 탭이 떠 있을 때만
-                _av = self._avail_of(self._asset, self._broker_name)
+            _crx = self._creds_of(_a, _b)
+            # 패널 가용 계좌 줄: 패널 칸이 같은 창고를 보고 있을 때만(2026-10-07 패널 분리)
+            if _crx is self._creds_of(_panel_asset_of(self), self._broker_name):
+                _av = _crx.get("avail") or []
                 if _av and hasattr(self, "_avail_lbl"):
                     _t, _c = self._avail_text_color(_av)
                     self._avail_lbl.config(text=_t, foreground=_c, font=("Helvetica", 11, "bold"))
-                for _w in getattr(self, "_acct_widgets", {}).values():
+            # 계좌 설정 행 콤보: 지금 계좌 탭 자산이 같은 창고를 쓸 때, 그 브로커 행만(brokermix 3)
+            if (_b in _ASSET_BROKERS.get(self._asset, []) and self._creds_of(self._asset, _b) is _crx):
+                _av = list(_crx.get("avail") or [])
+                _rows = (((self._acfg.get(self._asset) or {}).get("accounts")) or [])
+                for _ix, _w in getattr(self, "_acct_widgets", {}).items():
                     _icb = _w.get("acct_id")
-                    if _icb is not None:
-                        _icb["values"] = list(_av)
+                    if _icb is None:
+                        continue
+                    if _ix < len(_rows) and self._acct_broker(self._asset, _rows[_ix]) != _b:
+                        continue
+                    _icb["values"] = list(_av)
         except Exception:
             pass
 
@@ -3395,7 +5427,7 @@ class App:
             if _new:
                 _av.extend(_new)
                 self._save_cfg()
-            self._fill_scope(names)
+            self._fill_scope(names, asset=asset, broker="nt8")   # h1(a): 자산·브로커 명시(화면 브로커 avail 오염 방지)
             return
         import threading as _th
 
@@ -3430,7 +5462,7 @@ class App:
         콤보를 미리 채운다(대표 2026-07-26 버그: 예전엔 '연결 테스트'를 눌러야만 _fill_scope가
         호출돼 그 전엔 콤보가 비어 계좌를 못 골랐다). (브로커,사용자)별 캐시로 탭 전환마다
         재조회하지 않는다. 실패 시 조용히 생략 — '연결 테스트'를 누르면 원인이 로그에 나온다."""
-        cr = self._creds_of(asset)
+        cr = self._creds_of(asset, "projectx")       # 자산 브로커가 아니라 projectx 창고(2026-10-07)
         f1 = (cr.get("f1") or "").strip()
         if not f1:
             return
@@ -3482,54 +5514,113 @@ class App:
         return True
 
 
-    def _pull_broker_keys(self):
-        """① 브로커 키 전수 가져오기(대표 2026-09-04 "전 브로커 세팅을 다 복사해오게").
-        다른 자산들의 브로커 자격(f1·f3·가용 계좌)을 **브로커별로** 그러모아 이 자산에
-        병합한다. 종전 자산 단위 복사는 자산마다 브로커가 다르면(나스닥=탑스텝, 금=루시드)
-        브로커 선택까지 소스 것으로 갈아쳐 엉뚱한 필드 값이 뜬 것처럼 보였다 - 폐지.
-        원칙:
-          · 이 자산의 브로커 선택(드롭다운)은 안 건드린다 - 보던 화면 유지
-          · 이 자산에 이미 f1이 있는 브로커는 안 덮는다(살아 있는 키 보호) - 값이 다르면
-            ⚠ 로그로 알려만 준다
-          · 같은 브로커가 여러 자산에 있으면 f1이 있는 첫 자산 것(NQ·GC·BTC 순)
-          · f2(비밀)는 키체인이 f1 값을 키로 공유하므로 따로 옮길 게 없다
-         , 사용 계좌(②) 행은 그대로(유닛 분리)"""
-        import copy as _copy
-        dst = self._asset
-        if self._armed_here(dst):
-            self.log("⏸ 무장 중에는 브로커 키를 가져오지 않습니다 - 정지 후 다시 시도하세요.")
-            return
-        self._save_current_asset()
-        _ok = _ASSET_BROKERS.get(dst, [])
-        _dstcr = self._acfg[dst].setdefault("creds", {})
-        _moved, _kept = [], []
-        for bk in _ok:
-            _mine = str((_dstcr.get(bk) or {}).get("f1") or "").strip()
-            for a2 in _ASSETS:
-                if a2 == dst:
-                    continue
-                cr2 = (self._acfg.get(a2, {}).get("creds") or {}).get(bk) or {}
-                _theirs = str(cr2.get("f1") or "").strip()
-                if not _theirs:
-                    continue
-                if _mine:
-                    if _mine != _theirs:
-                        _kept.append(f"{_broker_label(bk)}({a2})")
-                    break                       # 살아 있는 키 보호 - 안 덮는다
-                _dstcr[bk] = _copy.deepcopy(cr2)
-                _moved.append(f"{_broker_label(bk)}←{a2}")
-                break
-        if not _moved and not _kept:
-            self.log("📋 가져올 브로커 키가 없습니다 - 다른 자산에도 키가 없거나 이미 다 있습니다.")
-            return
-        if _moved:
-            self._save_cfg()
-            self._build()
-            self.log("📋 브로커 키 가져오기 완료: " + ", ".join(_moved)
-                     + " (브로커 선택과 기존 키, 사용 계좌 행은 그대로)")
-        if _kept:
-            self.log("⚠ 값이 달라 안 덮은 키: " + ", ".join(_kept)
-                     + " - 이 자산 키를 쓰려면 해당 브로커 칸을 비운 뒤 다시 가져오세요.")
+    def _fmt_counts(self, cnt) -> str:
+        """{자산: n} → 'NQ 1개, GC 0개' / 'NQ 1, GC 0'."""
+        cnt = {a: n for a, n in cnt.items() if n} or cnt      # 0인 자산은 뺀다(전부 0이면 그대로)
+        if self.lang == "ko":
+            return ", ".join(f"{a} {n}개" for a, n in cnt.items())
+        return ", ".join(f"{a} {n}" for a, n in cnt.items())
+
+    def _clear_broker_conn(self, confirm=True, asset=None):
+        """[연결 지우기](대표 2026-10-07): 지금 화면 브로커의 연결을, 그 연결(같은 dict)을 쓰는 모든 자산에서 지운다.
+        키 삭제 경로는 이것 하나다(빈 칸 저장은 지우지 않는다). 무장 중이면 거절. 제자리에서 비워 별칭은 유지하고,
+        split이던 브로커는 남은 쪽으로 다시 합친다."""
+        ko = self.lang == "ko"
+        bk = self._broker_name
+        if App._golive_busy_conn(self, bk, (self._creds_of(asset if asset in _bk_holders(bk) else _panel_asset_of(self), bk)
+                                            .get("f1") or "")):
+            messagebox.showwarning(
+                "EQ Autopilot",
+                ("연결 테스트 중이라 연결 정보를 바꾸지 않았습니다. 끝난 뒤에 바꾸세요." if ko else
+                 "A connection test is running, so the connection was not changed. Change it after it finishes."))
+            return False
+        if getattr(self, "_enc_locked", False) is True:
+            # PIN 보관분(kc_enc)을 이번 기동에 열지 못했다 - 지금 지우면 다음 기동에 블롭에서 되살아난다.
+            messagebox.showwarning(
+                "EQ Autopilot",
+                ("PIN으로 보관한 키를 이번 실행에서 열지 않아 지금은 지울 수 없습니다. 다시 시작해 PIN을 넣은 뒤 지우세요."
+                 if ko else
+                 "Keys kept with your PIN were not unlocked this session, so this can't be removed now. "
+                 "Restart, enter the PIN, then remove it."))
+            return False
+        _ca = asset if asset in _bk_holders(bk) else _panel_asset_of(self)   # split이면 자산별 버튼이 asset을 준다
+        cr = self._creds_of(_ca, bk)
+        users = self._conn_users(bk, cr) or [_ca]
+        _arm = self._armed_on_conn(bk, cr)
+        if _arm:
+            messagebox.showwarning(
+                "EQ Autopilot",
+                (f"{', '.join(_arm)} 계좌가 이 연결로 가동 중이라 지금은 지울 수 없습니다. 전체 정지 뒤에 지우세요." if ko else
+                 f"{', '.join(_arm)} is running on this connection, so it can't be removed now. Stop all first."))
+            return False
+        if confirm:
+            _bn = _broker_short(bk)
+            _rc = self._conn_row_counts(bk, users, active_only=True)
+            _sp0 = getattr(self, "_creds_split", None)
+            _others = [a for a in _bk_holders(bk) if a not in users and a in self._acfg
+                       and _cr_has(((self._acfg[a].get("creds")) or {}).get(bk))]
+            if isinstance(_sp0, set) and bk in _sp0 and _others:
+                # split 해소(반박 리뷰 P3): 지우면 이 자산은 다른 자산의 연결을 같이 쓰게 된다 - 행 계좌를 다시 골라야 한다.
+                _a0, _o0, _n0 = _ca, _others[0], sum(_rc.values())
+                _msg = ((f"{_a0}의 {_bn} 연결을 지웁니다. 지우면 {_a0}는 {_o0}의 {_bn} 연결을 같이 씁니다. "
+                         + (f"{_a0}의 켜진 계좌 {_n0}개는 그 연결의 계좌로 다시 골라야 라이브 시작이 됩니다. " if _n0 else "")
+                         + "지울까요?") if ko else
+                        (f"Remove {_a0}'s {_bn} connection? {_a0} will then share {_o0}'s {_bn} connection. "
+                         + (f"{_a0}'s {_n0} active account(s) must be picked again from that connection's accounts "
+                            f"before Go Live works." if _n0 else "")).strip())
+            elif sum(_rc.values()):
+                _cnt = self._fmt_counts(_rc)
+                _msg = (f"{_bn} 연결을 지웁니다. 이 연결을 쓰는 켜진 계좌: {_cnt}. 다시 넣거나 이 계좌를 끄기 전까지는 "
+                        f"라이브 시작 전체가 멈춥니다(다른 자산 포함). 지울까요?" if ko else
+                        f"Remove the {_bn} connection? Active accounts using it: {_cnt}. Until you enter it again or turn "
+                        f"these accounts off, Go Live stops for every asset.")
+            else:
+                _msg = (f"{_bn} 연결을 지웁니다. 지울까요?" if ko else f"Remove the {_bn} connection?")
+            if not messagebox.askyesno(("연결 지우기" if ko else "Remove connection"), _msg):
+                return False
+        # 지우기 전에 빈 크립토 행을 지금 거래소로 박는다(최종 반박 리뷰 2026-10-08 P3): 안 박으면 '키 있는 유일한 거래소' 해석이
+        # 남은 거래소로 넘어가 확인창('라이브 시작 전체가 멈춥니다')과 달리 다른 거래소로 조용히 무장됐다.
+        self._pin_crypto_rows(list(dict.fromkeys(list(_bk_holders(bk)) + list(users))))
+        old = str(cr.get("f1") or "").strip()
+        for a in users:
+            for f in _secret_fields(bk):
+                _kc_del(_kc_key(a, bk, f))
+                _ENC_DROPPED.add(f"{a}|{bk}|{f}")
+        cr["f1"], cr["f3"] = "", ""
+        cr.setdefault("avail", [])
+        cr["avail"][:] = []
+        if old and _BROKER_SPEC.get(bk, {}).get("f2") and not self._f1_shared(old):
+            _f2_del(old)                     # f2는 f1 값이 계정 이름 - 다른 칸이 같은 아이디를 쓰면 남긴다
+            _ENC_DROPPED.add("f2|" + old)
+        try:
+            self._conn_by_broker[bk] = False
+        except Exception:
+            pass
+        try:
+            for _k in [k for k in list((getattr(self, "_scope_cache", None) or {})) if k and k[0] == bk]:
+                self._scope_cache.pop(_k, None)
+        except Exception:
+            pass
+        try:
+            for a in users:
+                getattr(self, "_test_ok", set()).discard(a)
+        except Exception:
+            pass
+        self._autotest_fp = None
+        self._connected = False
+        _sp = getattr(self, "_creds_split", None)
+        if isinstance(_sp, set) and bk in _sp:          # 한쪽을 지우면 남은 쪽으로 합쳐진다
+            _s2, _n2 = _unify_creds(self._acfg, self._profile, only=bk,
+                                    enc_locked=getattr(self, "_enc_locked", False) is True)
+            if bk not in _s2:
+                _sp.discard(bk)
+        self._unlocked = False
+        self._panel_fix()
+        self._save_cfg()
+        self._build()
+        self.log((f"{_broker_short(bk)} 연결을 지웠습니다({', '.join(users)}, 보안 저장소 포함)." if ko else
+                          f"Removed the {_broker_short(bk)} connection ({', '.join(users)}, including the secret store)."))
+        return True
 
     def _transfer_pin(self):
         """PIN 게이트(설정 내보내기 공용). 없으면 새로 만들고, 틀리면 재설정 흐름(_pin_forgot)."""
@@ -3557,8 +5648,11 @@ class App:
             return
         import copy as _copy
         assets, n_sec = {}, 0
+        _tg = self._mirror_targets()          # 저장과 같은 미러 대상 쌍만(브로커 연결 공용 2026-10-07 - v1 그대로, 옛 빌드 호환)
         for a, c in (self._acfg or {}).items():
             c2 = _copy.deepcopy(c)
+            if _tg is not None:
+                c2["creds"] = {b: v for b, v in (c2.get("creds") or {}).items() if (a, b) in _tg}
             for b, cr in (c2.get("creds") or {}).items():
                 _f1 = str(cr.get("f1") or "").strip()
                 if _f1 and _BROKER_SPEC.get(b, {}).get("f2"):
@@ -3598,6 +5692,8 @@ class App:
         무장 중엔 금지(_armed_here와 같은 이유 - 화면과 실발주 대상이 갈라진다).
         적용: f2 → 키체인(f1 키, 현행 저장 방식 그대로), 나머지 → _acfg → _save_cfg
         (가 f1/f3를 키체인으로 옮기고 평문을 벗긴다). 토큰까지 오므로 재시작 안내."""
+        if self._golive_refuse():
+            return
         if (getattr(self, "_sig_accts", None) or getattr(self, "_auto_accts", None)):
             messagebox.showwarning(
                 self.t("sec_live"),
@@ -3640,9 +5736,20 @@ class App:
                  "This overwrites this machine's broker & account settings.\nContinue?")):
             return
         n_sec = 0
+        _dropped = []
         for a, c in d["assets"].items():
-            if a not in _ASSETS:
+            if a not in _ASSETS or not isinstance(c, dict):
                 continue
+            # 이 자산이 못 쓰는 브로커는 받지 않는다(brokermix 10, 2026-10-07) - 드롭다운이 비고 엉뚱한 창고가 생겼다.
+            _okb = _ASSET_BROKERS.get(a, [])
+            if c.get("broker") not in _okb:
+                if c.get("broker"):
+                    _dropped.append(f"{a} {_broker_label(c.get('broker'))}")
+                c["broker"] = _okb[0]
+            _cr0 = c.get("creds") if isinstance(c.get("creds"), dict) else {}
+            for _b in [b for b in _cr0 if b not in _okb]:
+                _dropped.append(f"{a} {_broker_label(_b)}")
+            c["creds"] = {b: v for b, v in _cr0.items() if b in _okb and isinstance(v, dict)}
             for b, cr in (c.get("creds") or {}).items():
                 _f2 = str(cr.pop("f2", "") or "")     # f2는 _acfg에 안 남긴다(키체인 전용)
                 _f1 = str(cr.get("f1") or "").strip()
@@ -3654,15 +5761,26 @@ class App:
                                           if self.lang == "ko" else
                                           f"{a}/{_broker_label(b)}: secret store write failed - will be kept PIN-encrypted on save"))
             self._acfg[a] = c
+        if _dropped:
+            self.log(("그 자산에서 쓸 수 없는 브로커 설정은 가져오지 않았습니다: " if self.lang == "ko" else
+                      "Broker settings the asset can't use were not imported: ") + ", ".join(dict.fromkeys(_dropped)))
+        # 가져온 값으로 미러 대상(seed)을 다시 계산하고 브로커 연결을 다시 합친다(2026-10-07)
+        self._mirror_seed = _creds_seed(self._acfg)
+        self._creds_split, self._creds_notes = _unify_creds(
+            self._acfg, self._profile, enc_locked=bool(getattr(self, "_enc_locked", False) is True),
+            bridge=getattr(self, "_bridge_inst", None))
+        self._creds_notes_logged = False
         self.lang = d.get("lang", self.lang)
         self._token = str(d.get("token") or self._token)
         if isinstance(d.get("profile"), dict):
             self._profile = d["profile"]
         if not _pin_hash():
             _pin_set(p)                               # 새 기기 PIN = 파일을 연 그 PIN
+        self._sync_tab_broker()           # 가져온 설정의 자산 브로커로 화면도(리뷰 P2)
         self._save_cfg()
         self._unlocked = False
         self._build()
+        self._log_creds_notes()
         self.log("📥 " + (f"설정 가져오기 완료(비밀 {n_sec}건 포함)" if self.lang == "ko"
                           else f"Settings imported ({n_sec} secrets)"))
         messagebox.showinfo(
@@ -3673,114 +5791,205 @@ class App:
              "Imported. Quit and restart the app to apply everything.\n"
              "Delete the file afterwards for safety."))
 
-    def _copy_acct_setup(self, src_asset):
-        """② 사용 계좌 복사: 계좌 목록, 1R, 모드 + 그 행들이 굴러가는 데 필요한
-        브로커 선택, 키, 가용 계좌까지(대표 2026-08-28 "브로커 선택 자체도 다 완전 동일하게
-        카피 되야 해"). ①과의 차이는 방향이다 - ①은 계좌 행을 안 건드리고 자격만 옮기고,
-        ②는 계좌 행을 옮기면서 그 행이 필요로 하는 자격을 딸려 보낸다."""
-        import copy as _copy
-        dst = self._asset
-        if self._armed_here(dst):
-            return
-        src_accts = self._accts_of(src_asset)
-        if not src_accts or not any((x.get("id") or "").strip() for x in src_accts):
-            messagebox.showinfo(self.t("btn_accts"),
-                                (f"{src_asset}에 복사할 계좌가 없습니다." if self.lang == "ko"
-                                 else f"No accounts to copy from {src_asset}.")); return
-        if not messagebox.askyesno(
-                ("계좌 설정 복사" if self.lang == "ko" else "Copy account setup"),
-                (f"{src_asset}의 사용 계좌를 {dst}(으)로 덮어쓸까요?\n"
-                 f"계좌, 1R, 모드와 함께 브로커 선택, 키, 가용 계좌도 {src_asset} 것으로 "
-                 f"맞춥니다 - 복사 직후 바로 굴러가게." if self.lang == "ko" else
-                 f"Overwrite {dst}'s accounts with {src_asset}'s?\n"
-                 f"Broker choice, keys and available accounts come along, so the copy "
-                 f"works as-is.")):
-            return
-        self._collect_acct_widgets()
-        # 행 브로커 실체화(대표 2026-08-21 실사고: NQ 루시드 계좌를 GC로 복사하니 Topstep이
-        # 됨): 행의 broker 칸이 비면 '그 자산의 기본 브로커'로 해석되는데, 복사 후엔 해석
-        # 기준이 목적지 자산으로 바뀐다. 복사 시점에 원본 자산 기준 실효 브로커를 박는다.
-        _ok_bks = _ASSET_BROKERS.get(dst, [])
-        _copied, _need = [], []
-        for a in src_accts:
-            a2 = _copy.deepcopy(a)
-            try:
-                _rb = self._acct_broker(src_asset, a)
-            except Exception:
-                _rb = ""
-            if _rb in _ok_bks:
-                a2["broker"] = _rb
-                _need.append(_rb)
+    def _load_accounts_for_asset(self):
+        """[계좌 목록 불러오기](계좌 설정): 이 계좌 탭 자산이 쓸 수 있고 연결된 브로커(Topstep·Lucid)의 계좌 목록을
+        새로 받는다. 브로커 연결 설정 패널에서 무엇을 보고 있든 상관없다(2026-10-07 패널 분리). 결과는 브로커마다 로그 한 줄
+        (1b 반박 리뷰 P3, 2026-10-08: 실패도 목록 그대로도 아무 말이 없었다)."""
+        a = self._asset
+        ko = self.lang == "ko"
+        _bks = [b for b in _ASSET_BROKERS.get(a, []) if b in ("projectx", "nt8") and self._bk_configured(a, b)]
+        if not _bks:
+            if "ibkr" in _ASSET_BROKERS.get(a, []) and self._bk_configured(a, "ibkr"):
+                _m = ("IBKR 계좌는 위 브로커 연결 설정에서 IBKR을 고른 뒤 [가용 계좌 등록]으로 넣습니다." if ko else
+                      "IBKR accounts are entered with [Register account] after choosing IBKR in Broker connections above.")
             else:
-                a2.pop("broker", None)    # 이 자산에서 못 쓰는 브로커 - dst 기본으로 해석
-            _copied.append(a2)
-        self._acfg[dst]["accounts"] = _copied
-        # ★ 브로커 선택과 자격까지 함께 옮긴다(대표 2026-08-28 "브로커 선택 자체도 다
-        # 완전 동일하게 카피 되야 해"). 종전에는 계좌 행만 옮기고 브로커·키는 dst 것을
-        # 그대로 뒀는데, dst가 다른 브로커를 고르고 있으면 옮겨온 행이 **자격 없는
-        # 브로커**를 가리켜 계좌 드롭다운이 비고 라이브 시작이 "키 미설정"으로 막혔다.
-        # 복사 = 그대로 굴러가는 상태여야 한다.
-        _srccr = (self._acfg[src_asset].get("creds") or {})
-        _dstcr = self._acfg[dst].setdefault("creds", {})
-        _sb = self._acfg[src_asset].get("broker")
-        _moved = []
-        for _bk in dict.fromkeys(_need + ([_sb] if _sb else [])):
-            # 빈 자격은 실제 키를 못 덮는다(①과 같은 이유 - 리뷰 P0)
-            if _bk in _ok_bks and _bk in _srccr and (
-                    ((_srccr[_bk].get("f1") or "").strip()) or _bk not in _dstcr):
-                _dstcr[_bk] = _copy.deepcopy(_srccr[_bk])   # 키 + 가용 계좌 목록
-                if (_srccr[_bk].get("f1") or "").strip():
-                    _moved.append(_bk)
-        if _sb in _ok_bks:
-            self._acfg[dst]["broker"] = _sb
-        self._save_cfg()
-        self._build()
-        self.log(f"📋 {src_asset} → {dst} 사용 계좌 복사 완료 ({len(src_accts)}개, "
-                 f"브로커 {self._acfg[dst].get('broker')}, 자격 {len(_moved)}종 동반)")
+                _m = (f"{a}에 연결된 Topstep 또는 Lucid / Tradovate가 없습니다. 위 브로커 연결 설정에서 먼저 연결하세요." if ko else
+                      f"{a} has no connected Topstep or Lucid / Tradovate. Connect one in Broker connections above first.")
+            messagebox.showinfo(self.t("btn_accts"), _m)
+            return
+        self._save_current_asset()
+        _cache = getattr(self, "_scope_cache", None)
+        if isinstance(_cache, dict):
+            for b in _bks:
+                _f1 = str(self._creds_of(a, b).get("f1") or "").strip()
+                for k in [k for k in list(_cache) if k and k[0] == b and (b != "projectx" or k[1] == _f1)]:
+                    _cache.pop(k, None)
+        if "nt8" in _bks:
+            self.log((f"{a} Lucid / Tradovate 계좌 목록을 불러옵니다(NT8이 켜져 있어야 합니다)" if ko else
+                      f"Loading {a} Lucid / Tradovate accounts (NinjaTrader 8 must be running)"))
+            self._autoload_nt8_avail(a)
+        if "projectx" in _bks:
+            _f1 = str(self._creds_of(a, "projectx").get("f1") or "").strip()
+
+            def w():
+                err = self._conn_check(a, "projectx", rows=False)
+                _n = len(((getattr(self, "_scope_cache", None) or {}).get(("projectx", _f1))) or [])
+
+                def done():
+                    if err:
+                        self.log((f"❌ {a} Topstep: {err} - 브로커 연결 설정에서 키를 확인하세요" if ko else
+                                  f"❌ {a} Topstep: {err} - check the key in Broker connections"))
+                    else:
+                        self.log((f"{a} Topstep 계좌 목록 {_n}개를 불러왔습니다" if ko else
+                                  f"Loaded {_n} {a} Topstep account(s)"))
+                self.root.after(0, done)
+            threading.Thread(target=w, daemon=True).start()
+
+    def _sync_tab_broker(self):
+        """지금 탭의 화면 브로커(_broker_name)를 저장된 자산 브로커와 맞춘다 - 계좌 설정 복사·가져오기처럼
+        _acfg 브로커를 바꾸고 다시 그리는 경로용(2026-10-07 리뷰 P2: 어긋나면 Bridge Token이 TopstepX 이메일
+        칸에 들어가 다음 저장에 projectx f1으로 평문 저장되고 Topstep 이메일이 지워졌다)."""
+        # 2026-10-07 패널 분리 뒤: 패널 브로커는 자산 브로커를 따라가지 않는다. 브로커·패널 자산이 유효한지만 맞춘다.
+        try:
+            self._panel_fix()
+            self._connected = bool(self._conn_by_broker.get(self._broker_name, False))
+        except Exception:
+            pass
 
     def _add_acct(self):
         """[계좌 추가] = 빈 행 추가(대표 2026-08-11 행 중심 등록). 브로커, 계좌, 1R은 행에서
         고른다 - 행의 계좌 콤보가 그 행 브로커의 가용 목록을 보여준다."""
+        if self._golive_refuse():
+            return
         # 잠겨 있어도 추가는 되게 하되 **그 순간 편집을 연다**(대표 2026-09-21): 빈 행을
         # 만들어 놓고 못 채우면 더 혼란스럽다.
         self._acct_edit = True
         asset = self._asset
         self._collect_acct_widgets()             # 다른 행 미저장 편집 보존
-        _bk0 = self._broker_name
+        # 새 행 기본 브로커 = 패널 브로커가 이 자산에서 쓸 수 있으면 그것, 아니면 자산 브로커(2026-10-07 패널 분리)
+        _bk0 = self._broker_name if self._broker_name in _ASSET_BROKERS.get(asset, []) else self._broker_of(asset)
         _accts = self._accts_of(asset)
+        # 크립토(오픈 준비 버그 조사 2026-10-06 D): 키는 자산·브로커당 하나라 같은 거래소 행이 둘이면 같은 키로 주문이
+        # 두 번 나간다. 새 행은 아직 행이 없는 크립토 거래소로 만들고(지금 고른 거래소 우선), 거래소마다 행이 이미
+        # 있으면 만들지 않는다. 기존 행의 브로커 칸이 비어 있으면(=자산 기본 브로커로 해석) 지금 해석값으로 박아,
+        # 위 브로커 콤보를 바꿀 때 그 행이 따라 바뀌어 새 행과 같은 거래소가 되는 일을 막는다.
+        _cbks = [b for b in _ASSET_BROKERS.get(asset, []) if not _BROKER_SPEC.get(b, {}).get("acct")]
+        if _cbks and len(_cbks) == len(_ASSET_BROKERS.get(asset, [])):     # 크립토 전용 자산(BTC)
+            # 빈 행은 키가 있는 거래소로만 박는다(최종 반박 리뷰 2026-10-08b P2-1: 키 넣기 전 [계좌 추가]가 기본 행을 키 없는
+            # Bybit로 박아, 뒤에 Bitget 키만 넣은 회원의 라이브 시작이 막혔다). 키 없는 빈 행은 '쓰는 거래소'로 세지 않는다.
+            self._pin_crypto_rows([asset])
+            _used = set()
+            for _ac in _accts:
+                _rb = self._acct_broker(asset, _ac)
+                if str(_ac.get("broker") or "").strip() or self._bk_configured(asset, _rb):
+                    _used.add(_rb)
+            _free0 = [b for b in [_bk0] + _cbks if b in _cbks and b not in _used]
+            # 키를 넣은 거래소만(최종 반박 리뷰 2026-10-08 P2-2): 키 없는 거래소 행은 켜진 채 생겨 라이브 시작 전체를 멈췄다.
+            _free = [b for b in _free0 if self._bk_configured(asset, b)]
+            if not _free and _free0 and not _used:
+                ko = self.lang == "ko"
+                messagebox.showinfo(
+                    "EQ Autopilot",
+                    (f"{asset} 행은 이미 하나 있습니다. 브로커 연결 설정에 거래소 키를 넣으면 이 행이 그 거래소를 씁니다. "
+                     "1R은 이 행에 넣으세요." if ko else
+                     f"{asset} already has a row. Enter an exchange key in Broker connections and this row will use that "
+                     "exchange. Enter the 1R in this row."))
+                self._save_cfg()
+                self._build()
+                return
+            if not _free and _free0:
+                ko = self.lang == "ko"
+                _un = ", ".join(_broker_label(b) for b in dict.fromkeys(_free0))
+                _us = ", ".join(_broker_label(b) for b in _cbks if b in _used)
+                messagebox.showinfo(
+                    "EQ Autopilot",
+                    (f"{asset}는 키를 넣은 거래소마다 행이 하나입니다. {_us} 행이 이미 있으니 1R은 그 행에 넣으세요.\n"
+                     f"{_un} 행은 브로커 연결 설정에 그 거래소 키를 넣으면 만들 수 있습니다."
+                     if ko else
+                     f"{asset} has one row per exchange with a key. A row for {_us} already exists, so enter the 1R in that row.\n"
+                     f"A row for {_un} can be added after you enter that exchange's key in Broker connections."))
+                self._save_cfg()
+                self._build()
+                return
+            if not _free:
+                ko = self.lang == "ko"
+                _names = ", ".join(_broker_label(b) for b in _cbks)
+                messagebox.showinfo(
+                    "EQ Autopilot",
+                    (f"{asset} 계좌 행은 거래소마다 하나입니다 - {_names} 행이 이미 있습니다.\n"
+                     "같은 거래소 행이 둘이면 같은 API 키로 주문이 두 번 나가서 행을 더 만들지 않았습니다."
+                     if ko else
+                     f"{asset} rows are one per exchange - rows for {_names} already exist.\n"
+                     "A second row for the same exchange would send each order twice with the same API key, "
+                     "so no row was added."))
+                self._save_cfg()
+                self._build()
+                return
+            _accts.append(_new_acct(DEFAULT_ONE_R, "", True, _broker_label(_free[0]), broker=_free[0]))
+            self._save_cfg()
+            self._build()
+            return
         # 첫 계좌가 완전 빈 슬롯이면 새 행 대신 그걸 쓰게 둔다(중복 빈 행 방지)
-        if not (len(_accts) == 1 and not (_accts[0].get("id") or "").strip()
-                and _BROKER_SPEC.get(self._broker_of(asset), {}).get("acct")):
-            _accts.append(_new_acct(600.0, "", True,
+        _reuse = (len(_accts) == 1 and not (_accts[0].get("id") or "").strip()
+                  and _BROKER_SPEC.get(self._broker_of(asset), {}).get("acct"))
+        if _reuse:
+            # 그 빈 슬롯의 브로커를 패널 브로커로(1b 반박 리뷰 P1·P2-3, 2026-10-08): Lucid·IBKR만 연결한 회원의 빈 기본 행이 계속
+            # Topstep으로 해석돼 [계좌 추가]가 아무것도 바꾸지 않고 '다음:' 안내가 제자리를 돌았다. 회원이 누른 동작이다.
+            _s0 = _accts[0]
+            _old_bk = self._acct_broker(asset, _s0)
+            if (not str(_s0.get("broker") or "").strip()      # 회원이 행에서 고른 브로커는 덮지 않는다(확인 재리뷰 P2)
+                    and _bk0 != _old_bk and _bk0 in _ASSET_BROKERS.get(asset, []) and _BROKER_SPEC.get(_bk0, {}).get("acct")
+                    and self._bk_configured(asset, _bk0)):
+                _s0["broker"] = _bk0
+                if str(_s0.get("label") or "") == _broker_label(_old_bk):
+                    _s0["label"] = ""
+        if not _reuse:
+            _accts.append(_new_acct(DEFAULT_ONE_R, "", True,
                                     "" if _BROKER_SPEC.get(_bk0, {}).get("acct")
                                     else _broker_label(_bk0), broker=_bk0))
         self._save_cfg()
         self._build()
 
+    @staticmethod
+    def _rekey_after_delete(d, asset, idx):
+        """계좌 행 idx를 지운 뒤 (자산, 행) 키 dict 정리(오픈 준비 버그 조사 2026-10-06 S).
+        그 행의 키만 빼고, 뒤 행((asset, j>idx))은 (asset, j-1)로 한 칸씩 당긴다. 값(계좌 ID·브로커·키 사본)은
+        그대로라 발주·청산 대상은 바뀌지 않는다 - 키가 행 번호와 다시 맞을 뿐이다. 반환: 지운 키가 있었으면 True."""
+        if not isinstance(d, dict):
+            return False
+        hit = d.pop((asset, idx), None) is not None
+        for k in sorted([k for k in list(d) if k[0] == asset and k[1] > idx], key=lambda k: k[1]):
+            d[(asset, k[1] - 1)] = d.pop(k)
+        return hit
+
     def _del_acct(self, asset, idx):
-        """이 자산의 등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지. 인덱스가 밀리므로
-        이 자산의 무장은 전부 해제(잘못된 계좌 타겟 방지 — 실거래 안전)."""
+        """이 자산의 등록 계좌 삭제 — 확인 후. 최소 1개(빈 슬롯) 유지.
+        무장은 **지운 그 계좌만** 해제하고 뒤 행의 무장 키는 한 칸씩 당긴다(오픈 준비 버그 조사 2026-10-06 S).
+        종전에는 인덱스가 밀린다는 이유로 이 자산의 무장을 전부 풀어, 확인창은 '이 계좌 삭제'를 묻는데 같은 자산의
+        다른 계좌 진입과 세션 마감 자동 청산까지 경고 없이 사라졌다. 발주·청산은 무장 때의 계좌 ID 사본으로 돌기
+        때문에 키만 맞춰 주면 엉뚱한 계좌를 겨누지 않는다(신호 때 _live_acct_cfg가 ID·브로커를 다시 대조한다)."""
+        if self._golive_refuse():
+            return
         if asset == self._asset:
             self._collect_acct_widgets()   # 다른 행의 미저장 편집(라벨·1R) 보존 후 삭제
         accts = self._accts_of(asset)
         if idx >= len(accts):
             return
         lbl = accts[idx].get("label") or (accts[idx].get("id") or "")[-4:] or "?"
-        if not messagebox.askyesno(("계좌 삭제" if self.lang == "ko" else "Remove account"),
-                                   (f"'{lbl}' 계좌를 삭제할까요?" if self.lang == "ko"
-                                    else f"Remove account '{lbl}'?")):
+        _armed_row = ((asset, idx) in (getattr(self, "_sig_accts", None) or {})
+                      or (asset, idx) in (getattr(self, "_auto_accts", None) or {}))
+        _q = (f"'{lbl}' 계좌를 삭제할까요?" if self.lang == "ko" else f"Remove account '{lbl}'?")
+        if _armed_row:
+            _q += ((f"\n\n이 계좌는 지금 무장 중입니다. 삭제하면 이 계좌의 무장(신호 대기와 세션 마감 자동 청산)도 "
+                    f"함께 해제됩니다. {asset}의 다른 계좌는 그대로 돕니다.") if self.lang == "ko" else
+                   (f"\n\nThis account is armed now. Removing it also disarms this account (signal watch and "
+                    f"session-close auto-flatten). Other {asset} accounts keep running."))
+        if not messagebox.askyesno(("계좌 삭제" if self.lang == "ko" else "Remove account"), _q):
             return
-        # 삭제로 idx가 밀리면 (asset,idx) 무장 키가 엉뚱한 계좌를 가리키므로 이 자산 무장 전면 해제
-        for d in (self._sig_accts, self._auto_accts):
-            for k in [k for k in d if k[0] == asset]:
-                d.pop(k, None)
+        _hit = False
+        for d in (self._sig_accts, self._auto_accts, getattr(self, "_sig_parked", None)):
+            _hit = self._rekey_after_delete(d, asset, idx) or _hit
         if not self._auto_accts:
             self._auto_on = False
         if not self._sig_accts:
             self._sig_on = False
+        if _hit:
+            self.log(f"⏹ {asset} '{lbl}' 계좌 삭제 - 이 계좌의 무장을 해제했습니다({asset}의 다른 계좌는 그대로)."
+                     if self.lang == "ko" else
+                     f"⏹ {asset} '{lbl}' removed - this account is disarmed (other {asset} accounts keep running).")
         del accts[idx]
         if not accts:
-            accts.append(_new_acct(600.0, "", True, _broker_label(self._broker_of(asset))))
+            accts.append(_new_acct(DEFAULT_ONE_R, "", True, _broker_label(self._broker_of(asset))))
         self._set_auto_ind(bool(self._auto_accts), sorted({k[0] for k in self._auto_accts}))
         self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
         self._save_cfg()
@@ -3800,6 +6009,7 @@ class App:
     def healthcheck(self):
         if not self._creds_ok(): return
         self.log("\n── connection test ──")
+        _ha, _hb = _panel_asset_of(self), self._broker_name   # 응답 전에 패널 브로커가 바뀌어도 원래 창고에만(brokermix 2)
         def w():
             b = self._broker()
             try:
@@ -3817,7 +6027,7 @@ class App:
             if self._broker_name == "projectx":      # Topstep만 계좌목록 채움
                 try:
                     names = [str(a.get("name")) for a in b._accounts()]
-                    self.root.after(0, lambda: self._fill_scope(names))
+                    self.root.after(0, lambda: self._fill_scope(names, asset=_ha, broker=_hb))
                 except Exception:
                     pass
             pos = b.list_open_positions(); sc = self._scope()
@@ -3855,11 +6065,12 @@ class App:
             messagebox.showinfo(self.t("broker"), self.t("acct_topstep_only")); return
         if not self._creds_ok(): return
         self.log("\n── accounts ──")
+        _ha, _hb = _panel_asset_of(self), self._broker_name   # brokermix 2
         def w():
             b = self._broker()
             accts = b._accounts()
             names = [str(a.get("name")) for a in accts]
-            self.root.after(0, lambda: self._fill_scope(names))
+            self.root.after(0, lambda: self._fill_scope(names, asset=_ha, broker=_hb))
             for a in accts:
                 self.log(f"   • name={a.get('name')}  id={a.get('id')}  bal={a.get('balance')}  canTrade={a.get('canTrade')}")
         self._run(w)
@@ -3948,24 +6159,64 @@ class App:
                 f"[EQ Autopilot] The stop was rejected and the emergency close also failed "
                 f"({str(contract or '')[:16]}). Check your broker now.")
 
-    def _auto_loop(self):
+    def _auto_loop(self, gen=None):
         """자산별 세션 마감 자동청산. 잡은 self._auto_jobs에서 매 사이클 동적으로 읽는다
         (자산별 무장/해제 즉시 반영 — 대표 2026-07-11). 각 잡은
-        자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten.
+        자기 tz의 마감시각(+창 AUTO_FIRE_WINDOW_MIN분)에 하루 1회 그 자산 브로커를 flatten
+        (실패하면 그 창 안에서 AUTO_RETRY_SEC마다 다시 - 2026-10-06 F).
         같은 선물계좌의 NQ(14 ET)·GC(06 ET)는 세션이 안 겹쳐 flatten_all이 서로를 안 건드리고,
         BTC 02:00 UTC flatten은 다음(02-06) 세션 신호 발행(예측 계산 수 분)보다 항상 먼저 끝난다.
         실거래 여부는 발화 순간 _live_now로 재판정(강제 dry run 즉시 반영)."""
         import time as _t
-        fired = {}                                     # {(asset,hour): 그 tz의 날짜}
+        # 두 기록은 루프가 아니라 앱이 든다(버그 조사 재검증 2026-10-06 5): 종전엔 루프 지역이라, 실패 재시도 중에 정지→다시
+        # 무장으로 새 세대가 뜨면 기록이 사라져 새 루프의 첫 실패가 다시 '첫 실패'가 됐고(실패 팝업·회원 DM 반복), 새 루프가
+        # 성공하면 첫 실패 DM을 받은 회원에게 '끝났다' 후속 보고가 빠졌다. 이제 새 세대가 이어받는다.
+        fired = getattr(self, "_auto_fired", None)     # {(asset,hour,acct): 그 tz의 날짜} - **끝난** 것만
+        if not isinstance(fired, dict):
+            fired = self._auto_fired = {}
+        # 🐞 실패 재시도(오픈 준비 버그 조사 2026-10-06 F): 종전엔 시도 **전에** fired를 적어, 그 순간 브로커·NT8
+        # 브리지가 한 번 실패하면 다음 날 같은 시각(금요일이면 월요일)까지 그대로 들고 갔다. 이제 fired는
+        # 성공(또는 포지션 없음 확인, 의도된 건너뜀) 뒤에만 적고, 실패하면 창이 닫힐 때까지 AUTO_RETRY_SEC마다
+        # 다시 시도한다. {key: {day, n(실패 수), next(다음 시도 epoch), end(창 끝, 분), lab, err, live, gen(적은 세대)}}
+        retry = getattr(self, "_auto_retry", None)
+        if not isinstance(retry, dict):
+            retry = self._auto_retry = {}
         # tz는 _now_in()이 tzdata 없이도 정확히 계산(ET 산술 폴백) — ZoneInfo 로드 실패로
         # 청산이 죽던 사고 근절(대표 2026-07-20). ZoneInfo 없을 때 1회만 알린다.
         if ZoneInfo is None and not getattr(self, "_tz_fallback_warned", False):
             self._tz_fallback_warned = True
             self.log("ℹ 타임존 DB 없음 — 청산, 진입 시각을 UTC 기준 산술 계산으로 처리합니다(정상).")
 
-        while self._auto_on:
+        # 세대 확인(오픈 준비 버그 조사 2026-10-06 A): 정지 뒤 곧바로 다시 무장해 새 루프가 떴으면
+        # 이 루프는 낡은 것이다 - 같은 청산을 두 루프가 나눠 쏘지 않게 빠진다. gen=None은 세대 확인 없음(시험용).
+        def _mine():
+            return gen is None or gen == getattr(self, "_auto_gen", gen)
+
+        def _gave_up(rt):
+            """창이 닫힐 때까지 끝내 못 끝낸 자동 청산 - 한 번만 사실대로 알린다(F). 서버 원장·운영자에는
+            별도 ctx로 남겨, 첫 실패 때 이미 나간 서버 회원 DM('자동 청산 미완료')이 겹치지 않게 한다."""
+            _n, _lb, _er = rt["n"], rt["lab"], str(rt.get("err") or "")[:160]
+            self.log(f"\n🔴 {_lb} " + (
+                f"자동 청산을 {_n}번 시도했지만 끝내지 못했습니다. 오늘은 더 시도하지 않습니다."
+                if self.lang == "ko" else
+                f"auto-close was attempted {_n} times and did not complete. No more attempts today."))
+            self._report_error("auto_close_gaveup", f"{_lb} x{_n}: {_er}")
+            if not rt.get("live"):
+                return                                 # dry-run(킬스위치 등)은 실주문이 없었다 - 회원 DM 없음
+            self._member_alert(
+                "autoclose_gaveup",
+                f"[EQ Autopilot] {_lb} 자동 청산을 {_n}번 시도했지만 오류 없이 끝나지 않았습니다. "
+                f"포지션이나 주문이 남아 있을 수 있고, 앱은 오늘 이 청산을 더 시도하지 않습니다. "
+                f"마지막 오류: {_er}",
+                f"[EQ Autopilot] The {_lb} automatic exit was attempted {_n} times and did not finish "
+                f"without errors. Positions or orders may still be open, and the app will not attempt "
+                f"this exit again today. Last error: {_er}")
+
+        while self._auto_on and _mine():
             jobs = [j for jl in list(self._auto_accts.values()) for j in jl]   # 무장 계좌 동적 스냅샷
             for j in jobs:
+                if not _mine():
+                    break
                 now = _now_in(j["tz"])
                 today = now.strftime("%Y-%m-%d")
                 # 🐞 2026-07-27 실사고: 키가 (자산,시각)뿐이라 같은 자산 다계좌 무장 시 첫
@@ -3973,20 +6224,67 @@ class App:
                 # EXPRESS 실계좌 미청산). 계좌를 키에 포함해 계좌마다 하루 1회 독립 발화.
                 key = (j["asset"], j["hour"], j.get("acct") or j["broker"])
                 cur = now.hour * 60 + now.minute
-                due = j["hour"] * 60
+                due_fixed = j["hour"] * 60
                 # 서버 지정 청산 시각(뉴스 선행 청산). 고영향 지표 발표를 관통해 포지션을
                 # 들고 있으면 브로커 규정 위반이라, 그 날만 서버가 시각을 앞당겨 보낸다.
                 # 오늘·이 자산 것일 때만 쓰고, 값이 이상하면 조용히 고정 시각으로 돌아간다.
-                _ovr = (self._exit_override or {}).get(j["asset"])
-                due, _ovr_why = _exit_due(due, _ovr, now)
-                if not (due <= cur < due + AUTO_FIRE_WINDOW_MIN) or fired.get(key) == today:
+                # ⚠️서버는 계획 청산 시각이 있는 자산(NQ·GC, 하루 청산 1회)에만 보낸다 - BTC는 조건부 출구라 없다.
+                #   그 계약을 여기서도 지킨다(아래에서 값을 소진하지 않으므로 판정 시각 여섯 개에 퍼지지 않게).
+                _ovr = ((self._exit_override or {}).get(j["asset"])
+                        if len(_ASSET_EXITS.get(j["asset"], ())) == 1 else None)
+                due, _ovr_why = _exit_due(due_fixed, _ovr, now)
+                # 창 = 발화 시각(선행이면 앞당긴 시각) ~ **정규 시각**+30분. 선행 청산이 실패해도 정규 시각 창까지
+                # 이어서 시도한다(F). 서버 값은 그날 지나면 _exit_due가 버리므로 따로 소진(pop)하지 않는다 - 종전엔
+                # 자산 단위로 pop해 같은 자산 둘째 계좌부터 고정 시각으로 돌아가 지표 발표를 관통했다(F 반박 검증 (b)).
+                end = due_fixed + AUTO_FIRE_WINDOW_MIN
+                _rt = retry.get(key)
+                if _rt and (_rt["day"] != today or cur >= _rt["end"]):
+                    # 창이 닫혔는데 끝내 못 끝냈다 → 한 번 알리고 지운다. 기록이 앱 공유라(재검증 5) 옛·새 세대 루프가 잠깐
+                    # 같이 봐도 지운 쪽 하나만 알린다.
+                    if retry.pop(key, None) is None:
+                        _rt = None
+                    elif _rt["day"] != today and _rt.get("gen") != gen:
+                        # 정지 전 옛 세대가 남긴 **다른 날** 기록(재검증 5): 이 루프는 그 창을 본 적이 없다. 다시 무장한 날에
+                        # '오늘 더 시도하지 않습니다' DM을 뒤늦게 보내지 않고 사실 한 줄만 남긴다(종전엔 기록째 사라졌다).
+                        self.log(f"   · {_rt.get('lab')} " + (
+                            f"자동 청산 재시도 기록({_rt['day']}, 실패 {_rt.get('n')}번)은 자동 청산이 꺼져 있는 사이 "
+                            "창이 지나 닫았습니다." if self.lang == "ko" else
+                            f"auto-close retry record ({_rt['day']}, {_rt.get('n')} failed attempt(s)) closed - "
+                            "its window passed while auto-close was off."))
+                    else:
+                        _gave_up(_rt)
+                    _rt = None
+                if not (due <= cur < end) or fired.get(key) == today:
                     continue
+                if _rt and _t.time() < _rt["next"]:
+                    continue                             # 다음 재시도 시각 전
                 if _ovr_why:
                     self.log(f"\n⏰ {j['asset']} " + (
                         f"선행 청산 발화 ({_ovr_why})" if self.lang == "ko"
                         else f"early close fired ({_ovr_why})"))
-                    self._exit_override.pop(j["asset"], None)   # 그날 1회로 소진
-                fired[key] = today
+
+                def _done(note=None):
+                    """이 블록 일을 끝냈다(성공 아님 - 의도된 건너뜀·보유 포함). 오늘 다시 안 본다."""
+                    fired[key] = today
+                    if retry.pop(key, None) and note:
+                        self.log(note)
+                # 계좌 ID 없는 선물 청산은 하지 않는다(최종 반박 리뷰 2026-10-08 P0): 빈 계좌 목록으로 브로커를 만들면
+                # 어댑터가 그 로그인의 계좌 전부를 닫는다. _master_arm이 이런 무장을 만들지 않지만, 혹시 남아 있으면 오류만 남긴다.
+                if (_BROKER_SPEC.get(j.get("broker"), {}).get("acct")
+                        and not str(j.get("acct") or "").strip()):
+                    _done()
+                    self.log(f"\n⛔ {j['asset']} {j['hour']:02d}:00 " + (
+                        f"{_broker_label(j.get('broker'))} 마감 청산을 하지 않았습니다 - 이 무장에 계좌 ID가 없습니다"
+                        "(비어 있으면 그 로그인의 계좌 전부가 닫힙니다). [전체 정지] 뒤 계좌 ID를 넣고 다시 시작하세요."
+                        if self.lang == "ko" else
+                        f"{_broker_label(j.get('broker'))} session-close flatten skipped - this arming has no account id "
+                        "(an empty id would close every account on that login). Press [Stop all], set the account id "
+                        "and start again."))
+                    try:
+                        self._report_error("auto_close", f"{j['asset']} {j.get('broker')}: empty account id, flatten refused")
+                    except Exception:
+                        pass
+                    continue
                 # 🛡 오살 방지(연속 세션): 이 자산에 '방금'(발화창 이내) LIVE 새 진입이 있었으면
                 # 이번 마감 청산 스킵 — 신호 루프가 이미 "잔여 청산→확인→진입"을 끝냈다는 뜻이고,
                 # 여기서 flatten하면 방금 들어간 새 세션 포지션을 죽인다. (대표 2026-07-11)
@@ -3997,15 +6295,18 @@ class App:
                 _ent = _ent if isinstance(_ent, dict) else {}
                 _ea = max((self._entered_at or {}).get(j["asset"], 0), _ent.get(j["asset"], 0))
                 if _t.time() - _ea < AUTO_FIRE_WINDOW_MIN * 60:
+                    _done()
                     self.log(f"\n⏭ {j['asset']} 마감 청산 스킵 — {int((_t.time() - _ea) / 60)}분 전 "
                              f"새 세션 진입(신호 루프가 이전 세션 이미 정리).")
                     continue
                 # BTC 24h 만기(22:00 UTC 잡 = 블록 5)는 **월요일**의 일이다 - 진입이 일요일 22:00 UTC뿐이라, 일요일 22:00 UTC에
                 # 보이는 BTC 포지션은 정의상 방금 들어간 것이다(2026-10-04 사고의 이중 방어, 진입 시각 기록이 실패해도 막는다).
                 if j["asset"] == "BTC" and j["hour"] == 22 and now.weekday() == 6:
+                    _done()
                     continue
                 live, _fb_skip = self._close_mode(j)   # 평소: LIVE 선택 × 게이트(킬스위치면 dry-run) / 폴백: 로컬 일정대로
                 _lab = f"{j['asset']} {j['hour']:02d}:00 {'ET' if 'New_York' in j['tz'] else 'UTC'}"
+                _why = None                            # 이번 시도 실패 사유(None = 끝남)
                 try:
                     b = _build_broker(j["broker"], j["f1"], j["f2"], j["f3"],
                                       [j["acct"]] if j["acct"] else [])
@@ -4020,21 +6321,33 @@ class App:
                         except Exception:
                             _bq = "ERR"
                         if _bq != "ERR" and not _bq:
+                            _done("   ✓ BTC 포지션 없음 확인 — 앞선 청산 실패 기록을 닫습니다."
+                                  if self.lang == "ko" else
+                                  "   ✓ BTC position confirmed flat — closing the earlier failure record.")
                             continue          # 포지션 확실히 없음 → 무음 스킵
                     # Operator(대표 2026-09-30 "앱에 정해진 마지노 청산만 오퍼레이터"): BTC는 24시간 만기(블록 5)에만 닫는다.
                     # 4시간 봉 판정(반대봉 청산·손절 이동)은 회원이 메시지를 받고 직접 한다. 폴백(서버 불통)은 등급과 무관하게 이 블록에서 닫는다.
                     if (j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K and not _fb_skip and not self._full_exit()
                             and _BTC_BLOCK_K[j["hour"]] < 5):
+                        _done()
                         self.log(f"\n⏸ {_lab} " + (
-                            "Operator: 4시간 봉 판정은 메시지로 직접 하십시오. 앱은 24시간 만기에 닫습니다."
+                            "Operator: 4시간 봉 판정은 메시지로 갑니다. 앱은 24시간 만기에만 닫습니다."
                             if self.lang == "ko" else
-                            "Operator: act on the 4h candle message yourself. The app closes at the 24h limit."))
+                            "Operator: the 4h candle call comes by message. The app closes only at the 24h limit."))   # 사실문(대표 2026-10-06 "어 바꿔")
                         continue
+                    if not _mine():
+                        break                 # 발주 직전 세대 재확인(A) - 위 조회 사이에 새 루프가 떴다
                     self.log(f"\n⏰ {_lab} 세션 마감 → auto-close [{j['broker']}"
-                             f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})")
+                             f"{('/' + j['acct']) if j['acct'] else ''}] ({'LIVE' if live else 'dry-run'})"
+                             + ((f" — 재시도 {_rt['n']}" if self.lang == "ko" else f" — retry {_rt['n']}")
+                                if _rt else ""))
                     # ── BTC 조건부 출구(X2+TR) — 무조건 청산이 아니라 봉을 보고 판정 ──
                     if j["asset"] == "BTC" and j["hour"] in _BTC_BLOCK_K and not _fb_skip and self._full_exit():
-                        if not self._btc_x2be_step(b, j, live, _dt.timezone.utc):
+                        _xs = self._btc_x2be_step(b, j, live, _dt.timezone.utc)
+                        if _xs is None:               # 24h 만기 블록인데 포지션 상태를 못 맞춤 → 실패로 보고 재시도(F)
+                            raise RuntimeError("BTC position qty/list mismatch at the 24h limit")
+                        if not _xs:
+                            _done()
                             continue          # hold/breakeven → 이번 시각엔 청산 안 함
                     # 폴백(서버 불통)에서는 BTC도 조건부 출구 없이 다음 4시간 봉 마감(이 블록)에 닫는다(대표 2026-09-30).
                     # 크립토(BTC) 시간마감 청산 = 지정가 도전 → 시장가 폴백(대표 2026-07-15).
@@ -4062,19 +6375,48 @@ class App:
                             self._send_fill(j["asset"], closed=True)
                         else:
                             # 🚨 청산 후에도 포지션이 남았거나 실패 — 로그만으론 못 본다(2026-07-27
-                            # Follower 계좌 청산 거부 실사고). 팝업으로 즉시 수동 개입 요청.
-                            _errs = "\n".join(str(e)[:120] for e in res.errors[:4])
-                            self._report_error("auto_close", _errs)   # 원장+회원 DM(2026-09-03)
-                            _pt = ("자동청산 실패 — 수동 확인 필요" if self.lang == "ko"
-                                   else "Auto-close failed — manual action needed")
-                            _pm = ((f"{_lab} 자동청산이 완전히 끝나지 않았습니다.\n\n{_errs}\n\n"
-                                    "브로커 화면에서 포지션을 직접 확인, 청산하세요.") if self.lang == "ko"
-                                   else (f"Auto-close for {_lab} did not fully complete.\n\n{_errs}\n\n"
-                                         "Check and close the position directly on your broker."))
-                            self.root.after(0, lambda t=_pt, m=_pm: messagebox.showwarning(t, m))
+                            # Follower 계좌 청산 거부 실사고). 팝업·DM은 아래 실패 처리에서 첫 실패 때 한 번.
+                            _why = "\n".join(str(e)[:120] for e in res.errors[:4])
                 except Exception as e:
                     self.log(f"   ❌ auto-close failed — {e}")
-                    self._report_error("auto_close", e)   # 예외 리포트(대표 2026-07-27)
+                    _why = str(e)
+                if _why is None:
+                    # 끝남. 앞선 실패가 있었으면(재시도로 끝난 것) 첫 실패 DM을 받은 회원에게 결과도 알린다(F).
+                    _prev = retry.pop(key, None)
+                    fired[key] = today
+                    if _prev and live:
+                        _n = _prev["n"] + 1
+                        self.log(f"   ✅ {_lab} " + (f"{_n}번째 시도에서 끝났습니다(앞선 실패 {_n - 1}번)."
+                                                    if self.lang == "ko" else
+                                                    f"finished on attempt {_n} ({_n - 1} earlier failure(s))."))
+                        self._member_alert(
+                            "autoclose_ok",
+                            f"[EQ Autopilot] {_lab} 자동 청산이 {_n}번째 시도에서 오류 없이 끝났습니다"
+                            f"(앞선 시도 {_n - 1}번 실패).",
+                            f"[EQ Autopilot] The {_lab} automatic exit finished without errors on attempt "
+                            f"{_n} (after {_n - 1} failed attempt(s)).")
+                    continue
+                # ── 실패: 같은 창 안에서 AUTO_RETRY_SEC 뒤 다시(F). 서버 리포트(원장+회원 DM)·팝업은 첫 실패 때 한 번 -
+                #    재시도마다 보내면 도배라 회원이 알림을 꺼 버린다. 창이 닫히면 _gave_up이 한 번 알린다.
+                _n = (_rt["n"] if _rt else 0) + 1
+                retry[key] = {"day": today, "n": _n, "next": _t.time() + AUTO_RETRY_SEC, "end": end,
+                              "lab": _lab, "err": str(_why)[:300], "live": bool(live), "gen": gen}
+                _end_s = f"{end // 60:02d}:{end % 60:02d} {'ET' if 'New_York' in j['tz'] else 'UTC'}"
+                self.log("   ↻ " + (f"{AUTO_RETRY_SEC}초 뒤 다시 시도합니다({_end_s}까지)." if self.lang == "ko"
+                                    else f"retrying in {AUTO_RETRY_SEC}s (until {_end_s})."))
+                if _n == 1:
+                    self._report_error("auto_close", _why)   # 원장+회원 DM(2026-09-03), 예외 리포트(대표 2026-07-27)
+                    if live:
+                        _errs = str(_why)[:500]
+                        _pt = ("자동청산 실패 — 수동 확인 필요" if self.lang == "ko"
+                               else "Auto-close failed — manual action needed")
+                        _pm = ((f"{_lab} 자동청산이 완전히 끝나지 않았습니다.\n\n{_errs}\n\n"
+                                f"앱이 {_end_s}까지 {AUTO_RETRY_SEC}초마다 다시 시도합니다.\n\n"
+                                "브로커 화면에서 포지션을 직접 확인, 청산하세요.") if self.lang == "ko"
+                               else (f"Auto-close for {_lab} did not fully complete.\n\n{_errs}\n\n"
+                                     f"The app retries every {AUTO_RETRY_SEC}s until {_end_s}.\n\n"
+                                     "Check and close the position directly on your broker."))
+                        self.root.after(0, lambda t=_pt, m=_pm: messagebox.showwarning(t, m))
             _t.sleep(15)
 
     # ── auto-ENTRY on EdgeQuant signal ──────────────────────────────────────
@@ -4145,8 +6487,25 @@ class App:
         if _untested:
             return base + (", 연결 테스트 필요" if self.lang == "ko" else ", test connection"), "#9ca3af"
         if armed:
-            base += ", " + (("가동 중(실거래)" if live else "가동 중(주문 보류: 서버 잠금)") if self.lang == "ko"
-                             else ("RUNNING live" if live else "RUNNING (orders held: server lock)"))
+            ko = self.lang == "ko"
+            if auto_keys and not sig_keys and self._kill_on():
+                base += ", " + ("마감 청산 보류(서버 잠금)" if ko else "session-close held (server lock)")
+                return base, "#eab308"
+            if auto_keys and not sig_keys:
+                # 신호 대기가 꺼지고 마감 청산만 남은 상태(오픈 준비 버그 조사 2026-10-06 E): 서버 불통·권한
+                # 상실로 신호 루프가 꺼져도 화면이 '가동 중(실거래)'라 말하던 자리 - 사실대로 쓴다.
+                base += ", " + ("마감 청산만 가동(신호 대기 꺼짐)" if ko else "session-close only (signal watch off)")
+                return base, "#eab308"
+            if (getattr(self, "_gate", None) or {}).get("force_dry_run"):
+                live = False                      # 서버 잠금(킬스위치) 중엔 발주 순간 _live_now가 막는다 - 줄도 사실대로(P2-4)
+            base += ", " + (("가동 중(실거래)" if live else "가동 중(서버 잠금)") if ko
+                             else ("RUNNING live" if live else "RUNNING (server lock)"))
+            _need = self._rearm_needs(asset)
+            if _need:
+                # 가동 중 바꾼 새 행·키·계좌 ID는 다시 무장해야 주문에 닿는다(C) - 화면이 켜진 척하지 않게.
+                base += ", " + ((f"다시 무장해야 적용: {', '.join(_need)}") if ko
+                                 else f"re-arm to apply: {', '.join(_need)}")
+                return base, "#eab308"
             return base, ("#21c55e" if live else "#eab308")
         return base + (", 준비됨" if self.lang == "ko" else ", ready"), "#9ca3af"
 
@@ -4208,7 +6567,9 @@ class App:
 
         def _calc(*_):
             try:
-                cap = float((ce.get() or "").replace(",", ""))
+                cap = _parse_amount(ce.get())          # 엄격 파서(오픈 준비 버그 조사 2026-10-06 R) - '50000,5'→500005 방지
+                if cap is None:
+                    raise ValueError
                 pct = float(pe.get())
                 if cap <= 0 or pct <= 0 or pct > 100:
                     raise ValueError
@@ -4282,7 +6643,9 @@ class App:
 
         def _fill_lim():
             try:
-                cap = float((ce.get() or "").replace(",", ""))
+                cap = _parse_amount(ce.get())          # 엄격 파서(오픈 준비 버그 조사 2026-10-06 R) - '50000,5'→500005 방지
+                if cap is None:
+                    raise ValueError
                 if cap <= 0:
                     raise ValueError
                 le.delete(0, "end"); le.insert(0, f"{cap * 0.01:.0f}")
@@ -4298,17 +6661,34 @@ class App:
                   ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 8))
 
         def _lim_val():
-            t = (le.get() or "").replace(",", "").strip()
-            return max(0.0, _as_float(t, 0.0)) if t else 0.0
+            """한도 칸 → 금액(빈 칸 = 0 = 꺼짐). 못 읽으면 None(오픈 준비 버그 조사 2026-10-06 R: 종전엔 쉼표를 지워
+            '1,5'→15로 읽었다). None이면 호출부가 저장하지 않고 이유를 보여 준다."""
+            t = (le.get() or "").strip()
+            return _parse_amount(t) if t else 0.0
+
+        def _lim_bad():
+            _t = (le.get() or "").strip()
+            messagebox.showwarning("EQ", (f"한 계약 허용 한도를 저장하지 않았습니다: '{_t}' - {_amount_why(_t, ko)}.\n"
+                                          "금액은 숫자만 받습니다(소수점은 점, 천 단위 쉼표는 1,800처럼 세 자리씩)."
+                                          if ko else
+                                          f"The one-contract limit was not saved: '{_t}' - {_amount_why(_t, ko)}.\n"
+                                          "Amounts accept plain numbers ('.' is the decimal point; thousands commas "
+                                          "group three digits, as in 1,800)."), parent=win)
 
         def _save_lim():
-            acct["one_lim"] = _lim_val()
+            _lv = _lim_val()
+            if _lv is None:
+                _lim_bad(); return
+            acct["one_lim"] = _lv
             self._save_acct_widgets(); win.destroy()
 
         _apply_1r = _apply
 
         def _apply():
-            acct["one_lim"] = _lim_val()
+            _lv = _lim_val()
+            if _lv is None:
+                _lim_bad(); return
+            acct["one_lim"] = _lv
             _apply_1r()
 
         ttk.Button(frm, text=("1R로 적용" if ko else "Use as 1R"), command=_apply).grid(row=7, column=1, sticky="e")
@@ -4334,6 +6714,10 @@ class App:
             return
         _saved = acct.get("prop") or {}
         pr = dict(_PROP_DEFAULTS); pr.update(_saved)
+        # '아직 안 정한 계좌' 판정(오픈 준비 버그 조사 2026-10-06 Q): 종전 `not _saved`는 새 계좌도 기본 prop을 들고 있어
+        # 언제나 거짓이었다(08-18부터 죽은 분기) - 그래서 1200/300이 미리 채워졌다. 이제 set=False(새 계좌)거나,
+        # 표식 전 옛 값이면서 꺼져 있고 배포 기본값 묶음 그대로일 때 1R 칸을 0으로 연다.
+        _unset = _prop_is_unset(_saved)
         # 프리셋은 몰래 스왑하지 않는다(2026-08-13, 대표 "시뮬 결과 액수 사용 버튼 어때 -
         # 그건 자기가 누르는 거니깐"). 아래 [시뮬 기준값 채우기] 버튼이 유일한 적용 경로.
         try:
@@ -4358,6 +6742,18 @@ class App:
                         variable=ty_v, value="funded").grid(row=1, column=2, sticky="w")
         ttk.Radiobutton(frm, text=("라이브 초기" if ko else "Live (early)"),
                         variable=ty_v, value="live").grid(row=1, column=3, sticky="w")
+        # 대표 2026-10-11: 계좌 유형 바로 아래에 유형별 시뮬 기준 1R(버튼을 누르면 이 값이 들어감).
+        _psh = _prop_preset(_bk)
+        if _psh:
+            _pk = [f"테스트기 ${_psh['r_test']:,.0f}", f"펀디드 ${_psh['r_steady']:,.0f}"]
+            _pe = [f"challenge ${_psh['r_test']:,.0f}", f"funded ${_psh['r_steady']:,.0f}"]
+            if "r_live" in _psh:
+                _pk.append(f"라이브 초기 ${_psh['r_live']:,.0f}")
+                _pe.append(f"live-early ${_psh['r_live']:,.0f}")
+            ttk.Label(frm, foreground="#555", wraplength=380, justify="left",
+                      text=(("아래 [시뮬 기준값 채우기]를 누르면 각 유형별 1R이 채워집니다(" + ", ".join(_pk) + ").") if ko else
+                            ("Press [Fill simulation defaults] below to fill 1R for each type (" + ", ".join(_pe) + ")."))
+                      ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 6))
         ents = {}
         _rows = [("r_test", "챌린지 1R $" if ko else "Challenge 1R $"),
                  ("r_steady", "펀디드 1R $" if ko else "Funded 1R $"),
@@ -4365,40 +6761,24 @@ class App:
                  ("payouts", "출금 횟수 (0~5)" if ko else "Payouts so far (0~5)"),
                  ("pass_tp", "통과 목표 잔고 $ (0=끔)" if ko else "Pass target balance $ (0=off)")]
         # r_buffer·buffer 필드는 Fast-Payout 채택으로 미사용 — 저장값은 유지(마이그레이션 호환)
-        for i, (k, lab) in enumerate(_rows, start=2):
+        for i, (k, lab) in enumerate(_rows, start=3):
             ttk.Label(frm, text=lab).grid(row=i, column=0, sticky="w", pady=1)
             e = ttk.Entry(frm, width=10)
             # 새 계좌(저장 이력 없음)는 1R 필드 0으로 비워 시작(대표 2026-08-18) - 앱이
             # 임의 기본값을 앉히지 않는다. 값 적용 경로는 직접 입력 또는 [시뮬 기준값 채우기]뿐.
-            _v0 = (0.0 if (not _saved and k in ("r_test", "r_steady", "r_live"))
+            _v0 = (0.0 if (_unset and k in ("r_test", "r_steady", "r_live"))
                    else _as_float(pr.get(k), _PROP_DEFAULTS[k]))
             e.insert(0, f"{_v0:g}")
             e.grid(row=i, column=1, sticky="w", pady=1)
             ents[k] = e
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("출금 문턱에 닿으면 앱이 알려주고, 출금 횟수는 팝업에서 '예'를 누르면 "
-                         "+1 됩니다(여기서 수동 조정도 가능).\n운용 방식 전체 설명: "
-                         "홈페이지 → 자본 운용 → 프롭 운용 원칙") if ko else
-                        ("The app notifies you at payout thresholds; the count increments when "
-                         "you press Yes in the popup (adjustable here too).\nFull playbook: "
-                         "website → Capital → Prop playbook."))
-                  ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
+                  text=("출금 횟수는 출금 팝업에서 '예'를 누르면 1 늘어납니다." if ko else
+                        "The payout count goes up by 1 when you press Yes in the payout popup.")
+                  ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 2))
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=(("통과 목표 잔고: 테스트기 + Topstep(ProjectX), Lucid(NT8) 계좌에서 "
-                         "작동합니다(NT8은 새 브리지 애드온 필요). 프롭 화면에 보이는 "
-                         "통과 기준 잔고를 그대로 넣으십시오. (현재 잔고 + 미실현 이익)이 그 값"
-                         "(+계약수 비례 여유, 최소 $20)에 닿는 순간 이 계좌의 포지션을 시장가로 "
-                         "정리합니다. 남은 거리는 앱이 매번 계산하니 잔고가 늘어도 고칠 필요가 "
-                         "없습니다. 금액은 본인이 정하고, 규정 확인도 본인 몫입니다. 0=꺼짐(기본).")
-                        if ko else
-                        ("Pass target balance: test accounts on Topstep (ProjectX) and "
-                         "Lucid (NT8; new bridge add-on required). Enter the balance your firm "
-                         "requires to clear the evaluation. When (current balance + open profit) "
-                         "reaches it (plus size-scaled headroom, min $20), the app market-closes this "
-                         "account's positions. The remaining distance is recomputed each time, so "
-                         "you never need to update it as the balance grows. You set the number and "
-                         "you check your firm's rules. 0 disables it (default)."))
-                  ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 8))
+                  text=("통과 목표 잔고를 정해 놓으시면 그 잔고에 이를 때 계좌 포지션을 시장가로 정리합니다." if ko else
+                        "If you set a pass target balance, this account's positions are closed at market when the balance reaches it.")
+                  ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         # ── [시뮬 기준값 채우기] — 홈피 시뮬레이션이 쓰는 브로커별 정본 상수를 회원이
         #    버튼으로 불러온다(전 회원 동일 공개 상수 + 회원 클릭 = 개인화 아님). ──
@@ -4418,28 +6798,43 @@ class App:
             _bn = ("Topstep" if _bk == "projectx" else "Lucid" if _bk == "nt8" else _bk)
             ttk.Button(frm, text=(f"시뮬 기준값 채우기 ({_bn})" if ko
                                   else f"Fill simulation defaults ({_bn})"),
-                       command=_fill_preset).grid(row=10, column=0, columnspan=4,
+                       command=_fill_preset).grid(row=11, column=0, columnspan=4,
                                                   sticky="w", pady=(0, 2))
             ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                      text=("홈페이지 시뮬레이션과 같은 값입니다. 눌러도 저장 전엔 반영되지 않습니다."
-                            if ko else
-                            "Same values as the website simulation. Nothing applies until you save.")
-                      ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(0, 8))
+                      text=("저장해야 반영됩니다." if ko else "Applies after you save.")
+                      ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         def _ok():
             newp = {"on": bool(on_v.get()), "type": ty_v.get()}
-            for k in ents:
-                newp[k] = _as_float(ents[k].get(), _PROP_DEFAULTS[k])
-            newp["payouts"] = max(0, min(5, int(_as_float(ents["payouts"].get(), 0))))
-            newp["pass_tp"] = max(0.0, _as_float(ents["pass_tp"].get(), 0.0))
+            # 손으로 친 칸은 엄격 파서로 읽는다(오픈 준비 버그 조사 2026-10-06 R): 종전 _as_float는 '2.200'→2.2,
+            # '450,00'→45000으로 읽고, 빈 칸엔 기본값(1200 등)을 몰래 앉혔다. 못 읽은 칸이 있으면 저장하지 않고
+            # 칸 이름과 이유를 보여 준다(창은 열린 채 - 회원이 친 글자가 그대로 보인다). 빈 칸 = 0.
+            _vals, _bad = _prop_parse_fields({k: ents[k].get() for k in ents}, dict(_rows), ko)
+            newp.update(_vals)
+            if _bad:
+                messagebox.showwarning("EQ", (("저장하지 않았습니다 - 읽지 못한 칸:\n" if ko else
+                                               "Not saved - these fields could not be read:\n")
+                                              + "\n".join(_bad)
+                                              + ("\n\n금액은 숫자만 받습니다(소수점은 점, 천 단위 쉼표는 1,800처럼 세 자리씩)."
+                                                 if ko else
+                                                 "\n\nAmounts accept plain numbers ('.' is the decimal point; thousands "
+                                                 "commas group three digits, as in 1,800).")))
+                return
+            newp["payouts"] = max(0, min(5, int(newp.get("payouts", 0.0))))
+            newp["pass_tp"] = max(0.0, float(newp.get("pass_tp", 0.0)))
             # 다이얼로그에서 뺀 레거시 필드(r_buffer·buffer)는 기존 저장값 유지 — 여기서
             # 참조하다 KeyError로 저장이 조용히 죽던 사고 수리(대표 2026-07-28 "저장 안 됨").
+            # 아직 안 정한 Topstep 계좌를 처음 저장하면 방패 = 프리셋 3000(리뷰 P2-B: 새 계좌 경로가 옛 기본 6000을 들고 와 set=True로 굳던 것)
+            if _unset and _bk == "projectx": _ps_hidden.setdefault("buffer", _PROP_PRESETS["projectx"]["buffer"])
             for k in ("r_buffer", "buffer"):
                 newp[k] = _as_float(_ps_hidden.get(k, pr.get(k)), _PROP_DEFAULTS[k])
-            if newp["on"] and any(newp[k] <= 0 for k in ("r_test", "r_steady")):
+            # 라이브 초기 유형이면 그 1R도 0보다 커야 한다(R - 0이면 발주가 조용히 0계약으로 건너뛴다).
+            _need = ("r_test", "r_steady") + (("r_live",) if newp["type"] == "live" else ())
+            if newp["on"] and any(newp.get(k, 0.0) <= 0 for k in _need):
                 messagebox.showwarning("EQ", "1R 값은 0보다 커야 합니다." if ko
                                        else "1R values must be > 0.")
                 return
+            newp["set"] = True       # 회원이 이 창에서 저장한 값 - 기동 이행이 건드리지 않는다(Q)
             acct["prop"] = newp
             try:      # pass_tp 변경 시 이번 가동의 발동·안내 래치 리셋 → 감시 재개(2026-08-18 감사 ⑥)
                 _aidl = str(acct.get("id") or "").lower()
@@ -4464,8 +6859,8 @@ class App:
             self._save_acct_widgets()
             win.destroy()
 
-        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=12, column=1, pady=(4, 0))
-        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=12, column=2, pady=(4, 0))
+        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=13, column=1, pady=(4, 0))
+        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=13, column=2, pady=(4, 0))
 
     def _sync_pick_hint(self):
         """자산을 하나도 안 고른 상태에서만 선택 안내를 보인다."""
@@ -4489,6 +6884,44 @@ class App:
                 dot.config(foreground=col)
             except Exception:
                 pass
+        self._note_rearm_needs()
+        try:
+            self._refresh_next_action()          # 버튼 줄 옆 한 줄(상태+다음 할 일)도 같이
+        except Exception:
+            pass
+
+    def _note_rearm_needs(self):
+        """다시 무장해야 반영되는 변경이 **새로 생긴 순간** 로그 한 줄(오픈 준비 버그 조사 2026-10-06 C).
+        이 함수는 계좌 행·키 저장·재빌드 뒤 늘 불리는 _refresh_live_panel 끝에서 돈다 - 같은 상태로 반복 호출돼도
+        목록이 바뀔 때만 쓴다. 1R·프롭 값·실행 체크 끄기는 다음 신호부터 바로 반영되므로 여기 오지 않는다."""
+        try:
+            _seen = getattr(self, "_rearm_noted", None)
+            if not isinstance(_seen, dict):
+                _seen = self._rearm_noted = {}
+            for asset in _ASSETS:
+                _need = self._rearm_needs(asset)
+                _k = tuple(_need)
+                if _seen.get(asset, ()) == _k:
+                    continue
+                _seen[asset] = _k
+                if not _need:
+                    continue
+                # 문구는 실제 동작 그대로(버그 조사 재검증 2026-10-06 1): 이 계좌들은 신호 때 _live_acct_cfg가 건너뛴다 -
+                # 새 키·새 계좌로 시험 없이 주문하지도, 옛 키로 주문하지도 않는다. 키·계좌 ID·브로커를 바꾼 계좌의 마감
+                # 자동 청산 잡은 무장 때 사본(옛 키·옛 계좌)으로 계속 돈다(_auto_accts는 다시 무장할 때만 바뀐다).
+                self.log((f"ℹ {asset}: 가동 중에 추가하거나 켠 계좌, 키·계좌 ID·브로커를 바꾼 계좌({', '.join(_need)})는 "
+                          f"다시 무장하기 전까지 새 신호에 진입하지 않습니다. 키·계좌 ID·브로커를 바꾼 계좌의 마감 자동 "
+                          f"청산은 무장 때의 키·계좌로 돕니다. {asset} 체크를 껐다 다시 켜면 연결 테스트 뒤 무장됩니다. "
+                          f"1R·프롭 값과 계좌 실행 끄기는 다음 신호부터 바로 반영됩니다.")
+                         if self.lang == "ko" else
+                         (f"ℹ {asset}: accounts added or turned on while running, or with a changed key, account ID "
+                          f"or broker ({', '.join(_need)}), do not enter new signals until they are armed again. For "
+                          f"accounts with a changed key, account ID or broker, the session-close auto-flatten keeps "
+                          f"using the key and account from arming. Unchecking {asset} and checking it again arms "
+                          f"them after a connection test. 1R and prop values, and turning an account off, apply "
+                          f"from the next signal."))
+        except Exception:
+            pass
 
     def _acct_edit_row(self, parent, idx, acct, spec, deletable=True, show_on=True):
         """자산 탭 계좌 한 줄(편집): [on] 라벨, 1R$, (계좌ID), [삭제].
@@ -4504,12 +6937,26 @@ class App:
         # 브로커가 2개 이상일 때만 노출. 발주·청산·연결테스트 전부 이 값을 따른다.
         _brs = _ASSET_BROKERS.get(self._asset, [])
         if len(_brs) > 1:
-            bk_cb = ttk.Combobox(row, values=[_broker_label(b) for b in _brs],
+            # 이 자산에 적용되는 브로커만(대표 2026-10-07 "자산별 계좌 설정에서 적용되는 브로커만 보여주기"):
+            # 이 자산이 지원하고 브로커 연결이 설정된 것 + 이 행이 지금 쓰는 브로커(항상 남긴다).
+            _cur_bk = self._acct_broker(self._asset, acct)
+            _vis = [b for b in _brs if b == _cur_bk or self._bk_configured(self._asset, b)]
+            bk_cb = ttk.Combobox(row, values=[_broker_label(b) for b in _vis],
                                  state="readonly", width=8)
             bk_cb.set(_broker_label(self._acct_broker(self._asset, acct)))
             bk_cb.pack(side="left", padx=(0, 4))
-            bk_cb.bind("<<ComboboxSelected>>",
-                       lambda e: (self._save_acct_widgets(), self._build()))
+            def _bk_pick(e=None, _cb=bk_cb, _i=idx):
+                if self._golive_refuse():            # 연결 테스트 중 - 지금 값으로 되돌린다(그릴 때 값 아님, 2026-10-08b P3(a))
+                    try:
+                        _cur = ((self._acct_widgets.get(_i) or {}).get("broker_shown")
+                                or self._acct_broker(self._asset, self._accts_of(self._asset)[_i]))
+                        _cb.set(_broker_label(_cur))
+                    except Exception:
+                        pass
+                    return
+                self._save_acct_widgets()
+                self._build()
+            bk_cb.bind("<<ComboboxSelected>>", _bk_pick)
             # 계좌까지 고른 행은 브로커를 잠근다(대표 2026-09-15 "브로커를 실수로 바꾸면 에러 안 떠.
             # 나도 모르게 연결 안 되어 있어"): 계좌 ID는 그 브로커의 것이라 브로커만 바뀌면 행이
             # 조용히 죽은 계좌가 된다. 브로커를 바꾸려면 행을 삭제하고 새로 추가한다.
@@ -4519,17 +6966,22 @@ class App:
             bk_cb = None
         aid = (acct.get("id") or "").strip()
         lbl_e = ttk.Entry(row, width=12)
-        lbl_e.insert(0, acct.get("label")
+        _lb0 = acct.get("label")
+        _rb_lbl = _broker_label(self._acct_broker(self._asset, acct))
+        if _lb0 in {_broker_label(b) for b in _ASSET_BROKERS.get(self._asset, [])} and _lb0 != _rb_lbl:
+            _lb0 = _rb_lbl                    # 기본 라벨(브로커 이름)은 실제 실행 브로커 이름으로 보인다(재리뷰 2026-10-08)
+        lbl_e.insert(0, _lb0
                      or (aid[-4:] if aid
-                         else _broker_label(self._acct_broker(self._asset, acct))))
+                         else _rb_lbl))
         lbl_e.pack(side="left", padx=(0, 4))
         lbl_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
         ttk.Label(row, text="1R $").pack(side="left")
         r_e = ttk.Entry(row, width=8)
-        r_e.insert(0, f"{_as_float(acct.get('one_r'), 600.0):g}")
+        r_e.insert(0, f"{_as_float(acct.get('one_r'), _LEGACY_ONE_R):g}")
         r_e.pack(side="left", padx=(0, 4))
         r_e.bind("<FocusOut>", lambda e: self._save_acct_widgets())
-        self._acct_widgets[idx] = {"on": on, "label": lbl_e, "one_r": r_e, "broker": bk_cb}
+        self._acct_widgets[idx] = {"on": on, "label": lbl_e, "one_r": r_e, "broker": bk_cb,
+                                   "broker_shown": self._acct_broker(self._asset, acct)}
         pr = acct.get("prop") or {}
         _pb_txt = self._prop_btn_text(pr)
         pb = ttk.Button(row, text=_pb_txt, width=11,
@@ -4556,7 +7008,15 @@ class App:
             id_cb.set(f"…{aid[-6:]}" if aid else ("계좌 선택" if self.lang == "ko" else "pick"))
             id_cb.pack(side="left", padx=(4, 0))
             # 계좌를 고르는 순간 브로커 콤보를 잠근다(재빌드 없이도) - 대표 2026-09-15.
-            def _pick(e=None, i=idx, _bk=bk_cb):
+            def _pick(e=None, i=idx, _bk=bk_cb, _cb=id_cb):
+                if self._golive_refuse(warn=(getattr(e, "type", None) != tk.EventType.FocusOut
+                                             if e is not None else True)):
+                    try:                             # 연결 테스트 중 - 행의 지금 계좌 ID로 되돌린다(2026-10-08b P3(a))
+                        _a0 = str(self._accts_of(self._asset)[i].get("id") or "").strip()
+                        _cb.set(f"…{_a0[-6:]}" if _a0 else ("계좌 선택" if self.lang == "ko" else "pick"))
+                    except Exception:
+                        pass
+                    return
                 self._save_acct_widgets()
                 try:
                     if _bk is not None and (self._accts_of(self._asset)[i].get("id") or "").strip():
@@ -4592,9 +7052,16 @@ class App:
             except Exception:
                 pass
 
+    def _bk_configured(self, asset, bk) -> bool:
+        """그 자산에서 bk 연결이 설정돼 있는가(아이디가 있음, IBKR는 Host 또는 Port). 읽기 전용."""
+        _cr = self._creds_peek(asset, bk)
+        return bool(str(_cr.get("f1") or "").strip() or (bk == "ibkr" and str(_cr.get("f3") or "").strip()))
+
     def _toggle_acct_edit(self):
         """계좌 정보 편집 잠금 토글(대표 2026-09-21). 잠글 때는 화면 값을 먼저 저장한다 -
         고치다 바로 잠그면 마지막 입력이 FocusOut 없이 사라질 수 있다."""
+        if not getattr(self, "_acct_edit", False) and self._golive_refuse():
+            return                                   # 여는 것만 막는다 - 잠그기(저장)는 그대로
         if getattr(self, "_acct_edit", False):
             try:
                 self._save_acct_widgets()
@@ -4697,6 +7164,23 @@ class App:
         """가동 중 자산 체크 → 그 자산 무장. 라이브 시작과 **같은 검사**를 거친다
         (프리플라이트 → 연결 테스트 → _master_arm). 실패하면 무장하지 않고 이유를 말한다 -
         조용히 안 켜지는 것이 이 사고의 본질이었으므로 여기서는 반드시 이유를 남긴다."""
+        if (self._gate or {}).get("force_dry_run"):
+            # 서버가 라이브를 잠갔으면 [라이브 시작]처럼 무장하지 않는다(최종 반박 리뷰 2026-10-08 P2-4) - 종전엔 잠금 중에도 무장했다.
+            messagebox.showwarning(self.t("sec_live"),
+                                   "서버가 라이브를 잠갔습니다 - 지금은 시작할 수 없습니다. 공지를 확인하세요."
+                                   if self.lang == "ko" else
+                                   "Live is locked by the server - starting is not possible right now. "
+                                   "Check the announcements.")
+            for a in assets:                      # 체크를 되돌린다(켜진 척 금지)
+                self._acfg[a]["include"] = False
+                try:
+                    self._live_include[a].set(0)
+                except Exception:
+                    pass
+            self._save_cfg()
+            self._refresh_live_panel()
+            return
+        self._pin_crypto_rows(assets)            # 무장 전 빈 크립토 행 박기(확인 재리뷰 P1)
         _ctx = getattr(self, "_live_ctx", None) or {}
         live = bool(_ctx.get("live"))
         perm_auto = bool(_ctx.get("perm_auto"))
@@ -4713,14 +7197,18 @@ class App:
                 bk = self._acct_broker(a, ac)
                 _nm = ac.get("label") or _broker_label(bk)
                 if not (self._creds_of(a, bk).get("f1") or "").strip():
-                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
-                               + ("키 미설정" if self.lang == "ko" else "key missing"))
+                    bad.append(f"{a} {self._row_nm(_nm, bk)}: "
+                               + ("키 미설정" if self.lang == "ko" else "key missing")
+                               + ("" if _BROKER_SPEC.get(bk, {}).get("acct") else
+                                  self._crypto_keymiss_hint(a, bk, rearm=True)))
                 elif not self._broker_allowed(bk):
-                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                    bad.append(f"{a} {self._row_nm(_nm, bk)}: "
                                + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
                                   else "broker disabled (server)"))
                 elif _BROKER_SPEC.get(bk, {}).get("acct") and not (ac.get("id") or "").strip():
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
+            for _db, _dn in self._dup_crypto_rows(a):   # 같은 크립토 키 행 둘 = 주문 두 번(오픈 준비 버그 조사 2026-10-06 D)
+                bad.append(self._dup_crypto_msg(a, _db, _dn))
         if bad:
             for _b in bad:
                 self.log(f"⛔ {_b}")
@@ -4740,6 +7228,8 @@ class App:
             return
 
         _seq = getattr(self, "_arm_seq", 0)      # 이 요청의 세대(아래 done에서 대조)
+        _fps = self._arm_fps(assets)             # 연결 테스트 직전 행 지문 - done은 이 행만 무장(2026-10-08 P0)
+        _gtok = self._golive_busy_mark(True, conns=self._golive_conns(assets))
 
         def w():
             fails, tested = [], {}
@@ -4748,7 +7238,7 @@ class App:
                     bk = self._acct_broker(a, ac)
                     _tk = (bk, (self._creds_of(a, bk).get("f1") or "").strip())
                     if _tk in tested:
-                        err = tested[_tk]
+                        err = self._shared_conn_err(a, bk, _tk[1], tested[_tk])   # h1(b): 이 자산 행도 대조
                     else:
                         self.log(f"── {a}, {_broker_label(bk)} 연결 테스트 ──")
                         err = self._conn_check(a, bk)
@@ -4759,6 +7249,7 @@ class App:
                         fails.append(f"{a} ({_broker_label(bk)}): {err}")
 
             def done():
+                self._golive_busy_mark(False, _gtok)
                 # ⚠️최우선 재검증(2026-08-28 리뷰 P0). 연결 테스트가 도는 수 초 동안
                 # 화면은 안 잠긴다 - [전체 정지]도 체크 해제도 다 눌린다. 그 결과를
                 # 안 보고 무장하면 **정지가 취소되고** 신호 루프가 하나 더 떠서 같은
@@ -4785,12 +7276,7 @@ class App:
                         except Exception:
                             pass
                     self._save_cfg(); self._refresh_live_panel(); return
-                _n = 0
-                for a in assets:
-                    for idx, ac in enumerate(self._accts_of(a)):
-                        if ac.get("on"):
-                            self._master_arm(a, idx, live, arm_sig=(perm_auto or perm_use))
-                            _n += 1
+                _n = self._arm_tested_rows(assets, live, (perm_auto or perm_use), _fps)
                 self.log(f"🚀 {', '.join(assets)} 무장 — {_n}개 계좌 (LIVE)")
                 self._refresh_live_panel()
                 self._apply_gating()
@@ -4830,18 +7316,35 @@ class App:
         except Exception:
             pass
 
+    def _cfg_title(self):
+        """브로커 연결 설정 제목 - _build와 접기/펼치기가 같이 쓴다(1b 반박 리뷰 P3: 접었다 펴면 옛 이름으로 돌아갔다)."""
+        return "브로커 연결 설정" if self.lang == "ko" else "Broker connections"
+
     def _toggle_cfg(self):
-        """자산별 브로커 설정 접기/펼치기(대표 2026-07-13)."""
+        """브로커 연결 설정 접기/펼치기(대표 2026-07-13)."""
         self._cfg_open = not self._cfg_open
         if self._cfg_open:
             self._cfg_body.pack(fill="x", after=self._cfg_hdr)
         else:
             self._cfg_body.pack_forget()
         self._cfg_hdr.config(text=("▾ " if self._cfg_open else "▸ ")
-                             + ("자산별 브로커 설정 (NQ, GC, BTC)" if self.lang == "ko"
-                                else "Per-asset broker setup (NQ, GC, BTC)"))
+                             + self._cfg_title())
         self._save_cfg(dry_run=bool(self.live_dry.get()) if hasattr(self, "live_dry") else True,
                        cfg_open=self._cfg_open)
+
+    def _toggle_caut(self):
+        """주의 사항 접기/펼치기(11e). 한 번 만지면 그 세션 동안 그대로(동의 체크 상태로 다시 정하지 않음)."""
+        self._caut_user_set = True
+        self._caut_open = not self._caut_open
+        if self._caut_open:
+            self._caut_body.pack(fill="x", after=self._caut_hdr)
+        else:
+            self._caut_body.pack_forget()
+        self._caut_hdr.config(text=("▾ " if self._caut_open else "▸ ") + self.t("caut_head"))
+        try:
+            self.root.after_idle(self._fit_canvas)
+        except Exception:
+            pass
 
     def _toggle_acct(self):
         """자산별 계좌 설정 접기/펼치기(대표 2026-08-11 독립 접이식)."""
@@ -4886,32 +7389,50 @@ class App:
         """자동 저장 + (키 완성 시) 무음 연결 확인. 실패는 로그만 - 팝업으로 방해하지 않는다."""
         self._autosave_after = None
         try:
-            self._save_current_asset()               # 영속 + ✓저장됨 라벨
+            self._save_current_asset(transient=True)  # 영속 + ✓저장됨 라벨(잠깐 빈 칸은 공유 비밀 안 지움)
         except Exception:
             return
-        asset, bk = self._asset, self._broker_name
+        asset, bk = _panel_asset_of(self), self._broker_name   # 패널 칸의 창고(2026-10-07 패널 분리)
         f1 = (self._creds_of(asset, bk).get("f1") or "").strip()
         if not f1:
             return
         # 같은 크레덴셜 재테스트 방지 - 지문이 바뀌었을 때만 무음 확인
-        fp = (asset, bk, f1, len(self.key.get()) if hasattr(self, "key") else 0)
+        # 재확인 지문 = 키 해시(길이만 보면 같은 길이의 다른 키로 바꿔도 다시 확인하지 않았다, 1b 반박 리뷰 P2-1)
+        fp = (asset, bk, f1, (hashlib.sha256(self.key.get().encode()).hexdigest()[:12] if hasattr(self, "key") else ""),
+              self._f3() if hasattr(self, "f3") else "")
         if getattr(self, "_autotest_fp", None) == fp:
             return
         self._autotest_fp = fp
 
+        # 연결 단위 확인(1b 반박 리뷰 P2-4, 2026-10-08): 접속은 한 번, 계좌 행 대조는 이 연결을 쓰는 자산마다 따로 -
+        # 종전엔 늘 NQ 행만 대조해 GC만 Topstep을 쓰는 회원에게 NQ 오류를 보이고 GC는 '확인됨'이 되지 않았다.
+        _cr0 = self._creds_of(asset, bk)
+        _users = [a for a in self._conn_users(bk, _cr0) if bk in _ASSET_BROKERS.get(a, [])] or [asset]
+        _rowa = [a for a in _users
+                 if (self._acfg.get(a) or {}).get("include", True)       # 실행 체크가 꺼진 자산의 행은 대조하지 않는다(확인 재리뷰 P3)
+                 and any(self._acct_broker(a, x) == bk and x.get("on") and not x.get("manual")
+                         for x in ((self._acfg.get(a) or {}).get("accounts") or []))]
+
         def w():
-            err = self._conn_check(asset, bk)
+            err = self._conn_check(asset, bk, rows=False)
+            per = {}
+            for _a in (_rowa or [asset]):
+                per[_a] = err or self._shared_conn_err(_a, bk, f1, None)
 
             def done():
-                if err:
-                    self.log(f"❌ {asset}, {_broker_label(bk)}: {err}")
-                else:
+                _ok = [a for a, e in per.items() if not e]
+                for _a, _e in per.items():
+                    if _e:
+                        self.log(f"❌ {_a}, {_broker_label(bk)}: {_e}")
+                if not err:
                     self._connected = True
                     self._conn_by_broker[bk] = True
                     if not hasattr(self, "_test_ok"):
                         self._test_ok = set()
-                    self._test_ok.add(asset)
-                    self.log(f"✅ {asset}, {_broker_label(bk)} 연결 확인 - 자동 저장, 검증 완료")
+                    for _a in _ok:
+                        self._test_ok.add(_a)
+                    if _ok:
+                        self.log(f"✅ {', '.join(_ok)}, {_broker_label(bk)} 연결 확인 - 자동 저장, 검증 완료")
                     try:
                         if bk == "projectx":         # 연결되면 가용 계좌 자동 채움(②로 직행)
                             self._autoload_topstep_scope(asset)
@@ -4930,7 +7451,7 @@ class App:
         키(f1/f2/f3)·계좌 설정 즉시 영속 → 현재 브로커 연결 테스트 → 통과 시 이 자산 전
         계좌 잔고, 1R 미리보기까지 이어서. 실패는 에러 팝업, 성공 확인 = 잔고, 1R 팝업."""
         self._save_current_asset()
-        asset, bk = self._asset, self._broker_name
+        asset, bk = _panel_asset_of(self), self._broker_name   # 패널 칸의 창고(2026-10-07 패널 분리)
         self.log(f"\n💾 {asset}, {_broker_label(bk)} " + ("설정 저장 완료 — 연결 테스트 중…"
                  if self.lang == "ko" else "saved — testing connection…"))
         if not (self._creds_of(asset, bk).get("f1") or "").strip():
@@ -4954,6 +7475,8 @@ class App:
                         if not hasattr(self, "_test_ok"):
                             self._test_ok = set()
                         self._test_ok.add(asset)
+                        for _u in self._conn_users(bk, self._creds_of(asset, bk)):
+                            self._test_ok.add(_u)
                         self.root.after(0, self._refresh_next_action)
                     except Exception:
                         pass
@@ -4997,7 +7520,38 @@ class App:
             self.root.after(0, self._refresh_live_panel)
         threading.Thread(target=w, daemon=True).start()
 
-    def _conn_check(self, asset, broker=None):
+    def _rows_in_list(self, asset, bk, names, ids=None):
+        """그 자산의 켜진 bk 행 계좌 ID가 브로커 계좌 목록(names)에 있는가(_conn_check에서 떼어 냄, 2026-10-07 h1(b)).
+        반환: None(통과) | 오류 문장. 네트워크 없음 - 공유 연결 검사 결과를 다른 자산이 다시 쓸 때도 이 대조는 자산마다 한다."""
+        for ac in self._active_accts(asset):
+            if self._acct_broker(asset, ac) != bk:
+                continue              # 다른 브로커 계좌 행은 이 테스트 대상 아님
+            aid = (ac.get("id") or "").strip()
+            if not aid:
+                return ("등록 계좌 중 계좌ID 미지정 — 자산 설정에서 계좌를 추가하세요"
+                        if self.lang == "ko" else "a registered account has no id — add one")
+            # 이름 또는 숫자 id로 대조 - 주문 경로(ProjectXBroker._accounts 필터)와 같은 기준(반박 리뷰 P3, 2026-10-07)
+            if aid not in names and aid not in set(ids or []):
+                _lb = str(ac.get("label") or "").strip()
+                _lbk = f"({_lb})" if _lb and _lb not in aid else ""          # 라벨이 없거나 ID 일부면 괄호 생략(재리뷰 P3)
+                _lbe = f" ({_lb})" if _lbk else ""
+                return (f"등록 계좌 '{aid}'{_lbk}가 계좌 목록에 없음 - 닫힌 계좌면 이 계좌 행을 끄거나 지우세요. "
+                        f"그러면 나머지 계좌는 시작됩니다" if self.lang == "ko"
+                        else f"registered account '{aid}'{_lbe} not in list - if the account is closed, turn this row "
+                             f"off or remove it, and the other accounts will start")
+        return None
+
+    def _shared_conn_err(self, asset, bk, f1, err):
+        """같은 (브로커, 아이디) 연결 검사 결과를 다른 자산이 다시 쓸 때(h1(b), 2026-10-07): 연결이 통과했어도 projectx는
+        그 자산 행 계좌 ID를 캐시된 계좌 목록과 대조한다(네트워크 없음). 캐시가 없으면 그 자산으로 다시 검사한다."""
+        if err or bk != "projectx":
+            return err
+        _names = (getattr(self, "_scope_cache", None) or {}).get(("projectx", f1))
+        if _names is None:
+            return self._conn_check(asset, bk)
+        return self._rows_in_list(asset, bk, _names, (getattr(self, "_scope_ids", None) or {}).get(("projectx", f1)))
+
+    def _conn_check(self, asset, broker=None, rows=True):
         """자산의 (지정 또는 기본) 브로커 크레덴셜로 무음 연결 테스트 + (projectx) 등록 계좌ID
         유효성 검사(스레드 컨텍스트). 성공 시 _conn_by_broker[bk]=True(연결=크레덴셜=브로커
         단위). broker 지정 = 계좌별 브로커 테스트(대표 2026-08-09). 반환: None(성공) | 오류."""
@@ -5008,26 +7562,23 @@ class App:
             b = _build_broker(bk, f1, _f2_load(f1) or "", cr.get("f3", ""), [])
             b.healthcheck()
             if bk == "projectx":
-                names = [str(x.get("name")) for x in b._accounts()]
+                _accs = b._accounts()
+                names = [str(x.get("name")) for x in _accs]
+                _ids = [str(x.get("id")) for x in _accs if x.get("id") not in (None, "")]
                 # 세션 캐시 교체(2026-08-18): 연결 테스트의 신선 목록이 정본 - 안 그러면
                 # 탭 재진입 때 _autoload가 낡은 캐시로 콤보를 도로 덮는다.
                 try:
                     getattr(self, "_scope_cache", None) is not None or setattr(self, "_scope_cache", {})
                     self._scope_cache[("projectx", f1)] = names
+                    getattr(self, "_scope_ids", None) is not None or setattr(self, "_scope_ids", {})
+                    self._scope_ids[("projectx", f1)] = _ids
                 except Exception:
                     pass
                 self.root.after(0, lambda n=names: self._fill_scope(
                     n, asset=asset, broker="projectx"))
-                for ac in self._active_accts(asset):
-                    if self._acct_broker(asset, ac) != bk:
-                        continue              # 다른 브로커 계좌 행은 이 테스트 대상 아님
-                    aid = (ac.get("id") or "").strip()
-                    if not aid:
-                        return ("등록 계좌 중 계좌ID 미지정 — 자산 설정에서 계좌를 추가하세요"
-                                if self.lang == "ko" else "a registered account has no id — add one")
-                    if aid not in names:
-                        return (f"등록 계좌 '{aid}'가 계좌 목록에 없음" if self.lang == "ko"
-                                else f"registered account '{aid}' not in list")
+                _rerr = self._rows_in_list(asset, bk, names, _ids) if rows else None
+                if _rerr:
+                    return _rerr
             self._conn_by_broker[bk] = True
             try:
                 for _ln in (b.entry_info() or []):
@@ -5075,6 +7626,44 @@ class App:
         except Exception as e:
             return str(e)[:200]
 
+    def _arm_fp(self, a, idx, ac):
+        """무장 대상 행의 지문(최종 반박 리뷰 2026-10-08 P0): (자산, 행 번호, 행 브로커, 계좌 ID, f1, f2 해시, f3, 수동).
+        연결 테스트 직전에 찍어 두고, 테스트가 끝난 뒤 지문이 같은 행만 무장한다 - 테스트 사이에 [계좌 추가]로 생긴 행,
+        브로커·계좌·키가 바뀐 행은 시험을 거치지 않았다."""
+        bk = self._acct_broker(a, ac)
+        cr = self._creds_of(a, bk) or {}
+        _f1 = str(cr.get("f1") or "").strip()
+        try:                                     # 비밀(f2)은 값 대신 지문으로 - 테스트 뒤 키만 바꿔도 다른 행이다
+            _f2 = hashlib.sha256((_f2_load(_f1) or "").encode("utf-8")).hexdigest()[:16] if _f1 else ""
+        except Exception:
+            _f2 = "?"
+        return (a, idx, bk, str(ac.get("id") or "").strip(), _f1, _f2,
+                str(cr.get("f3") or "").strip(), bool(ac.get("manual")))
+
+    def _arm_fps(self, assets):
+        """assets의 켜진 행 지문 집합(_arm_fp)."""
+        return {self._arm_fp(a, i, ac) for a in assets
+                for i, ac in enumerate(self._accts_of(a)) if ac.get("on")}
+
+    def _arm_tested_rows(self, assets, live, arm_sig, fps):
+        """켜진 행 중 지문이 fps(연결 테스트 직전)와 같은 행만 무장한다. 반환 = 무장한 계좌 수.
+        나머지는 이유를 로그에 남기고 건너뛴다(조용히 빠지지 않게)."""
+        n = 0
+        for a in assets:
+            for idx, ac in enumerate(self._accts_of(a)):
+                if not ac.get("on"):
+                    continue
+                if self._arm_fp(a, idx, ac) not in fps:
+                    self.log(f"⏭ {a} {ac.get('label') or _broker_label(self._acct_broker(a, ac))}: " + (
+                        "연결 테스트가 도는 사이에 생기거나 바뀐 계좌라 무장하지 않았습니다 - "
+                        "[전체 정지] 뒤 다시 시작하면 같이 무장됩니다." if self.lang == "ko" else
+                        "added or changed while the connection test ran, so it was not armed - "
+                        "press [Stop all] and start again to include it."))
+                    continue
+                if self._master_arm(a, idx, live, arm_sig=arm_sig):
+                    n += 1
+        return n
+
     def _master_arm(self, asset, idx, live, arm_sig):
         """자산 asset의 계좌 idx 하나 무장 — 자동청산(그 자산의 _ASSET_EXITS) + (권한 시) 신호대기.
         cred = 자산 브로커 크레덴셜 + 그 계좌 acct_id/one_r (대표 2026-07-24 자산별 계좌)."""
@@ -5083,6 +7672,13 @@ class App:
         cr = self._creds_of(asset, bk)
         f1 = (cr.get("f1") or "").strip()
         aid = (acct.get("id") or "").strip()
+        if _BROKER_SPEC.get(bk, {}).get("acct") and not aid:
+            # 계좌 ID 없는 선물 행은 무장하지 않는다(최종 반박 리뷰 2026-10-08 P0): 마감 청산 잡이 빈 계좌로 돌면
+            # 그 로그인의 계좌 전부를 닫는다. 사전점검이 이미 막지만, 점검 뒤에 생긴 행이 여기까지 오면 오류만 남긴다.
+            self.log(f"⛔ {asset} {acct.get('label') or _broker_label(bk)}: " + (
+                "계좌 ID가 없어 이 계좌는 무장하지 않았습니다." if self.lang == "ko" else
+                "no account id, so this account was not armed."))
+            return False
         cred = {"broker": bk, "f1": f1, "f2": (_f2_load(f1) or ""),
                 "f3": cr.get("f3", ""), "acct": aid}
         # 수동 모드 계좌 = 티켓만, 자동 청산 안 함(진입도 청산도 사용자가 직접 — API 없는 프롭 대응).
@@ -5093,8 +7689,7 @@ class App:
         if jobs:
             self._auto_accts[key] = jobs
             if not self._auto_on:
-                self._auto_on = True
-                threading.Thread(target=self._auto_loop, daemon=True).start()
+                self._start_auto_loop()
         if arm_sig:
             self._sig_accts[key] = {**cred, "one_r": float(acct.get("one_r", 0) or 0),
                                     "prop": dict(acct.get("prop") or {}),
@@ -5102,12 +7697,118 @@ class App:
                                     "one_lim": _as_float(acct.get("one_lim"), 0.0),
                                     "manual": bool(acct.get("manual")),   # 수동 모드=티켓만, 자동진입 안 함
                                     "live": live, "label": acct.get("label", "")}
+            # 새로 무장했으니 서버 불통 때 남긴 이 키의 사본은 버린다(E - 되살릴 때 새 무장을 덮지 않게)
+            try:
+                self._sig_parked.pop(key, None)
+            except Exception:
+                pass
             if not self._sig_on:
-                self._sig_on = True
-                threading.Thread(target=self._sig_loop, args=(_feed_url(self._token),),
-                                 daemon=True).start()
+                self._start_sig_loop()
         self._set_auto_ind(bool(self._auto_accts), sorted({k[0] for k in self._auto_accts}))
         self._set_sig_ind(bool(self._sig_accts), sorted({k[0] for k in self._sig_accts}))
+        return True
+
+    def _start_sig_loop(self):
+        """신호 루프를 새 세대로 하나 띄운다(오픈 준비 버그 조사 2026-10-06 A). 번호를 먼저 올리므로
+        아직 끝나지 않은 옛 루프는 다음 확인(while·계좌 선별 직전·발주 직전)에서 빠진다 - 새 신호를 처리하는 루프는 하나다.
+        발주 직전 확인을 이미 지난 옛 루프는 그 진입만 끝내고 빠진다. 그 신호를 새 루프가 다시 처리하지 않게 하는 것은
+        앱이 드는 처리 기록(_sig_seen·_sig_entered_day)이다(버그 조사 재검증 2026-10-06 3)."""
+        self._sig_gen = getattr(self, "_sig_gen", 0) + 1
+        self._sig_on = True
+        threading.Thread(target=self._sig_loop, args=(_feed_url(self._token), self._sig_gen),
+                         daemon=True).start()
+
+    def _start_auto_loop(self):
+        """자동 청산 루프를 새 세대로 하나 띄운다(오픈 준비 버그 조사 2026-10-06 A, _start_sig_loop와 같은 틀)."""
+        self._auto_gen = getattr(self, "_auto_gen", 0) + 1
+        self._auto_on = True
+        threading.Thread(target=self._auto_loop, args=(self._auto_gen,), daemon=True).start()
+
+    def _live_acct_cfg(self, key, cfg):
+        """신호를 처리하는 순간 무장 사본(cfg)을 지금 계좌 설정에 맞춘다(오픈 준비 버그 조사 2026-10-06 C).
+
+        종전에는 _master_arm이 무장 때 복사한 1R·프롭·한 계약 한도로만 진입해, 가동 중 1R을 600→300으로
+        낮추거나 계좌 실행 체크를 꺼도 재시작 전까지 옛 값으로 주문이 나갔다(화면은 새 값을 보여 줬다).
+        반환 (사본, '') 또는 (None, 로그 문장):
+          · 행이 없어졌거나, 실행 체크가 꺼졌거나, 계좌 ID·브로커·키(f1·f3)가 무장 때와 다르면 None - 이번 신호에 진입하지 않는다.
+            키·계좌는 무장 때 연결 테스트를 거친 것만 쓴다(새 키·새 계좌로 시험 없이 주문하지 않는다).
+          · 그 밖에는 1R·프롭·자본%·한 계약 한도·라벨을 지금 값으로 바꾼 **새 사본**(무장 dict는 그대로).
+        백그라운드(신호 루프)에서 불리므로 _accts_of(빈 행을 채우는 쓰기)를 쓰지 않고 읽기만 한다."""
+        asset, idx = key
+        ko = self.lang == "ko"
+        _lbl0 = cfg.get("label") or (str(cfg.get("acct") or "")[-4:]) or _broker_label(cfg.get("broker"))
+        try:
+            acct = ((self._acfg.get(asset) or {}).get("accounts") or [])[idx]
+        except Exception:
+            acct = None
+        if not isinstance(acct, dict):
+            return None, (f"[{_lbl0}] {asset} 계좌 행이 없어져 이번 신호에 진입하지 않습니다." if ko else
+                          f"[{_lbl0}] {asset}: the account row is gone, so this signal is not entered.")
+        _lbl = acct.get("label") or _lbl0
+        if not acct.get("on"):
+            return None, (f"[{_lbl}] {asset} 계좌 실행 체크가 꺼져 있어 이번 신호에 진입하지 않습니다"
+                          f"(이 계좌의 마감 자동 청산은 그대로 돕니다)." if ko else
+                          f"[{_lbl}] {asset}: the account's run checkbox is off, so this signal is not entered "
+                          f"(its session-close auto-flatten keeps running).")
+        if (self._acct_broker(asset, acct) != cfg.get("broker")
+                or (acct.get("id") or "").strip() != (cfg.get("acct") or "").strip()):
+            return None, (f"[{_lbl}] {asset} 계좌 ID나 브로커가 무장 뒤 바뀌어 이번 신호에 진입하지 않습니다. "
+                          f"바뀐 계좌는 {asset} 체크를 껐다 다시 켜면 연결 테스트를 거쳐 무장됩니다." if ko else
+                          f"[{_lbl}] {asset}: the account ID or broker changed after arming, so this signal is not "
+                          f"entered. The changed account is armed after a connection test when {asset} is "
+                          f"unchecked and checked again.")
+        # 키(f1·f3)도 무장 사본과 대조한다(버그 조사 재검증 2026-10-06 1). 종전엔 broker·계좌 ID만 봐서, 가동 중 키만
+        # 바꾼 계좌는 화면·로그가 '아직 무장되지 않았다'고 하는데 다음 신호에 무장 때의 옛 키로 실주문이 나갔다(크립토는
+        # 키가 곧 거래소 계정이라 옛 계정으로 주문). _rearm_needs와 같은 값·같은 비교로 본다 - 표시와 동작이 갈리지 않게.
+        _cr = ((self._acfg.get(asset) or {}).get("creds") or {}).get(cfg.get("broker")) or {}
+        if _key_changed(_cr, cfg):
+            return None, (f"[{_lbl}] {asset} 키가 무장 뒤 바뀌어 이번 신호에 진입하지 않습니다(무장 때의 옛 키로 "
+                          f"주문하지 않습니다). 바뀐 계좌는 {asset} 체크를 껐다 다시 켜면 연결 테스트를 거쳐 무장됩니다."
+                          if ko else
+                          f"[{_lbl}] {asset}: the key changed after arming, so this signal is not entered (no order "
+                          f"is sent with the old key from arming). The changed account is armed after a connection "
+                          f"test when {asset} is unchecked and checked again.")
+        out = dict(cfg)
+        out.update({"one_r": float(acct.get("one_r", 0) or 0),
+                    "prop": dict(acct.get("prop") or {}),
+                    "pct": dict(acct.get("pct") or {}),
+                    "one_lim": _as_float(acct.get("one_lim"), 0.0),
+                    "label": acct.get("label", "")})
+        return out, ""
+
+    def _rearm_needs(self, asset):
+        """가동 중 바뀐 설정 가운데 **다시 무장해야** 주문에 닿는 계좌 라벨 목록(오픈 준비 버그 조사 2026-10-06 C).
+        1R·프롭·한 계약 한도·라벨·실행 체크 끄기는 신호 때 _live_acct_cfg가 바로 반영한다. 새 행, 실행 체크를 새로 켠 행,
+        키(f1·f3)·계좌 ID·브로커를 바꾼 행은 연결 테스트를 거치지 않았으므로 저절로 무장하지 않는다 - 화면에 사실대로 표시한다.
+        그 자산이 무장 중이 아니면 빈 목록."""
+        armed = {}
+        try:
+            for (_a, _i), _c in list((getattr(self, "_sig_accts", None) or {}).items()):
+                if _a == asset:
+                    armed[_i] = (_c.get("broker"), _c.get("f1"), _c.get("f3"), _c.get("acct"))
+            for (_a, _i), _jobs in list((getattr(self, "_auto_accts", None) or {}).items()):
+                if _a == asset and _i not in armed and _jobs:
+                    _j = _jobs[0]
+                    armed[_i] = (_j.get("broker"), _j.get("f1"), _j.get("f3"), _j.get("acct"))
+        except Exception:
+            return []
+        if not armed:
+            return []
+        out = []
+        for idx, ac in enumerate(((self._acfg.get(asset) or {}).get("accounts") or [])):
+            if not ac.get("on"):
+                continue                                   # 꺼진 행 = 신호 때 건너뜀(재무장 필요 없음)
+            bk = self._acct_broker(asset, ac)
+            aid = (ac.get("id") or "").strip()
+            lbl = ac.get("label") or (aid[-4:] if aid else _broker_label(bk))
+            if idx not in armed:
+                out.append(lbl); continue
+            _cr = ((self._acfg.get(asset) or {}).get("creds") or {}).get(bk) or {}
+            a_bk, a_f1, a_f3, a_id = armed[idx]
+            if (bk != a_bk or aid != (a_id or "").strip()
+                    or _key_changed(_cr, {"f1": a_f1, "f3": a_f3})):   # 신호 때 _live_acct_cfg와 같은 비교(재검증 1)
+                out.append(lbl)
+        return out
 
     # ── (구) 월 1회 실행 확인(2026-08-15 도입) - **폐지**(대표 2026-09-24 "필요 없어. 걍 계속 켜 놓으면 지 책임이지").
     #    30일마다 계속할지 다시 묻고 무응답이면 새 진입을 보류하던 _consent_left/_consent_summary/_consent_ask와
@@ -5121,12 +7822,15 @@ class App:
         라이브를 잠갔으면(force_dry_run) 시작 자체를 거부한다."""
         if (self._gate or {}).get("force_dry_run"):
             messagebox.showwarning(self.t("sec_live"),
-                                   "서버가 라이브를 잠갔습니다 — 지금은 시작할 수 없습니다. 공지를 확인하세요."
+                                   "서버가 라이브를 잠갔습니다 - 지금은 시작할 수 없습니다. 공지를 확인하세요."
                                    if self.lang == "ko" else
-                                   "Live is locked by the server — starting is not possible right now. "
+                                   "Live is locked by the server - starting is not possible right now. "
                                    "Check the announcements."); return
         self.live_dry.set(0)
-        if self._sig_accts or self._auto_accts:
+        # 마감 청산만 남고 신호 대기가 꺼진 상태(서버 불통·권한 상실 뒤, 통과 익절 뒤)는 '이미 가동 중'이 아니다(오픈 준비
+        # 버그 조사 2026-10-06 E): 종전에는 여기서 막혀, 경고창이 '다시 켜라'고 해도 [전체 정지]를 먼저 눌러야 했다.
+        # 시작을 그대로 진행하면 연결 테스트 뒤 같은 (자산, 계좌) 키로 다시 무장한다 - 마감 청산 무장은 그 사이에도 그대로다.
+        if self._sig_accts:
             messagebox.showinfo(self.t("sec_live"),
                                 "이미 가동 중입니다 — 먼저 '전체 정지' 후 다시 시작하세요."
                                 if self.lang == "ko" else
@@ -5148,6 +7852,7 @@ class App:
             messagebox.showwarning(self.t("token"), self.t("gate_none")); return
         self._save_current_asset()
         incl = [a for a in _ASSETS if self._live_include[a].get()]
+        self._pin_crypto_rows(incl)              # 무장 전에 빈 크립토 행을 지금 거래소로 박는다(확인 재리뷰 P1)
         # 키는 있는데 '실행 자산' 체크가 꺼진 자산을 로그에 한 줄씩(대표 2026-09-28 "둘 다 넣어"): 새 설치 기본값이
         # 꺼짐이라, 연결 테스트까지 마친 자산이 아무 말 없이 시작에서 빠졌다(9/28 고객 BTC 무장 건).
         for _a in _ASSETS:
@@ -5180,11 +7885,13 @@ class App:
                 bk = self._acct_broker(a, ac)
                 _nm = ac.get("label") or _broker_label(bk)
                 if not (self._creds_of(a, bk).get("f1") or "").strip():
-                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
-                               + ("키 미설정" if self.lang == "ko" else "key missing"))
+                    bad.append(f"{a} {self._row_nm(_nm, bk)}: "
+                               + ("키 미설정" if self.lang == "ko" else "key missing")
+                               + ("" if _BROKER_SPEC.get(bk, {}).get("acct") else
+                                  self._crypto_keymiss_hint(a, bk)))
                     continue
                 if not self._broker_allowed(bk):
-                    bad.append(f"{a} {_nm} ({_broker_label(bk)}): "
+                    bad.append(f"{a} {self._row_nm(_nm, bk)}: "
                                + ("브로커 지원 꺼짐(서버)" if self.lang == "ko"
                                   else "broker disabled (server)"))
                     continue
@@ -5194,6 +7901,8 @@ class App:
                 if (_BROKER_SPEC.get(bk, {}).get("acct")
                         and not (ac.get("id") or "").strip()):
                     bad.append(f"{a} {_nm}: " + ("계좌ID" if self.lang == "ko" else "account id"))
+            for _db, _dn in self._dup_crypto_rows(a):   # 같은 크립토 키 행 둘 = 주문 두 번(오픈 준비 버그 조사 2026-10-06 D)
+                bad.append(self._dup_crypto_msg(a, _db, _dn))
         if bad:
             # 사전점검 실패도 로그에 남긴다(2026-09-28): 종전엔 창만 떠서, 창을 닫으면 무엇이 막았는지 흔적이 없었다.
             self.log(("⛔ 라이브 시작 중단 - 사전점검: " if self.lang == "ko" else "⛔ Live start stopped - preflight: ")
@@ -5232,6 +7941,10 @@ class App:
         self.b_live_start.config(state="disabled")
         _alabels = ", ".join(incl)
         self.log(f"\n══ 라이브 시작 — 연결 테스트 {_alabels} (LIVE) ══")
+        # 이 시작 요청의 세대(오픈 준비 버그 조사 2026-10-06 P) - 아래 done에서 대조한다.
+        _seq = getattr(self, "_arm_seq", 0)
+        _fps = self._arm_fps(incl)               # 연결 테스트 직전 행 지문 - done은 이 행만 무장(2026-10-08 P0)
+        _gtok = self._golive_busy_mark(True, conns=self._golive_conns(incl))     # 연결 테스트~무장 사이 연결 정보 편집 막음(1b 반박 리뷰 P3)
 
         def w():
             fails = []
@@ -5258,7 +7971,7 @@ class App:
                     _f1 = (self._creds_of(a, bk).get("f1") or "").strip()
                     _tk = (bk, _f1)
                     if _tk in tested:
-                        err = tested[_tk]
+                        err = self._shared_conn_err(a, bk, _f1, tested[_tk])   # h1(b): 이 자산 행도 대조
                         self.log(f"── {a}, {_broker_label(bk)} — "
                                  + ("연결 확인됨(공유)" if not err else f"연결 실패(공유): {err}"))
                     else:
@@ -5273,9 +7986,27 @@ class App:
                             nt8_fail.append(a)
 
             def done():
+                self._golive_busy_mark(False, _gtok)
                 self.b_live_start.config(state="normal")
+                # ⚠️최우선 재검증(오픈 준비 버그 조사 2026-10-06 P) - _live_arm_assets.done과 같은 가드.
+                # 연결 테스트가 도는 몇 초 동안 [전체 정지]는 늘 눌린다. 종전에는 여기서 그 결과를 안 보고 클로저에
+                # 잡아 둔 live·권한으로 켜진 계좌를 전부 무장해, '자동 실행만 멈췄습니다' 창 뒤에 라이브가 다시 켜졌다.
+                if _seq != getattr(self, "_arm_seq", 0) or not getattr(self, "_live_session", False):
+                    self.log("⏹ 무장 취소 — 연결 테스트 중에 정지 또는 체크 해제가 있었습니다."
+                             if self.lang == "ko" else
+                             "⏹ Arming cancelled - stopped or unchecked while the test ran.")
+                    if not (self._sig_accts or self._auto_accts):
+                        self._live_session = False          # 시작이 끝나지 않았다 - 세션도 닫힌 상태로
+                        self._live_ctx = {}
+                    self._refresh_live_panel(); return
                 if fails:
                     self.log("⛔ 전체 중단 — 아무 계좌도 가동하지 않았습니다.")
+                    if self._auto_accts:
+                        # 마감 청산만 남은 상태에서 다시 시작하던 경우(E) - 그 청산 무장은 그대로 남는다(사실대로).
+                        self.log("   " + ("이미 무장돼 있던 계좌의 마감 자동 청산은 그대로 돕니다(신호 대기는 꺼진 채)."
+                                          if self.lang == "ko" else
+                                          "Session-close auto-flatten for accounts that were already armed keeps "
+                                          "running (signal watch stays off)."))
                     _msg = (("연결 실패 — 전체 중단:\n" if self.lang == "ko"
                              else "Connection failed — aborted:\n") + "\n".join(fails))
                     # Lucid 실패 = 십중팔구 NT8 꺼짐(대표 2026-08-12 "닌자 켜졌나 봐라 워닝")
@@ -5291,12 +8022,11 @@ class App:
                     self._refresh_live_panel(); return
                 # Operator(자동진입 없음)도 신호 확인만은 켠다 - 수량은 만들지도 보이지도 않는다.
                 self._watch_only = bool(perm_use and not perm_auto)
-                narmed = 0
-                for a in incl:
-                    for idx, ac in enumerate(self._accts_of(a)):
-                        if ac.get("on"):
-                            self._master_arm(a, idx, live, arm_sig=(perm_auto or perm_use))
-                            narmed += 1
+                try:
+                    self._sig_parked.clear()        # 새로 시작했다 - 서버 불통 때 남긴 사본은 쓰지 않는다(E)
+                except Exception:
+                    pass
+                narmed = self._arm_tested_rows(incl, live, (perm_auto or perm_use), _fps)
                 _what = ("자동 청산" + (" + 신호 자동 진입" if perm_auto else
                                      " + 신호 확인 (수량 비공개, 자동 발주 없음 - Autopilot 등급만 자동 진입)")
                          if self.lang == "ko" else
@@ -5305,6 +8035,12 @@ class App:
                                         "auto-entry is Autopilot tier only)"))
                 try:
                     self._alive_ping(armed=True, force=True)   # 홈피 즉시 반영(이중 안전)
+                except Exception:
+                    pass
+                try:                                  # 연결 테스트를 통과해 무장한 자산 = 확인됨(1b 반박 리뷰 P2-6)
+                    if not hasattr(self, "_test_ok"):
+                        self._test_ok = set()
+                    self._test_ok.update(incl)
                 except Exception:
                     pass
                 self.log(f"🚀 라이브 가동 시작 — {narmed}개 계좌 [{_alabels}], {_what}, LIVE")
@@ -5324,6 +8060,10 @@ class App:
         self._live_session = False
         self._sig_accts.clear()
         self._auto_accts.clear()
+        try:
+            self._sig_parked.clear()        # 정지했다 - 서버가 돌아와도 되살리지 않는다(오픈 준비 버그 조사 2026-10-06 E)
+        except Exception:
+            pass
         self._sig_on = False
         self._auto_on = False
         self._alive_ping(armed=False, force=True)   # 정상 종료 신고 - 다운 경보 대상 제외
@@ -5487,9 +8227,14 @@ class App:
 
     def _btc_x2be_step(self, b, j, live, utc_tz):
         """BTC 판정 시각(02/06/10/14/18/22 UTC) 1회 처리. 반환 True=청산 진행 / False=보유 유지.
-        포지션 없으면 True(아래 flatten_all이 no-op으로 잔여 주문만 정리)."""
+        포지션 없으면 True(아래 flatten_all이 no-op으로 잔여 주문만 정리).
+        24시간 만기 블록(k=5)에서만 None이 나온다 = 포지션 상태를 못 맞춰 판정 불가 → 호출부가 실패로 보고 재시도(F)."""
         import datetime as _d
         k = _BTC_BLOCK_K[j["hour"]]
+        # 24시간 만기(k=5)는 봉을 보지 않고 무조건 닫는 자리다(오픈 준비 버그 조사 2026-10-06 F). 종전엔 조회 실패면
+        # 여기서도 홀드라, 만기를 놓치고 다음 날 02 UTC 블록0부터 다시 판정해 최대 24시간을 더 들고 갔다(Operator는
+        # k=5에서 곧장 flatten_all이라 이 구멍이 없는 역전). 조회 실패면 flatten_all로 넘긴다 - 그쪽이 다시 읽고 실패면 재시도.
+        _expiry = k >= 5
         # 🚨조회 실패와 '확인된 플랫'을 가른다(2026-09-21 실사고, 대표 "빗겟 손절 네 시간봉 때
         # 업뎃 안 되네 / 바이빗은 되는데"). 종전엔 둘 다 return True였다 - 로그 한 줄 없이
         # 손절 이동을 건너뛰고 청산 경로로 넘어갔다. 모르는 상태에서 청산을 부르면 안 되고,
@@ -5500,6 +8245,9 @@ class App:
         except Exception as _qe:
             qty, _qerr = None, _qe
         if _qerr is not None or qty is None:
+            if _expiry:
+                self.log(f"   ⚠ X2+TR 블록{k}: 포지션 조회 실패({_qerr}) — 24h 만기라 청산 경로로")
+                return True
             self.log(f"   ⚠ X2+TR 블록{k}: 포지션 조회 실패({_qerr}) — 손절 이동 건너뜀(홀드)")
             return False                      # 모르면 청산하지 않는다
         if not qty:
@@ -5507,6 +8255,9 @@ class App:
         try:
             _poss = list(b.list_open_positions() or [])
         except Exception as _pe:
+            if _expiry:
+                self.log(f"   ⚠ X2+TR 블록{k}: 포지션 목록 조회 실패({_pe}) — 24h 만기라 청산 경로로")
+                return True
             self.log(f"   ⚠ X2+TR 블록{k}: 포지션 목록 조회 실패({_pe}) — 손절 이동 건너뜀(홀드)")
             return False
         pos = next((p for p in _poss if "BTC" in str(p.symbol).upper()), None)
@@ -5515,8 +8266,9 @@ class App:
             # 오늘 오전 가짜 청산 보고(_check_stop_closed)와 같은 뿌리일 수 있어 목록을 남긴다.
             self.log(f"   ⚠ X2+TR 블록{k}: 수량 {qty}인데 포지션 목록에 BTC 없음 "
                      f"(목록 {len(_poss)}건: {[str(getattr(p,'symbol','')) for p in _poss][:4]}) "
-                     f"— 손절 이동 건너뜀(홀드)")
-            return False
+                     + ("— 24h 만기 판정 불가, 다시 시도" if _expiry else "— 손절 이동 건너뜀(홀드)"))
+            # 만기 블록에서 flatten_all로 넘기면 같은 목록을 읽어 '플랫'으로 끝낼 수 있다(거짓 완료) - 실패로 돌려 재시도.
+            return None if _expiry else False
         is_long = pos.net_qty > 0
         now = _d.datetime.now(utc_tz)
         end = now.replace(minute=0, second=0, microsecond=0)   # 방금 닫힌 블록의 마감시각
@@ -5627,10 +8379,13 @@ class App:
         """블록 k(0~5) 마감 시 결정. 반환: 'close' | 'trail' | 'hold'.
         'trail'이면 손절을 blk_open으로 옮긴다(k=0이면 그게 곧 진입가 = 본절).
         순수 함수 — 백테스트 규칙과 1:1 대조 가능하게 IO 분리."""
-        if blk_open is None or blk_close is None:
-            return "hold"                       # 판정 불가 → 보수적 홀드
+        # 만기 검사가 봉 검사보다 먼저다(오픈 준비 버그 조사 2026-10-06 F): 종전엔 k=5에서 봉 조회가 실패하면
+        # '홀드'가 돼 '24h 만기가 백스톱'이라는 규칙과 반대로 다음 만기까지 24시간을 더 들고 갔다.
+        # 봉이 있으면 결과는 종전과 같다(서버 btc_x2be_resolve의 마지막 블록 = 무조건 마감가 청산).
         if k >= 5:
             return "close"                      # 24h 만기
+        if blk_open is None or blk_close is None:
+            return "hold"                       # 판정 불가 → 보수적 홀드
         against = (blk_close < blk_open) if is_long else (blk_close > blk_open)
         if against:
             return "close"
@@ -6230,6 +8985,63 @@ class App:
                 pass
         return ""
 
+    def _uses_nt8(self, asset):
+        """이 자산이 NinjaTrader 8 브리지를 쓰는가 - 자산 브로커 또는 계좌 행 하나라도 nt8."""
+        if self._broker_of(asset) == "nt8":
+            return True
+        try:
+            return any(self._acct_broker(asset, x) == "nt8" for x in (self._acfg[asset].get("accounts") or []))
+        except Exception:
+            return False
+
+    def _nt8_store_token(self, tok, assets, port=None):
+        """Bridge Token을 assets의 nt8 창고 전부에 쓰고, 지금 탭이 nt8이면 칸도 채운 뒤 저장.
+        port = .cs에 실제로 쓴 포트(반박 리뷰 P2-3, 2026-10-07): 앱 쪽 포트도 그 값으로 맞춘다 - 어긋나면 NQ·GC 브리지가 함께 끊긴다."""
+        _pt = str(port).strip() if port not in (None, "") else ""
+        for _a in assets:
+            try:
+                _c = self._creds_of(_a, "nt8")
+                _c["f1"] = tok
+                if _pt and str(_c.get("f3") or "").strip() != _pt and not (_pt == "8377" and not str(_c.get("f3") or "").strip()):
+                    _c["f3"] = _pt
+            except Exception:
+                pass
+        # nt8이 split(자산마다 다른 토큰)이었으면 지금 같은 토큰을 받았으니 다시 합친다(2026-10-07 판정 13)
+        _sp = getattr(self, "_creds_split", None)
+        if isinstance(_sp, set) and "nt8" in _sp:
+            try:
+                _s2, _ = _unify_creds(self._acfg, self._profile, only="nt8", bridge=(tok, _pt),
+                                      enc_locked=getattr(self, "_enc_locked", False) is True)
+                if "nt8" not in _s2:
+                    _sp.discard("nt8")
+            except Exception:
+                pass
+        self._bridge_inst = (tok, _pt)
+        self._nt8_fill_token_field(tok)
+        try:
+            self._save_cfg()
+        except Exception:
+            pass
+        try:
+            self._build()                     # 화면의 옛 포트·토큰 칸이 다음 저장에서 공용 창고를 덮지 않게 다시 그린다
+        except Exception:
+            pass
+
+    def _nt8_fill_token_field(self, tok):
+        """지금 탭이 nt8이면 Bridge Token 칸(self.user)에 tok를 넣는다. 읽기 전용 칸은 잠깐 풀었다 원래 상태로."""
+        try:
+            if self._broker_name != "nt8" or not hasattr(self, "user"):   # 패널 브로커가 nt8일 때만(자산 탭과 무관)
+                return
+            _st = str(self.user.cget("state"))
+            if _st != "normal":
+                self.user.config(state="normal")
+            self.user.delete(0, "end")
+            self.user.insert(0, tok)
+            if _st != "normal":
+                self.user.config(state=_st)
+        except Exception:
+            pass
+
     def _nt8_install_bridge(self):
         """[브리지 설치/업데이트] - NT8 애드온 설치를 원클릭으로(대표 2026-08-31 "자동화
         불가능한가?" → "토큰 입력만 받음 되잖아" - 그 토큰조차 이미 저장돼 있어 입력 0).
@@ -6256,33 +9068,72 @@ class App:
                  "The app creates and stores it automatically, and injects the same value "
                  "into the bridge file.\nNothing to type, nothing to remember.\n\nContinue?")):
             return
+        _pxids = set()
         try:
             # 자산 컨텍스트 자가 결정(2026-09-04, 버튼 최상단 이동에 따른 수리): 현재 탭이
             # 크립토여도 ①f1 저장된 자산 ②브로커=nt8인 자산 순으로 찾는다 - 아니면 엉뚱한
             # 자산 밑에 새 토큰을 만들어 기존 브리지와 토큰이 어긋난다(통신 두절 지뢰).
-            _cands = [a for a in _ASSETS if (self._creds_of(a, "nt8") or {}).get("f1")]
-            _cands += [a for a in _ASSETS if self._broker_of(a) == "nt8"]
-            cr = self._creds_of(_cands[0] if _cands else self._asset, "nt8")
+            # 토큰 후보에서 이메일·Topstep 아이디는 뺀다(brokermix 7, 2026-10-07 - 섞인 값이 .cs Token에 들어갔다)
+            _pxids = {str(((((self._acfg.get(a) or {}).get("creds")) or {}).get("projectx") or {}).get("f1") or "").strip()
+                      for a in _ASSETS} - {""}
+            _cands = []
+            for a in _ASSETS:
+                _t = str((self._creds_of(a, "nt8") or {}).get("f1") or "").strip()
+                if not _t:
+                    continue
+                if "@" in _t or _t in _pxids:
+                    self.log((f"{a}의 Bridge Token 칸 값이 토큰이 아니라 쓰지 않았습니다." if ko else
+                                     f"{a}: the Bridge Token field does not hold a token, so it was not used."))
+                    continue
+                _cands.append(a)
+            # nt8을 쓰는 자산 = 자산 브로커가 nt8이거나 계좌 행 하나라도 nt8(2026-10-07 리뷰 P2: 자산 브로커는
+            # Topstep, 행은 Lucid인 혼합 자산을 빠뜨리면 버튼이 안내창만 띄우고 끝났다).
+            _nt8_assets = [a for a in _ASSETS if self._uses_nt8(a)]
+            _cands += _nt8_assets
+        except Exception:
+            _cands, _nt8_assets = [], []
+        # (2026-10-07 회원 실사례) nt8을 쓰는 자산도, 저장된 토큰도 없으면 토큰을 엉뚱한 자산(예: 지금 탭 BTC)에
+        # 만들지 않는다 - 그러면 NQ·GC 칸은 계속 비고 다음부터 _cands가 그 자산을 먼저 집는다.
+        # 새 설치(1b 반박 리뷰 P1, 2026-10-08): 패널에서 Lucid / Tradovate를 고른 상태면 nt8 공용 창고(NQ·GC)에 토큰을 만든다 -
+        # 자산 탭이 없어진 뒤로는 '자산 브로커가 nt8'인 경로가 없어 새 회원이 여기서 막혔다.
+        if not _cands and self._broker_name == "nt8":
+            _cands = list(_bk_holders("nt8"))
+            _nt8_assets = list(_cands)
+        if not _cands:
+            messagebox.showinfo(
+                "NinjaTrader 8",
+                ("Lucid / Tradovate를 브로커 연결 설정에서 고른 뒤 다시 누르세요." if self.lang == "ko" else
+                 "Choose Lucid / Tradovate in Broker connections, then press this again."))
+            return
+        try:
+            cr = self._creds_of(_cands[0], "nt8")
         except Exception:
             cr = {}
         tok = (cr.get("f1") or "").strip()
+        if "@" in tok or tok in _pxids:
+            tok = ""                              # 후보가 혼합 자산뿐이고 값이 오염된 경우 - 새 토큰을 만든다
+        try:
+            _prt = int(str(cr.get("f3") or "").strip() or 8377)
+        except (TypeError, ValueError):
+            _prt = 8377
+        # 이 앱 안에서 그 포트로 브리지 서버가 이미 떠 있으면 그 토큰이 1순위(2026-10-07 리뷰 P3): 서버는 포트마다
+        # 처음 받은 토큰으로 고정돼(nt8.py _BRIDGES), 다른 토큰을 브리지에 넣으면 NT8만 재시작해서는 붙지 않는다.
+        try:
+            from eqexec.broker.nt8 import NT8Broker as _NB
+            with _NB._BRIDGES_LOCK:
+                _ent = _NB._BRIDGES.get(_prt)
+            if _ent and str(_ent[2] or "").strip():
+                tok = str(_ent[2]).strip()
+        except Exception:
+            pass
         _gen = False
         if not tok:
             # 처음 까는 사람은 토큰을 지어낼 필요도 없다(대표 2026-08-31 "처음 까는 사람은?").
             # 앱이 만들고, _save_cfg의 비밀 스윕이 키체인에 넣는다 - 필드에 친 것과 동일 경로.
             import secrets as _sec
             tok = _sec.token_urlsafe(18)
-            cr["f1"] = tok
             _gen = True
-            try:
-                self._save_cfg()
-            except Exception:
-                pass
-            self.log("🧩 Bridge Token 자동 생성 - 앱에 저장했고 브리지에도 같은 값을 넣습니다")
-        try:
-            _prt = int(str(cr.get("f3") or "").strip() or 8377)
-        except (TypeError, ValueError):
-            _prt = 8377
+        # 저장(앱 쪽 토큰 반영)은 브리지 파일 쓰기에 성공한 뒤 _nt8_store_token이 한다(리뷰 P3).
         import sys as _sys
         _base = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         src = None
@@ -6318,27 +9169,9 @@ class App:
         # ①지난번 성공 경로(프로필 기억) ②윈도 레지스트리의 실제 '문서' 위치(폴더
         # 리다이렉트를 어디로 했든 이게 정답) ③기본/OneDrive 후보. 전부 실패하면
         # 폴더 선택창으로 대표가 직접 지정 - 한 번 고르면 기억한다.
-        _cands = []
-        _saved = str((self._profile or {}).get("nt8_custom_dir") or "")
-        if _saved:
-            _cands.append(_saved)
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\CurrentVersion"
-                                r"\Explorer\User Shell Folders") as _k:
-                _docs = winreg.QueryValueEx(_k, "Personal")[0]
-                _docs = os.path.expandvars(_docs)
-                _cands.append(os.path.join(_docs, "NinjaTrader 8", "bin", "Custom"))
-        except Exception:
-            pass                      # 맥/리눅스 또는 레지스트리 접근 실패 - 후보로 계속
-        _home = os.path.expanduser("~")
-        _cands.append(os.path.join(_home, "Documents", "NinjaTrader 8", "bin", "Custom"))
-        _od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer") or ""
-        if _od:
-            _cands.append(os.path.join(_od, "Documents", "NinjaTrader 8", "bin", "Custom"))
-            _cands.append(os.path.join(_od, "문서", "NinjaTrader 8", "bin", "Custom"))
-        _dstb = next((c for c in _cands if c and os.path.isdir(c)), None)
+        # 폴더 후보는 _dirs(2026-10-07 재리뷰: 종전 _cands가 위의 자산 후보를 덮어 저장 대상이 폴더 경로가 됐다)
+        _dirs = _nt8_custom_dirs(self._profile)   # _installed_bridge와 같은 후보(2026-10-07 공용으로 뗌)
+        _dstb = next((c for c in _dirs if c and os.path.isdir(c)), None)
         if not _dstb:
             # 마지막 수단: 대표가 직접 고른다. 'NinjaTrader 8' 폴더를 고르면 bin/Custom을
             # 이어 붙이고, Custom까지 고른 경우도 알아서 받는다.
@@ -6383,6 +9216,11 @@ class App:
         except Exception as _e:
             messagebox.showwarning("EQ Autopilot", f"브리지 설치 실패: {_e}")
             return
+        # 브리지는 하나라 토큰도 하나 - nt8을 쓰는 자산 전부에 같은 값을 쓰고, 화면 칸도 채운다(2026-10-07 회원
+        # 실사례: 칸이 빈 채면 다음 자동 저장·탭 전환·연결 테스트가 f1 = 빈 칸 값으로 덮고 키체인까지 지웠다).
+        self._nt8_store_token(tok, _nt8_assets or _cands[:1], port=_prt)
+        if _gen:
+            self.log("🧩 Bridge Token 자동 생성 - 앱에 저장했고 브리지에도 같은 값을 넣었습니다")
         self.log(f"🧩 브리지 설치 완료: {_dst} (토큰, 포트 자동 주입)")
         messagebox.showinfo("EQ Autopilot",
                             ("브리지를 설치했습니다(" + ("토큰 자동 생성, " if _gen else "") + "토큰 자동 주입" +
@@ -6904,7 +9742,7 @@ class App:
         """
         pr = ac.get("prop") or {}
         if not pr.get("on"):
-            return float(_as_float(ac.get("one_r"), 600.0))
+            return float(_as_float(ac.get("one_r"), _LEGACY_ONE_R))
         t = pr.get("type")
         if t == "live":
             return float(_as_float(pr.get("r_live"), 100.0))
@@ -7045,7 +9883,7 @@ class App:
                     continue
                 _prc = ac.get("prop") or {}
                 _tr_r = (_as_float(_prc.get("r_steady"), 600.0) if _prc.get("on")
-                         else _as_float(ac.get("one_r"), 600.0))
+                         else _as_float(ac.get("one_r"), _LEGACY_ONE_R))
                 credlist.append({"broker": bk, "f1": f1, "f2": (_f2_load(f1) or ""),
                                  "f3": cr.get("f3", ""), "acct": aid,
                                  "one_r": _tr_r,
@@ -7113,15 +9951,15 @@ class App:
 
             # EQ 원장 대조 — 회원의 수동 거래 배제(대표 2026-07-17). admin 등급은 수동도 포함.
             _admin_all = str((self._gate or {}).get("tier") or "") == "admin"
-            _ledger, _since = _ledger_load(), _ledger_since()
-            try:                                     # 실제 1R 원장 로드(A안 트랙레코드 R 정확화)
-                import json as _json2
-                with open(_RLEDGER_PATH, encoding="utf-8") as _rf:
-                    _rledger = _json2.load(_rf)
-                if not isinstance(_rledger, dict):
-                    _rledger = {}
-            except Exception:
-                _rledger = {}
+            try:
+                _ledger, _since = _ledger_load(), _ledger_since()
+                _rledger, _rl_st = _read_json_guarded(_RLEDGER_PATH, dict)   # 실제 1R 원장(A안), 깨졌으면 .bak 복구
+            except OSError as _oe:                   # 원장을 못 읽으면(파일 잠김 등) 이번 동기화는 건너뛴다 - 틀린 1R로 올리지 않게(리뷰 P2-1)
+                self.log(f"   ⚠ 원장 파일을 읽지 못해 이번 동기화를 건너뜁니다({_oe}). 잠시 뒤 다시 시도합니다.")
+                return
+            if _rl_st in ("corrupt", "restored"):
+                self.log("   ⚠ 1R 원장 파일이 손상돼 " + ("백업본으로 되살렸습니다" if _rl_st == "restored" else
+                         "빈 원장으로 시작합니다"))
             _mine = 0
             agg = {}
             for f in fills:
@@ -7162,7 +10000,7 @@ class App:
                 # 참여 계좌 1R = 그 체결 시각 직전 진입의 '실제 1R'(R 원장). 없으면 계좌 명목값
                 # 폴백. 프롭 페이즈·자본 비례로 시점마다 1R이 달라도 정확히 정규화(대표 A안).
                 _aid = f.get("_acct_id")
-                _fb = float(f.get("_one_r") or 600.0)
+                _fb = float(f.get("_one_r") or _LEGACY_ONE_R)
                 e["accts"][_aid] = _lookup_real_r(
                     _rledger, a, _aid, (f.get("ts_ms") or 0) / 1000.0, _fb)
                 e.setdefault("base", {})[_aid] = _lookup_baseline_r(_rledger, a, _aid, _fb)
@@ -7314,7 +10152,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.10.03b"
+    _APP_VER = "2026.10.12d"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -7327,12 +10165,20 @@ class App:
     # ⚠️ 발주 경로에는 손대지 않는다 - 이 호출은 전부 별도 스레드이고, 실패해도 조용하다.
     _FILL_RETRY_WINDOW_S = 900      # 15분 창(2026-09-08: 5분) - 그 뒤엔 미전송 큐가 24시간 재시도
 
-    def _claim_entry(self, sig, acct_id) -> bool:
+    def _claim_entry(self, sig, acct_id, per_process=False) -> bool:
         """서버 진입 클레임(대표 2026-08-22 "같은 토큰 다른 머신 이중 진입 막게"):
         같은 (토큰, 신호, 계좌)에 서버가 선착 1기기만 허가한다 - 기기 간 타이밍 경쟁 소멸.
         계좌번호는 안 보낸다(sha256 해시 12자). **fail-open**: 서버 불가침·오류면 True
         (단일 기기 회원이 서버 순단에 막히면 안 됨 - 신호가 방금 서버에서 왔으니 사실상
-        항상 도달한다). False = 다른 기기가 선점 → 이 계좌 양보."""
+        항상 도달한다). False = 다른 기기가 선점 → 이 계좌 양보.
+
+        per_process=True(선물 경로만, 버그 조사 재검증 2026-10-06 6): mid에 프로세스 난수 4자를 붙인다(12+4=16자, 서버 상한 안).
+        서버는 같은 mid의 재요청을 허가하므로, 같은 PC의 두 실행(업데이트 날 옛 03b 창 + 새 빌드 창 - 03b엔 단일 실행 잠금이
+        없다)이나 신호 직후 재시작한 실행이 같은 신호·같은 계좌에 둘 다 허가를 받아 이중 진입·청산 후 재진입이 났다. 난수를
+        붙이면 늦은 쪽이 taken을 받는다. 선물은 클레임이 '이전 세션 잔여' 정리보다 **앞**이라(03b·이 빌드 모두) 늦은 쪽이
+        포지션을 건드리지 않고 양보한다. 같은 프로세스의 재요청(세대가 바뀐 루프 포함)은 난수가 같아 종전처럼 멱등이다.
+        ⚠️크립토 경로에는 붙이지 않는다: 거기는 클레임이 잔여 청산 **뒤**라, 늦은 쪽이 먼저 들어간 포지션을 닫은 다음 taken을
+        받고 양보해 계좌가 비고, 먼저 들어간 쪽은 사라진 포지션을 손절 청산으로 보고한다(지금보다 나쁜 결과)."""
         try:
             import hashlib
             import requests as _rq
@@ -7342,9 +10188,12 @@ class App:
             if not tid or not sid:
                 return True
             ah = hashlib.sha256(str(acct_id).strip().lower().encode()).hexdigest()[:12]
+            _mid = str(_machine_id())
+            if per_process:
+                _mid = _mid[:12] + _CLAIM_NONCE
             r = _rq.post(PUSH_BASE + "eqclaim", timeout=6,
                          json={"tok_id": tid, "sig_id": sid, "acct_h": ah,
-                               "mid": _machine_id()})
+                               "mid": _mid})
             if r.ok and r.text.startswith("claim:taken"):
                 return False
             return True
@@ -7517,6 +10366,191 @@ class App:
         except Exception:
             pass
 
+    def _mark_unconfirmed(self, asset) -> None:
+        """진입 결과를 끝내 확인하지 못한 포지션을 감시 집합에 넣는다(오픈 준비 버그 조사 2026-10-06 B).
+        _remember_open 바로 뒤에 부른다. 종전엔 _note_fill이 없어 _open_assets에 안 들어가, 하트비트의
+        _check_stop_closed·_check_stop_alive가 이 포지션을 아예 보지 않았다.
+
+        ctx에 unconfirmed를 단다 - 체결 보고(_note_fill)를 안 한 포지션이라는 뜻이다. _check_stop_closed가
+          ①포지션이 보이면 손절 확인(_check_stop_alive)을 바로 돌려, 없으면 기억해 둔 자리에 다시 걸고
+          ②안 보이면(연속 2회) 청산 보고 없이 놓는다 - 열렸다고 보고한 적이 없으니 닫혔다고 보고할 것도 없다.
+        _open_assets에 이 표시로 넣은 경우만(unconf_added) 놓을 때 뺀다 - 다른 계좌가 확정한 자산은 그대로 둔다.
+
+        ⚠️진입 경로는 이제 이 함수를 부르지 않는다(버그 조사 재검증 2026-10-06 2) - 자산 ctx는 하나라 두 leg·다계좌에서
+        마지막 것만 남았다. 미확인 leg는 _unconf_watch_add(leg 단위 목록)가 맡는다. 이 함수와 _check_stop_closed의
+        unconfirmed 분기는 이 표시가 붙어 디스크에 남은 기록(이번 수리 전 시험 빌드)을 끝까지 처리하려고 둔다."""
+        try:
+            _k = str(asset)
+            _c = (getattr(self, "_open_ctx", {}) or {}).get(_k)
+            if _c is None:
+                return
+            if not hasattr(self, "_open_assets"):
+                self._open_assets = set()
+            _c["unconfirmed"] = True
+            if _k not in self._open_assets:
+                _c["unconf_added"] = True
+                self._open_assets.add(_k)
+                try:
+                    self._profile["open_assets"] = sorted(self._open_assets)
+                    self._save_cfg()
+                except Exception:
+                    pass
+            self._persist_open_ctx(_k)
+        except Exception:
+            pass
+
+    # ── 미확인 진입 감시(버그 조사 재검증 2026-10-06 2) ─────────────────────────────────────────
+    # 진입 결과를 끝내 확인하지 못한 leg마다 (자산, 계좌, 계약) 한 칸. 하트비트(_check_unconf_watch)가 이 목록을
+    # 자산 ctx와 따로 돌며, 포지션이 보이면 기존 손절 확인·재거치(_check_stop_alive)를 그 leg의 값으로 돌리고,
+    # 연속 2회 안 보이면 청산 보고 없이 놓는다(열렸다고 보고한 적이 없다). 종전(_mark_unconfirmed)은 자산 ctx 하나에
+    # 표시를 달아, 미니+마이크로 두 leg면 마지막 leg만 봤고 다른 계좌가 확정한 포지션의 감시를 이 leg로 바꿔 놓았다.
+    @staticmethod
+    def _unconf_key(asset, aid, con) -> str:
+        return f"{asset}|{aid}|{con}"
+
+    def _unconf_save(self) -> None:
+        with _UNCONF_LOCK:
+            _save_unconf_watch(dict(getattr(self, "_unconf_watch", None) or {}))
+
+    def _unconf_clear_state(self, key) -> None:
+        for _n in ("_nostop_seen", "_stop_chk_at", "_size_seen", "_unconf_flat", "_unconf_retry_at"):
+            _d = getattr(self, _n, None)
+            if isinstance(_d, dict):
+                _d.pop(key, None)
+
+    def _unconf_watch_add(self, asset, b, aid, con, *, stop=None, direction=None, size=None, sc="", leg="") -> bool:
+        """미확인 leg 하나를 감시 목록에 넣는다. 넣었으면 True - 회원 알림의 '계속 확인' 문장은 이게 True일 때만 붙인다."""
+        import time as _t
+        try:
+            _k = self._unconf_key(asset, aid, con)
+            _rec = {"asset": str(asset), "b": b, "broker": str(getattr(b, "name", "") or ""),
+                    "aid": aid, "con": str(con), "sym": str(con), "sc": str(sc or ""), "leg": str(leg or ""),
+                    "dir": (str(direction).upper() if direction else None), "ts": _t.time(),
+                    "seen": False, "manual": False, "_wkey": _k, "unconf": True}
+            try:
+                _rec["stop"] = _rec["app_stop"] = (float(stop) if stop is not None else None)
+            except (TypeError, ValueError):
+                _rec["stop"] = _rec["app_stop"] = None
+            try:
+                _rec["size"] = abs(int(size)) or None
+            except (TypeError, ValueError):
+                _rec["size"] = None
+            with _UNCONF_LOCK:
+                _w = getattr(self, "_unconf_watch", None)
+                if not isinstance(_w, dict):
+                    _w = self._unconf_watch = {}
+                _w[_k] = _rec
+                self._unconf_clear_state(_k)
+                _save_unconf_watch(dict(_w))
+            return True
+        except Exception:
+            return False
+
+    def _unconf_watch_drop(self, asset, aid, con) -> None:
+        """이 (자산, 계좌, 계약) 감시를 놓는다 - 포지션이 없거나, 같은 자리에 새 진입이 확정됐다(그 뒤는 자산 ctx가 본다)."""
+        try:
+            _k = self._unconf_key(asset, aid, con)
+            with _UNCONF_LOCK:
+                _w = getattr(self, "_unconf_watch", None)
+                if not isinstance(_w, dict) or _w.pop(_k, None) is None:
+                    return
+                self._unconf_clear_state(_k)
+                _save_unconf_watch(dict(_w))
+        except Exception:
+            pass
+
+    def _unconf_restore_broker(self, key, rec):
+        """재시작 뒤: 디스크 기록으로 브로커를 다시 짓는다(_restore_open_ctx와 같은 재료·같은 5분 재시도)."""
+        import time as _t
+        if not isinstance(getattr(self, "_unconf_retry_at", None), dict):
+            self._unconf_retry_at = {}
+        if _t.time() < float(self._unconf_retry_at.get(key, 0)):
+            return None
+        self._unconf_retry_at[key] = _t.time() + 300
+        _bk = str(rec.get("broker") or "").strip()
+        _a = str(rec.get("asset") or "")
+        if not _bk or not _a:
+            return None
+        try:
+            _cr = self._creds_of(_a, _bk)
+            _f1 = (_cr.get("f1") or "").strip()
+            _b = _build_broker(_bk, _f1, _f2_load(_f1) or "", _cr.get("f3", ""),
+                               [str(rec.get("aid"))] if rec.get("aid") is not None else [])
+        except Exception as _e:
+            self.log(f"   · {_a} 미확인 진입 감시 복구 실패({str(_e)[:80]}) — 5분 뒤 재시도")
+            return None
+        rec["b"] = _b
+        self.log(f"   · {_a} 미확인 진입 감시 복구({_bk} {rec.get('con')}) — 이어서 확인합니다.")
+        return _b
+
+    def _check_unconf_watch(self) -> None:
+        """하트비트마다 미확인 leg를 하나씩 본다(읽기 + 손절 없을 때만 재거치). 조회 실패는 판단하지 않는다.
+        포지션은 부호가 있는 목록(list_open_positions)에서 (계좌, 계약)으로 찾는다 - 방향이 이 주문과 반대면 이 주문의
+        포지션이 아니므로(회원이 따로 연 것 등) 손절을 걸지 않고 감시를 놓는다. 반대 방향 손절은 노출을 키운다."""
+        import time as _t
+        _w = getattr(self, "_unconf_watch", None)
+        if not isinstance(_w, dict) or not _w:
+            return
+        if not isinstance(getattr(self, "_unconf_flat", None), dict):
+            self._unconf_flat = {}
+        for _k, _rec in list(_w.items()):
+            if not isinstance(_rec, dict):
+                continue
+            _a = str(_rec.get("asset") or str(_k).split("|")[0])
+            _con = _rec.get("con")
+            try:
+                _old = _t.time() - float(_rec.get("ts") or 0) > _UNCONF_MAX_AGE
+            except (TypeError, ValueError):
+                _old = True
+            if _old:
+                self.log(f"   · {_a} 확인하지 못했던 진입({_con}) 감시가 {_UNCONF_MAX_AGE // 3600}시간을 넘어 놓습니다"
+                         "(그날 세션 마감 청산 시각이 지났습니다).")
+                self._unconf_watch_drop(_a, _rec.get("aid"), _con)
+                continue
+            _b = _rec.get("b") or self._unconf_restore_broker(_k, _rec)
+            if _b is None or not hasattr(_b, "list_open_positions"):
+                continue
+            try:
+                _poss = _b.list_open_positions()
+            except Exception:
+                _poss = None
+            if _poss is None:
+                self._unconf_flat.pop(_k, None)          # 조회 실패 = 무판단
+                continue
+            _hit = next((p for p in _poss
+                         if str(getattr(p, "symbol", "")) == str(_con)
+                         and str(getattr(p, "account_id", "")) == str(_rec.get("aid"))), None)
+            try:
+                _net = int(getattr(_hit, "net_qty", 0) or 0) if _hit is not None else 0
+            except (TypeError, ValueError):
+                self._unconf_flat.pop(_k, None)          # 수량을 못 읽으면 판단하지 않는다
+                continue
+            if _net:
+                self._unconf_flat.pop(_k, None)
+                _long = str(_rec.get("dir") or "LONG").upper() in ("LONG", "BUY", "0")
+                if (_net > 0) != _long:
+                    self.log(f"   ⚠ {_a} {_con} 포지션 방향이 확인하지 못했던 진입({_rec.get('dir')})과 반대입니다 — 이 "
+                             "주문의 포지션이 아니어서 손절을 걸지 않고 이 감시를 놓습니다.")
+                    self._unconf_watch_drop(_a, _rec.get("aid"), _con)
+                    continue
+                if not _rec.get("seen"):
+                    # 처음 보였다 - 손절 확인을 선물 조회 주기(180초)까지 미루지 않고 이번 바퀴에 바로 돌린다.
+                    _rec["seen"] = True
+                    if isinstance(getattr(self, "_stop_chk_at", None), dict):
+                        self._stop_chk_at.pop(_k, None)
+                    self._unconf_save()
+                    self.log(f"   · {_a} 확인하지 못했던 진입({_con})의 포지션이 브로커에 보입니다 ×{abs(_net)} "
+                             "— 보호 손절을 확인합니다.")
+                self._check_stop_alive(_a, _hit, ctx=_rec, skey=_k)
+                continue
+            _n = int(self._unconf_flat.get(_k, 0)) + 1
+            self._unconf_flat[_k] = _n
+            if _n < 2:
+                continue                                  # 한 번은 안 믿는다(전송 지연·일시 오류)
+            self.log(f"   · {_a} 확인하지 못했던 진입({_con}): 브로커에 포지션이 없습니다 — 이 주문의 감시를 "
+                     "놓습니다(청산 보고 없음).")
+            self._unconf_watch_drop(_a, _rec.get("aid"), _con)
+
     def _persist_open_ctx(self, asset) -> None:
         """감시 맥락을 디스크에 남긴다 - 앱을 껐다 켜도 손절 감시가 이어지게(2026-09-21).
         브로커 객체와 비밀은 안 담는다: 브로커 **이름**과 계좌만 적고, 복구할 때
@@ -7533,6 +10567,9 @@ class App:
                               # 기준)과 manual(=회원이 만졌다). 이걸 안 남기면 앱을 껐다 켠
                               # 순간 '수동이 우선'이 풀려 트레일이 회원 손절을 도로 옮긴다.
                               "app_stop": _c.get("app_stop"), "manual": bool(_c.get("manual")),
+                              # B(2026-10-06): 미확인 진입 표시도 재시작을 넘긴다 - 빠지면 끝내 없던 포지션을
+                              # 재시작 뒤 '손절 청산'으로 서버에 보고한다.
+                              **{_f: True for _f in ("unconfirmed", "unconf_added") if _c.get(_f)},
                               "ts": _t.time()}
             _save_open_ctx(_d)
         except Exception:
@@ -7581,6 +10618,9 @@ class App:
                               "dir": _r.get("dir"), "size": _r.get("size"),
                               "aid": _r.get("aid"), "app_stop": _r.get("app_stop"),
                               "manual": bool(_r.get("manual"))}
+        for _f in ("unconfirmed", "unconf_added"):           # B(2026-10-06) - 있을 때만 단다
+            if _r.get(_f):
+                self._open_ctx[_k][_f] = True
         self.log(f"   · {_k} 감시 맥락 복구({_bk}) — 손절 감시를 이어갑니다.")
         return True
 
@@ -7649,6 +10689,12 @@ class App:
                 continue
             if _still:
                 self._flat_seen.pop(str(_a), None)
+                if _ctx.get("unconfirmed") and not _ctx.get("unconf_seen"):
+                    # B(오픈 준비 버그 조사 2026-10-06): 확인 못 한 진입이 브로커에 보인다 - 손절 확인을
+                    # 선물 조회 주기(180초)까지 미루지 않고 이번 바퀴에 바로 돌린다.
+                    _ctx["unconf_seen"] = True
+                    getattr(self, "_stop_chk_at", {}).pop(str(_a), None)
+                    self.log(f"   · {_a} 확인하지 못했던 진입의 포지션이 브로커에 보입니다 — 보호 손절을 확인합니다.")
                 self._check_stop_alive(_a, _hit)
                 continue
             _n = int(self._flat_seen.get(str(_a), 0)) + 1
@@ -7661,6 +10707,21 @@ class App:
             if _n < 2:
                 continue                      # 한 번은 안 믿는다(전송 지연·일시 오류)
             self._flat_seen.pop(str(_a), None)
+            if _ctx.get("unconfirmed"):
+                # B(2026-10-06): 체결 보고를 안 한 포지션(진입 결과 미확인) - 열렸다고 보고한 적이 없으니
+                # 청산도 보고하지 않고 감시만 놓는다. 이 표시로 넣은 자산만 _open_assets에서 뺀다.
+                self.log(f"   · {_a} 확인하지 못했던 진입: 브로커에 포지션이 없습니다 — 감시를 놓습니다(청산 보고 없음).")
+                self._open_ctx.pop(str(_a), None)
+                self._forget_open_ctx(_a)
+                if _ctx.get("unconf_added"):
+                    try:
+                        self._open_assets.discard(str(_a))
+                        self._profile["open_assets"] = sorted(self._open_assets)
+                        self._save_cfg()
+                        self.root.after(0, self._refresh_live_panel)
+                    except Exception:
+                        pass
+                continue
             self.log(f"\u2139 {_a} \ud3ec\uc9c0\uc158\uc774 \ube0c\ub85c\ucee4\uc5d0\uc11c "
                      f"\uc0ac\ub77c\uc84c\uc2b5\ub2c8\ub2e4(\uc190\uc808 \ucd94\uc815) "
                      f"- \uc11c\ubc84\uc5d0 \uccad\uc0b0\uc744 \ubcf4\uace0\ud569\ub2c8\ub2e4.")
@@ -7717,11 +10778,14 @@ class App:
                     or ((seen_px > float(_cur)) if _lg else (seen_px < float(_cur)))):
                 if _cur is None or abs(seen_px - float(_cur)) > 1e-9:
                     ctx["stop"] = float(seen_px)
-                    self._persist_open_ctx(str(asset))
+                    if ctx.get("_wkey"):
+                        self._unconf_save()          # 미확인 leg(재검증 2) - 자산 ctx 기록을 건드리지 않는다
+                    else:
+                        self._persist_open_ctx(str(asset))
         except (TypeError, ValueError, AttributeError):
             pass
 
-    def _check_stop_size(self, asset, ctx, b, pos, aid, con, stops) -> None:
+    def _check_stop_size(self, asset, ctx, b, pos, aid, con, stops, skey=None) -> None:
         """보호 손절 **주문 수량**이 지금 포지션과 맞는가 - 안 맞으면 맞춘다(2026-09-21).
 
         왜(대표 "내가 반익을 해도 나머지에 대해선 손절이 잘 작동하게"): 크립토는 손절이
@@ -7755,18 +10819,19 @@ class App:
             if not hasattr(self, "_size_seen"):
                 self._size_seen = {}
             _k = str(asset)
+            _sk = str(skey) if skey else _k     # 상태 키 - 미확인 leg 감시는 leg 단위(버그 조사 재검증 2026-10-06 2)
             if _have == _need:
-                self._size_seen.pop(_k, None)
+                self._size_seen.pop(_sk, None)
                 return
-            _n = int(self._size_seen.get(_k, 0))
+            _n = int(self._size_seen.get(_sk, 0))
             if _n < 0:
                 return                          # 이미 손봤다(맞아지면 위에서 리셋)
             _n += 1
-            self._size_seen[_k] = _n
+            self._size_seen[_sk] = _n
             self.log(f"   · {_k} 손절 수량 불일치 {_n}/2 — 주문 {_have} vs 포지션 {_need}")
             if _n < 2:
                 return
-            self._size_seen[_k] = -1
+            self._size_seen[_sk] = -1
 
             _lvl = ctx.get("stop")
             if not _lvl:
@@ -7823,7 +10888,7 @@ class App:
         except Exception:
             pass
 
-    def _check_stop_alive(self, asset, pos):
+    def _check_stop_alive(self, asset, pos, ctx=None, skey=None):
         """열린 포지션에 **보호 손절이 아직 붙어 있는지** 확인하고, 없으면 다시 건다(2026-09-21).
 
         왜 필요한가: 거치 시점의 실패는 _handle_stop_failure가 막는다(거부=즉시 청산,
@@ -7848,7 +10913,10 @@ class App:
         """
         import time as _t
         _k = str(asset)
-        _ctx = (getattr(self, "_open_ctx", {}) or {}).get(_k) or {}
+        # 미확인 진입 감시(버그 조사 재검증 2026-10-06 2)는 자산 ctx가 아니라 leg 하나의 ctx와 leg 키를 넘긴다 -
+        # 판단·재거치 로직은 같고, 연속 관측 횟수·조회 주기 상태만 leg 단위로 따로 센다. 넘기지 않으면 종전 그대로.
+        _sk = str(skey) if skey else _k
+        _ctx = ctx if ctx is not None else ((getattr(self, "_open_ctx", {}) or {}).get(_k) or {})
         _b = _ctx.get("b")
         _raw = getattr(pos, "raw", None) or {}
         if not hasattr(self, "_nostop_seen"):
@@ -7862,7 +10930,7 @@ class App:
             try:
                 _pl = _b.stop_plans(_ctx.get("sym") or getattr(pos, "symbol", "")) or []
             except Exception:
-                self._nostop_seen.pop(_k, None)      # 조회 실패 = 무판단
+                self._nostop_seen.pop(_sk, None)      # 조회 실패 = 무판단
                 return
             _alive = bool(_pl)
             _seen_px = next((x.get("price") for x in _pl if x.get("price")), None)
@@ -7875,15 +10943,15 @@ class App:
         elif hasattr(_b, "_open_orders"):                        # ── 선물(ProjectX)
             if not hasattr(self, "_stop_chk_at"):
                 self._stop_chk_at = {}
-            if _t.time() - float(self._stop_chk_at.get(_k, 0)) < self.STOP_ORDER_CHECK_SEC:
+            if _t.time() - float(self._stop_chk_at.get(_sk, 0)) < self.STOP_ORDER_CHECK_SEC:
                 return
-            self._stop_chk_at[_k] = _t.time()
+            self._stop_chk_at[_sk] = _t.time()
             _aid = _raw.get("_accountId") or getattr(pos, "account_id", None)
             _con = str(_raw.get("contractId") or getattr(pos, "symbol", "") or "")
             try:
                 _ords = _b._open_orders(_aid) or []
             except Exception:
-                self._nostop_seen.pop(_k, None)      # 조회 실패 = 무판단
+                self._nostop_seen.pop(_sk, None)      # 조회 실패 = 무판단
                 return
             # 보호 손절 = type 4(스탑). 같은 계약에 걸린 것만 센다.
             _stops = [_o for _o in _ords if isinstance(_o, dict)
@@ -7895,23 +10963,23 @@ class App:
             except (TypeError, ValueError):
                 _seen_px = None
             if _alive:
-                self._check_stop_size(_k, _ctx, _b, pos, _aid, _con, _stops)
+                self._check_stop_size(_k, _ctx, _b, pos, _aid, _con, _stops, skey=_sk)
         if _alive is None:
             return
         if _alive:
-            self._nostop_seen.pop(_k, None)
+            self._nostop_seen.pop(_sk, None)
             self._learn_seen_stop(_k, _ctx, _seen_px)
             return
 
-        _n = int(self._nostop_seen.get(_k, 0))
+        _n = int(self._nostop_seen.get(_sk, 0))
         if _n < 0:
             return                                   # 이미 알렸다(복구되면 위에서 리셋)
         _n += 1
-        self._nostop_seen[_k] = _n
+        self._nostop_seen[_sk] = _n
         self.log(f"   · {_k} 보호 손절 미발견 {_n}/2 — 포지션은 살아 있음")
         if _n < 2:
             return
-        self._nostop_seen[_k] = -1                   # 한 번만 움직인다
+        self._nostop_seen[_sk] = -1                   # 한 번만 움직인다
 
         _lvl = _ctx.get("stop")
         _done, _why = False, "기억해 둔 손절 자리가 없습니다"
@@ -7938,7 +11006,19 @@ class App:
                 _done, _why = False, str(_e)[:160]
 
         if _done:
-            self._nostop_seen.pop(_k, None)          # 다음 주기에 정상으로 확인된다
+            self._nostop_seen.pop(_sk, None)          # 다음 주기에 정상으로 확인된다
+            if _ctx.get("_wkey"):
+                # 미확인 leg(버그 조사 재검증 2026-10-06 2): 진입 응답이 없던 주문이라 손절이 걸린 적이 없을 수 있다 -
+                # '사라져 있었다'고 말하지 않고 본 것과 한 일만 쓴다.
+                _wl = f"{_ctx.get('sc') or ''} {_ctx.get('leg') or _ctx.get('con') or ''}".strip()
+                self.log(f"   \u2705 {_k} 확인하지 못했던 진입({_wl})에 보호 손절이 없어 {_lvl:g}에 걸었습니다.")
+                self._member_alert(
+                    "stop_restored",
+                    f"[EQ Autopilot] 진입 결과를 확인하지 못했던 {_k} 포지션(계좌 {_wl})이 브로커에 보였고 "
+                    f"보호 손절이 없어, 앱이 {_lvl:g}에 걸었습니다.",
+                    f"[EQ Autopilot] The {_k} position whose entry could not be confirmed (account {_wl}) "
+                    f"showed up at the broker without a protective stop, so the app placed one at {_lvl:g}.")
+                return
             self.log(f"   \u2705 {_k} 보호 손절이 사라져 {_lvl:g}에 다시 걸었습니다.")
             self._member_alert(
                 "stop_restored",
@@ -8226,8 +11306,12 @@ class App:
             self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
                      + " (미니 묶음 — 커미션 절감)")
         # ── 서버 진입 클레임(2026-08-22): 같은 토큰의 다른 기기가 이 계좌를 선점했으면 양보 ──
-        if live and not self._claim_entry(sig, _aid):
-            self.log(f"   🤝 다른 기기가 이 계좌의 이번 진입을 선점 — 양보(진입 안 함)")
+        # 선물은 프로세스 단위 클레임(버그 조사 재검증 2026-10-06 6) - 같은 PC의 다른 실행도 '다른 기기'처럼 양보시킨다.
+        if live and not self._claim_entry(sig, _aid, per_process=True):
+            self.log("   🤝 다른 기기나 이 PC의 다른 EQ Autopilot 실행(다른 창, 재시작 전 실행)이 이 계좌의 이번 진입을 "
+                     "먼저 잡아 양보합니다(진입 안 함)." if self.lang == "ko" else
+                     "   🤝 Another device, or another EQ Autopilot run on this PC (another window, or the run before a "
+                     "restart), claimed this account's entry first - yielding (not entered).")
             return
         # ── 대기조 모드(2026-08-21): 다른 기기 선진입 창을 통째로 기다린 뒤 포지션을 본다 ──
         _standby = type(b).__name__ == "NT8Broker" and self._nt8_standby()
@@ -8307,6 +11391,13 @@ class App:
         for _sym, _qty, _con in resolved:
             _base_tag = f"EQ-AP-{int(recv.timestamp() * 1000)}-{_sym}"
             _placed = False          # True=확정 체결 / None=정책 스킵 / False=실패
+            # 실제 체결 수량 - leg마다 0에서 시작한다(오픈 준비 버그 조사 2026-10-06 U): 종전엔 확인 창에서만
+            # 처음 대입돼, 첫 제출이 예외로 끝나고 늦은 체결 검사가 확정하면 _remember_open에서
+            # UnboundLocalError가 났다(실제 포지션은 열린 채 '진입 실패' 팝업, 감시·원장·남은 leg 누락).
+            # 둘째 leg부터는 앞 leg 값이 남아 틀린 수량으로 기억했다.
+            _seen_qty = 0
+            _stop_qty = _qty         # 손절 재시도 수량 - 늦은 확정(B)에서 실측 수량으로 건 경우만 바뀐다
+            _stop_by_seen = False    # B: 늦은 확정에서 손절을 실측 수량으로 직접 걸었다
             _last_why = ""
             _net_last = ""           # 마지막 망 프로브 결과(대표 "인터넷 불안정도 로깅")
             _res_ok = None           # 확정 시의 res(스탑 표시용)
@@ -8317,7 +11408,9 @@ class App:
             res = {}
             while True:
                 if _try:
-                    if _t.time() - _t0 > _budget_s or _try >= 6:
+                    # 예산 0(비NT8·dry-run)은 경과 시간과 무관하게 1회로 끝낸다(B): 윈도 시계 해상도(약 15ms)
+                    # 안에 예외가 나면 경과가 0이라 '0 > 0'이 거짓이 돼 재진입 경로로 샜다.
+                    if not _budget_s or _t.time() - _t0 > _budget_s or _try >= 6:
                         break
                     # ① 늦은 체결 검사 - 직전 제출이 확인창(6초) 뒤에 체결됐을 수 있다
                     #    (오늘 사고의 8.6초 지연). 있으면 성공 처리, 조회 실패면 보류.
@@ -8327,6 +11420,7 @@ class App:
                         _lateq = -1
                     if _lateq > 0:
                         _placed = True; _res_ok = _res_ok or res
+                        _seen_qty = _lateq                     # 실측으로 기억(U)
                         self.log(f"   ✅ {_sym} 늦은 체결 확인 ×{_lateq} — 재진입 불필요")
                         break
                     if _lateq < 0:
@@ -8340,6 +11434,7 @@ class App:
                             _enp = (b.order_status(_aid, _tag) or {}).get("entry") or {}
                             if str(_enp.get("state") or "") in ("Filled", "PartFilled"):
                                 _placed = True; _res_ok = _res_ok or res
+                                _seen_qty = abs(int(_enp.get("filled") or 0)) or int(_qty)   # U
                                 self.log(f"   ✅ {_sym} 직전 주문 체결 확인(주문 상태 {_enp.get('state')}) — 재진입 불필요")
                                 break
                         except Exception:
@@ -8473,6 +11568,67 @@ class App:
                 _try += 1
             if _placed is None:
                 continue                                   # 정책 스킵 - 다음 leg
+            # ── 비NT8 '미확인'을 바로 포기하지 않는다(오픈 준비 버그 조사 2026-10-06 B) ──
+            # ProjectX·IBKR은 확인 창이 2초이고, Order/place가 예외(접수 뒤 타임아웃·5xx, 요청 도중 망 끊김)면 그마저 없다.
+            # 그때 주문은 나갔을 수 있는데 ProjectX 손절은 진입 POST가 성공한 다음에만 나가므로 안 나갔다. 종전엔 여기서
+            # 손절 거치·손절 실패 처리·감시를 모두 건너뛰어 세션 마감 청산까지(최대 약 4시간) 손절 없이 남을 수 있었다.
+            # 포지션을 ENTRY_RECHECK_S초 더 보고, 보이면 아래 확정 경로(손절 확인·_handle_stop_failure·_note_fill)로 보낸다.
+            if live and _placed is False and not _is_nt8:
+                _lq = 0
+                _t_end = _t.time() + ENTRY_RECHECK_S
+                while True:
+                    try:
+                        _lq = abs(int(b.position_qty(_aid, _con) or 0))
+                    except Exception:
+                        _lq = 0
+                    if _lq > 0 or _t.time() >= _t_end:
+                        break
+                    _t.sleep(1.0)
+                if _lq > 0:
+                    _placed = True; _seen_qty = _lq
+                    self.log(f"   ✅ {_sym} 재확인으로 체결 확인 ×{_lq} (처음 확인 실패: {_last_why or '미상'})")
+                    _r0 = dict(_res_ok or {})            # 정상 응답이 있었으면 그 손절 결과를 그대로 쓴다
+                    if stop is not None and not _r0.get("stop") and not _r0.get("stop_error"):
+                        # 진입 응답이 없어(예외) 손절이 나갔는지 모른다. 손절을 두 번 걸면 첫 손절이 닫은 뒤
+                        # 둘째가 반대 포지션을 연다 - 브로커 주문 목록으로 '손절 없음'을 확인한 뒤에만 건다.
+                        _ords = None
+                        if hasattr(b, "_open_orders") and hasattr(b, "place_protective_stop"):
+                            try:
+                                _ords = b._open_orders(_aid) or []
+                            except Exception as _oe:
+                                _r0["stop_unconfirmed"] = f"주문 조회 실패: {str(_oe)[:80]}"
+                        else:
+                            _r0["stop_unconfirmed"] = "이 브로커는 앱이 주문 목록을 보지 못함"
+                        if _ords is not None:
+                            try:
+                                _ws = 1 if _is_long else 0          # 보호 손절 = 진입 반대 방향(ProjectX side 0=매수, 1=매도)
+                                _have = [o for o in _ords if isinstance(o, dict)
+                                         and int(o.get("type") or 0) == 4
+                                         and str(o.get("contractId") or "") == str(_con)
+                                         and (o.get("side") is None or int(o.get("side")) == _ws)]
+                            except (TypeError, ValueError) as _pe:
+                                _have = None
+                                _r0["stop_unconfirmed"] = f"주문 목록 해석 실패: {str(_pe)[:80]}"
+                            if _have:
+                                _r0["stop"] = _have[0]
+                                try:
+                                    _r0["stop_price"] = float(_have[0].get("stopPrice"))
+                                except (TypeError, ValueError):
+                                    _r0.pop("stop_price", None)
+                                self.log(f"   · {_sym} 브로커에 손절 주문이 이미 있습니다 — 다시 걸지 않습니다.")
+                            elif _have is not None:
+                                _r0.update(b.place_protective_stop(_aid, _con, direction, _lq, stop,
+                                                                   custom_tag=_tag) or {})
+                                _stop_qty = _lq; _stop_by_seen = True   # 실측 수량으로 걸었다(재시도도 같은 수량)
+                        if _r0.get("stop_unconfirmed"):
+                            self._member_alert(
+                                "stop_unconfirmed",
+                                f"[EQ Autopilot] {asset} 진입은 확인됐지만(계좌 {sc} {_sym} ×{_lq}) 보호 손절이 "
+                                f"걸렸는지 앱이 확인하지 못했습니다. 브로커 화면에서 손절 확인이 필요합니다.",
+                                f"[EQ Autopilot] The {asset} entry is confirmed (account {sc} {_sym} ×{_lq}), but "
+                                f"the app could not confirm that the protective stop is in place. The stop "
+                                f"needs checking at your broker.")
+                    _res_ok = _r0
             if live and not _placed:
                 if _is_nt8:
                     _whyf = (_last_why or "사유 미상") + (f" | {_net_last}" if _net_last else "")
@@ -8491,11 +11647,29 @@ class App:
                 else:
                     self.log(f"   ⚠ {_sym} 주문은 접수됐으나 포지션이 확인되지 않아 "
                              f"보고에서 제외합니다(계좌를 직접 확인하십시오)")
-                    # 기존 동작: 갭·오픈추적·원장은 진행(주문이 살아있을 수 있음)
+                    # 기존 동작: 갭·원장은 진행(주문이 살아있을 수 있음)
                     self._send_gap(asset, sig, b, _con, mkt_at_send=_px_at_send)
-                    self._remember_open(asset, b, _con, stop=stop, aid=_aid,
-                                        direction=direction, size=_qty)
                     _ledger_add(asset, _con, direction, _tag)
+                    # B(오픈 준비 버그 조사 2026-10-06): 재확인 뒤에도 모른다 - 로그 한 줄로 끝내지 않는다.
+                    # 감시는 leg 단위 목록(_unconf_watch)에 넣는다(버그 조사 재검증 2026-10-06 2). 종전엔 _remember_open이
+                    # 자산 ctx를 통째로 갈아 끼우고 거기 표시를 달아, 미니+마이크로 두 leg면 마지막 leg만 감시했고(위험 대부분을
+                    # 진 미니 leg가 세션 마감까지 손절 없이 남을 수 있었다) 다른 계좌가 확정한 포지션의 감시도 이 leg로 바뀌었다.
+                    # 자산 ctx(_open_ctx)는 이제 확정된 포지션만 든다. 손절 재거치까지 하는 브로커(주문 목록을 보는 ProjectX)만 넣는다.
+                    _watch = bool(hasattr(b, "_open_orders")
+                                  and self._unconf_watch_add(asset, b, _aid, _con, stop=stop, direction=direction,
+                                                             size=_qty, sc=sc, leg=_sym))
+                    self._member_alert(
+                        "entry_unconfirmed",
+                        f"[EQ Autopilot] {asset} 진입 결과를 확인하지 못했습니다(계좌 {sc} {_sym}). 주문이 "
+                        f"들어갔는지와 보호 손절이 걸렸는지 앱이 알 수 없어, 브로커 화면에서 포지션과 손절 "
+                        f"확인이 필요합니다."
+                        + (f" 앱은 이 계좌의 {_sym} 포지션을 계속 확인해, 보이면 보호 손절이 있는지 보고 없으면 겁니다."
+                           if _watch else ""),
+                        f"[EQ Autopilot] The {asset} entry result could not be confirmed (account {sc} {_sym}). "
+                        f"The app cannot tell whether the order went in or whether the protective stop is in "
+                        f"place, so the position and stop need checking at your broker."
+                        + (f" The app keeps checking this account's {_sym} position; if it shows up, the app "
+                           "checks for a protective stop and places one if there is none." if _watch else ""))
                 continue
             if not live:
                 _ok += 1; continue
@@ -8514,7 +11688,13 @@ class App:
             self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
                                 aid=_aid, direction=direction,
                                 size=(_seen_qty or _qty))   # 감지+재거치용
-            if _seen_qty and int(_seen_qty) != int(_qty):
+            # 같은 (자산, 계좌, 계약)에 남은 미확인 감시가 있으면 놓는다(버그 조사 재검증 2026-10-06 2) - 이 자리 포지션은
+            # 이제 확정된 이번 진입이고 위 자산 ctx가 본다. 남겨 두면 옛 손절 자리로 새 포지션의 손절을 판단한다.
+            self._unconf_watch_drop(asset, _aid, _con)
+            if _stop_by_seen and _seen_qty and int(_seen_qty) != int(_qty):
+                # B: 재확인 경로가 손절을 실측 수량으로 걸었다 - 손절이 포지션보다 크지 않으니 아래 경보는 사실이 아니다.
+                self.log(f"   ⚠ {_sym} 부분 체결 {_seen_qty}/{_qty} — 보호 손절은 체결분({_seen_qty})으로 걸었습니다.")
+            elif _seen_qty and int(_seen_qty) != int(_qty):
                 self.log(f"   \u26a0 {_sym} 부분 체결 {_seen_qty}/{_qty} — 보호 손절이 주문 "
                          f"수량({_qty})으로 걸려 있어 포지션보다 큽니다. 교정을 시도합니다.")
                 self._member_alert(
@@ -8541,7 +11721,7 @@ class App:
                         if _sp is not None and float(_sp) != float(stop) else "")
                 self.log(f"   🛡 {_sym} 보호 손절 거치 @{(_sp if _sp is not None else stop)}{_adj}")
             elif res.get("stop_error"):
-                self._handle_stop_failure(b, _aid, _con, direction, _qty, stop, res)
+                self._handle_stop_failure(b, _aid, _con, direction, _stop_qty, stop, res)   # B: 늦은 확정이면 실측 수량
             elif stop is not None:
                 _why = f" [{res.get('stop_unconfirmed')}]" if res.get("stop_unconfirmed") else ""
                 self.log(f"   ⚠ {_sym} 손절 거치 확인 안 됨{_why} — 브로커 화면에서 스탑 존재를 "
@@ -8821,6 +12001,11 @@ class App:
                 self._check_stop_closed()
             except Exception:
                 pass
+            # 진입 결과를 확인하지 못한 leg 감시(버그 조사 재검증 2026-10-06 2) - 자산 ctx 감시와 따로, 목록이 있을 때만.
+            try:
+                self._check_unconf_watch()
+            except Exception:
+                pass
             _th.sleep(60)          # _alive_ping이 240초 스로틀을 갖고 있다
 
     def _enc_unlock_startup(self):
@@ -8857,6 +12042,86 @@ class App:
         # 취소 또는 3회 실패: 값이 메모리에 없다 → 재입력 안내(기동 경고 경로 재사용)
         self._kc_failed = list(getattr(self, "_kc_failed", []) or []) + \
             [_enc_label(k) for k in (_enc.get("fields") or [])]
+        # 블롭을 열지 못한 기동(2026-10-07): 브로커 연결을 합치지 않고, 저장 때 블롭·kc_failed를 유지한다.
+        self._enc_locked = True
+
+    def _log_creds_notes(self):
+        """브로커 연결 공용 기동 로그(대표 2026-10-07) - 세션 1회. 값은 찍지 않는다(어느 칸이었는지만).
+        '합쳤습니다' 한 줄은 처음 한 번만(프로필 표시 - 다음 저장에 같이 남는다)."""
+        if getattr(self, "_creds_notes_logged", False) is True:
+            return
+        self._creds_notes_logged = True
+        try:
+            ko = self.lang == "ko"
+            notes = list(getattr(self, "_creds_notes", None) or [])
+            _merged = [n[1] for n in notes if n and n[0] == "merged"]
+            if _merged and isinstance(self._profile, dict) and not self._profile.get("creds_shared_v1"):
+                _lst = ", ".join(_broker_short(b) for b in _merged)
+                self.log((f"브로커 연결을 NQ와 GC 공용으로 합쳤습니다: {_lst}. 계좌와 1R은 그대로입니다." if ko else
+                                 f"Broker connections are now shared by NQ and GC: {_lst}. Accounts and 1R are unchanged."))
+                self._profile["creds_shared_v1"] = True
+            for n in notes:
+                if not n:
+                    continue
+                if n[0] == "scrub" and len(n) > 4 and n[4] == "id":
+                    self.log("  " + (f"({n[1]}의 Bridge Token 칸에 Topstep 아이디가 들어 있어 쓰지 않습니다. 화면 맨 위 "
+                                     f"[NT8 브리지 설치/업데이트]를 누르세요)" if ko else
+                                     f"({n[1]}: the Bridge Token field holds your Topstep user, so it is not used. "
+                                     f"Press [Install/Update NT8 bridge] at the top)"))
+                elif n[0] == "scrub" and len(n) > 4 and n[4] == "email":
+                    self.log("  " + (f"({n[1]}의 Bridge Token 칸에 이메일이 들어 있어 쓰지 않습니다. 화면 맨 위 "
+                                     f"[NT8 브리지 설치/업데이트]를 누르세요)" if ko else
+                                     f"({n[1]}: the Bridge Token field holds an email address, so it is not used. "
+                                     f"Press [Install/Update NT8 bridge] at the top)"))
+                elif n[0] == "scrub":
+                    _a, _b, _f = n[1], n[2], n[3]
+                    _fk, _fe = _field_short(_b, _f, True), _field_short(_b, _f, False)
+                    if not _fk.startswith("Topstep"):
+                        _fk, _fe = f"{_broker_short(_b)} {_fk}", f"{_broker_short(_b)} {_fe}"
+                    self.log("  " + (f"({_a}의 {_fk} 칸에 다른 브로커 키가 들어 있어 쓰지 않습니다)" if ko else
+                                     f"({_a}: the {_fe} field holds another broker's key, so it is not used)"))
+                elif n[0] == "ambig":
+                    _a, _b, _f = n[1], n[2], n[3]
+                    _fk, _fe = _field_short(_b, _f, True), _field_short(_b, _f, False)
+                    if not _fk.startswith("Topstep"):
+                        _fk, _fe = f"{_broker_short(_b)} {_fk}", f"{_broker_short(_b)} {_fe}"
+                    self.log("  " + (f"({_a}의 {_fk} 칸과 Bridge Token 칸에 같은 값이 있어 어느 쪽 것인지 알 수 없습니다. "
+                                     f"지우지 않고 자산별로 따로 둡니다. 두 칸을 확인하세요. Bridge Token이 틀렸다면 화면 맨 위 "
+                                     f"[NT8 브리지 설치/업데이트]를 누르세요)" if ko else
+                                     f"({_a}: the {_fe} field and the Bridge Token field hold the same value, so it is unclear "
+                                     f"which is right. Nothing was removed and the assets stay separate. Check both fields. If the "
+                                     f"Bridge Token is wrong, press [Install/Update NT8 bridge] at the top)"))
+                elif n[0] == "merged":
+                    for _a in (n[2] or []):
+                        self.log("  " + (f"({_a}의 {_broker_short(n[1])} 값은 이 컴퓨터에서 연결되지 않는 값이라 쓰지 않습니다)"
+                                         if ko else
+                                         f"({_a}: the {_broker_short(n[1])} value cannot connect on this computer, so it is not used)"))
+            for _b in sorted(getattr(self, "_creds_split", None) or []):
+                if any(n and n[0] == "split" and n[1] == _b for n in notes):
+                    self.log(self._split_text(_b))
+        except Exception:
+            pass
+
+    def _split_text(self, bk):
+        """split 안내(브로커별로 실제로 풀리는 방법 - 2026-10-07 반박 리뷰, 1b 반박 리뷰 P3 문구)."""
+        ko = self.lang == "ko"
+        if bk == "nt8":
+            return ("NQ와 GC의 Bridge Token이 서로 달라 따로 둡니다. 화면 맨 위 [NT8 브리지 설치/업데이트]를 누르면 하나로 맞춰집니다."
+                    if ko else
+                    "NQ and GC have different Bridge Tokens, so they stay separate. Press [Install/Update NT8 bridge] at the "
+                    "top to make them one.")
+        if bk == "ibkr":
+            return ("NQ와 GC의 IBKR Host/Port 설정이 서로 달라 따로 둡니다. 하나로 합치려면 안 쓰는 쪽의 [NQ 연결 지우기] 또는 "
+                    "[GC 연결 지우기]를 누르세요." if ko else
+                    "NQ and GC have different IBKR Host/Port settings, so they stay separate. To make them one, press "
+                    "[Remove NQ connection] or [Remove GC connection] for the one you don't need.")
+        _n = _broker_short(bk)
+        return (f"NQ와 GC에 서로 다른 {_n} 로그인이 있어 따로 둡니다. 둘 다 쓰시면 그대로 두세요. 하나로 합치려면 안 쓰는 쪽의 "
+                f"[NQ 연결 지우기] 또는 [GC 연결 지우기]를 누른 뒤, 아래 자산별 계좌 설정의 그 자산 탭에서 계좌를 목록에서 "
+                f"다시 고르세요." if ko else
+                f"NQ and GC have different {_n} logins, so they stay separate. If you use both, leave them. To make them "
+                f"one, press [Remove NQ connection] or [Remove GC connection] for the one you don't need, then pick that "
+                f"asset's accounts again from the list on its tab in the account setup below.")
 
     def _warn_kc_failed(self):
         """평문으로 남은 비밀이 있으면 기동 시 1회 경고(2026-08-28).
@@ -8865,6 +12130,10 @@ class App:
         '키체인을 열라'고 하면 없는 것을 열라는 말이 된다). 해결책도 사실이어야 한다 -
         '다시 켜면 자동으로 옮겨진다'는 코드에 없는 동작이었다. 실제 경로는
         '보안 저장소를 쓸 수 있게 만든 뒤 그 값을 다시 입력하고 저장'이다."""
+        try:
+            self._log_creds_notes()
+        except Exception:
+            pass
         _r = list(getattr(self, "_kc_enc_restored", []) or [])
         if _r and not getattr(self, "_kc_enc_logged", False):
             self._kc_enc_logged = True
@@ -8967,16 +12236,27 @@ class App:
     def _connected_assets(self):
         """브로커 자격이 실제로 입력된 자산 목록(["NQ","GC","BTC"] 부분집합).
         서버는 이것만 보고 3자산 연결 여부를 판정한다 - 키, 계좌번호는 보내지 않는다."""
-        out = []
+        # 새 정의(브로커 연결 공용, 2026-10-07 판정 11): 자산 브로커 창고에 값이 있느냐가 아니라 _conn_qual -
+        # NQ만 설정해도 GC가 공용 창고 덕에 '연결'로 잡히면 서버의 3자산 판정(trial_ready)이 바뀐다.
         try:
-            for _a in _ASSETS:
-                _c = (self._acfg.get(_a) or {})
-                _b = _c.get("broker")
-                _cr = ((_c.get("creds") or {}).get(_b) or {}) if _b else {}
-                if _b and any(str(v or "").strip() for v in _cr.values()):
-                    out.append(_a)
+            return [_a for _a in _ASSETS if self._conn_qual(_a)]
         except Exception:
             return []
+
+    def _conn_qual(self, asset):
+        """그 자산이 실제로 쓰는 연결의 브로커 목록: 켜진 비수동 행 중 그 행 브로커에 아이디(f1, IBKR는 f1 또는 f3)가 있고,
+        선물(계좌 ID가 있는 브로커)이면 행 계좌 ID까지 있는 것. 가용 계좌(avail)만 있는 것은 연결이 아니다. 읽기 전용."""
+        out = []
+        for _ac in (((self._acfg.get(asset) or {}).get("accounts")) or []):
+            if not isinstance(_ac, dict) or not _ac.get("on") or _ac.get("manual"):
+                continue
+            _b = _row_broker_of(self._acfg, asset, _ac, self._crypto_unique_ok(asset))
+            if _BROKER_SPEC.get(_b, {}).get("acct") and not str(_ac.get("id") or "").strip():
+                continue
+            _cr = self._creds_peek(asset, _b)
+            _has = str(_cr.get("f1") or "").strip() or (_b == "ibkr" and str(_cr.get("f3") or "").strip())
+            if _has and _b not in out:
+                out.append(_b)
         return out
 
     def _asset_brokers(self):
@@ -8991,11 +12271,10 @@ class App:
         out = {}
         try:
             for _a in _ASSETS:
-                _c = (self._acfg.get(_a) or {})
-                _b = _c.get("broker")
-                _cr = ((_c.get("creds") or {}).get(_b) or {}) if _b else {}
-                if _b and any(str(v or "").strip() for v in _cr.values()):
-                    out[_a] = str(_b)[:16]
+                _bs = self._conn_qual(_a)
+                if _bs:
+                    _b0 = (self._acfg.get(_a) or {}).get("broker")
+                    out[_a] = str(_b0 if _b0 in _bs else _bs[0])[:16]
         except Exception:
             return {}
         return out
@@ -9054,14 +12333,7 @@ class App:
         out = {}
         try:
             for _a in _ASSETS:
-                _bs = []
-                for _ac in self._accts_of(_a):
-                    if not _ac.get("on"):
-                        continue
-                    _b = self._acct_broker(_a, _ac)
-                    _cr = self._creds_of(_a, _b) or {}
-                    if _b and any(str(v or "").strip() for v in _cr.values()) and _b not in _bs:
-                        _bs.append(str(_b)[:16])
+                _bs = [str(_b)[:16] for _b in self._conn_qual(_a)]
                 if _bs:
                     out[_a] = _bs[:4]
         except Exception:
@@ -9089,6 +12361,7 @@ class App:
             # 통과해 1~3초마다 핑을 쏜다**(대표 기기 3대에서 실측: 마지막 보고 1~3초 전).
             # _bg가 전송 직전에 다시 읽는 값과도 같은 기준이어야 서명이 뜻을 갖는다.
             _sig = (bool(self._sig_accts or self._auto_accts),
+                    bool(self._sig_accts),      # 신호 대기만 꺼진 것도 상태 변화(오픈 준비 버그 조사 2026-10-06 E)
                     tuple(self._armed_assets()), tuple(self._connected_assets()),
                     tuple(self._included_assets()),
                     # NT8 연결 상태가 바뀌면(ok↔down) 4분 스로틀을 기다리지 않고 바로 보고(2026-09-28)
@@ -9142,7 +12415,10 @@ class App:
                                    # 확인 모드(2026-09-24 R44 P0 곁가지, v2026.09.23g): 무장은 맞지만 자동 진입은
                                    # 하지 않는 상태(Operator 등급·1R 미설정 등). 웹 무장 칩이 라임 '무장'과
                                    # 구분해 '확인 모드'라고 말하게 한다 - 화면이 사실과 반대를 말하던 자리.
-                                   "wo": bool(getattr(self, "_watch_only", False)),
+                                   # 신호 대기가 꺼지고 마감 청산만 남은 상태도 '자동 진입 안 함'이다(오픈 준비 버그
+                                   # 조사 2026-10-06 E) - 서버 불통·권한 상실 뒤 칩이 '무장'으로 남던 자리.
+                                   "wo": bool(getattr(self, "_watch_only", False))
+                                         or bool(self._auto_accts and not self._sig_accts),
                                    # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
                                    "bk": self._asset_brokers(),
                                    "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
@@ -9286,9 +12562,11 @@ class App:
                             else:
                                 r = rs
                                 _sh = _pcv < 2
-                                note = ((f"펀디드 {_pcv}/5발, " + ("방패기($12k→$6k 출금)" if _sh
+                                _bf = _as_float(_pr.get("buffer"), 0.0)    # 방패 문턱 = 계좌 방패 + 출금 단위(리뷰 P2-1: $12k→$6k 하드코딩)
+                                _shl = f"${(_bf + _PAYOUT_CHUNK) / 1000:g}k→${_bf / 1000:g}k"
+                                note = ((f"펀디드 {_pcv}/5발, " + (f"방패기({_shl} 출금)" if _sh
                                                                     else "Fast-Payout(자격 즉시 절반)")) if ko
-                                        else (f"funded {_pcv}/5, " + ("shield ($12k→$6k)" if _sh
+                                        else (f"funded {_pcv}/5, " + (f"shield ({_shl})" if _sh
                                                                        else "fast-payout (half on qualify)")))
                         else:
                             r = _as_float(_pr.get("r_test"), 1200.0); note = ("테스트기" if ko else "test")
@@ -9303,7 +12581,7 @@ class App:
                             note = (f"${bal:,.0f}×{pct:g}%" if r > floor else f"최소 ${floor:g}")
                     else:                                          # 고정
                         mode = ("고정" if ko else "Fixed")
-                        r = _as_float(ac.get("one_r"), 600.0); note = ("수동" if ko else "manual")
+                        r = _as_float(ac.get("one_r"), _LEGACY_ONE_R); note = ("수동" if ko else "manual")
                     balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
                     rstr = (f"${r:,.0f}" if r is not None else ("진입 안 함" if ko else "no entry"))
                     self.log(f"   ⚙ [{asset}, {lbl}] 잔고 {balstr}, {mode} 1R {rstr} ({note})")
@@ -9341,6 +12619,9 @@ class App:
             import threading  # noqa: F401
             seen = set()
             n_closed = 0
+            # 끝내지 못한 계좌 라벨(오픈 준비 버그 조사 2026-10-06 X): 종전엔 오류가 있든 없든 마지막 줄이
+            # '✅ 전체 청산 완료'였고 팝업도 없었다. 브로커가 오류를 반환값(errors)으로 주면 서버 보고도 없었다.
+            failed = []
             for a in _ASSETS:
                 # 계좌별 브로커(대표 2026-08-09) — 계좌 행마다 (브로커, 계좌ID) 수집.
                 # 패닉 버튼이므로 on/off 무관 전 계좌 대상(구 동작 유지).
@@ -9377,13 +12658,35 @@ class App:
                         n_closed += len(res.closed or [])
                         self.log(f"   [{lbl}] closed: {closed}"
                                  + (f", ⚠ {'; '.join(str(e)[:60] for e in errs)}" if errs else ""))
+                        if errs:
+                            failed.append(lbl)
+                            self._report_error("close_all", "\n".join(str(e)[:120] for e in errs[:4]))
                     except AttributeError:
                         self.log(f"   ⏭ [{lbl}] 이 브로커는 일괄 청산 미지원 — 건너뜀")
+                        failed.append(lbl)            # 닫지 않았다 - '완료'로 세지 않는다(X)
                     except Exception as e:
                         self.log(f"   ❌ [{lbl}] 청산 실패: {str(e)[:100]}")
                         self._report_error("close_all", e)
-            self.log("   ✅ " + (f"전체 청산 완료 — 포지션 {n_closed}개 정리" if ko
-                                else f"Close-all done — {n_closed} positions flattened"))
+                        failed.append(lbl)
+            if not failed:
+                self.log("   ✅ " + (f"전체 청산 완료 — 포지션 {n_closed}개 정리" if ko
+                                    else f"Close-all done — {n_closed} positions flattened"))
+                return
+            _fl = ", ".join(failed[:8]) + (" …" if len(failed) > 8 else "")
+            self.log("   ⚠ " + (f"전체 청산 미완료 — 끝내지 못한 계좌: {_fl} (정리된 포지션 {n_closed}개)" if ko
+                                else f"Close-all incomplete — not finished: {_fl} ({n_closed} positions flattened)"))
+            try:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "EQ Autopilot",
+                    (f"전체 청산이 다 끝나지 않았습니다.\n\n끝내지 못한 계좌: {_fl}\n"
+                     f"정리된 포지션: {n_closed}개\n\n포지션과 주문이 브로커에 남아 있을 수 있습니다. "
+                     "계좌별 원인은 로그에 있습니다."
+                     if ko else
+                     f"Close-all did not fully finish.\n\nNot finished: {_fl}\n"
+                     f"Positions flattened: {n_closed}\n\nPositions and orders may still be open at the "
+                     "broker. The per-account cause is in the log.")))
+            except Exception:
+                pass
         import threading as _th
         _th.Thread(target=w, daemon=True).start()
 
@@ -9806,6 +13109,22 @@ class App:
                                     stop_loss_price=stop, custom_tag=_ctag, dry_run=not live)
             if res.get("skipped"):
                 return
+            if res.get("error") and live and _entry_err_unknown(res.get("error")):
+                # B(오픈 준비 버그 조사 2026-10-06): 타임아웃·연결 끊김·5xx는 '거절'이 아니라 '모름'이다. 크립토는
+                # 손절이 주문에 붙어 나가므로(stopLoss·presetStopLossPrice) 들어갔다면 손절도 있다 - 보고만 사실대로.
+                _em = str(res.get("error"))[:300]
+                self.log(f"   ⚠ [{lbl}] 진입 결과 미확인: {_em} — 주문이 들어갔다면 손절은 주문에 함께 붙어 있습니다.")
+                self._report_error(f"entry:{asset}", _em)
+                self._send_ev("entry_fail", asset, why="error", err=_em[:120])   # 'rejected'(거절)가 아니다
+                self.root.after(0, lambda m=_em, a=asset, L=lbl: messagebox.showwarning(
+                    "진입 결과 미확인" if self.lang == "ko" else "Entry result unconfirmed",
+                    (f"[{L}] {a} 진입 주문을 보내는 중 오류가 나 결과를 확인하지 못했습니다:\n\n{m}\n\n"
+                     "주문이 들어갔다면 손절은 주문에 함께 붙어 있습니다. 브로커 화면에서 포지션 확인이 필요합니다."
+                     if self.lang == "ko" else
+                     f"[{L}] The {a} entry order hit an error while sending, so the result could not be "
+                     f"confirmed:\n\n{m}\n\nIf the order went in, its stop is attached to it. The position "
+                     "needs checking at your broker.")))
+                return
             if res.get("error"):
                 self.log(f"   ❌ [{lbl}] 진입 실패: {res.get('error')}")
                 _em = str(res.get("error"))[:300]; _hint = _entry_fail_hint(_em, self.lang == "ko")
@@ -9854,19 +13173,59 @@ class App:
                 (f"[{L}] {a} 진입 중 오류:\n\n{m}" if self.lang == "ko"
                  else f"[{L}] {a} entry error:\n\n{m}")))
 
-    def _sig_loop(self, url):
+    def _sig_loop(self, url, gen=None):
         # 무장 계좌 설정은 self._sig_accts에서 동적으로 읽는다(계좌별 무장/해제 즉시 반영).
         # {(asset,idx): {broker,f1,f2,f3,acct,one_r,live,label}} — 신호 자산(key[0]==자산)을 굴리는
         # 계좌 전부에 각자 1R로 진입한다(대표 2026-07-24 자산별 계좌).
         import time as _t
         import requests
         import autopilot_crypto
-        last_id = None
-        entered_day = {}       # {(key, dedup_key): 발행날짜}. 계좌·세션별 하루 1회 재진입 금지
-        while self._sig_on:
+        # 처리 기록은 루프가 아니라 앱이 든다(버그 조사 재검증 2026-10-06 3). 종전엔 last_id·entered_day가 루프 지역이라,
+        # 정지→시작(새 세대)이면 새 루프가 처리 기록 없이 시작해 발행 60초 안의 같은 신호를 다시 처리했다 - 방금 잡은 포지션을
+        # '이전 세션 잔여'로 닫고 다시 진입했고(수수료 두 번, ProjectX는 옛 손절이 남아 손절 둘), 옛 루프의 진입이 아직 돌던
+        # 계좌는 두 배가 될 수 있었다. 서버 클레임은 같은 기기를 다시 허가하므로 막지 못했다. 이제 새 세대가 이어받는다.
+        #   _sig_seen = (맡은 신호 id, 맡은 세대) / _sig_entered_day = {((자산, 행), 세션 키): 발행 날짜}(계좌·세션별 하루 1회)
+        entered_day = getattr(self, "_sig_entered_day", None)
+        if not isinstance(entered_day, dict):
+            entered_day = self._sig_entered_day = {}
+
+        def _seen_id():
+            _s = getattr(self, "_sig_seen", None)
+            return _s[0] if isinstance(_s, tuple) and _s else None
+
+        def _take(sid):
+            """이 신호를 이 루프가 맡는다. 이미 맡긴 신호(어느 세대든)면 (False, None). 맡으면 (True, 되돌릴 이전 값)."""
+            with _SIG_SEEN_LOCK:
+                if not sid or sid == _seen_id():
+                    return False, None
+                _prev = getattr(self, "_sig_seen", None)
+                self._sig_seen = (sid, gen)
+                return True, _prev
+
+        def _give_back(sid, prev, marks=()):
+            """발주하지 않고 빠지는 루프: 맡은 표시와 이번에 단 재진입 금지 표시를 되돌려, 새 루프가 이 신호를 처리하게 한다.
+            표시가 이미 이 루프 것이 아니면(새 루프가 맡았으면) 맡은 표시는 건드리지 않는다."""
+            with _SIG_SEEN_LOCK:
+                for _mk in marks:
+                    entered_day.pop(_mk, None)
+                if getattr(self, "_sig_seen", None) == (sid, gen):
+                    self._sig_seen = prev if isinstance(prev, tuple) else None
+
+        # 세대 확인(오픈 준비 버그 조사 2026-10-06 A): 정지→시작이 이 루프의 한 바퀴(피드 조회+3초,
+        # 진입 중이면 최대 45초 join)보다 빠르면 새 루프가 떠 있는데 이 루프도 살아 있었다 - 두 루프가
+        # 이후 신호를 각자 처리해 계좌마다 두 번 진입했다. 자기 세대가 아니면 while·계좌 선별 직전·발주 직전에 빠진다.
+        # ⚠️세대 확인만으로는 '같은 신호 재처리'가 막히지 않았다(재검증 3 - 종전 주석·커밋의 '이중 진입 없음'은 과장): 발주 직전
+        # 확인을 이미 지난 옛 루프는 그 진입을 끝내고, 새 루프는 처리 기록 없이 시작했다. 그 몫은 위 공유 처리 기록이 맡는다.
+        # gen=None은 세대 확인 없음(시험용).
+        def _mine():
+            return gen is None or gen == getattr(self, "_sig_gen", gen)
+
+        while self._sig_on and _mine():
             self._alive_ping(armed=True)          # 생존 핑(4분 스로틀) - 다운 알림의 심박
             try:
+                _fq0 = _t.time()
                 r = requests.get(url, params={"t": int(_t.time())}, timeout=8)
+                self._note_clock(getattr(r, "headers", None), _fq0, _t.time())   # PC 시계 차이(W) - 폴마다 잰다
                 sig = autopilot_crypto.decrypt(self._token, r.text) if r.ok else {}
             except Exception as e:
                 self._feed_errs = getattr(self, "_feed_errs", 0) + 1
@@ -9881,9 +13240,9 @@ class App:
             self._feed_errs = 0
             self._note_exit_ts(sig)      # 서버 지정 계획 청산 시각(뉴스 선행 청산) 반영
             sid = sig.get("id")
+            _ntr = not (sig.get("tradeable") and sig.get("direction"))
             # no-trade(거래 없음) 신호도 새로 오면 '받았다'만 표시(포지션은 안 잡음).
-            if sid and sid != last_id and not (sig.get("tradeable") and sig.get("direction")):
-                last_id = sid
+            if sid and _ntr and _take(sid)[0]:
                 import datetime as _dtl0
                 _recv0 = _dtl0.datetime.now()
                 _pub0 = sig.get("published_at")
@@ -9894,8 +13253,8 @@ class App:
                 self.log(f"\n📭 신호 수신 [{sid}] — {sig.get('instrument') or ''}, NO-TRADE (거래 없음, 포지션 안 잡음)")
                 self.log(f"   ⏱ 보낸 시각 {_sent0.strftime('%H:%M:%S') if _sent0 else '?'} ,  "
                          f"받은 시각 {_recv0.strftime('%H:%M:%S')}")
-            if sid and sid != last_id and sig.get("tradeable") and sig.get("direction"):
-                last_id = sid    # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지)
+            _took, _prev_seen = _take(sid) if (sid and not _ntr) else (False, None)
+            if _took:            # 이 신호 id는 처리/스킵 완료로 표시(매 폴 재판단 방지) - 새 세대도 이어받는다(재검증 3)
                 _asset = str(sig.get("instrument") or "").upper()   # NQ/GC/BTC
                 _sess = sig.get("session")                          # BTC 2세션(22/2), 나머지 None
                 _dedup_key = f"{_asset}:{_sess}" if _sess is not None else _asset  # 세션별 재진입 판정
@@ -9912,30 +13271,65 @@ class App:
                 # 신선도/발행일 게이트 (시그널 단위 1회, 계좌 무관)
                 import datetime as _dtd
                 _pub_ts = sig.get("published_at")
+                # 나이는 서버 시각 기준(오픈 준비 버그 조사 2026-10-06 W): 피드 응답 Date로 잰 시계 차이를 빼서 '지금'을
+                # 서버 시각으로 맞춘다. 종전 PC 시계 기준은 시계가 1분 넘게 빠르면 모든 신호를 '오래됨'으로 건너뛰고,
+                # 느리면 오래된 신호도 통과시켰다. 차이를 못 잰 경우(헤더 없음)만 종전처럼 PC 시계.
+                _skew = self._clock_skew_now()
                 try:
-                    _age = _t.time() - float(_pub_ts) if _pub_ts is not None else None
+                    _age = ((_t.time() - (_skew or 0.0)) - float(_pub_ts)) if _pub_ts is not None else None
                     _sig_day = (_dtd.datetime.fromtimestamp(float(_pub_ts)).date()
                                 if _pub_ts is not None else None)
                 except (TypeError, ValueError):
                     _age, _sig_day = None, None
+                _ko_s = self.lang == "ko"
                 # 🛑 오래된 신호로 실수 진입 방지: published_at이 최근(MAX_SIGNAL_AGE_SEC 이내)이 아니면
                 # 진입하지 않고 새 신호를 기다린다. 발행시각 불명이면 안전상 진입 안 함.
                 if _age is None or _age > MAX_SIGNAL_AGE_SEC:
+                    _base_s = ("" if _skew is None else (" 서버 시각 기준" if _ko_s else " by server time"))
                     if _age is None:
-                        _why = "발행시각 불명(안전상 스킵)"
+                        _why = "발행시각 불명(안전상 스킵)" if _ko_s else "publish time unknown (skipped for safety)"
                     elif _age < 300:
-                        _why = f"발행 {_age:.0f}초 전(1분 초과, 오래됨)"
+                        _why = (f"발행 {_age:.0f}초 전{_base_s}(1분 초과, 오래됨)" if _ko_s
+                                else f"published {_age:.0f} s ago{_base_s} (over 1 min, stale)")
                     else:
-                        _why = f"발행 {_age / 60:.0f}분 전(오래됨)"
-                    self.log(f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 새 신호를 기다립니다.")
+                        _why = (f"발행 {_age / 60:.0f}분 전{_base_s}(오래됨)" if _ko_s
+                                else f"published {_age / 60:.0f} min ago{_base_s} (stale)")
+                    self.log((f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 새 신호를 기다립니다." if _ko_s
+                              else f"\n⏸ Signal [{sid}] {_asset} not entered — {_why}. Waiting for the next signal."))
                     self._entry_skip_ev(_asset, "stale_signal")
+                    _t.sleep(SIG_POLL_SECS); continue
+                # 🛑 미래 발행(나이 음수) 거부(W + ChatGPT 교차 검토 '시계 느림'): 발행 시각이 '지금'보다 뒤면 시계가
+                # 어긋난 것이다 - 서버 시각을 못 잰 상태면 PC 시계가 느린 것이고, 그때는 오래된 신호도 젊어 보인다.
+                if _age < -FUTURE_SIGNAL_TOL_SEC:
+                    if _skew is None:
+                        _why = (f"발행 시각이 이 PC 시계보다 {-_age:.0f}초 뒤(PC 시계가 느림)" if _ko_s
+                                else f"publish time is {-_age:.0f} s after this PC's clock (PC clock behind)")
+                    else:
+                        _why = (f"발행 시각이 서버 시각보다 {-_age:.0f}초 뒤" if _ko_s
+                                else f"publish time is {-_age:.0f} s after the server time")
+                    self.log((f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — {_why}. 안전상 진입하지 않습니다." if _ko_s
+                              else f"\n⏸ Signal [{sid}] {_asset} not entered — {_why}. Not entered for safety."))
+                    self._entry_skip_ev(_asset, "clock_skew" if _skew is None else "future_signal")
                     _t.sleep(SIG_POLL_SECS); continue
                 direction, stop = sig.get("direction"), sig.get("stop_price")
                 # size 배수(신뢰도 사이징) — 0~3 클램프(랜딩 '거래당 최대 3R' 캡과 일치).
-                try:
-                    _mult = float(sig.get("size_mult") or 1.0)
-                except (TypeError, ValueError):
+                # (오픈 준비 버그 조사 2026-10-06 size_mult0) 필드가 없을 때만 1.0. 종전 `or 1.0`은 명시적 0을 1배로 바꿨다 -
+                # 지금 서버는 0을 거래 없음(tradeable=False)으로만 보내 도달하지 않지만, 0 이하·못 읽는 값은 진입하지 않는다.
+                _sm_raw = sig.get("size_mult")
+                if _sm_raw is None or (isinstance(_sm_raw, str) and not _sm_raw.strip()):
                     _mult = 1.0
+                else:
+                    try:
+                        _mult = float(_sm_raw)
+                    except (TypeError, ValueError):
+                        _mult = float("nan")
+                if not (_mult > 0):                  # 0·음수·NaN
+                    self.log((f"\n⏸ 신호 [{sid}] {_asset} 진입 안 함 — 신호 배수(size_mult)가 {_sm_raw!r}(0 이하 또는 읽지 못함)."
+                              if _ko_s else
+                              f"\n⏸ Signal [{sid}] {_asset} not entered — size multiplier (size_mult) is {_sm_raw!r} "
+                              "(zero or below, or unreadable)."))
+                    self._entry_skip_ev(_asset, "size_mult0")
+                    _t.sleep(SIG_POLL_SECS); continue
                 _mult = max(0.0, min(_mult, 3.0))
                 import datetime as _dtl
                 _recv = _dtl.datetime.now(); _pub = sig.get("published_at")
@@ -9946,16 +13340,57 @@ class App:
                     _lat = f"{_recv.timestamp() - float(_base):.1f}s" + (" (마감 기준)" if sig.get("barclose_ts") else "")
                 except (TypeError, ValueError):
                     _sent, _lat = None, "?"
+                if not (self._sig_on and _mine()):
+                    _give_back(sid, _prev_seen)                   # 발주 전이다 - 새 루프(또는 다시 무장)가 처리하게 넘긴다
+                    break                                         # 낡은 루프(A) - 새 루프가 이 신호를 처리한다
                 # 🚫 재진입 금지(계좌·세션별 하루 1회) → 발주 대상 계좌 선별
                 # 수동 계좌(manual)는 자동 발주 대상이 아니라 '티켓만' 표시(진입은 사용자가 직접).
                 _fire = []
                 _manual = []
+                _changed = 0
+                _marks = []                                       # 이번에 단 재진입 금지 표시(발주 전에 빠지면 되돌린다)
                 _watching = bool(getattr(self, "_watch_only", False))
+                # 앱을 다시 켠 경우(버그 조사 재검증 2026-10-06 3, Z): 위 처리 기록은 메모리라 앱 재시작을 넘지 못한다. 이 자산의
+                # 마지막 실진입 시각(.entered.json - 체결 확인 뒤 기록, 재시작을 넘긴다)이 이 신호 발행 뒤면, 이 신호는 앞선 실행에서
+                # 이미 진입한 것이다(같은 자산 신호는 몇 시간 간격이라 발행 뒤의 진입은 이 신호 것뿐). 체결 확인 전에 꺼졌으면 기록이
+                # 없어 종전처럼 처리한다. 서버 시각 차이를 잰 경우 그만큼 맞춘다(W). 확인 모드(Operator)는 진입이 없어 보지 않는다.
+                _pre_at = None
+                if not _watching and _pub_ts is not None:
+                    try:
+                        _ent0 = getattr(self, "_entered_at", None)
+                        _ea0 = float((_ent0 if isinstance(_ent0, dict) else {}).get(_asset) or 0)
+                        if _ea0 and (_ea0 - (_skew or 0.0)) > float(_pub_ts):
+                            _pre_at = _ea0
+                    except (TypeError, ValueError):
+                        _pre_at = None
                 for _key, _cfg in targets:
                     if _sig_day is not None and entered_day.get((_key, _dedup_key)) == _sig_day:
                         self.log(f"   ⏹ [{_cfg.get('label')}] {_asset} 오늘({_sig_day}) 이미 진입 — 재진입 금지.")
                         continue
+                    if _pre_at is not None:
+                        _pre_s = _dtd.datetime.fromtimestamp(_pre_at).strftime("%H:%M:%S")
+                        self.log((f"   ⏹ [{_cfg.get('label')}] {_asset} 이 신호 발행 뒤에 이미 진입한 기록({_pre_s})이 있어 "
+                                  "다시 진입하지 않습니다.") if _ko_s else
+                                 (f"   ⏹ [{_cfg.get('label')}] {_asset} an entry is already recorded after this signal "
+                                  f"was published ({_pre_s}), so it is not entered again."))
+                        if _sig_day is not None:
+                            entered_day[(_key, _dedup_key)] = _sig_day
+                        continue
+                    if not _watching:
+                        # 가동 중 바뀐 계좌 설정을 이 신호에 반영(오픈 준비 버그 조사 2026-10-06 C):
+                        # 무장 때 사본이 아니라 지금 설정의 1R·프롭·한 계약 한도·라벨로 진입하고,
+                        # 실행 체크를 껐거나 계좌 ID·브로커가 바뀐 행은 진입하지 않는다.
+                        try:
+                            _cfg2, _skipmsg = self._live_acct_cfg(_key, _cfg)
+                        except Exception:
+                            _cfg2, _skipmsg = _cfg, ""            # 다시 읽기 실패 = 종전 동작(무장 사본) - 루프를 죽이지 않는다
+                        if _cfg2 is None:
+                            self.log(f"   ⏭ {_skipmsg}")
+                            _changed += 1
+                            continue
+                        _cfg = _cfg2
                     entered_day[(_key, _dedup_key)] = _sig_day   # 성공/실패 무관 — 같은 날 재진입 금지
+                    _marks.append((_key, _dedup_key))
                     if _watching:
                         continue                                  # 아래에서 계좌 단위가 아니라 한 번만 확인 카드
                     (_manual if _cfg.get("manual") else _fire).append(_cfg)
@@ -9968,7 +13403,25 @@ class App:
                     for _cfg in _manual:
                         self._manual_ticket(_cfg, sig, _asset, direction, stop, _mult)
                 if not _fire:
+                    if _changed and not _manual:
+                        self._entry_skip_ev(_asset, "no_account")   # 켜진(유효한) 계좌가 하나도 안 남음(C)
                     _t.sleep(SIG_POLL_SECS); continue
+                # ⏸ PC 시계가 서버와 MAX_CLOCK_SKEW_SEC 넘게 어긋나면 새 자동 진입 보류(오픈 준비 버그 조사 2026-10-06 W).
+                # 나이는 위에서 서버 시각으로 맞췄지만, 세션 마감 청산·BTC 블록 판정은 PC 시계로 돈다 - 어긋난 시계로
+                # 포지션을 열면 청산이 엉뚱한 시각에 난다. 열린 포지션·손절·청산은 건드리지 않는다(새 진입만).
+                _skew_h = self._clock_skew_now()
+                if _skew_h is not None and abs(_skew_h) > MAX_CLOCK_SKEW_SEC:
+                    self.log((f"\n⏸ 신호 [{sid}] {_asset} 자동 진입 보류 — {self._clock_skew_text(_skew_h)}"
+                              f"(허용 {MAX_CLOCK_SKEW_SEC}초). 세션 마감 청산 시각도 PC 시계를 따르므로 시계가 맞을 때까지 "
+                              "새 진입을 하지 않습니다." if _ko_s else
+                              f"\n⏸ Signal [{sid}] {_asset} automatic entry held — {self._clock_skew_text(_skew_h)} "
+                              f"(limit {MAX_CLOCK_SKEW_SEC} s). Session-close exits also follow the PC clock, so no new "
+                              "entry is made until the clock is right."))
+                    self._entry_skip_ev(_asset, "clock_skew")
+                    _t.sleep(SIG_POLL_SECS); continue
+                if not (self._sig_on and _mine()):
+                    _give_back(sid, _prev_seen, _marks)           # 발주 전이다 - 맡은 표시·재진입 금지 표시를 되돌린다(재검증 3)
+                    break                                         # 발주 직전 세대 재확인(A)
                 self.log(f"\n📶 신호 캡처 [{sid}] — {_asset} {direction}, 손절 {stop}, "
                          f"진입참조 {sig.get('entry_ref')}, size×{_mult:.2f}, {len(_fire)}개 계좌 자동 진입")
                 self.log(f"   ⏱ 보낸 시각 {_sent.strftime('%H:%M:%S') if _sent else '?'} ,  "
@@ -10061,7 +13514,75 @@ def _bind_clipboard(root):
         pass
 
 
+_INSTANCE_LOCK_FH = None      # 단일 실행 잠금 파일 핸들 - 프로세스가 끝날 때까지 쥐고 있어야 잠금이 유지된다
+
+
+def _acquire_instance_lock():
+    """설정 폴더(APP_DIR)마다 앱 하나만(오픈 준비 버그 조사 2026-10-06 O). 같은 폴더를 쓰는 앱 두 개가 다 라이브면
+    기기 ID(.machine_id)가 같아 서버 진입 클레임이 둘 다 허가하고, 같은 신호에 주문이 두 번 나간다(업데이트 날 옛 창을
+    켜 둔 채 새 zip을 다른 폴더에 풀어 실행하는 경우). 윈도 msvcrt.locking, 맥 fcntl.flock - 프로세스가 끝나면(강제
+    종료·크래시 포함) OS가 풀어 주므로 남은 잠금 때문에 못 켜지는 일은 없다. --profile은 폴더가 달라 따로 잡힌다.
+    True = 잡았음(또는 이 환경에서 잠금을 쓸 수 없음 - 그때는 막지 않는다), False = 다른 프로세스가 이미 쥐고 있음."""
+    global _INSTANCE_LOCK_FH
+    import errno as _en
+    try:
+        fh = open(os.path.join(APP_DIR, ".instance.lock"), "a+")
+    except Exception:
+        return True
+    try:
+        if sys.platform.startswith("win"):
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        _busy = e.errno in {_en.EACCES, _en.EAGAIN, getattr(_en, "EWOULDBLOCK", _en.EAGAIN),
+                            getattr(_en, "EDEADLK", _en.EAGAIN), getattr(_en, "EDEADLOCK", _en.EAGAIN)}
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return not _busy
+    except Exception:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return True
+    _INSTANCE_LOCK_FH = fh
+    return True
+
+
+def _already_running_notice():
+    """이미 실행 중이라 이 창을 열지 않는다는 사실을 알린다(O). 언어는 저장된 설정을 따른다."""
+    try:                                   # 언어만 읽는다 - _load()는 키체인까지 읽으므로 여기선 쓰지 않는다
+        import yaml
+        with open(CFG_PATH) as f:
+            _ko = ((yaml.safe_load(f) or {}).get("lang", "ko") == "ko")
+    except Exception:
+        _ko = True
+    _msg = ("이 컴퓨터에서 EQ Autopilot이 이미 실행 중입니다(같은 설정 폴더).\n"
+            "두 창이 함께 돌면 같은 신호에 주문이 두 번 나갈 수 있어 이 창은 열지 않습니다."
+            if _ko else
+            "EQ Autopilot is already running on this computer (same settings folder).\n"
+            "Two windows running together could send the same signal's order twice, so this window does not open.")
+    _log_to_file("⛔ " + _msg.replace("\n", " "))
+    try:
+        _r = tk.Tk()
+        _r.withdraw()
+        messagebox.showwarning("EQ Autopilot", _msg, parent=_r)
+        _r.destroy()
+    except Exception:
+        pass
+
+
 def main():
+    # 단일 실행(오픈 준비 버그 조사 2026-10-06 O) - Tk를 띄우기 전에 잡는다.
+    if not _acquire_instance_lock():
+        _already_running_notice()
+        return
     root = tk.Tk()
     # 창·작업표시줄 아이콘(대표 2026-08-11 "이상한 모양 나와") - exe 아이콘(spec)과 별개로
     # 런타임 Tk 아이콘을 명시해야 기본 깃털이 안 뜬다. 윈도=ico, 맥/기타=png 폴백.

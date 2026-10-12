@@ -117,6 +117,8 @@ ck("⑦ 소수점 없는 6~7자리 가격(BTC 100250, 1234567)도 그대로", _m
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"), encoding="utf-8").read()
 ck("⑥ 로그 문구 '본절(=블록0 시가)'·'(본절)' 없음, '진입 기준가' 있음",
    "본절(=블록0 시가)" not in src and '" (본절)"' not in src and "진입 기준가(=블록0 시가)" in src)
-ck("버전 2026.10.03b", 'APP_VER = "2026.10.03b"' in src)
+import re as _re
+_v = _re.search(r'_APP_VER = "([^"]+)"', src).group(1)
+ck("버전 03b 이상", _v >= "2026.10.03b", _v)
 print("\n" + ("전부 통과" if not FAIL else f"실패 {len(FAIL)}"))
 sys.exit(1 if FAIL else 0)

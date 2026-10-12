@@ -12,7 +12,7 @@ import time
 
 import requests
 
-from .base import BrokerAdapter, FlattenResult, Position
+from .base import BrokerAdapter, FlattenResult, Position, refuse_flatten_without_accounts
 
 _TIMEOUT = (10, 30)
 _TOKEN_TTL = 24 * 60 * 60       # ProjectX session token ~24h
@@ -45,6 +45,9 @@ _SIDE = {"BUY": 0, "LONG": 0, "BID": 0, 0: 0, "SELL": 1, "SHORT": 1, "ASK": 1, 1
 
 # 계약 메타데이터 조회 실패 시 폴백 틱사이즈(우리가 다루는 심볼만).
 _FALLBACK_TICK = {"MNQ": 0.25, "NQ": 0.25, "MGC": 0.1, "GC": 0.1}
+# flatten_all 대기(초, 오픈 준비 버그 조사 2026-10-06 G): closeContract 1회 재시도 전 / 청산 반영 재조회 전.
+_CLOSE_RETRY_WAIT = 1.0
+_RECHECK_WAIT = 1.5
 
 
 def _side_code(side):
@@ -219,27 +222,78 @@ class ProjectXBroker(BrokerAdapter):
 
     # ── act ───────────────────────────────────────────────────────────────
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+        """계좌 포지션 전부 시장가 청산 → 재조회 → **플랫으로 확인된 계약의** 잔여 주문만 취소.
+
+        순서(오픈 준비 버그 조사 2026-10-06 G): 종전엔 청산 → 계좌 주문 **전부** 취소 → 재조회였다.
+        closeContract가 실패해도(5xx·시간 초과·거절) 그 계약의 보호 손절까지 걷어 손절 없는 포지션이
+        남았다(IBKR close_contract는 2026-09-30에 '청산 → 플랫 확인 → 취소'로 이미 고쳤다).
+        이제 재조회에서 아직 열려 있는 계약과, 재조회 실패로 확인 못 한 청산 대상 계약의 주문은 손대지
+        않는다. closeContract가 실패했어도 재조회가 플랫이면(그 사이 손절 체결 등) 남은 주문은 고아라 걷는다 -
+        남기면 그 스탑이 나중에 혼자 체결돼 새 포지션을 연다. 포지션이 없던 계약의 고아 주문 정리는 종전 그대로다."""
+        _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
+        if _refuse is not None:
+            return _refuse
         plan = self.list_open_positions()
         res = FlattenResult(dry_run=dry_run, planned=list(plan))
         if dry_run:
             return res
+
+        def _k(p):                                   # (계좌, 계약) - 주문의 accountId/contractId와 같은 꼴
+            return (str((p.raw or {}).get("_accountId", p.account_id)),
+                    str((p.raw or {}).get("contractId") or p.symbol))
+        failed = set()                               # closeContract가 재시도까지 실패한 (계좌, 계약)
         for pos in plan:
-            try:
-                # closeContract market-closes the entire position for {accountId, contractId}.
-                self._post("/api/Position/closeContract", {
-                    "accountId": int(pos.raw["_accountId"]),
-                    "contractId": pos.raw.get("contractId"),
-                })
-            except Exception as e:
-                res.errors.append(f"{pos.account_name}/{pos.symbol}: {e}")
-        # "Flat" = no positions AND no working orders. Cancel any resting orders (e.g. a protective
-        # stop left behind after the position closed) so a leftover stop can't re-open a position
-        # next session. Best-effort: failures are logged, never block the position close above.
-        for a in self._accounts():
+            err = None
+            for _try in range(2):                    # 일시 오류 대비 1회 재시도(G)
+                try:
+                    # closeContract market-closes the entire position for {accountId, contractId}.
+                    self._post("/api/Position/closeContract", {
+                        "accountId": int(pos.raw["_accountId"]),
+                        "contractId": pos.raw.get("contractId"),
+                    })
+                    err = None
+                    break
+                except Exception as e:
+                    err = e
+                    if _try == 0:
+                        time.sleep(_CLOSE_RETRY_WAIT)
+            if err is not None:
+                failed.add(_k(pos))
+                res.errors.append(f"{pos.account_name}/{pos.symbol}: {err}")
+        # Confirm-after-act **먼저**: 재조회로 플랫을 확인한 뒤에만 그 계약의 주문을 걷는다.
+        planned_keys = {_k(p) for p in plan}
+        still = None
+        try:
+            still = self.list_open_positions()
+            # 시장가 청산이 조회에 반영되기 전일 수 있다 - 청산 요청이 성공한 계약이 남아 보이면 한 번만 다시 본다.
+            if any(_k(s) in planned_keys and _k(s) not in failed for s in still):
+                time.sleep(_RECHECK_WAIT)
+                still = self.list_open_positions()
+            res.closed = [p for p in plan if not any(
+                s.account_id == p.account_id and s.symbol == p.symbol for s in still)]
+            for p in still:
+                res.errors.append(f"STILL OPEN after flatten: {p.account_name}/{p.symbol} "
+                                  f"net={p.net_qty} (its working orders, incl. the stop, left in place)")
+        except Exception as e:
+            res.errors.append(f"post-flatten position re-check failed: {e} "
+                              f"(working orders on planned contracts left in place)")
+        # 주문을 남길 계약: 재조회에서 아직 열린 것. 재조회가 실패했으면 청산하려던 계약 전부.
+        keep = {_k(s) for s in still} if still is not None else set(planned_keys)
+        # "Flat" = no positions AND no working orders. Cancel resting orders on contracts confirmed flat
+        # (e.g. a protective stop left behind after the position closed) so a leftover stop can't re-open
+        # a position next session. Best-effort: failures are logged, never block the position close above.
+        try:
+            accts = self._accounts()
+        except Exception as e:
+            accts = []
+            res.errors.append(f"open-order cleanup skipped: account read failed: {e}")
+        for a in accts:
             aid = a.get("id")
             try:
                 for o in self._open_orders(aid):
                     oid = o.get("id")
+                    if (str(aid), str(o.get("contractId"))) in keep:
+                        continue                     # 열린(또는 확인 못 한) 계약의 보호 손절은 남긴다(G)
                     try:
                         self._cancel_order(aid, oid)
                         res.cancelled.append(f"{a.get('name', aid)}:{oid}")
@@ -247,16 +301,6 @@ class ProjectXBroker(BrokerAdapter):
                         res.errors.append(f"cancel order {oid} failed: {e}")
             except Exception as e:
                 res.errors.append(f"{a.get('name', aid)}: open-order read failed: {e}")
-        # Confirm-after-act: re-read; anything still open is an error to alert on loudly.
-        try:
-            still = self.list_open_positions()
-            res.closed = [p for p in plan if not any(
-                s.account_id == p.account_id and s.symbol == p.symbol for s in still)]
-            for p in still:
-                res.errors.append(f"STILL OPEN after flatten: {p.account_name}/{p.symbol} "
-                                  f"net={p.net_qty}")
-        except Exception as e:
-            res.errors.append(f"post-flatten position re-check failed: {e}")
         return res
 
     def entry_info(self) -> list:

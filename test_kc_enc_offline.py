@@ -57,7 +57,10 @@ raw = open(eqgui.CFG_PATH, encoding="utf-8").read()
 d = yaml.safe_load(raw) or {}
 chk("YAML에 평문 비밀 0(f3·f2)", F3 not in raw and F2 not in raw)
 chk("kc_enc 블롭 있음 · kc_failed 없음", bool((d.get("kc_enc") or {}).get("blob")) and not d.get("kc_failed"))
-chk("kc_enc.fields = 비밀 필드 전부 + f2", sorted(d["kc_enc"]["fields"]) == sorted([f"{a3}|{b3}|{f}" for f in eqgui._secret_fields(b3)] + ["f2|user@x"]))
+_h = "f2|#" + eqgui.hashlib.sha256(b"user@x").hexdigest()[:10]
+chk("kc_enc.fields = 비밀 필드 전부 + f2(해시 이름)", sorted(d["kc_enc"]["fields"]) == sorted([f"{a3}|{b3}|{f}" for f in eqgui._secret_fields(b3)] + [_h]))
+chk("(나) kc_enc.fields·YAML에 f1 원문 없음", "user@x" not in str(d["kc_enc"]["fields"]) and "f2|user@x" not in raw)
+chk("(나) 해시 이름 라벨 = 'API secret'", eqgui._enc_label(_h) == "API secret")
 chk("PIN 두 번 물음(설정+확인)", len(PROMPTS) == 2 and not PINS)
 chk("메모리 acfg는 그대로(세션 동작)", acfg[a3]["creds"][b3]["f3"] == F3)
 chk("표시 상태 _KC_LAST_ENC N개·_KC_LAST_FAILED 0", len(eqgui._KC_LAST_ENC) == NSEC and not eqgui._KC_LAST_FAILED)
@@ -128,6 +131,68 @@ src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"),
 chk("f2 읽기 사이트 전부 _f2_load 경유(직접 _kc_load(f1)은 헬퍼 안 1곳뿐)", len(re.findall(r"_kc_load\((f1|_f1|user)\)", src)) == 1)
 chk("f2 저장 사이트 전부 _f2_save 경유", not re.search(r"_kc_save\((_f1_now|_f1, _f2|user or f1)", src))
 chk("기동 되채움이 __init__에 배선", "self._enc_unlock_startup()" in src)
+_i_call = src.index("self._enc_unlock_startup()")
+chk("기동 되채움 앞에서 _kc_enc_pending·_kc_failed를 정함(순서)",
+    0 <= src.index("self._kc_enc_pending = _d0.get(") < _i_call and 0 <= src.index("self._kc_failed = list(_d0.get(") < _i_call
+    and src.count("self._kc_enc_pending = ") == 1 and src.count("self._kc_failed = list(_d0.get(") == 1)
+
+# ⑨ 기동 되채움으로 메모리에 오른 f2 → 키체인이 되면 다음 저장에서 키체인으로 옮기고 블롭(kc_enc)을 지운다(2026-10-07 재리뷰)
+_store = {}
+eqgui._kc_save = lambda a, v, *x, **k: (_store.__setitem__(a, v) or True) if v else False
+eqgui._kc_load = lambda a, *x, **k: _store.get(a, "")
+eqgui._ENC_SECRETS.clear(); eqgui._ENC_SECRETS["f2|restored@x"] = "RESTORED-F2"
+PROMPTS[:] = []
+eqgui._save_full("ko", "tok", {a3: {"broker": b3, "creds": {b3: {"f1": "restored@x", "f3": "", "avail": []}},
+                                     "include": True, "accounts": []}})
+raw = open(eqgui.CFG_PATH, encoding="utf-8").read(); d = yaml.safe_load(raw) or {}
+chk("되채운 f2 → 키체인 이동·kc_enc 없음·PIN 프롬프트 0", _store.get("restored@x") == "RESTORED-F2"
+    and not d.get("kc_enc") and not eqgui._ENC_SECRETS and not PROMPTS and "RESTORED-F2" not in raw)
+
+# ⑩ 블롭 유지(2026-10-07): PIN을 열지 못한 기동(carry)에서 새로 보관할 것이 없으면 지난 kc_enc·kc_failed를 그대로 다시 싣는다
+eqgui._kc_save = lambda *a, **k: False
+eqgui._kc_load = lambda *a, **k: ""
+eqgui._ENC_SECRETS.clear(); eqgui._ENC_PIN = None
+_old_blob = eqgui._enc_pack("2468", {"GC|nt8|f1": "OLD-TOKEN-xyz", "f2|old@x": "OLD-F2"})
+with open(eqgui.CFG_PATH, "w") as _f:
+    yaml.safe_dump({"lang": "ko", "token": "t", "assets": {}, "kc_failed": ["GC/nt8/f1"],
+                    "kc_enc": {"blob": _old_blob, "fields": ["GC|nt8|f1", "f2|#abc"]}}, _f)
+_carry = {"kc_enc": {"blob": _old_blob, "fields": ["GC|nt8|f1", "f2|#abc"]}, "kc_failed": ["GC/nt8/f1"]}
+_plain = {"NQ": {"broker": "projectx", "creds": {"projectx": {"f1": "", "f3": ""}}, "include": True, "accounts": []}}
+PINS[:] = []; PROMPTS.clear()
+eqgui._save_full("ko", "tok", _plain, carry=_carry)
+d = yaml.safe_load(open(eqgui.CFG_PATH, encoding="utf-8").read()) or {}
+chk("carry: 새 비밀 없음 → 지난 블롭·kc_failed 그대로·PIN 프롬프트 0", (d.get("kc_enc") or {}).get("blob") == _old_blob
+    and d.get("kc_failed") == ["GC/nt8/f1"] and not PROMPTS)
+eqgui._save_full("ko", "tok", _plain)
+d = yaml.safe_load(open(eqgui.CFG_PATH, encoding="utf-8").read()) or {}
+chk("(대조) carry 없으면 종전대로 블롭이 빠진다", not d.get("kc_enc"))
+# carry + 새 비밀 + PIN 취소 → 블롭은 남고 새 항목은 kc_failed
+with open(eqgui.CFG_PATH, "w") as _f:
+    yaml.safe_dump({"lang": "ko", "token": "t", "assets": {}, "kc_enc": {"blob": _old_blob, "fields": []}}, _f)
+_new = {"BTC": {"broker": b3, "creds": {b3: {"f1": "NEWKEY", "f3": "NEW-F3", "avail": []}}, "include": True, "accounts": []}}
+PINS[:] = []; PROMPTS.clear()
+eqgui._save_full("ko", "tok", _new, carry=_carry)
+raw = open(eqgui.CFG_PATH, encoding="utf-8").read(); d = yaml.safe_load(raw) or {}
+chk("carry + PIN 취소: 지난 블롭 유지·새 항목 kc_failed·평문 0", (d.get("kc_enc") or {}).get("blob") == _old_blob
+    and len(d.get("kc_failed") or []) >= 1 and "NEW-F3" not in raw and "NEWKEY" not in raw)
+# carry + 새 비밀 + 맞는 PIN → 지난 블롭의 메모리에 없는 항목을 병합
+PINS[:] = ["2468"]; PROMPTS.clear(); eqgui._ENC_PIN = None
+eqgui._save_full("ko", "tok", _new, carry=_carry)
+d = yaml.safe_load(open(eqgui.CFG_PATH, encoding="utf-8").read()) or {}
+_m = eqgui._enc_unpack("2468", d["kc_enc"]["blob"])
+chk("블롭 병합: 메모리에 없는 지난 항목(GC 토큰·옛 f2) 유지 + 새 항목", _m.get("GC|nt8|f1") == "OLD-TOKEN-xyz"
+    and _m.get("f2|old@x") == "OLD-F2" and _m.get(f"BTC|{b3}|f3") == "NEW-F3")
+chk("블롭 병합 뒤 fields에 f1 원문 없음", not any("old@x" in x for x in d["kc_enc"]["fields"]))
+# [연결 지우기]로 지운 항목은 병합으로 되살리지 않는다
+eqgui._ENC_DROPPED.add("GC|nt8|f1")
+eqgui._save_full("ko", "tok", _new, carry=_carry)
+d = yaml.safe_load(open(eqgui.CFG_PATH, encoding="utf-8").read()) or {}
+chk("지운 항목(_ENC_DROPPED)은 병합하지 않음", "GC|nt8|f1" not in eqgui._enc_unpack("2468", d["kc_enc"]["blob"]))
+eqgui._ENC_DROPPED.discard("GC|nt8|f1")
+# 기동 되채움 취소 → _enc_locked
+eqgui._ENC_PIN = None; PINS[:] = []
+fk = _fake({"blob": _old_blob, "fields": ["GC|nt8|f1"]}); eqgui.App._enc_unlock_startup(fk)
+chk("기동 PIN 취소 → _enc_locked=True", getattr(fk, "_enc_locked", None) is True)
 
 print()
 print(("실패 %d건: %s" % (len(fails), fails)) if fails else "전부 통과")

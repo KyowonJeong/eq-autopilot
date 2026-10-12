@@ -38,7 +38,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from .base import BrokerAdapter, FlattenResult, Position
+from .base import BrokerAdapter, FlattenResult, Position, refuse_flatten_without_accounts
 
 _ACK_WAIT_S = 2.5            # 주문 접수/거절 판정 대기(TWS는 거절을 비동기 에러로 준다)
 _CONNECT_TIMEOUT_S = 15
@@ -662,6 +662,9 @@ class IBKRBroker(BrokerAdapter):
 
     def flatten_all(self, dry_run: bool = True) -> FlattenResult:
         """계좌(들) 전체 청산: 미체결 전부 취소 → 포지션마다 시장가 반대 주문 → 재확인."""
+        _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
+        if _refuse is not None:
+            return _refuse
         ibi = _ib_classes()
         with self._lock:
             ib = self._connect()

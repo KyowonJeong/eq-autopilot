@@ -32,6 +32,28 @@ class FlattenResult:
         return not self.errors
 
 
+def configured_accounts(adapter) -> list[str]:
+    """이 인스턴스에 지정된 계좌 목록(공백 제외). cfg가 없거나 비면 []."""
+    acc = getattr(adapter, "accounts", None)
+    if acc is None:
+        acc = getattr(getattr(adapter, "cfg", None), "accounts", None)
+    return [str(a).strip() for a in (acc or []) if str(a).strip()]
+
+
+def refuse_flatten_without_accounts(adapter, dry_run: bool):
+    """선물 어댑터 flatten_all의 안전장치(최종 반박 리뷰 2026-10-08 P0).
+
+    선물 로그인 하나에 계좌가 여럿이다(프롭 평가·펀디드·다른 회원 설정의 계좌). 계좌 목록이 빈 인스턴스에서
+    flatten_all을 돌리면 _accounts()가 '전부'로 풀려 그 로그인의 모든 계좌를 닫는다. 청산은 계좌를 지정한
+    인스턴스에서만 한다 - 비면 아무것도 하지 않고 오류를 돌려준다(dry_run이어도 같은 결과: 계획도 세우지 않는다).
+    반환: 거부면 FlattenResult(errors=[...]), 진행해도 되면 None."""
+    if configured_accounts(adapter):
+        return None
+    return FlattenResult(dry_run=dry_run, errors=[
+        f"{getattr(adapter, 'name', 'broker')}: no account id set - refusing to flatten "
+        f"(an empty account list would close every account on this login)"])
+
+
 class BrokerAdapter(abc.ABC):
     name: str = "base"
 
