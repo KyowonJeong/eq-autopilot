@@ -315,12 +315,46 @@ class NT8Broker(BrokerAdapter):
                 return a
         return None
 
+    def _attached_state(self):
+        """공유 브리지 상태(없으면 붙인다). 붙이지 못하면(토큰 없음, 토큰 다름, 포트 사용 중) None.
+        2026-10-15 대표 PC 실사고: 평가 계좌 감시가 _build_broker로 새로 만든 인스턴스로 맨 먼저 snapshot_fresh()를 불렀는데,
+        이 메서드만 authenticate()를 부르지 않아 _state가 None인 채로 늘 False였다 - 감시가 NT8 계좌를 매번 말없이 건너뛰었다
+        (Sim101 +$204 미정리, Lucid '오늘 남은' 줄 없음). 다른 조회처럼 먼저 붙인다(closed_fills 2026-09-08과 같은 구멍)."""
+        if self._state is None:
+            try:
+                self.authenticate()
+            except Exception:
+                return None
+        return self._state
+
     def snapshot_fresh(self, max_age: float = 10.0) -> bool:
         """push 신선도(2026-08-20 D1) - NT8이 죽으면 last_state가 고착되므로, 무인 판정
-        (통과 익절)은 이 게이트를 통과한 스냅샷만 믿는다."""
-        st = self._state
+        (통과 익절)은 이 게이트를 통과한 스냅샷만 믿는다. 아직 브리지에 안 붙은 인스턴스면 먼저 붙는다."""
+        st = self._attached_state()
         return bool(st and st.last_state_ts
                     and (time.time() - st.last_state_ts) <= max_age)
+
+    def state_ts(self) -> float:
+        """마지막 push를 받은 시각(time.time 초, 없으면 0). 평가 계좌 감시가 서로 다른 두 스냅샷에서만 정리를 확정하는 데 쓴다
+        (3차 리뷰 P0 - NetLiq 한 번 튄 값으로 닫지 않게). 아직 브리지에 안 붙은 인스턴스면 먼저 붙는다."""
+        st = self._attached_state()
+        return float(st.last_state_ts) if (st and st.last_state_ts) else 0.0
+
+    def snapshot_pair(self, acct):
+        """한 스냅샷에서 (push 시각, 현금, NetLiq, 미실현, [포지션 dict]) - 이 계좌만. 현금과 NetLiq, 포지션을 서로 다른 push에서 섞어
+        읽지 않게(3차 리뷰 P0). 계좌가 없으면 None."""
+        self.authenticate()
+        with self._state.lock:
+            snap = dict(self._state.last_state)
+            ts = float(self._state.last_state_ts or 0.0)
+        want = str(acct or "").strip().lower()
+        row = next((a for a in snap.get("accounts", []) or []
+                    if str(a.get("name") or "").strip().lower() == want), None)
+        if row is None:
+            return None
+        poss = [dict(p) for p in snap.get("positions", []) or []
+                if str(p.get("account") or "").strip().lower() == want and int(p.get("net_qty") or 0)]
+        return ts, row.get("cash_value"), row.get("net_liq"), row.get("unrealized_pnl"), poss
 
     def account_connected(self, acct) -> bool:
         """이 계정이 현재 push에 존재(=NT8 연결됨)하는가(2026-08-20 D2) - 연결 blip 중엔

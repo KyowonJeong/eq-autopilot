@@ -1024,6 +1024,15 @@ _PV_BY_ROOT = {"MNQ": 2.0, "NQ": 20.0, "ENQ": 20.0, "MGC": 10.0, "GC": 100.0, "G
 _PROP_DEFAULTS = {"on": False, "type": "test", "r_test": 1200.0, "r_buffer": 300.0,
                   "r_steady": 300.0, "buffer": 6000.0, "payouts": 0, "r_live": 100.0,
                   "pass_tp": 0.0,
+                  # 평가 계좌 익절(대표 2026-10-14): day_cap None=자동(규모별 목표 × Topstep 55%, Lucid 50%), 0=끔, >0=회원 값.
+                  # size 0=자동(계좌 이름, 잔고) 또는 25000/50000/100000/150000. pass_set True = 회원이 이 빌드부터 통과 목표를
+                  # 직접 저장함(0이면 끔) - False면 옛 빌드의 0을 '안 정함'으로 보고 평가 계좌에 규모 + 이익 목표를 기본으로 쓴다.
+                  "day_cap": None, "size": 0, "pass_set": False,
+                  # stage = 회원이 답한 Lucid 계좌 단계('eval' 평가 / 'funded' 펀디드, None = 아직 모름 - 평가 계좌 익절 꺼짐, 2026-10-14 결정 4).
+                  # Topstep은 계좌 이름으로 판별해 이 값을 쓰지 않는다. 사이징(프롭 유형 type)과는 별개다.
+                  # stage_for = 그 답을 받은 계좌 id(소문자). 행의 계좌를 다른 계좌로 바꾸면 답이 따라가지 않는다(2차 리뷰 P1: 행에 붙은 답을
+                  # 새 계좌가 물려받아 펀디드 계좌에 평가 상한이 걸리던 것). 비어 있으면(이 값 전 저장) 그 행 계좌의 답으로 본다.
+                  "stage": None, "stage_for": None,
                   "last_bal": None}   # r_live = 라이브 초기 1R(Lucid, +$4,500 락 전. 2026-08-11)   # 직전 관측 잔고 - 출금 자동 감지용(2026-08-02)
 _PCT_DEFAULTS = {"on": False, "pct": 0.4, "floor": 200.0}   # 자본 비례 모드(대표 2026-07-26 #18)
 # ── 브로커별 프롭 정본 프리셋(대표 2026-08-11 "브로커 자동 감지해서 페이즈별 사이징") ──
@@ -1043,6 +1052,1402 @@ _PROP_PRESETS = {
 def _prop_preset(broker):
     return _PROP_PRESETS.get(str(broker or "").lower())
 _PAYOUT_CHUNK = 6000.0   # Topstep 회당 출금 단위(DLL 계좌 $6,000) — 방패+이 값 도달 시 출금 권장 팝업
+
+
+# ── 평가 계좌 익절: 하루 이익 상한 + 통과 목표(대표 2026-10-14 "앱에 만들자. 걍.", "두 익절 중에 낮은 값으로 하면 되지",
+#    "루시드도 사실 +9000에 해 놔야", "어 가자", 2차 결정 "앱이 보다가 정리하는 방식 고") ─────────────────────────────────
+# 평가(Topstep Trading Combine, Lucid 평가) 계좌는 두 익절 가운데 **가까운 쪽**에서 닫는다:
+#   ① 하루 이익 상한 = 규모별 평가 이익 목표 × 상한 비율(Topstep, LucidDaily - 다른 Lucid 요금제는 상한 없이 통과 목표만). 그날(17:00 CT 시작) 손익(실현 + 미실현)으로 본다.
+#      Topstep은 하루 최고 이익이 목표의 55%를 넘으면 목표가 최고/0.55로 올라가고(help.topstep.com 'Consistency at Topstep',
+#      2026-10-14 확인), LucidDaily 평가는 50% 규칙이다. 상한 비율은 그 선 아래다(아래 _DAYCAP_FIRMS, 서버 값 우선).
+#   ② 통과 익절 잔고(기존 pass_tp) - 평가 계좌에서는 실제로 통과하는 잔고 + $50을 날마다 다시 계산해 기본으로 켠다(3차 결정 B):
+#      Topstep = 규모 + max(목표, 지금까지 최고일 / 0.55) + $50, Lucid = 규모 + max(목표, 2 x 최고일) + $50(최고일을 모르면 목표).
+#      같은 금액에서 두 번 정리하지 않는다. 회원이 저장한 0 아닌 값은 그대로 쓴다(수동 우선). 어느 경로로든 통과 잔고에 닿으면 그 계좌를
+#      '통과'로 표시하고 상한과 통과 익절을 끈다.
+# 실행(2차 결정): 브로커에 익절 주문을 걸지 않는다 - 앱이 계좌의 오늘 손익(오늘 실현 + 열린 포지션 미실현)을 지켜보다 닿으면
+# 그 계좌만 시장가로 정리하고 남은 손절 주문을 걷는다(통과 익절 감시와 같은 규약). 고아 익절 주문이 생길 수 없다.
+# 단계 판별(회원 설정 없음, 2차 결정 4): Topstep은 계좌 이름(50KTC/100KTC/150KTC = 평가와 그 규모, EXPRESS = 펀디드, PRAC = 연습)
+# + 잔고 확인(이름의 규모 ±10% 밖이면 끔). 이름이 정해 주면 저장된 프롭 유형보다 이름이 이긴다(저장된 'test'는 기본값이라 회원 선택과
+# 구별되지 않는다). Lucid는 이름(L + 요금제 D/F/P + 드로다운 I/E + 규모 025/050/100/150)에 단계가 없어 회원에게 한 번 묻고
+# 답(prop["stage"])을 저장한다 - 답하기 전에는 상한을 걸지 않는다. 그 밖의 이름은 끔.
+# 펀디드, 연습, 라이브, 모르는 계좌, 프롭이 아닌 브로커(Tradovate, IBKR, Bybit, Bitget)는 아무것도 바뀌지 않는다.
+# 킬스위치 EQ_DAYCAP_OFF=1 = 이 기능 전체 끔(통과 목표 기본값도 끄고, 회원이 직접 넣은 통과 목표만 종전대로 돈다).
+_DAYCAP_FIRMS = {
+    # 하루 이익 상한 비율(pct)과 일관성 선(cons) 한 표: 상한 = 이익 목표 x pct, 감시는 이 금액에서 그대로 닫는다.
+    #   내장 pct는 공개된 일관성 선(Topstep 55%, LucidDaily 50%) 바로 아래로 내림한 값이다. 실제로 쓰는 값은 서버가 하트비트로
+    #   내려 준다(_DAYCAP_SRV, 범위 밖이면 이 표). 150K 내장값: Topstep $4,860, Lucid $4,410.
+    "projectx": {"firm": "Topstep", "pct": 0.54, "cons": 0.55,
+                 "targets": {50000: 3000.0, 100000: 6000.0, 150000: 9000.0}},
+    "nt8": {"firm": "Lucid", "pct": 0.49, "cons": 0.50,
+            "targets": {25000: 1250.0, 50000: 3000.0, 100000: 6000.0, 150000: 9000.0}},
+}
+# 통과 익절 여유(3차 결정 B): 자동 통과 익절 = 시작 잔고(규모) + max(이익 목표, 지금까지 최고일 / 일관성 선) + 이 값. 실제로 통과하는 금액
+# 위 $50에서 닫는다 - 시장가 청산 미끄러짐을 덮는다. 서버가 바꿀 수 있다(0~500).
+_DAYCAP_PASS_MARGIN = 50.0
+# 3차 리뷰 P0(통과 익절 여유): 실제 여유 = max(위 값, 2틱 x 정리할 계약 수). 계약이 많으면 고정 금액이 시장가 청산 2틱에 모자란다.
+# 틱 = NQ, MNQ 0.25포인트, GC, MGC 0.1포인트(틱 가치 NQ $5, MNQ $0.50, GC $10, MGC $1 = 틱 x 포인트 가치).
+_DAYCAP_SLIP_TICKS = 2
+_DAYCAP_TICK = {"NQ": 0.25, "GC": 0.1}
+_DAYCAP_PASS_EXTRA_MAX = 500.0               # 지난 통과 익절이 통과 금액에 모자랐던 만큼 다음 거래일 여유에 더한다(이 값까지, 3차 리뷰 P1)
+_DAYCAP_LEG_GRACE_S = 20                     # 앱 진입 leg가 이보다 오래됐는데 그 계약이 플랫이거나 반대면 앱 몫이 끝난 것으로 본다
+_DAYCAP_MARK_JUMP = 0.015                    # 시세가 15초 안의 마지막 정상 시세에서 이보다 크게 튀면 1초 뒤 다른 값으로 한 번 더 확인한다
+_DAYCAP_MARK_FAR = 0.03                      # 최근 정상 시세가 없을 때 평균 진입가에서 이보다 멀면 같은 확인
+_DAYCAP_MARK_AGE_S = 120                     # 이보다 오래된 1분봉 종가는 시세로 쓰지 않는다
+_DAYCAP_XCHK_USD = 100.0                     # ProjectX: 잔고 - 오늘 실현(= 거래일 시작 잔고)이 이만큼 넘게 흔들리면 정리하지 않는다
+_DAYCAP_NL_TOL_USD = 25.0                    # NT8: (NetLiq - 현금)과 브리지 미실현이 max(이 값, 2%) 넘게 다르면 정리하지 않는다
+_DAYCAP_SIZES = (25000, 50000, 100000, 150000)
+_COMBINE_RE = r"^(50|100|150)KTC"            # Topstep Trading Combine 계좌 이름(예: 50KTC-V2-26505604, 150KTC-A) = 평가
+_XFA_RE = r"(EXPRESS|XFA)"                   # Topstep 펀디드(Express Funded) 이름 - 평가로 보지 않는다
+_PRAC_RE = r"^PRAC"                          # Topstep 연습 계좌 - 상한을 걸지 않는다
+_LUCID_RE = r"^L([DFP])([IE])(025|050|100|150)"   # Lucid 계좌 이름: L + 요금제(D Daily, F Flex, P Pro) + 드로다운(I 장중, E 장마감) + 규모
+_DAYCAP_SANITY_BAND = 0.10                   # 이름의 규모와 잔고가 이보다 벌어지면(평가 잔고는 규모 - 최대 손실 ~ 규모 + 목표 안) 판별을 믿지 않는다
+_DAYCAP_ENTRY_TIMEOUT = (3, 5)               # 진입 직전 하루 실현 손익 조회 상한(초) - 느리면 상한 없이 종전대로 진입
+# 결정 2(대표 2026-10-14): 오늘 남은 하루 이익 한도가 이번 진입 손절 위험(1R x 배수)의 이 배수보다 작으면 그 계좌만 이번 신호를 건너뛴다
+# (사유 cap_room - 이미 닿은 day_cap과 다른 코드). 상한이 묶는 쪽일 때만 본다.
+_DAYCAP_MIN_ROOM_R = 0.5
+# 감시 주기(3차 결정 C): 지켜보는 평가 계좌 가운데 하나라도 가까운 선(하루 상한, 통과 익절)까지 남은 거리가 '남은 한도의 25%'와
+# '이번 포지션 손절 위험(1R x 배수)' 가운데 큰 값 안이면 1초, 아니면 포지션이 있을 때 5초, 없을 때 30초. ProjectX 호출 한도(문서
+# gateway.docs.projectx.com 'Rate Limits': History/retrieveBars 30초에 50회, 나머지 60초에 200회)를 넘지 않게 감시 몫을 _DcGate로 묶고,
+# 시세는 로그인 하나에 자산 하나당 1초에 한 번(같은 자산 미니, 마이크로, 여러 계좌가 나눠 쓴다), 계좌 목록은 몇 초씩 다시 쓴다.
+_DAYCAP_POLL_FAST_S = 1                      # 선 가까이에서 보는 주기(초)
+_DAYCAP_FAST_ROOM_PCT = 0.25                 # 남은 한도의 이 비율 안이면 1초
+_DAYCAP_POLL_OPEN_S = 5                      # 포지션이 열린 평가 계좌(또는 앱이 막 진입한 계좌)를 보는 주기(초)
+_DAYCAP_POLL_IDLE_S = 30                     # 포지션 없는 무장 평가 계좌를 보는 주기(초) - ProjectX 호출 수를 아낀다
+_DAYCAP_REAL_TTL_S = 60                      # ProjectX 오늘 실현 손익 재조회 주기(포지션 구성이 바뀌면 바로 다시 읽는다)
+_DAYCAP_FLAT_REAL_TTL_S = 300                # 포지션이 없을 때 화면 '오늘 남은' 금액을 위한 재조회 주기
+_DAYCAP_SNAP_MISS_S = 30                     # 감시가 한 계좌를 이 시간 넘게 계속 못 읽으면 이유와 함께 한 번 알린다(2026-10-15 NT8 말없는 건너뜀)
+_DAYCAP_NOTE_EVERY_S = 3600                  # 같은 감시 오류, 같은 못 읽음 안내는 이 간격에 한 번만
+_DAYCAP_MON_MAX_AGE = 12 * 3600              # 앱 진입 감시 기록 수명 - 선물은 진입 4시간 뒤 세션 마감 청산, 이보다 오래된 기록은 놓는다
+_DAYCAP_FIRED_MAX_AGE = 7 * 86400            # 정리 중(발동) 기록 수명 - 남은 주문(손절) 정리를 마칠 때까지 재시작을 넘어 들고 간다(2차 리뷰 P0)
+_DAYCAP_MARK_TTL_S = 0.9                     # 시세 재사용: 같은 로그인, 같은 자산의 시세는 이 시간 안에서 다시 읽지 않는다(1초에 한 번)
+_DAYCAP_MARK_STALE_S = 5                     # 호출 한도에 막혔을 때 이 시간 안의 시세는 그대로 쓴다(그보다 낡으면 그 회차는 판단하지 않는다)
+_DAYCAP_POS_STALE_S = 5                      # 같은 규칙, 포지션 목록(발사 직전 확인, 청산 확인은 늘 새로 읽는다)
+_DAYCAP_POS_STALE_LOW_S = 15                 # 1초 구간 계좌에 호출 몫을 남겨 두느라 미룬 먼 계좌의 포지션 재사용 시간(3차 마무리 5)
+_DAYCAP_POS_STALE_BUSY_S = 10                # 1초 구간 계좌가 있는 로그인에서 몫이 모자랄 때 1초 구간 계좌의 포지션 재사용 시간(시세는 늘 새로, 3차 마무리 5)
+_DAYCAP_ACCT_TTL_S = 5                       # 계좌 목록(잔고) 재사용 시간 - 포지션 구성이 바뀌면 바로 다시 읽는다
+_DAYCAP_HIST_DAYS = 365                      # Topstep 최고일: 이만큼 거슬러 거래 기록을 읽는다(사실상 계좌 첫 거래부터)
+_DAYCAP_HIST_RETRY_S = 600                   # 거래 기록을 못 읽었을 때 다시 읽는 간격
+# Lucid 하루 이익 상한은 LucidDaily(이름 둘째 글자 D)에만 건다(대표 결정 5의 표는 LucidDaily). LucidPro는 평가에 일관성 규칙이 없고
+# (Lucid 공개 규칙: 일관성 40%는 펀디드만), LucidFlex는 확인 전이다 - 두 요금제는 통과 목표만 쓴다(회원이 칸에 넣은 상한은 그대로).
+_LUCID_CAP_PLANS = ("D",)
+# 통과 익절의 최고일 규칙(목표 대신 최고일 / 일관성 선)은 평가에 일관성 규칙이 있는 요금제에만: Topstep 전부, Lucid는 Daily와 Flex(확인 전이라
+# 보수적으로 건다). LucidPro 평가는 일관성 규칙이 없어 규모 + 목표 + 여유만 쓴다.
+_LUCID_NO_CONS_PLANS = ("P",)
+
+# ── 서버가 하트비트로 내려 주는 값(3차 결정 I, 대표 "권장값은 서버에서 실시간으로 받지?") ──
+# 하트비트 autopilot.prop_reco = {"reco_1r": {브로커: {단계: {규모: 1R}}}, "cap_pct": {브로커: 비율}, "targets": {브로커: {규모: 목표}},
+# "pass_margin": 여유}. 서버 파일(data/app_prop_reco.json)이 없으면 서버는 아무것도 안 보내고 앱은 아래 표(내장값)를 쓴다. 값마다 범위를 보고
+# 벗어나거나 빠진 칸은 그 칸만 내장값으로 돌아간다. 마지막으로 받은 정상 값은 디스크(.prop_reco.json)에 두어 다음 기동의 첫 하트비트 전에도 쓴다.
+# 서버 값은 권장값과 상한, 통과 익절 계산만 바꾼다 - 회원이 저장한 1R은 바꾸지 않는다(바꾸려면 회원이 누른다).
+_SRV_BOUNDS = {"cap_pct": (0.40, 0.56), "reco_1r": (100.0, 5000.0), "targets": (1000.0, 20000.0), "pass_margin": (0.0, 500.0)}
+# 3차 리뷰 P1, P2: 핵심 값(상한 비율, 이익 목표)은 위 넓은 범위에 더해 회사, 규모별로 좁게 본다 - 오타 하나가 모든 회원의 상한, 통과를 바꾸지 않게.
+#   상한 비율 = 내장값 ±0.02, 그리고 그 회사 일관성 선 - 0.001 이하(Topstep 0.52~0.549, Lucid 0.47~0.499).
+#   이익 목표 = 그 회사, 그 규모 내장값의 ±25%(150K 6,750~11,250).
+# 핵심 값 하나라도 벗어나면 그 서버 값은 통째로 쓰지 않고 마지막 정상 값을 그대로 쓴다(로그 한 줄). 권장 1R, 통과 여유는 칸마다 내장값.
+_SRV_PCT_BAND = 0.02
+_SRV_TARGET_BAND = 0.25
+_DAYCAP_SRV = {}                             # 검증된 서버 값(없으면 빈 dict = 모두 내장값). 통째로 바꿔 끼운다(스레드 안전)
+_PROP_RECO_PATH = os.path.join(APP_DIR, ".prop_reco.json")
+
+# ── 프롭 규칙도 서버 값으로(3차 마무리 1, 대표 2026-10-14 "consistency rule 등등 서버에서 받게 해") ──
+# 하트비트 autopilot.prop_reco.rules(없거나 빠진 칸은 아래 내장값 = 지금 공개된 회사 규칙):
+#   "cons":      {"projectx": {"": 0.55}, "nt8": {"D": 0.50, "F": 0.50, "P": 0}}  평가 일관성 선(요금제별, 0 = 평가에 일관성 규칙 없음)
+#   "cap_plans": {"nt8": ["D"]}                                                  Lucid 자동 하루 상한을 거는 요금제(Topstep은 늘 건다)
+#   "names":     {"projectx": {"eval": ..., "funded": ..., "practice": ...}, "nt8": {"eval": ...}}   계좌 이름 패턴(아래 _COMBINE_RE 등)
+#   "limits":    {"combine": {규모: 마이크로}, "xfa": {규모: [[잔고 이상, 마이크로], ..., [null, 마이크로]]}, "xfa_fallback": 규모, "lucid": 마이크로}
+#   "margin":    {"per_micro": {"NQ": $, "GC": $}, "micro_risk": {"NQ": $, "GC": $}, "max_mult": 배수, "max_micros": 계약}
+#   "day_start": {"hour": 18, "minute": 0}                                       거래일 시작(America/New_York, 18:00 ET = 17:00 CT)
+# 핵심 값(일관성 선, 거래일 시작)이 범위를 벗어나면 그 서버 값은 통째로 쓰지 않고 마지막 정상 값을 쓴다(상한 비율, 이익 목표와 같은 규약 - 3차 리뷰
+# P1-9). 나머지(상한 요금제, 이름 패턴, 계약 한도, 증거금 표)는 그 칸만 내장값.
+# 범위(3차 마무리 리뷰: 서버 오타 하나가 돈이 걸린 판단을 위험한 쪽으로 옮기지 못하게 - 서버는 공개 값보다 엄한 쪽으로만 바꾼다):
+#   일관성 선 = 내장값 - 0.05 ~ 내장값(높이면 통과 익절이 실제 통과보다 일찍 닫는다). 0(규칙 없음)은 내장값이 0인 요금제(LucidPro)만, 내장값이
+#     0인 요금제는 0.30~0.70도 받는다(규칙을 더하면 늦게 닫을 뿐). 모르는 요금제는 회사 기본 선 - 0.05 ~ 회사 기본 선.
+#   상한 비율은 상한을 거는 모든 요금제의 일관성 선 - 0.001 이하. 상한 요금제는 내장 목록에 더하기만 한다(LucidDaily 상한을 끄지 못한다).
+#   거래일 시작 = 17:00~18:00 ET(CME 휴장 시간 - 그 안에서만 옮겨야 한 세션이 두 거래일로 갈리지 않는다).
+#   계약 한도 = 그 규모 공개 한도의 절반 ~ 공개 한도(마이크로 환산, 10 이상), Lucid 50~100. XFA 줄은 잔고 문턱이 내려갈수록 한도가 같거나
+#     작고 마지막 줄 문턱은 null이며, 어느 잔고에서도 그 규모 내장 표보다 크지 않다. 규모 모를 때 쓰는 표는 어느 잔고에서도 50K 표보다 크지
+#     않은 규모만.
+#   증거금 표(경고만) = 경고가 줄어드는 쪽으로 옮기지 못하게: 마이크로당 증거금은 공개 장중 증거금(내장값) x 1~16, 마이크로 한 계약 위험은
+#     $25~$1,000(내장값 없음 - 서버 값만), 최대 배수 내장값 x 0.75~10배, 최대 계약 내장값 x 0.75~1,000.
+# 계약 한도의 펀디드(XFA) 판별은 앱 내장 펀디드 패턴만 본다 - 서버 펀디드, 연습 패턴은 평가 감시를 끄는 데만 쓴다(Topstep이 아닌 펀디드 이름에
+# XFA 표가 걸리지 않게).
+# 이름 패턴은 안전한 꼴만 받는다: 글자, 숫자, ^ $ ( ) | [ ] - _ 만 쓰는 64자 이하(반복, 와일드카드, 이스케이프, 범위 없음 - 정해진 길이의 이름만
+# 맞는다). 평가 패턴은 ^로 시작하고 묶음 수(Topstep 1 = 규모(천 달러), Lucid 3 = 요금제, 드로다운, 규모), 묶음 밖 글자(Topstep 2자, Lucid 1자 이상),
+# 가장 짧은 이름 4자 이상을 지키고 알려진 펀디드, 연습, 다른 회사 이름 표본에 맞지 않아야 한다. 펀디드, 연습 패턴은 글자 2자 이상, 가장 짧은 이름
+# 3자 이상(한 글자 갈래가 아무 이름에나 맞지 않게), 평가 이름 표본에 맞지 않아야 한다.
+# 판별은 늘 내장 패턴과 서버 패턴을 함께 보고 펀디드, 연습을 먼저 본다(서버 패턴은 더할 뿐) - 잘못된 서버 패턴이 펀디드나 모르는 계좌를 평가로
+# 만들지 못한다(안전 쪽 = 평가 아님). 시험용 스위치의 연습 계좌 판별은 서버 패턴을 보지 않는다.
+_RULE_CONS = {"projectx": {"": 0.55}, "nt8": {"D": 0.50, "F": 0.50, "P": 0.0}}
+_RULE_CONS_BAND = 0.05
+_RULE_CONS_RANGE = (0.30, 0.70)
+_RULE_DAY_START = (18, 0)
+_RULE_DAY_MIN = (17 * 60, 18 * 60)           # 거래일 시작 허용 범위(분, America/New_York) = CME 휴장 17:00~18:00 ET
+_RULE_LIMIT_RANGE = (10, 300)
+_RULE_LIMIT_LOW = 0.5                        # 계약 한도 = 공개 한도 x 0.5 ~ 공개 한도
+_RULE_LUCID_LIMIT = (50, 100)
+_RULE_MARGIN_BOUNDS = {"per_micro": (50.0, 5000.0), "micro_risk": (25.0, 1000.0), "max_mult": (1.0, 10.0), "max_micros": (10, 1000)}
+_RULE_MARGIN_BAND = {"per_micro": (1.0, 16.0), "micro_risk": None, "max_mult": (0.75, None), "max_micros": (0.75, None)}
+_PAT_MAX = 64
+_PAT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789^$()|[]-_")
+_PAT_NONEVAL_PROBES = ("EXPRESS-V2-12345-67890", "XFA-V2-1234", "PRAC-V2-12345-67890", "Sim101", "Sim102", "Playback101", "Backtest",
+                       "DU1234567", "U1234567", "S1Nov0612345", "APEX-12345-01", "MFFU12345", "TPT12345", "TOPSTEP", "LIVE-12345",
+                       "FUNDED-12345", "12345678", "A", "X")
+_PAT_EVAL_PROBES = ("50KTC-V2-12345678", "100KTC-V2-12345678", "150KTC-V2-26505604", "150KTC-A", "LDI150A1234", "LFE050B1234")
+_PAT_BUILTIN = {("projectx", "eval"): _COMBINE_RE, ("projectx", "funded"): _XFA_RE, ("projectx", "practice"): _PRAC_RE,
+                ("nt8", "eval"): _LUCID_RE}
+_PAT_CACHE = {}
+
+
+def _srv_rules() -> dict:
+    """검증된 서버 프롭 규칙(없으면 빈 dict = 모두 내장값)."""
+    r = _DAYCAP_SRV.get("rules") if isinstance(_DAYCAP_SRV, dict) else None
+    return r if isinstance(r, dict) else {}
+
+
+def _srv_int(v, lo, hi):
+    """서버 값 하나: 정수(소수점 아래 0)이고 [lo, hi] 안이면 int, 아니면 None."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f != int(f) or f < lo or f > hi:
+        return None
+    return int(f)
+
+
+def _srv_size(k) -> int:
+    try:
+        n = int(float(k))
+    except (TypeError, ValueError):
+        return 0
+    return n if n in (25000, 50000, 100000, 150000) else 0
+
+
+def _pat_shape(s):
+    """이름 패턴의 꼴 (묶음 수, 묶음 밖 글자 수, 글자 수(묶음 안 포함), ^로 시작, 가장 짧은 맞는 길이) 또는 None(받지 않는 꼴 - 반복, 와일드카드,
+    이스케이프, 범위, 맨 위 |, 빈 갈래)."""
+    if not isinstance(s, str) or not (2 <= len(s) <= _PAT_MAX) or any(c not in _PAT_CHARS for c in s):
+        return None
+    if "||" in s or "(|" in s or "|)" in s or "()" in s:
+        return None
+    depth, groups, lit, lit_any, i, n = 0, 0, 0, 0, 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "^":
+            if i != 0:
+                return None
+        elif c == "$":
+            if i != n - 1:
+                return None
+        elif c == "(":
+            depth += 1
+            groups += 1
+        elif c == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == "[":
+            j = s.find("]", i + 1)
+            if j <= i + 1 or not s[i + 1:j].isalnum():
+                return None
+            i = j
+        elif c == "]":
+            return None
+        elif c == "|":
+            if depth == 0:
+                return None
+        elif c.isalpha():
+            lit_any += 1
+            if depth == 0:
+                lit += 1
+        i += 1
+    if depth != 0:
+        return None
+
+    def _seq(k):                                        # 가장 짧은 맞는 길이(묶음 = 가장 짧은 갈래)
+        tot = 0
+        while k < n and s[k] not in ")|":
+            ch = s[k]
+            if ch in "^$":
+                k += 1
+            elif ch == "(":
+                alts, k = [], k + 1
+                while True:
+                    m, k = _seq(k)
+                    alts.append(m)
+                    if k < n and s[k] == "|":
+                        k += 1
+                        continue
+                    break
+                k += 1
+                tot += min(alts)
+            elif ch == "[":
+                tot += 1
+                k = s.index("]", k) + 1
+            else:
+                tot += 1
+                k += 1
+        return tot, k
+    return groups, lit, lit_any, s.startswith("^"), _seq(0)[0]
+
+
+def _srv_pat_ok(bk, kind, s) -> bool:
+    """서버 이름 패턴 하나를 받아도 되는가(위 규칙). 안 되면 그 칸은 내장 패턴만 쓴다. 평가 = ^로 시작, 묶음 수(Topstep 1, Lucid 3, 묶음 안 묶음
+    없음), 규모 묶음은 숫자 갈래만, Lucid 요금제 묶음은 글자 하나, 묶음 밖 글자(Topstep 2, Lucid 1 이상), 가장 짧은 이름 4자 이상, 평가 아닌 이름
+    표본에 맞지 않음. 펀디드, 연습 = 글자 2자 이상, 가장 짧은 이름 3자 이상(한 글자 갈래로 아무 이름에나 맞지 않게), 평가 이름 표본에 맞지 않음."""
+    import re as _re
+    sh = _pat_shape(s)
+    if sh is None:
+        return False
+    groups, lit, lit_any, anchored, minlen = sh
+    try:
+        rx = _re.compile(s, _re.I)
+    except Exception:
+        return False
+    if kind == "eval" and bk in ("projectx", "nt8"):
+        if not anchored or groups != (1 if bk == "projectx" else 3) or lit < (2 if bk == "projectx" else 1) or minlen < 4:
+            return False
+        _gs = _re.findall(r"\(([^()]*)\)", s)                 # 묶음 안의 묶음은 받지 않는다(묶음 수와 같아야 한다)
+        _dg = _re.compile(r"^[0-9]+(\|[0-9]+)*$")
+        if len(_gs) != groups or not _dg.match(_gs[0 if bk == "projectx" else 2]):
+            return False                                    # 규모 묶음 = 숫자 갈래만(천 달러 또는 025 꼴)
+        if bk == "nt8" and not _re.match(r"^(\[[A-Za-z]+\]|[A-Za-z](\|[A-Za-z])*)$", _gs[0]):
+            return False                                    # 요금제 묶음 = 글자 하나
+        return not any(rx.search(p) for p in _PAT_NONEVAL_PROBES)
+    if kind in ("funded", "practice") and bk == "projectx":
+        return groups <= 3 and lit_any >= 2 and minlen >= 3 and not any(rx.search(p) for p in _PAT_EVAL_PROBES)
+    return False
+
+
+def _rx(s):
+    import re as _re
+    c = _PAT_CACHE.get(s)
+    if c is None:
+        c = _PAT_CACHE[s] = _re.compile(s, _re.I)
+    return c
+
+
+def _dc_pats(bk, kind, builtin_only=False) -> list:
+    """그 종류의 이름 패턴 [내장, 서버(받았으면)] - 둘 다 본다. builtin_only = 내장 패턴만(계약 한도의 펀디드 판별)."""
+    out = [_PAT_BUILTIN[(bk, kind)]] if (bk, kind) in _PAT_BUILTIN else []
+    if builtin_only:
+        return out
+    s = ((_srv_rules().get("names") or {}).get(bk) or {}).get(kind)
+    if isinstance(s, str) and s and s not in out:
+        out.append(s)
+    return out
+
+
+def _dc_name_info(broker, name, builtin_only=False):
+    """계좌 이름 → (종류, 규모, 요금제, 맞은 글자). 종류: 'eval'(Topstep Combine 이름 / Lucid 형식 이름 - Lucid 단계는 회원 답), 'funded',
+    'practice', 'unknown'. Topstep은 펀디드, 연습 패턴(내장 + 서버)을 먼저 본다 - 둘 중 하나에 맞으면 평가 패턴은 보지 않는다. 묶음에서 읽은 규모가
+    그 회사 규모 표에 없으면 모르는 이름이다. broker 'tradovate'는 Lucid 형식만 본다(계좌 한도용). builtin_only = 앱 내장 패턴만."""
+    nm = str(name or "").strip()
+    _bo = bool(builtin_only)
+    if broker == "projectx":
+        if any(_rx(p).search(nm) for p in _dc_pats("projectx", "funded", _bo)):
+            return "funded", 0, None, ""
+        if any(_rx(p).search(nm) for p in _dc_pats("projectx", "practice", _bo)):
+            return "practice", 0, None, ""
+        for p in _dc_pats("projectx", "eval", _bo):
+            m = _rx(p).search(nm)
+            if not m:
+                continue
+            try:
+                sz = int(m.group(1)) * 1000
+            except (TypeError, ValueError, IndexError):
+                continue
+            if sz in _DAYCAP_FIRMS["projectx"]["targets"]:
+                return "eval", sz, "", m.group(0)
+        return "unknown", 0, None, ""
+    if broker in ("nt8", "tradovate"):
+        for p in _dc_pats("nt8", "eval", _bo):
+            m = _rx(p).search(nm)
+            if not m:
+                continue
+            try:
+                pl, sz = str(m.group(1)).upper(), int(m.group(3)) * 1000
+            except (TypeError, ValueError, IndexError):
+                continue
+            if len(pl) == 1 and pl.isalpha() and sz in _DAYCAP_FIRMS["nt8"]["targets"]:
+                return "eval", sz, pl, m.group(0)
+    return "unknown", 0, None, ""
+
+
+def _dc_cons_plan(broker, plan) -> float:
+    """그 회사, 요금제의 평가 일관성 선(0 = 규칙 없음). 서버 값 > 내장 표 > 회사 기본(모르는 요금제는 규칙이 있다고 본다 - 통과 익절이 늦어지는 쪽)."""
+    v = ((_srv_rules().get("cons") or {}).get(broker) or {}).get(plan)
+    if v is None:
+        v = (_RULE_CONS.get(broker) or {}).get(plan)
+    if v is None:
+        v = (_DAYCAP_FIRMS.get(broker) or {}).get("cons", 0.0)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dc_cons(broker, name="") -> float:
+    """이 계좌의 평가 일관성 선(Topstep 0.55, Lucid Daily, Flex 0.50, Pro 0 - 서버 값 우선)."""
+    if broker == "nt8":
+        return _dc_cons_plan("nt8", _daycap_lucid_plan(name) or "")
+    return _dc_cons_plan(broker, "")
+
+
+def _dc_cap_plans() -> tuple:
+    """Lucid 자동 하루 상한을 거는 요금제 = 내장 ('D',) + 서버가 더한 요금제(서버 값은 더하기만 한다 - 3차 마무리 리뷰: 서버 목록이 내장 목록을
+    바꿔 끼우면 ['F'] 하나로 LucidDaily 상한이 조용히 꺼졌다)."""
+    return _cap_plans_union((_srv_rules().get("cap_plans") or {}).get("nt8"))
+
+
+def _cap_plans_union(v) -> tuple:
+    out = set(_LUCID_CAP_PLANS)
+    for x in (v or ()):
+        if isinstance(x, str) and len(x.strip()) == 1 and x.strip().isalpha():
+            out.add(x.strip().upper())
+    return tuple(sorted(out))
+
+
+def _dc_day_hm():
+    """거래일 시작 (시, 분) America/New_York(서버 값 > 내장 18:00 = 17:00 CT)."""
+    d = _srv_rules().get("day_start") or {}
+    try:
+        return int(d["hour"]), int(d.get("minute", 0))
+    except (KeyError, TypeError, ValueError):
+        return _RULE_DAY_START
+
+
+def _dc_day_txt() -> str:
+    """화면 문구의 거래일 시작 시각(17:00 CT). 시카고는 뉴욕보다 늘 1시간 이르다(서머타임 날짜가 같다)."""
+    h, mi = _dc_day_hm()
+    return f"{(h - 1) % 24:02d}:{mi:02d} CT"
+
+
+def _lim_combine(size) -> int:
+    v = (((_srv_rules().get("limits") or {}).get("combine")) or {}).get(_srv_size(size))
+    return int(v) if v is not None else int(_SIZE_LIMIT_COMBINE.get(_srv_size(size), 0))
+
+
+def _lim_xfa(size):
+    """그 규모 XFA Scaling Plan 표 ((잔고 이상 또는 None, 마이크로), ...) 또는 None."""
+    v = (((_srv_rules().get("limits") or {}).get("xfa")) or {}).get(_srv_size(size))
+    return tuple(tuple(r) for r in v) if v else _SIZE_LIMIT_XFA.get(_srv_size(size))
+
+
+def _lim_xfa_fallback() -> int:
+    v = (_srv_rules().get("limits") or {}).get("xfa_fallback")
+    return int(v) if v in _SIZE_LIMIT_XFA else _XFA_LIMIT_FALLBACK_SIZE
+
+
+def _lim_lucid() -> int:
+    v = (_srv_rules().get("limits") or {}).get("lucid")
+    return int(v) if v is not None else int(_SIZE_LIMIT_LUCID)
+
+
+def _margin_tbl():
+    """증거금 사전 점검 표 (마이크로당 증거금 {자산: $}, 마이크로 한 계약 위험 {자산: $}, 최대 배수, 최대 마이크로) - 서버 값으로 칸마다 덮은 내장 표."""
+    m = _srv_rules().get("margin") or {}
+    pm = dict(_MARGIN_PER_MICRO)
+    pm.update(m.get("per_micro") or {})
+    mr = dict(_MARGIN_MICRO_RISK)
+    mr.update(m.get("micro_risk") or {})
+    return pm, mr, float(m.get("max_mult", _MARGIN_MAX_MULT)), int(m.get("max_micros", _MARGIN_MAX_MICROS))
+
+
+def _rule_cons_bounds(bk, pl):
+    """서버 일관성 선 허용 범위 (lo, hi, 0 허용) 또는 None(모르는 칸 - 버린다). Topstep은 요금제 '' 하나, Lucid는 요금제 글자 하나.
+    3차 마무리 리뷰: 통과 익절이 일찍 닫히는 쪽(선을 높임, 상한 요금제에 0)은 받지 않는다 - 내장값 - 0.05 ~ 내장값. 0은 내장값이 0인 요금제만
+    (그 요금제는 0.30~0.70도 받는다). 모르는 요금제는 회사 기본 선 - 0.05 ~ 회사 기본 선(앱이 모르는 요금제에 쓰는 값)."""
+    if bk == "projectx":
+        if pl != "":
+            return None
+    elif bk == "nt8":
+        if not (isinstance(pl, str) and len(pl) == 1 and pl.isalpha()):
+            return None
+    else:
+        return None
+    base = (_RULE_CONS.get(bk) or {}).get(pl)
+    if base is None:
+        base = float((_DAYCAP_FIRMS.get(bk) or {}).get("cons", 0.0) or 0.0)
+    if float(base) > 0:
+        return round(max(_RULE_CONS_RANGE[0], float(base) - _RULE_CONS_BAND), 4), round(float(base), 4), False
+    return _RULE_CONS_RANGE[0], _RULE_CONS_RANGE[1], True
+
+
+def _xfa_lim_at(tbl, bal):
+    """XFA 표 ((문턱 또는 None, 한도), ...)에서 그 잔고의 한도(마이크로)."""
+    return next((mic for thr, mic in tbl if thr is None or bal >= thr), tbl[-1][1])
+
+
+def _xfa_no_looser(tbl, ref) -> bool:
+    """표 tbl이 어느 잔고에서도 표 ref보다 크지 않은가(두 표의 모든 문턱과 그 바로 아래, 아주 낮은 잔고에서 본다)."""
+    if not tbl or not ref:
+        return False
+    pts = {-1e9, 1e9}
+    for t in (tbl, ref):
+        for thr, _m in t:
+            if thr is not None:
+                pts.update((float(thr), float(thr) - 0.01))
+    return all(_xfa_lim_at(tbl, p) <= _xfa_lim_at(ref, p) for p in pts)
+
+
+def _limit_bounds(base):
+    """공개 한도(마이크로) → 서버 허용 범위 (공개 x 0.5(10 이상), 공개)."""
+    import math as _m
+    b = int(base)
+    return max(_RULE_LIMIT_RANGE[0], int(_m.ceil(b * _RULE_LIMIT_LOW))), b
+
+
+def _margin_bounds(key, a=None):
+    """증거금 표 한 칸의 서버 허용 범위(내장값 기준 띠, 넓은 범위 안). 띠가 없는 칸(마이크로 한 계약 위험 - 내장값 없음)은 넓은 범위만."""
+    lo0, hi0 = _RULE_MARGIN_BOUNDS[key]
+    if _RULE_MARGIN_BAND.get(key) is None:
+        return (float(lo0), float(hi0)) if a in ("NQ", "GC") else None
+    base = {"per_micro": lambda: _MARGIN_PER_MICRO.get(a), "micro_risk": lambda: _MARGIN_MICRO_RISK.get(a),
+            "max_mult": lambda: _MARGIN_MAX_MULT, "max_micros": lambda: _MARGIN_MAX_MICROS}[key]()
+    if base is None:
+        return None
+    blo, bhi = _RULE_MARGIN_BAND[key]
+    lo = max(lo0, float(base) * blo)
+    hi = min(hi0, float(base) * bhi) if bhi else hi0
+    return round(lo, 4), round(hi, 4)
+
+
+def _xfa_rows_ok(rows):
+    """XFA 표 한 규모: [[잔고 이상, 마이크로], ..., [null, 마이크로]] 1~8줄, 문턱은 0~20,000에서 내려가고 마지막만 null, 한도는 10~300에서
+    같거나 작아진다. 맞으면 ((문턱, 한도), ...), 아니면 None."""
+    if not isinstance(rows, (list, tuple)) or not (1 <= len(rows) <= 8):
+        return None
+    out, prev_thr, prev_mic = [], None, None
+    for i, r in enumerate(rows):
+        if not isinstance(r, (list, tuple)) or len(r) != 2:
+            return None
+        last = i == len(rows) - 1
+        thr = None if r[0] is None else _srv_num(r[0], 0.0, 20000.0)
+        mic = _srv_int(r[1], *_RULE_LIMIT_RANGE)
+        if mic is None or (last and r[0] is not None) or (not last and thr is None):
+            return None
+        if prev_thr is not None and thr is not None and thr >= prev_thr:
+            return None
+        if prev_mic is not None and mic > prev_mic:
+            return None
+        out.append((thr, mic))
+        prev_thr, prev_mic = (thr if thr is not None else prev_thr), mic
+    return tuple(out)
+
+
+def _rules_clean(rr):
+    """서버 rules → (검증된 dict, 핵심 값(일관성 선, 거래일 시작) 잘못 [설명]). 그 밖의 잘못된 칸은 조용히 버린다(그 칸은 내장값)."""
+    out, bad = {}, []
+    if not isinstance(rr, dict):
+        return out, bad
+    c = rr.get("cons")
+    if isinstance(c, dict):
+        cc = {}
+        for bk, by in list(c.items())[:4]:
+            if bk not in _DAYCAP_FIRMS or not isinstance(by, dict):
+                continue
+            for pl, v in list(by.items())[:8]:
+                _pl = str(pl).strip().upper() if bk == "nt8" else str(pl).strip()
+                b = _rule_cons_bounds(bk, _pl)
+                if b is None:
+                    continue
+                f = _srv_num(v, 0.0, 1.0)
+                if f is None or not ((f == 0.0 and b[2]) or b[0] <= f <= b[1]):
+                    bad.append(f"rules.cons.{bk}.{_pl or '-'}={str(v)[:12]}")
+                    continue
+                cc.setdefault(bk, {})[_pl] = f
+        if cc:
+            out["cons"] = cc
+    d = rr.get("day_start")
+    if d is not None:
+        hm = None
+        if isinstance(d, dict):
+            h, mi = _srv_int(d.get("hour"), 0, 23), _srv_int(d.get("minute", 0), 0, 59)
+            if h is not None and mi is not None and _RULE_DAY_MIN[0] <= h * 60 + mi <= _RULE_DAY_MIN[1]:
+                hm = {"hour": h, "minute": mi}
+        if hm is None:
+            bad.append(f"rules.day_start={str(d)[:24]}")
+        else:
+            out["day_start"] = hm
+    cp = rr.get("cap_plans")
+    if isinstance(cp, dict) and isinstance(cp.get("nt8"), (list, tuple)):
+        _l = list(cp.get("nt8"))
+        pls = [str(x).strip().upper() for x in _l]
+        if 0 < len(pls) <= 6 and all(len(p) == 1 and p.isalpha() for p in pls):
+            out["cap_plans"] = {"nt8": sorted(set(pls))}
+    nm = rr.get("names")
+    if isinstance(nm, dict):
+        nn = {}
+        for bk, kinds in (("projectx", ("eval", "funded", "practice")), ("nt8", ("eval",))):
+            by = nm.get(bk)
+            if not isinstance(by, dict):
+                continue
+            for kd in kinds:
+                s = by.get(kd)
+                if isinstance(s, str) and _srv_pat_ok(bk, kd, s):
+                    nn.setdefault(bk, {})[kd] = s
+        if nn:
+            out["names"] = nn
+    lm = rr.get("limits")
+    if isinstance(lm, dict):
+        ll = {}
+        # 3차 마무리 리뷰: 한도는 공개 한도보다 크게 받지 않는다(오타 하나가 회사 한도의 몇 배 진입이 되지 않게)
+        if isinstance(lm.get("combine"), dict):
+            for k, v in list(lm["combine"].items())[:8]:
+                n = _srv_size(k)
+                f = _srv_int(v, *_limit_bounds(_SIZE_LIMIT_COMBINE[n])) if n in _SIZE_LIMIT_COMBINE else None
+                if f is not None:
+                    ll.setdefault("combine", {})[n] = f
+        if isinstance(lm.get("xfa"), dict):
+            for k, rows in list(lm["xfa"].items())[:8]:
+                n, t = _srv_size(k), _xfa_rows_ok(rows)
+                if n in _SIZE_LIMIT_XFA and t is not None and _xfa_no_looser(t, _SIZE_LIMIT_XFA[n]):
+                    ll.setdefault("xfa", {})[n] = t
+        _fb = _srv_size(lm.get("xfa_fallback"))
+        if _fb in _SIZE_LIMIT_XFA:
+            # 규모 모를 때 쓰는 표 = 가장 엄한 표(3차 리뷰 P2). 어느 잔고에서도 50K 표(서버 값이면 그 값)보다 크지 않은 규모만 받는다.
+            _xt = (ll.get("xfa") or {})
+            if _xfa_no_looser(_xt.get(_fb) or _SIZE_LIMIT_XFA[_fb], _xt.get(_XFA_LIMIT_FALLBACK_SIZE)
+                              or _SIZE_LIMIT_XFA[_XFA_LIMIT_FALLBACK_SIZE]):
+                ll["xfa_fallback"] = _fb
+        _lu = _srv_int(lm.get("lucid"), *_RULE_LUCID_LIMIT)
+        if _lu is not None:
+            ll["lucid"] = _lu
+        if ll:
+            out["limits"] = ll
+    mg = rr.get("margin")
+    if isinstance(mg, dict):
+        mm = {}
+        for key in ("per_micro", "micro_risk"):
+            by = mg.get(key)
+            if isinstance(by, dict):
+                for a in ("NQ", "GC"):
+                    _bd = _margin_bounds(key, a)
+                    f = _srv_num(by.get(a), *_bd) if (by.get(a) is not None and _bd) else None
+                    if f is not None:
+                        mm.setdefault(key, {})[a] = f
+        _mx = _srv_num(mg.get("max_mult"), *_margin_bounds("max_mult")) if mg.get("max_mult") is not None else None
+        if _mx is not None:
+            mm["max_mult"] = _mx
+        _mm = _srv_int(mg.get("max_micros"), *_margin_bounds("max_micros"))
+        if _mm is not None:
+            mm["max_micros"] = _mm
+        if mm:
+            out["margin"] = mm
+    return out, bad
+
+
+def _rules_pct_bad(raw, rules) -> list:
+    """상한 비율(서버 값이 범위 안이면 그 값, 아니면 내장값)이 상한을 거는 요금제의 일관성 선(서버 값 > 내장) - 0.001보다 크면 [설명]."""
+    bad = []
+    _c = raw.get("cap_pct") if isinstance(raw, dict) and isinstance(raw.get("cap_pct"), dict) else {}
+    for bk in _DAYCAP_FIRMS:
+        pct = _srv_num(_c.get(bk), *_srv_pct_bounds(bk)) if _c.get(bk) is not None else None
+        pct = float(pct if pct is not None else _DAYCAP_FIRMS[bk]["pct"])
+        cons = dict(_RULE_CONS.get(bk) or {})
+        cons.update(((rules or {}).get("cons") or {}).get(bk) or {})
+        plans = [""] if bk == "projectx" else list(_cap_plans_union(((rules or {}).get("cap_plans") or {}).get("nt8")))   # 내장 + 서버(더하기만)
+        for pl in plans:
+            cv = float(cons.get(pl, _DAYCAP_FIRMS[bk]["cons"]) or 0.0)
+            if cv > 0 and pct > cv - 0.001 + 1e-9:
+                bad.append(f"cap_pct.{bk}={pct:g}>cons.{pl or '-'}={cv:g}")
+    return bad
+
+
+def _daycap_off() -> bool:
+    return str(os.environ.get("EQ_DAYCAP_OFF", "")).strip() == "1"
+
+
+# 시험판 표시(대표 시험용 빌드만 True, 회원판은 늘 False). True면 평가 계좌 익절 그림자 모드가 기본으로 켜지고(config.yaml에
+# `daycap_shadow: false`를 넣어야 꺼진다), 창 제목과 [라이브 시작] 로그에 시험판이라고 쓴다. 버전 문자열(_APP_VER)은 바꾸지 않는다 -
+# 서버의 앱 버전 비교는 'YYYY.MM.DD + 글자' 꼴만 읽는다.
+_TEST_BUILD = True
+_SHADOW_CACHE = {"mt": None, "v": {}}
+_HIDDEN_KEYS = ("daycap_shadow", "daycap_test", "daycap_test_cap")   # config.yaml에 손으로 넣는 숨은 설정(회원 화면에 없음) - 저장이 지우지 않는다
+
+
+def _hidden_cfg() -> dict:
+    """config.yaml의 숨은 설정 {daycap_shadow, daycap_test, daycap_test_cap}(있는 키만). 파일이 바뀐 때만(시각, 크기) 다시 읽는다."""
+    try:
+        _s = os.stat(CFG_PATH)
+        mt = (_s.st_mtime_ns, _s.st_size)
+    except OSError:
+        return {}
+    if _SHADOW_CACHE["mt"] != mt:
+        v = {}
+        try:
+            import yaml
+            with open(CFG_PATH, encoding="utf-8") as f:
+                _d = yaml.safe_load(f) or {}
+            if isinstance(_d, dict):
+                v = {k: _d.get(k) for k in _HIDDEN_KEYS if k in _d}
+        except Exception:
+            v = {}
+        _SHADOW_CACHE["mt"], _SHADOW_CACHE["v"] = mt, v
+    return dict(_SHADOW_CACHE["v"] or {})
+
+
+def _cfg_true(v) -> bool:
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _daycap_shadow() -> bool:
+    """그림자 모드(3차 결정 E, 대표 첫 시험용 숨은 설정): 감시가 닿아도 주문(청산, 주문 걷기)을 내지 않고 '정리했을 경우: ...' 로그만 남긴다.
+    켜는 법 = 환경 변수 EQ_DAYCAP_SHADOW=1 또는 config.yaml에 `daycap_shadow: true` 한 줄. 기본 꺼짐(시험판 _TEST_BUILD는 기본 켜짐 -
+    config.yaml에 `daycap_shadow: false`가 있을 때만 꺼진다). 설정 파일은 바뀐 때만 다시 읽는다."""
+    if str(os.environ.get("EQ_DAYCAP_SHADOW", "")).strip() == "1":
+        return True
+    _h = _hidden_cfg()
+    if "daycap_shadow" in _h:
+        return bool(_h.get("daycap_shadow"))
+    return bool(_TEST_BUILD)
+
+
+def _test_build_tag():
+    """시험판이면 ('시험판', 'Test build'), 회원판이면 ('', '')."""
+    return ("시험판", "Test build") if _TEST_BUILD else ("", "")
+
+
+def _window_title() -> str:
+    """메인 창 제목. 시험판이면 KO/EN으로 시험판이라고 붙인다."""
+    _tk, _te = _test_build_tag()
+    return ("EQ Autopilot" + (f"  [{PROFILE}]" if PROFILE else "") + ("  - share mode" if SHARE_MODE else "")
+            + (f"  - {_tk} ({_te})" if _tk else ""))
+
+
+# ── 시험용 스위치(3차 마무리 3, 시험 계획 3단계 '연습 계좌 실제 정리') ──
+# config.yaml에 `daycap_test: true`(그리고 고르면 `daycap_test_cap: 50`, 10~500, 기본 50)를 넣으면: Topstep 연습 계좌(PRAC, 앱 내장 이름 패턴만 -
+# 서버 패턴은 보지 않는다)와 NinjaTrader Sim101을 평가 계좌처럼 보고 하루 이익 상한을 그 작은 금액으로 건다. 이 연습 계좌에서만 손으로 연
+# 포지션도 정리한다(대표가 MNQ 1계약을 손으로 열고 +$50에서 앱이 정리하는지 본다). 정리 뒤에는 실제 상한과 같게 그 계좌의 남은 손절 주문을 걷고
+# 그날 다음 진입을 건너뛴다. 그림자 모드가 켜져 있어도 이 연습 계좌는 실제로 정리한다(다른 계좌는 그림자 모드 그대로). 어드민 라이브 잠금은
+# 따른다. 기본 꺼짐, 회원 화면에는 없다. 연습 계좌가 아닌 계좌(평가, 펀디드, 모르는 이름, 다른 브로커)에는 절대 걸리지 않는다.
+_DAYCAP_TEST_CAP = 50.0
+_DAYCAP_TEST_CAP_RANGE = (10.0, 500.0)
+
+
+def _daycap_test_on() -> bool:
+    return _cfg_true(_hidden_cfg().get("daycap_test")) and not _daycap_off()
+
+
+def _daycap_test_cap_raw():
+    return _hidden_cfg().get("daycap_test_cap")
+
+
+def _daycap_test_cap() -> float:
+    """시험 상한($). 없거나 10~500 밖, 숫자가 아니면 $50."""
+    v = _daycap_test_cap_raw()
+    if v is None:
+        return _DAYCAP_TEST_CAP
+    try:
+        f = float(v) if not isinstance(v, bool) else None
+    except (TypeError, ValueError):
+        f = None
+    if f is None or f != f or not (_DAYCAP_TEST_CAP_RANGE[0] <= f <= _DAYCAP_TEST_CAP_RANGE[1]):
+        return _DAYCAP_TEST_CAP
+    return f
+
+
+def _daycap_test_acct(broker, name) -> bool:
+    """시험 모드가 켜져 있고 이 계좌가 시험 대상 연습 계좌인가: Topstep(projectx) 이름이 앱 내장 연습 패턴(PRAC)이고 펀디드, 평가 이름이
+    아님, 또는 NinjaTrader(nt8) 계좌 이름이 정확히 Sim101. 그 밖은 늘 False."""
+    if not _daycap_test_on():
+        return False
+    import re as _re
+    nm = str(name or "").strip()
+    if not nm:
+        return False
+    if broker == "projectx":
+        return (bool(_re.match(_PRAC_RE, nm, _re.I)) and not _re.search(_XFA_RE, nm, _re.I)
+                and not _re.match(_COMBINE_RE, nm, _re.I))
+    if broker == "nt8":
+        return nm.casefold() == "sim101"
+    return False
+
+
+def _money(v, cents=False) -> str:
+    """금액 표기: $1,234 / -$120(부호는 $ 앞, 3차 결정 H). cents = 센트까지(그림자 모드의 정확한 금액)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    s = f"${abs(f):,.2f}" if cents else f"${abs(f):,.0f}"
+    return ("-" + s) if (f < 0 and s not in ("$0", "$0.00")) else s
+
+
+def _srv_num(v, lo, hi):
+    """서버 값 하나: 숫자이고 [lo, hi] 안이면 float, 아니면 None(그 칸은 내장값)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f < lo or f > hi:
+        return None
+    return f
+
+
+def _srv_pct_bounds(bk):
+    """그 회사 상한 비율의 서버 허용 범위(내장값 ±0.02, 일관성 선 - 0.001 이하, 넓은 범위 안)."""
+    f = _DAYCAP_FIRMS[bk]
+    return (round(max(_SRV_BOUNDS["cap_pct"][0], float(f["pct"]) - _SRV_PCT_BAND), 4),
+            round(min(_SRV_BOUNDS["cap_pct"][1], float(f["pct"]) + _SRV_PCT_BAND, float(f["cons"]) - 0.001), 4))
+
+
+def _srv_target_bounds(bk, size):
+    """그 회사, 그 규모 이익 목표의 서버 허용 범위(내장값 ±25%, 넓은 범위 안). 내장 표에 없는 규모는 None."""
+    base = _DAYCAP_FIRMS[bk]["targets"].get(size)
+    if not base:
+        return None
+    return (max(_SRV_BOUNDS["targets"][0], float(base) * (1.0 - _SRV_TARGET_BAND)),
+            min(_SRV_BOUNDS["targets"][1], float(base) * (1.0 + _SRV_TARGET_BAND)))
+
+
+def _prop_reco_core_bad(raw) -> list:
+    """서버가 보낸 핵심 값(상한 비율, 이익 목표) 가운데 회사, 규모별 범위를 벗어난 칸 [설명]. 모르는 회사, 그 회사에 없는 규모는 셈하지 않는다
+    (그냥 버린다). 하나라도 있으면 그 서버 값은 통째로 쓰지 않는다(3차 리뷰 P1)."""
+    bad = []
+    if not isinstance(raw, dict):
+        return bad
+    _c = raw.get("cap_pct")
+    if isinstance(_c, dict):
+        for bk, v in list(_c.items())[:8]:
+            if bk in _DAYCAP_FIRMS and _srv_num(v, *_srv_pct_bounds(bk)) is None:
+                bad.append(f"cap_pct.{bk}={str(v)[:12]}")
+    _t = raw.get("targets")
+    if isinstance(_t, dict):
+        for bk, by_sz in list(_t.items())[:8]:
+            if bk not in _DAYCAP_FIRMS or not isinstance(by_sz, dict):
+                continue
+            for k, v in list(by_sz.items())[:8]:
+                try:
+                    n = int(float(k))
+                except (TypeError, ValueError):
+                    continue
+                _b = _srv_target_bounds(bk, n)
+                if _b is not None and _srv_num(v, *_b) is None:
+                    bad.append(f"targets.{bk}.{n}={str(v)[:12]}")
+    # 3차 마무리 1: 프롭 규칙의 핵심 값(일관성 선, 거래일 시작) + 상한 비율이 상한을 거는 요금제의 일관성 선 아래인가(서버가 보낸 일관성 선 기준)
+    _rc, _rbad = _rules_clean(raw.get("rules"))
+    bad.extend(_rbad)
+    bad.extend(_rules_pct_bad(raw, _rc))
+    return bad
+
+
+def _prop_reco_validate(raw) -> dict:
+    """하트비트 prop_reco → 검증된 값만 남긴 dict(빈 dict = 쓸 값 없음). 브로커는 projectx, nt8, 단계는 eval, funded, 규모는 25K/50K/100K/150K
+    (이익 목표는 그 회사 내장 표에 있는 규모만). 범위: 1R 100~5000, 통과 여유 0~500, 상한 비율과 이익 목표는 회사, 규모별(_srv_pct_bounds,
+    _srv_target_bounds)."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+
+    def _sz(k):
+        try:
+            n = int(float(k))
+        except (TypeError, ValueError):
+            return 0
+        return n if n in _DAYCAP_SIZES else 0
+    _r = raw.get("reco_1r")
+    if isinstance(_r, dict):
+        rr = {}
+        for bk, by_st in list(_r.items())[:4]:
+            if bk not in _DAYCAP_FIRMS or not isinstance(by_st, dict):
+                continue
+            for stg, by_sz in list(by_st.items())[:4]:
+                if stg not in ("eval", "funded") or not isinstance(by_sz, dict):
+                    continue
+                for k, v in list(by_sz.items())[:8]:
+                    n, f = _sz(k), _srv_num(v, *_SRV_BOUNDS["reco_1r"])
+                    if n and f is not None:
+                        rr.setdefault(bk, {}).setdefault(stg, {})[n] = f
+        if rr:
+            out["reco_1r"] = rr
+    _c = raw.get("cap_pct")
+    if isinstance(_c, dict):
+        cc = {bk: f for bk, f in ((bk, (_srv_num(v, *_srv_pct_bounds(bk)) if bk in _DAYCAP_FIRMS else None))
+                                  for bk, v in list(_c.items())[:4])
+              if bk in _DAYCAP_FIRMS and f is not None}
+        if cc:
+            out["cap_pct"] = cc
+    _t = raw.get("targets")
+    if isinstance(_t, dict):
+        tt = {}
+        for bk, by_sz in list(_t.items())[:4]:
+            if bk not in _DAYCAP_FIRMS or not isinstance(by_sz, dict):
+                continue
+            for k, v in list(by_sz.items())[:8]:
+                n = _sz(k)
+                _b = _srv_target_bounds(bk, n) if n else None
+                f = _srv_num(v, *_b) if _b is not None else None
+                if n and f is not None:
+                    tt.setdefault(bk, {})[n] = f
+        if tt:
+            out["targets"] = tt
+    _m = _srv_num(raw.get("pass_margin"), *_SRV_BOUNDS["pass_margin"])
+    if _m is not None:
+        out["pass_margin"] = _m
+    _rc, _ = _rules_clean(raw.get("rules"))             # 프롭 규칙(3차 마무리 1) - 범위 안 칸만
+    if _rc:
+        out["rules"] = _rc
+    return out
+
+
+def _load_prop_reco() -> dict:
+    """디스크에 둔 마지막 정상 서버 값(기동 때, 첫 하트비트 전). 읽을 수 없으면 빈 dict(내장값)."""
+    try:
+        import json as _json
+        with open(_PROP_RECO_PATH, encoding="utf-8") as f:
+            return _prop_reco_validate(_json.load(f))
+    except Exception:
+        return {}
+
+
+def _save_prop_reco(raw) -> None:
+    try:
+        import json as _json
+        _write_text_atomic(_PROP_RECO_PATH, _json.dumps(raw or {}))
+    except Exception:
+        pass
+
+
+def _prop_reco_boot() -> None:
+    """기동: 디스크의 마지막 정상 서버 값을 쓴다(없거나 깨졌으면 내장값)."""
+    global _DAYCAP_SRV
+    _DAYCAP_SRV = _load_prop_reco()
+
+
+def _dc_pct(broker) -> float:
+    """하루 상한 비율(서버 값 > 내장 표)."""
+    v = ((_DAYCAP_SRV.get("cap_pct") or {}).get(broker))
+    return float(v) if v is not None else float(_DAYCAP_FIRMS[broker]["pct"])
+
+
+def _dc_targets(broker) -> dict:
+    """규모 → 이익 목표(서버 값으로 칸마다 덮은 내장 표)."""
+    t = dict(_DAYCAP_FIRMS[broker]["targets"])
+    t.update((_DAYCAP_SRV.get("targets") or {}).get(broker) or {})
+    return t
+
+
+def _dc_margin() -> float:
+    v = _DAYCAP_SRV.get("pass_margin")
+    return float(v) if v is not None else float(_DAYCAP_PASS_MARGIN)
+
+
+def _dc_cap_amount(broker, target) -> float:
+    """자동 하루 상한 = 이익 목표 x 비율(서버 값 > 내장), 달러 반올림(내장값으로 150K Topstep 9,000 x 0.54 = $4,860, Lucid 9,000 x 0.49 = $4,410)."""
+    import math as _m
+    t = float(target or 0)
+    return float(_m.floor(t * _dc_pct(broker) + 0.5)) if t > 0 else 0.0
+
+
+def _dc_cons_applies(broker, name="") -> bool:
+    """통과 익절에 최고일 규칙을 거는가(평가 일관성 규칙이 있는 요금제 - 일관성 선 > 0). 내장값으로는 LucidPro만 아니다(서버 값이 바꿀 수 있다)."""
+    return broker in _DAYCAP_FIRMS and _dc_cons(broker, name) > 0
+
+
+def _dc_pass_need(broker, size, target, best=None, name="") -> float:
+    """실제로 통과하는 잔고 = 시작(규모) + max(이익 목표, 최고일 / 일관성 선)(Topstep 0.55 → 최고일 / 0.55, Lucid 0.50 → 최고일 x 2).
+    best None(모름) 또는 일관성 규칙이 없는 요금제 = 규모 + 목표."""
+    t = float(target or 0)
+    if not t or not size:
+        return 0.0
+    need = t
+    if best is not None and _dc_cons_applies(broker, name):
+        try:
+            need = max(t, float(best) / _dc_cons(broker, name))         # 일관성 선 = 그 요금제 값(서버 값 > 내장, 3차 마무리 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            need = t
+    return round(float(size) + need, 2)
+
+
+def _dc_tick_value(contract) -> float:
+    """계약 한 틱의 달러 가치(NQ $5, MNQ $0.50, GC $10, MGC $1). 모르는 계약은 0."""
+    s = str(contract or "").upper()
+    parts = s.split(".")
+    root = parts[3] if len(parts) >= 5 and parts[0] == "CON" else s.split(" ")[0]
+    pv = _PV_BY_ROOT.get(root)
+    if pv is None:
+        for tok, v in _PV_BY_ROOT.items():
+            if tok in s:
+                pv = v
+                break
+    fam = "GC" if "GC" in root else ("NQ" if "NQ" in root else None)
+    if not pv or fam is None:
+        return 0.0
+    return float(pv) * float(_DAYCAP_TICK[fam])
+
+
+def _dc_slip_margin(closing) -> float:
+    """정리할 계약 [(계약, 수량)]의 시장가 청산 2틱 비용(통과 익절 여유의 아래 값과 비교할 값)."""
+    tot = 0.0
+    for con, q in closing or []:
+        try:
+            tot += _DAYCAP_SLIP_TICKS * _dc_tick_value(con) * abs(int(q))
+        except (TypeError, ValueError):
+            continue
+    return round(tot, 2)
+
+
+def _iso_utc(s):
+    """ISO 시각 글자 → UTC datetime. 소수 초 자릿수가 3, 6이 아니어도(.NET이 끝의 0을 지운 '.52329') 읽는다 - 파이썬 3.9의
+    fromisoformat은 그 꼴을 거절한다(3차 리뷰 P1: 맥 빌드에서 거래 기록 행이 조용히 빠지던 것). 못 읽으면 ValueError."""
+    import re as _re
+    t = str(s or "").strip().replace("Z", "+00:00")
+    if not t:
+        raise ValueError("empty timestamp")
+    t = _re.sub(r"(\.\d+)", lambda m: (m.group(1) + "000000")[:7], t, count=1)
+    d = _dt.datetime.fromisoformat(t)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.astimezone(_dt.timezone.utc)
+
+
+def _daycap_norm(v):
+    """day_cap 저장값 정규화: None(또는 빈 값, 못 읽는 값) = 자동, 0 = 끔, 양수 = 회원 값."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        f = float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return None if f < 0 else f
+
+
+def _daycap_norm_size(v) -> int:
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return 0
+    return n if n in _DAYCAP_SIZES else 0
+
+
+def _daycap_root(contract) -> str:
+    """계약 표기 → 루트(CON.F.US.GCE.Z26 → GCE, 'MGC 12-26' → MGC, MNQZ6 → MNQZ6)."""
+    s = str(contract or "").upper()
+    parts = s.split(".")
+    return parts[3] if len(parts) >= 5 and parts[0] == "CON" else s.split(" ")[0]
+
+
+def _daycap_size_from_name(broker, name):
+    """계좌 이름의 규모: Topstep 150KTC-… → 150000, Lucid LDI150… → 150000(이름 패턴 = 내장 + 서버, 3차 마무리 1). 모르면 None."""
+    if broker not in ("projectx", "nt8"):
+        return None
+    kd, sz, _pl, _mt = _dc_name_info(broker, name)
+    return sz if (kd == "eval" and sz) else None
+
+
+def _daycap_size_from_balance(broker, bal):
+    """잔고에서 가장 가까운 규모(±10% 안일 때만). 평가 잔고는 규모 − 최대 손실 ~ 규모 + 목표 사이에 있고 네 규모의
+    ±10% 띠는 겹치지 않는다. Topstep 펀디드는 잔고가 0에서 시작해 걸리지 않는다."""
+    f = _DAYCAP_FIRMS.get(broker)
+    try:
+        b = float(bal)
+    except (TypeError, ValueError):
+        return None
+    if not f or b <= 0:
+        return None
+    best = min(f["targets"], key=lambda s: abs(b / s - 1.0))
+    return best if abs(b / best - 1.0) <= 0.10 else None
+
+
+def _daycap_stage(broker, pr, name="", bal=None):
+    """(단계, 이름의 규모) - 회원 설정 없이 판별한다(대표 2026-10-14 결정 4).
+    단계: 'eval' 평가, 'funded' 펀디드, 'practice' 연습, 'unknown' 모르는 이름, 'unanswered' Lucid 단계를 아직 안 물었거나 답이 없음,
+    'mismatch' 이름의 규모와 잔고가 맞지 않음, 'none' 대상 브로커가 아님(또는 킬스위치). 'eval'만 상한과 통과 익절을 건다.
+    Topstep: 이름이 이긴다 - 저장된 프롭 유형(기본값 'test')은 보지 않는다. Lucid: 회원 답 pr['stage'] ('eval'/'funded')."""
+    if broker not in _DAYCAP_FIRMS or _daycap_off():
+        return "none", 0
+    nm = str(name or "").strip()
+    if _daycap_test_acct(broker, nm):
+        return "eval", 0                                # 시험용 스위치(3차 마무리 3): 연습 계좌를 평가처럼 - 규모 없이 시험 상한만
+    # 이름 패턴 = 내장 + 서버(3차 마무리 1). 펀디드, 연습을 먼저 본다 - 잘못된 서버 패턴이 펀디드, 모르는 계좌를 평가로 만들지 못한다.
+    kd, size, _pl, _mt = _dc_name_info(broker, nm)
+    if broker == "projectx":
+        if kd in ("funded", "practice"):
+            return kd, 0
+        if kd != "eval":
+            return "unknown", 0
+    else:
+        if kd != "eval":
+            return "unknown", 0
+        _st = (pr or {}).get("stage")
+        _sf = str((pr or {}).get("stage_for") or "").strip().casefold()
+        if _sf and _sf != nm.casefold():
+            _st = None                                  # 다른 계좌에서 받은 답 - 이 계좌는 아직 안 물었다
+        if _st == "funded":
+            return "funded", size
+        if _st != "eval":
+            return "unanswered", size
+    try:
+        b = float(bal) if bal is not None else None
+    except (TypeError, ValueError):
+        b = None
+    if b is not None:
+        # 통과 목표(규모 + 목표) 이상은 ±10% 띠 밖이어도 평가로 본다 - 진입, 감시가 '통과'로 표시하게(2차 리뷰 P2: 앱이 안 보던 사이
+        # 통과를 넘긴 계좌가 'mismatch'로 빠져 상한도 통과 멈춤도 없이 다시 거래하던 것). 목표의 3배를 넘는 잔고는 평가로 보기 어렵다.
+        _tg = float(_dc_targets(broker).get(size, 0.0))
+        if _tg and size + _tg <= b <= size + 3 * _tg:
+            return "eval", size
+        if abs(b / float(size) - 1.0) > _DAYCAP_SANITY_BAND:
+            return "mismatch", size
+    return "eval", size
+
+
+def _daycap_lucid_plan(name):
+    """Lucid 계좌 이름의 요금제 글자('D' Daily, 'F' Flex, 'P' Pro) 또는 None(이름 패턴 = 내장 + 서버)."""
+    kd, _sz, pl, _mt = _dc_name_info("nt8", name)
+    return pl if kd == "eval" and pl else None
+
+
+def _daycap_is_eval(broker, pr, name="", bal=None) -> bool:
+    return _daycap_stage(broker, pr, name, bal)[0] == "eval"
+
+
+def _daycap_resolve(broker, pr, name="", bal=None, learned_size=None, best=None):
+    """평가 계좌 익절 설정 → None(평가 아님) 또는 {firm, pct, size, size_src, size_conflict, target, cap, cap_src, pass_tp, pass_need,
+    pass_src, best, margin}.
+    규모: 계좌 이름 > 회원이 고른 값 > 잔고 > 앱이 전에 알아낸 값. 이름이 규모를 말하면 이름이 이긴다(2차 리뷰 P1: 다른 계좌에서 남은
+    150K 선택이 50K Combine에 150K 상한, 통과 목표를 걸던 것) - 다르게 고른 값은 size_conflict로 알린다. 모르면 0 - 기본값 모두 꺼짐.
+    하루 상한: day_cap None=자동(목표 x 상한 비율, Lucid는 LucidDaily만 - 다른 요금제 자동은 0), 0=끔, 양수=회원 값. 이 금액이 곧
+    감시가 닫는 선이다(여유를 더 빼지 않는다, 3차 결정 A).
+    통과 익절(3차 결정 B): pass_set이면 저장값(0=끔), 아니면 저장값이 양수면 그 값(옛 빌드에서 회원이 넣은 값은 덮지 않는다) - 회원 값은
+    pass_need = pass_tp(그 잔고를 넘기려고 감시가 청산 비용 여유를 더해 닫는다, 종전 규약). 자동 = 실제로 통과하는 잔고 pass_need =
+    규모 + max(목표, best / 일관성 선) + 통과 여유($50)에서 닫는다(best = 지금까지 최고일, None = 모름 = 목표)."""
+    if not _daycap_is_eval(broker, pr, name, bal):
+        return None
+    f = _DAYCAP_FIRMS[broker]
+    pr = pr or {}
+    if _daycap_test_acct(broker, name):
+        # 시험용 스위치(3차 마무리 3): 연습 계좌 = 시험 상한 하나(회원 칸, 규모, 통과 익절 없음). 정리는 손으로 연 포지션까지(test=True).
+        return {"broker": broker, "firm": ("Topstep" if broker == "projectx" else "NinjaTrader"), "pct": 0.0, "size": 0,
+                "size_src": "", "target": 0.0, "size_conflict": 0, "cap": float(_daycap_test_cap()), "cap_src": "test",
+                "pass_tp": 0.0, "pass_need": 0.0, "pass_src": "test", "best": None, "margin": 0.0, "test": True}
+    _nsz = _daycap_size_from_name(broker, name) or 0
+    _ssz = _daycap_norm_size(pr.get("size"))
+    size, src = (_nsz, "name") if _nsz else (_ssz, "set")
+    if not size and bal is not None:
+        size, src = (_daycap_size_from_balance(broker, bal) or 0), "balance"
+    if not size and learned_size:
+        size, src = _daycap_norm_size(learned_size), "seen"
+    if not size:
+        src = ""
+    tgt = float(_dc_targets(broker).get(size, 0.0))
+    dc = _daycap_norm(pr.get("day_cap"))
+    if dc is None:
+        cap, cap_src = _dc_cap_amount(broker, tgt), "auto"
+        if broker == "nt8" and _daycap_lucid_plan(name) not in _dc_cap_plans():
+            cap, cap_src = 0.0, "plan"                  # LucidPro, LucidFlex 평가 = 하루 상한 규칙 없음(확인 전) - 통과 목표만
+    else:
+        cap, cap_src = float(dc), ("off" if dc == 0 else "set")
+    ptp = _as_float(pr.get("pass_tp"), 0.0)
+    _mg = _dc_margin()
+    if pr.get("pass_set"):
+        pass_tp, pass_src = max(0.0, ptp), "set"
+        pass_need = pass_tp
+    elif ptp > 0:
+        pass_tp, pass_src = ptp, "set"
+        pass_need = pass_tp
+    else:
+        pass_need = _dc_pass_need(broker, size, tgt, best, name) if tgt else 0.0
+        pass_tp, pass_src = ((pass_need + _mg) if pass_need else 0.0), "auto"
+    return {"broker": broker, "firm": f["firm"], "pct": _dc_pct(broker), "size": size, "size_src": src, "target": tgt,
+            "size_conflict": (_ssz if (_nsz and _ssz and _ssz != _nsz) else 0),
+            "cap": cap, "cap_src": cap_src, "pass_tp": pass_tp, "pass_need": pass_need, "pass_src": pass_src,
+            "best": best, "margin": (_mg if pass_src == "auto" else 0.0)}
+
+
+def _ny_offset_h(u) -> float:
+    if ZoneInfo is not None:
+        try:
+            return u.astimezone(ZoneInfo("America/New_York")).utcoffset().total_seconds() / 3600.0
+        except Exception:
+            pass
+    return float(_us_eastern_offset(u))
+
+
+def _daycap_day_start(now_utc=None):
+    """프롭 거래일 시작 = 가장 최근 17:00 America/Chicago(= 18:00 America/New_York, 두 도시는 서머타임 날짜가 같다).
+    Topstep 거래일은 17:00 CT 시작, Lucid는 18:00 ET 재개(16:45 ET 마감)라 같은 경계다. tzdata가 없어도 산술로 돈다.
+    반환 (시작 UTC datetime, 거래일 키 'YYYY-MM-DD' = 그 거래일이 끝나는 날의 ET 날짜)."""
+    u = now_utc or _dt.datetime.now(_dt.timezone.utc)
+    et = (u + _dt.timedelta(hours=_ny_offset_h(u))).replace(tzinfo=None)
+    _h, _mi = _dc_day_hm()                              # 18:00 ET 내장, 서버 값(3차 마무리 1)
+    start = et.replace(hour=_h, minute=_mi, second=0, microsecond=0)
+    if et < start:
+        start -= _dt.timedelta(days=1)
+    s_utc = (start - _dt.timedelta(hours=_ny_offset_h(u))).replace(tzinfo=_dt.timezone.utc)
+    s_utc = (start - _dt.timedelta(hours=_ny_offset_h(s_utc))).replace(tzinfo=_dt.timezone.utc)
+    return s_utc, (start + _dt.timedelta(days=1)).date().isoformat()
+
+
+# ── 권장 1R(대표 2026-10-14 결정 6, 법적 선: 크기는 회원이 정한다 - 앱은 제안하고 미리 채울 뿐, 회원이 한 번 눌러 정한다) ──
+# 권장 1R 표 하나(3차 결정 G): {브로커: {단계: {규모: 1R}}}. 내장값은 150K만(Topstep, Lucid 모두 평가 $2,200 / 펀디드 $450 - _PROP_PRESETS와
+# 같은 값). 표에 없는 규모는 아무것도 권하지 않는다. 값은 서버 하트비트(reco_1r)로 바뀐다(앱 재빌드 없이).
+_RECO_1R = {
+    "projectx": {"eval": {150000: 2200.0}, "funded": {150000: 450.0}},
+    "nt8": {"eval": {150000: 2200.0}, "funded": {150000: 450.0}},
+}
+# Topstep 펀디드(EXPRESS-…) 이름에는 규모가 없다 - 회원이 프롭 설정에서 규모를 고르지 않았으면 150K로 보고 권한다(대표 2026-10-14
+# "회원들은 설정 안 바꾼다"). 권장에만 쓴다 - 계좌 한도(XFA Scaling Plan)는 모르면 가장 엄한 50K 줄(3차 리뷰 P2).
+_XFA_DEFAULT_SIZE = 150000
+
+
+def _reco_table() -> dict:
+    """권장 1R 표(서버 값으로 칸마다 덮은 내장 표)."""
+    out = {bk: {stg: dict(v) for stg, v in by.items()} for bk, by in _RECO_1R.items()}
+    for bk, by in ((_DAYCAP_SRV.get("reco_1r") or {}).items()):
+        for stg, by_sz in (by or {}).items():
+            out.setdefault(bk, {}).setdefault(stg, {}).update(by_sz or {})
+    return out
+
+
+def _reco_one_r(broker, stage, size):
+    """권장 1R($) 또는 None. stage: 'eval' → 평가 1R, 'funded'/'passed' → 펀디드 1R. 표에 있는 규모만(지금은 150K)."""
+    _st = "eval" if stage == "eval" else ("funded" if stage in ("funded", "passed") else None)
+    if _st is None:
+        return None
+    try:
+        v = ((_reco_table().get(str(broker or "")) or {}).get(_st) or {}).get(int(size or 0))
+    except (TypeError, ValueError):
+        return None
+    return float(v) if v is not None else None
+
+
+# ── 증거금 사전 점검(대표 2026-10-14 결정 7 "이번 앱에 포함해"): 경고만, 막지 않는다 ──
+# 진입 전 점검(T-70, T-10)에서 계좌 잔고(NT8 = 브리지 현금, 없으면 NetLiq / ProjectX = 잔고)가 이번 세션에 필요한 증거금보다 적어 보이거나
+# 0 이하면 계좌마다 한 줄 경고한다:
+#   · 마이크로 한 계약 증거금 = 서버 값(prop_reco.rules.margin), 없으면 공개된 장중 증거금(Tradovate 2026-10-05: MNQ $100, MGC $200).
+#     미니/풀사이즈는 마이크로의 10배.
+#   · 예상 계약(마이크로 환산) = 1R x 최대 배수 3 ÷ 마이크로 한 계약 위험(서버 값만 - 앱에 내장값이 없다). 서버 값이 없으면 계약 수를
+#     어림하지 않고 마이크로 한 계약의 증거금과만 비교한다. 사이징 천장(마이크로 400)을 넘지 않는다.
+#   · Topstep 펀디드(EXPRESS, 잔고가 $0에서 시작하는 이익 잔고)와 프롭 '라이브 초기' 계좌는 보지 않는다 - 0 이하가 정상이라 거짓 경고가 된다.
+_MARGIN_PER_MICRO = {"NQ": 100.0, "GC": 200.0}       # 공개된 장중 증거금(마이크로 한 계약)
+_MARGIN_MICRO_RISK = {}                              # 내장값 없음 - 서버 값만
+_MARGIN_MAX_MULT = 3.0
+_MARGIN_MAX_MICROS = 400
+
+
+def _margin_est(asset) -> bool:
+    """이 자산의 예상 계약 수를 어림할 수 있는가(마이크로 한 계약 위험의 서버 값이 있음)."""
+    return str(asset or "").upper() in _margin_tbl()[1]
+
+
+def _margin_need(asset, one_r):
+    """(예상 마이크로 환산 계약 수, 필요 증거금 $) - 1R을 모르거나 선물 자산이 아니면 (0, 0.0). 마이크로 한 계약 위험(서버 값)이 없으면
+    계약 수를 어림하지 않고 (1, 마이크로 한 계약 증거금)."""
+    a = str(asset or "").upper()
+    try:
+        r = float(one_r or 0)
+    except (TypeError, ValueError):
+        r = 0.0
+    _pm, _mr, _mx, _mmax = _margin_tbl()                 # 서버 값으로 칸마다 덮은 표(3차 마무리 1)
+    if a not in _pm or r <= 0:
+        return 0, 0.0
+    if a not in _mr:
+        return 1, float(_pm[a])
+    n = int(round(r * _mx / _mr[a]))
+    n = max(1, min(_mmax, n))
+    return n, n * _pm[a]
+
+
+# ── 계좌 한도(3차 결정 D): 계획 계약이 계좌 한도를 넘으면 한도까지만 진입한다(차분한 로그 한 줄). 마이크로 환산(미니 1 = 마이크로 10) ──
+#   Topstep Trading Combine(평가): 50K 5 미니(50), 100K 10(100), 150K 15(150) - help.topstep.com 'Trading Combine Parameters'.
+#   Topstep XFA(펀디드) Scaling Plan: 그날 시작 잔고(XFA 잔고는 $0에서 시작하는 이익 잔고) 단계별 미니 계약 -
+#     잔고        50K  100K  150K
+#     $1,500 미만   2     3     3
+#     $1,500+       3     4     4
+#     $2,000+       5     5     5
+#     $3,000+       5    10    10
+#     $4,500+       5    10    15
+#     공식 표는 Topstep XFA 규칙 페이지의 그림이라 숫자는 제3자 옮겨 적기다. 장중에는 늘지 않는다 - 앱은 그날 처음 본 잔고와 지금 잔고
+#     가운데 작은 쪽으로 단계를 고른다.
+#     이름에 규모가 없으면 회원이 고른 규모, 없으면 가장 엄한 50K 줄(_XFA_LIMIT_FALLBACK_SIZE, 3차 리뷰 P2 - 한도는 넘지 않는 게 목적이라
+#     모르면 작게 잡는다. 너무 작으면 진입이 작아질 뿐이다). 150K로 보는 가정(_XFA_DEFAULT_SIZE)은 권장 1R에만 쓴다.
+#   Lucid: 10 미니 = 100 마이크로(대표 2026-10-14, LucidDaily 150K). 다른 규모의 한도는 확인 전이라 같은 100을
+#     위 한도로만 쓴다(그보다 작을 수 있다).
+#   연습(PRAC), 모르는 이름, 프롭이 아닌 계좌는 줄이지 않는다(종전 그대로).
+_SIZE_LIMIT_COMBINE = {50000: 50, 100000: 100, 150000: 150}
+_SIZE_LIMIT_XFA = {
+    50000: ((4500.0, 50), (3000.0, 50), (2000.0, 50), (1500.0, 30), (None, 20)),
+    100000: ((4500.0, 100), (3000.0, 100), (2000.0, 50), (1500.0, 40), (None, 30)),
+    150000: ((4500.0, 150), (3000.0, 100), (2000.0, 50), (1500.0, 40), (None, 30)),
+}
+_SIZE_LIMIT_LUCID = 100
+_XFA_LIMIT_FALLBACK_SIZE = 50000
+
+
+def _size_limit(broker, name, bal=None, size_hint=0):
+    """(마이크로 환산 한도, 설명 KO, 설명 EN) 또는 (0, '', '') = 줄이지 않음. broker = 어댑터 이름(projectx, nt8, tradovate),
+    name = 브로커가 준 계좌 이름, bal = XFA 단계용 잔고(그날 시작 잔고 쪽), size_hint = 회원이 고른 규모(XFA 이름에 규모가 없을 때)."""
+    nm = str(name or "").strip()
+    kd, sz0, _pl, _mt = _dc_name_info(broker, nm) if broker in ("projectx", "nt8", "tradovate") else ("unknown", 0, None, "")
+    if broker == "projectx":
+        # 3차 마무리 리뷰: 펀디드(XFA 표)와 Combine 판별은 앱 내장 패턴을 먼저 본다 - 서버 펀디드, 연습 패턴은 평가 감시를 끄는 데만 쓴다(다른 회사
+        # 'TDY-FUNDED-...' 같은 이름에 Topstep XFA 표가 걸려 진입이 줄던 것). 서버 평가 패턴으로만 평가인 이름은 Combine 한도 그대로.
+        _kb, _sb, _pb, _mb = _dc_name_info(broker, nm, builtin_only=True)
+        if _kb in ("funded", "eval"):
+            kd, sz0 = _kb, _sb
+        elif kd == "funded":
+            kd = "unknown"
+
+    def _mini(lim):                                     # 마이크로 환산 한도 → '미니 15계약'(괄호 안에 다시 괄호를 쓰지 않게, 3차 마무리 4)
+        return (f"미니 {lim // 10}계약" + (f" + 마이크로 {lim % 10}계약" if lim % 10 else ""),
+                f"{lim // 10} mini contracts" + (f" + {lim % 10} micro" if lim % 10 else ""))
+    if broker == "projectx":
+        if kd == "eval":
+            lim = _lim_combine(sz0)
+            if not lim:
+                return 0, "", ""
+            _k, _e = _mini(lim)
+            return lim, f"Topstep {sz0 // 1000}K 평가 한도 {_k}", f"Topstep {sz0 // 1000}K evaluation limit of {_e}"
+        if kd == "funded":
+            sz = (_daycap_norm_size(size_hint) if _lim_xfa(_daycap_norm_size(size_hint)) else _lim_xfa_fallback())
+            try:
+                b = float(bal) if bal is not None else None
+            except (TypeError, ValueError):
+                b = None
+            tbl = _lim_xfa(sz)
+            if b is None or not tbl:
+                return 0, "", ""
+            lim = next(mic for thr, mic in tbl if thr is None or b >= thr)
+            _k, _e = _mini(lim)
+            return (lim, f"Topstep {sz // 1000}K 펀디드 Scaling Plan 한도 {_k}, 잔고 {_money(b)} 기준",
+                    f"Topstep {sz // 1000}K funded Scaling Plan limit of {_e}, at a balance of {_money(b)}")
+        return 0, "", ""
+    if broker in ("nt8", "tradovate") and kd == "eval":
+        lim = _lim_lucid()
+        _k, _e = _mini(lim)
+        return lim, f"Lucid 한도 {_k}", f"Lucid limit of {_e}"
+    return 0, "", ""
+
+
+def _clamp_legs(legs, limit):
+    """legs [(심볼, 수량)] → (줄인 legs, 줄이기 전 마이크로 환산, 줄인 뒤). 한도 이하면 legs 그대로. 줄일 때는 마이크로 환산 합을 한도로
+    낮춘 뒤 사이징과 같은 규칙으로 다시 나눈다(마이크로 10 이상이면 미니 + 남은 마이크로) - 미니, 마이크로 나눔도 한도를 지킨다."""
+    from eqexec import sizing as _sz
+    mini_of = dict(getattr(_sz, "_MINI_OF", {"MNQ": "NQ", "MGC": "GC"}))
+    ratio = int(getattr(_sz, "MINI_RATIO", 10))
+    micro_of = {v: k for k, v in mini_of.items()}
+    legs = [(str(s), int(q)) for s, q in (legs or []) if int(q) > 0]
+    tot, micro = 0, None
+    for s, q in legs:
+        if s in micro_of:
+            tot += q * ratio
+            micro = micro or micro_of[s]
+        else:
+            tot += q
+            micro = micro or (s if s in mini_of else None)
+    try:
+        lim = int(limit or 0)
+    except (TypeError, ValueError):
+        lim = 0
+    if lim <= 0 or tot <= lim or micro is None:
+        return legs, tot, tot
+    mini = mini_of.get(micro)
+    if mini and lim >= ratio:
+        n_mini, n_micro = divmod(lim, ratio)
+        new = [(mini, n_mini)] + ([(micro, n_micro)] if n_micro else [])
+    else:
+        new = [(micro, lim)]
+    return new, tot, lim
+
+
+# 여러 계좌 1초 감시(3차 마무리 5, 3차 검증 P2: 한 로그인에 Combine 8개면 1초 구간 계좌도 4.3초마다 보던 것): 회차마다 정리 중, 1초 구간, 막 진입한
+# 계좌를 먼저(포지션을 가장 오래전에 읽은 계좌부터, 같으면 선에 가까운 순서) 보고, 그 밖 계좌는 회차 시작 뒤 0.5초 안에서만 본다(못 본 계좌는 다음
+# 회차 - 10초 넘게 밀린 계좌는 한 회차에 하나는 본다). 1초 구간 계좌가 있는 로그인은 호출 몫의 일부를 그 계좌에 남겨 두고(_DcGate.reserve - 그 밖
+# 계좌의 호출은 따로 세어 남은 몫만 쓴다) 몫을 창의 1/6씩 고르게 쓴다(몰아 쓰고 오래 막히지 않게). 몫이 모자라면 1초 구간 계좌는 10초, 미룬 계좌는
+# 15초 안의 포지션 목록에 새 시세를 넣어 본다(정리 직전 확인은 늘 새로 읽는다). 1초 구간 계좌가 없으면 종전과 같다.
+# 3차 마무리 리뷰 P1(최소 보장): 1초 구간 계좌가 3개 넘게 몫을 다 쓰면 먼 계좌는 몇 분씩 한 번도 보지 못했다(몫 나눔으로 막힌 호출이 '미룸'
+# 표시를 남기지 않아 기한이 5초씩 밀렸고, 그래서 '10초 넘게 밀림' 탈출도 끝내 걸리지 않았다). 이제 (1) 먼 계좌의 호출이 어떤 이유로든 막히면
+# 기한을 늦추지 않고, (2) 마지막으로 손익을 본 때(_dc_eval_ts)에서 포지션이 있는 계좌는 10초, 없는 계좌는 60초가 지나면 '굶은 계좌'로 회차마다 하나를
+# 본다 - 그 계좌의 호출은 몫 나눔을 건너뛰고 감시 몫 + 여유(시세 30초 4회, 그 밖 60초 20회)까지 쓴다(문서 한도 50/200 아래).
+_DAYCAP_SCAN_BUDGET_S = 0.5
+_DAYCAP_STARVE_S = 10
+_DAYCAP_STARVE_IDLE_S = 60
+_DAYCAP_RECENT_ENTRY_S = 30
+_DC_TLS = threading.local()                  # 감시 스레드: 지금 보는 계좌가 뒤로 미뤄도 되는 계좌인가(그 호출은 남겨 둔 몫을 쓰지 않는다), 굶은 계좌인가
+
+
+def _dc_low() -> bool:
+    return bool(getattr(_DC_TLS, "low", False))
+
+
+def _dc_deferred() -> bool:
+    """지금 보는 계좌(미룬 계좌, 굶은 계좌)의 호출이 몫 때문에 막혔나 - 그러면 기한을 늦추지 않는다."""
+    return bool(getattr(_DC_TLS, "refused", False)) and (_dc_low() or bool(getattr(_DC_TLS, "starve", False)))
+
+
+class _DcGate:
+    """ProjectX 호출 한도 안에서 감시 몫을 센다(로그인 하나에 하나). 문서 한도 = History/retrieveBars 30초 50회, 그 밖 60초 200회 -
+    감시는 시세 30초 40회, 그 밖 60초 120회까지만 쓴다(진입, 손절 확인, 통과 익절 감시 같은 다른 경로 몫을 남긴다). take(force=True)는
+    발사 직전 확인, 청산, 청산 확인처럼 꼭 해야 하는 호출 - 세기만 하고 막지 않는다. 429를 받으면 10초 쉰다.
+    reserve = 1초 구간 계좌 몫으로 남겨 둘 수(3차 마무리 5) - 뒤로 미뤄도 되는 계좌의 호출(low)은 따로 세어 한도 - reserve까지만 쓴다(전체도
+    한도 안)."""
+    LIMITS = {"bars": (40, 30.0), "other": (120, 60.0)}
+    STARVE_EXTRA = {"bars": 4, "other": 20}         # 굶은 계좌 한 번 보기에 감시 몫 위로 더 쓸 수 있는 수(문서 한도 50/200 아래)
+
+    def __init__(self):
+        import collections as _co
+        self._ev = {k: _co.deque() for k in self.LIMITS}
+        self._low = {k: _co.deque() for k in self.LIMITS}
+        self._lock = threading.Lock()
+        self.pause_until = 0.0
+        self.reserve = {"bars": 0, "other": 0}
+
+    def take(self, kind, force=False, low=None) -> bool:
+        import time as _t
+        n, win = self.LIMITS.get(kind, self.LIMITS["other"])
+        if low is None:
+            low = _dc_low()
+        starve = bool(getattr(_DC_TLS, "starve", False))
+        now = _t.time()
+        with self._lock:
+            _kd = kind if kind in self._ev else "other"
+            q, ql = self._ev[_kd], self._low[_kd]
+            for _q in (q, ql):
+                while _q and now - _q[0] >= win:
+                    _q.popleft()
+            _res = int((self.reserve or {}).get(_kd, 0) or 0)
+            _lowx, _subx = False, False
+            if _res:
+                # 1초 구간 계좌가 있는 동안은 몫을 창의 1/6마다 1/6씩만 쓴다(몰아 쓰고 30초 넘게 막히지 않게 고르게). 미뤄도 되는 계좌의 몫(한도 -
+                # reserve)도 같은 방식으로 따로 센다.
+                _sub = win / 6.0
+                _subx = sum(1 for x in q if now - x < _sub) >= max(1, -(-n // 6))
+                if low:
+                    _lowx = len(ql) >= n - _res or sum(1 for x in ql if now - x < _sub) >= max(1, -(-(n - _res) // 6))
+            if starve and not force:
+                # 굶은 계좌(3차 마무리 리뷰 P1): 몫 나눔은 건너뛰고 감시 몫 + 여유까지(429로 쉬는 중이면 쉰다)
+                if now < self.pause_until or len(q) >= n + int(self.STARVE_EXTRA.get(_kd, 0)):
+                    _DC_TLS.refused = True
+                    return False
+                q.append(now)
+                return True
+            if not force and (now < self.pause_until or len(q) >= n or _lowx or _subx):
+                if low:
+                    _DC_TLS.refused = True                  # 미룬 계좌(어떤 이유로든 막힘) - 기한을 늦추지 않고 다음 회차에 다시(3차 마무리 리뷰 P1)
+                return False
+            q.append(now)
+            if low:
+                ql.append(now)
+            return True
+
+    def used(self, kind) -> int:
+        import time as _t
+        n, win = self.LIMITS.get(kind, self.LIMITS["other"])
+        now = _t.time()
+        with self._lock:
+            return sum(1 for x in self._ev.get(kind, ()) if now - x < win)
+
+    def note_error(self, err) -> None:
+        import time as _t
+        if "429" in str(err):
+            self.pause_until = _t.time() + 10.0
 
 
 _TOPSTEP_R_TEST = _PROP_PRESETS["projectx"]["r_test"]   # 평가 1R 이행 목표(2026-09-30 2200) - 프리셋 한 곳에서
@@ -1085,6 +2490,11 @@ def _new_acct(one_r=DEFAULT_ONE_R, acct_id="", on=True, label="", prop=None, pct
         for k in ("r_test", "r_buffer", "r_steady", "buffer"):
             p[k] = _as_float(p[k], _PROP_DEFAULTS[k])
         p["payouts"] = max(0, min(5, int(_as_float(p.get("payouts"), 0))))
+        p["day_cap"] = _daycap_norm(p.get("day_cap"))          # 평가 계좌 익절(2026-10-14) - 읽을 수 없는 값은 자동
+        p["size"] = _daycap_norm_size(p.get("size"))
+        p["pass_set"] = bool(p.get("pass_set"))
+        p["stage"] = p.get("stage") if p.get("stage") in ("eval", "funded") else None   # Lucid 단계 답(2026-10-14) - 그 밖 값은 '모름'
+        p["stage_for"] = (str(p.get("stage_for")).strip().casefold() or None) if (p["stage"] and p.get("stage_for")) else None
         if "set" in prop:
             p["set"] = bool(prop.get("set"))
         _before = tuple(p[k] for k in _PROP_SIG_KEYS)
@@ -1912,6 +3322,147 @@ def _save_unconf_watch(d: dict) -> None:
         pass
 
 
+# 평가 계좌 익절 감시 기록(2026-10-14 2차): 앱이 진입한 평가 계좌마다 한 칸 {"브로커|계좌": {...}}. 브로커에 익절 주문을 걸지 않는다 -
+# 이 기록은 앱을 다시 켠 뒤 [라이브 시작] 전에도 그 계좌 포지션을 계속 지켜보게 하는 재료다(브로커 객체, 비밀은 안 담는다 - 복구 때
+# 설정 + 키체인으로 다시 짓는다). 플랫을 두 번 보거나 12시간이 지나면 놓고, [전체 정지]는 지운다(회원이 넘겨받음).
+# 'fired' = 감시가 그 계좌를 정리하기 시작한 기록(발동 래치의 디스크 사본, 2차 리뷰 P0). 정리한 계약의 남은 주문(손절)을 다 걷을 때까지
+# 지우지 않는다 - 재시작, [전체 정지], 걷기 실패가 있어도 다음 회차가 이어서 걷는다(7일까지). [전체 정지]는 포지션 정리만 멈춘다(halt).
+_DAYCAP_MON_PATH = os.path.join(APP_DIR, ".daycap_mon.json")
+_DAYCAP_STATE_PATH = os.path.join(APP_DIR, ".daycap_state.json")   # 알아낸 계좌 이름, 규모, 오늘 닿음 표시, 통과 표시, Lucid 거래일 시작 잔고, 화면 상태
+_DAYCAP_LOCK = threading.Lock()
+_DAYCAP_INIT_LOCK = threading.Lock()
+_DAYCAP_STATE_LOCK = threading.Lock()     # .daycap_state.json(메모리 사본 포함) - 진입 스레드 여럿과 감시 스레드가 함께 쓴다
+_DAYCAP_MON_FIELDS = ("broker", "sc", "aid", "lbl", "legs", "day", "ts", "stage", "fired", "risk")
+
+
+def _load_daycap_mon() -> dict:
+    """디스크 감시 기록(12시간 넘은 것은 버린다 - 정리 중 기록 'fired'는 남은 주문을 걷을 때까지 7일)."""
+    try:
+        import json as _json
+        import time as _t
+        with open(_DAYCAP_MON_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        if not isinstance(d, dict):
+            return {}
+        _now = _t.time()
+        return {str(k): dict(v) for k, v in d.items()
+                if isinstance(v, dict) and _now - float(v.get("ts") or 0) < (
+                    _DAYCAP_FIRED_MAX_AGE if isinstance(v.get("fired"), dict) else _DAYCAP_MON_MAX_AGE)}
+    except Exception:
+        return {}
+
+
+def _save_daycap_mon(d: dict) -> None:
+    try:
+        import json as _json
+        _write_text_atomic(_DAYCAP_MON_PATH, _json.dumps(
+            {str(k): {_f: v.get(_f) for _f in _DAYCAP_MON_FIELDS if _f != "fired" or isinstance(v.get(_f), dict)}
+             for k, v in (d or {}).items() if isinstance(v, dict)}))
+    except Exception:
+        pass
+
+
+def _load_daycap_state() -> dict:
+    try:
+        import json as _json
+        with open(_DAYCAP_STATE_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_daycap_state(d: dict) -> None:
+    try:
+        import json as _json
+        _write_text_atomic(_DAYCAP_STATE_PATH, _json.dumps(d or {}))
+    except Exception:
+        pass
+
+
+# ── 감시 사건 서버 보고(3차 마무리 2, 대표가 로그를 보내지 않아도 서버에서 그림자 기록을 1분봉으로 다시 셀 수 있게) ──
+# 감시가 정리했거나(real), 정리했을 경우(그림자 shadow, 라이브 잠금 lock), 시험용 스위치로 연습 계좌를 정리했을 때(test) 짧은 사건 하나를 쌓아 생존 핑
+# (/eqalive, 4분마다 + 쌓을 때 바로 한 번)에 실어 보낸다. 서버가 'dce:' 답을 주면 보낸 사건을 지운다(옛 서버는 모르는 키를 무시하고 그 답을 주지
+# 않는다 - 사건은 남아 다음 핑에 다시 간다). 파일(.daycap_events.json)에 두어 앱을 껐다 켜도 남는다. 50개, 7일까지, 같은 id는 한 번.
+# 담는 것: 시각, 회사, 단계, 요금제, 규모, 선의 종류(cap/pass), 선 금액, 그때 오늘 손익(또는 잔고 + 미실현), 오늘 실현, 잔고, 계약별 수량과 평균가,
+# 앱 진입 시각, real/shadow/lock/test, 계좌 끝 4자리. 계좌 번호 전체, API 키, 비밀번호, PIN은 담지 않는다.
+# 서버 하트비트가 'dce'를 켠 토큰에서만 쌓고 보낸다(지금은 대표 토큰만 - 금액이 들어가 개인정보 처리방침 5.4 '잔고, 계좌 전체 손익은 보고하지 않는다'와
+# 맞추려고. 회원에게 켜려면 방침을 먼저 고친다).
+_DCE_PATH = os.path.join(APP_DIR, ".daycap_events.json")
+_DCE_LOCK = threading.Lock()
+_DCE_MAX = 50
+_DCE_MAX_AGE = 7 * 86400
+_DCE_PER_PING = 10
+
+
+def _dce_load() -> list:
+    try:
+        import json as _json
+        import time as _t
+        with open(_DCE_PATH, encoding="utf-8") as f:
+            q = _json.load(f)
+        _now = _t.time()
+        return [e for e in (q if isinstance(q, list) else [])
+                if isinstance(e, dict) and e.get("id") and _now - float(e.get("q_ts") or 0) < _DCE_MAX_AGE]
+    except Exception:
+        return []
+
+
+def _dce_save(q) -> None:
+    try:
+        import json as _json
+        _write_text_atomic(_DCE_PATH, _json.dumps(list(q or [])[-_DCE_MAX:]))
+    except Exception:
+        pass
+
+
+def _dce_add(ev) -> bool:
+    """사건 하나를 쌓는다(같은 id가 있으면 그대로). 새로 쌓았으면 True."""
+    import time as _t
+    if not isinstance(ev, dict) or not ev.get("id"):
+        return False
+    with _DCE_LOCK:
+        q = _dce_load()
+        if any(e.get("id") == ev["id"] for e in q):
+            return False
+        q.append(dict(ev, q_ts=_t.time()))
+        _dce_save(q[-_DCE_MAX:])
+    return True
+
+
+def _dce_pending() -> list:
+    """보낼 사건(오래된 것부터 10개, 쌓은 시각 키는 빼고)."""
+    with _DCE_LOCK:
+        q = _dce_load()
+    return [{k: v for k, v in e.items() if k != "q_ts"} for e in q[:_DCE_PER_PING]]
+
+
+def _dce_ack(ids) -> None:
+    """서버가 받았다고 답한 사건을 지운다."""
+    ids = {str(i) for i in (ids or []) if i}
+    if not ids:
+        return
+    with _DCE_LOCK:
+        q = _dce_load()
+        _dce_save([e for e in q if str(e.get("id")) not in ids])
+
+
+def _daycap_ctx_closing(app, ctx) -> bool:
+    """자산 맥락(ctx)의 계좌를 평가 계좌 감시가 지금 포지션을 정리하는 중인가(발동 래치 _dc_fired 가운데 아직 플랫 확인 전이고 멈추지
+    않은 것 - 플랫 확인 뒤 남은 주문만 걷는 래치, [전체 정지]로 멈춘 래치는 아니다: 2차 리뷰 P1, 그 동안 청산 보고가 막히지 않게).
+    모듈 함수인 이유: 시험의 가짜 App에도 이 속성이 없을 수 있다(없으면 False = 종전 동작)."""
+    try:
+        _f = getattr(app, "_dc_fired", None)
+        if not isinstance(_f, dict) or not _f or not ctx:
+            return False
+        _a = str(ctx.get("aid") or "").strip().casefold()
+        return bool(_a) and any(_a in (str(v.get("aid") or "").strip().casefold(), str(v.get("sc") or "").strip().casefold())
+                                for v in list(_f.values())
+                                if isinstance(v, dict) and not v.get("done") and not v.get("halt"))
+    except Exception:
+        return False
+
+
 def _mark_entered(asset: str) -> dict:
     d = _load_entered()
     import time as _t
@@ -2324,6 +3875,12 @@ def _save_full(lang, token, acfg, profile=None, dry_run=None, cfg_open=None, acc
         try:
             with open(CFG_PATH) as _pf:
                 _pd = yaml.safe_load(_pf) or {}
+            if isinstance(_pd, dict) and "daycap_shadow" in _pd:
+                payload["daycap_shadow"] = bool(_pd.get("daycap_shadow"))   # 손으로 넣은 숨은 설정(그림자 모드, 3차 결정 E) - 저장이 지우지 않게
+            if isinstance(_pd, dict):                                       # 시험용 스위치(3차 마무리 3)도 같은 규약
+                for _hk in ("daycap_test", "daycap_test_cap"):
+                    if _hk in _pd:
+                        payload[_hk] = _pd.get(_hk)
             _prev_enc = _pd.get("kc_enc") if isinstance(_pd.get("kc_enc"), dict) else None
             _prev_failed = [str(x) for x in (_pd.get("kc_failed") or [])]
         except Exception:
@@ -2448,7 +4005,7 @@ def _save(user, key, acct, lang, token=None, broker=None, f1=None, f3=None, one_
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("EQ Autopilot" + (f"  [{PROFILE}]" if PROFILE else "") + ("  - share mode" if SHARE_MODE else ""))
+        root.title(_window_title())                         # 시험판이면 제목에 '시험판 (Test build)'(_TEST_BUILD)
         # ── 예외 자동 리포트(대표 2026-07-27 "필수") — 회원 머신의 미처리 예외를 서버(/eqerr)로.
         #    키·계좌번호·잔고 무전송(마스킹), EQ_ERR_REPORT=0 으로 끔. 실패해도 앱 무사.
         self._err_sent = {}
@@ -2556,6 +4113,13 @@ class App:
         self._open_ctx = {}          # {asset: {"b": broker, "sym": 심볼조각}}
         # 진입 결과를 확인하지 못한 leg 감시 - leg마다 한 칸, 재시작을 넘긴다(버그 조사 재검증 2026-10-06 2).
         self._unconf_watch = _load_unconf_watch()
+        # 평가 계좌 익절 감시 기록(2026-10-14 2차) - 앱이 진입한 평가 계좌. 재시작 뒤에도 그 계좌 포지션을 계속 지켜본다.
+        self._dc_mon = _load_daycap_mon()
+        _prop_reco_boot()            # 마지막으로 받은 서버 권장 값(첫 하트비트 전에도, 3차 결정 I) - 없으면 내장값
+        try:   # 정리 중이던 계좌(디스크 'fired')는 기동 때 바로 래치로 - 첫 감시 회차 전에 온 신호도 그 계좌에 들어가지 않게(2차 리뷰 P0)
+            self._daycap_fired_restore()
+        except Exception:
+            pass
         self._flat_seen = {}         # {asset: 연속 flat 관측 횟수} - 1회는 안 믿는다
         self._entered_at = _load_entered()   # 자산별 마지막 LIVE 진입 시각(자동청산 오살 방지)
         # 서버가 지정한 계획 청산 시각(exit_ts) — {asset: (epoch, 사유)}. 고영향 지표
@@ -2585,6 +4149,8 @@ class App:
         root.after(45 * 1000, self._nt8_probe_tick)
         root.after(150 * 1000, self._bar_backup_tick)              # 백업 5분봉 전송(오너 기기만, 2026-09-23)
         root.after(90 * 1000, self._passtp_tick)                   # 평가 통과 익절 감시(테스트기)
+        root.after(20 * 1000, self._daycap_tick)                   # 평가 계좌 익절: 앱 감시(하루 상한 + 통과 목표, 2026-10-14)
+        root.after(4 * 1000, self._lucid_stage_check)              # 단계 답이 없는 Lucid 계좌에 한 번 묻기(2026-10-14 결정 4)
         root.after(7 * 1000, self._idle_warn_tick)                 # 프롭 비활동 경고(21일)
         root.after(120 * 1000, self._unsent_fill_tick)             # 미전송 체결 보고 재시도(2분)
 
@@ -3785,6 +5351,10 @@ class App:
                                     "caps": ap.get("caps", {}) or {}, "brokers": ap.get("brokers", {}) or {},
                                     # 150K 판별 패턴(서버가 늘린다 - 앱 재빌드 없이, 2026-09-28)
                                     "p150": ap.get("p150") if isinstance(ap.get("p150"), dict) else None,
+                                    # 평가 계좌 익절, 권장 1R 값(서버가 늘린다 - 앱 재빌드 없이, 2026-10-14 3차 결정 I). 없으면 None = 내장값
+                                    "prop_reco": ap.get("prop_reco") if isinstance(ap.get("prop_reco"), dict) else None,
+                                    # 감시 사건 서버 보고 스위치(3차 마무리 2): 서버가 켤 때만(지금은 대표 토큰만 - 사건에 금액이 들어가므로)
+                                    "dce": ap.get("dce") is True,
                                     # [로그 보내기] 버튼 스위치(2026-09-29): 서버가 켤 때만 버튼이 보인다(방침 반영일과 맞춤)
                                     "log_upload": bool(ap.get("log_upload")),
                                     "reason": ""}
@@ -3822,6 +5392,11 @@ class App:
                 else:
                     gate["revoked"] = True
             self._gate = gate
+            if gate.get("ok"):
+                try:                                        # 서버 권장 값(3차 결정 I) - 받은 하트비트만. 닿지 못한 실패는 지금 값 그대로
+                    self._prop_reco_apply(gate.get("prop_reco"))
+                except Exception:
+                    pass
             try:
                 self.root.after(0, self._sync_log_btn)      # [로그 보내기] 버튼 표시 = 서버 스위치
             except Exception:
@@ -4515,6 +6090,9 @@ class App:
                     _v = str(_icb.get()).strip()
                     # "…끝자리"/"계좌 선택" 표시값은 무시 - 가용 목록 선택이나 직접 입력만 저장
                     if _v and not _v.startswith("…") and _v not in ("계좌 선택", "pick"):
+                        _old_id = str(accts[idx].get("id") or "").strip()
+                        if _old_id and _old_id.casefold() != _v.casefold():
+                            self._daycap_reset_row(self._asset, accts[idx], _old_id, _v)
                         accts[idx]["id"] = _v
                         if not (accts[idx].get("label") or "").strip():
                             accts[idx]["label"] = _v[-4:]
@@ -6907,10 +8485,154 @@ class App:
                   text=("출금 횟수는 출금 팝업에서 '예'를 누르면 1 늘어납니다." if ko else
                         "The payout count goes up by 1 when you press Yes in the payout popup.")
                   ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        _aid0 = str(acct.get("id") or "").strip()
+        # 평가 계좌 익절 칸(2026-10-14) - Topstep 행과 Lucid 이름(L + D/F/P + I/E + 규모)의 NT8 행에만. 그 밖 NT8 계좌(자기 자본, 다른 회사)는
+        # 이 기능이 없으므로 칸도, 단계 고르기도 보이지 않는다(2차 리뷰 P2: 'Lucid 단계'를 골라도 아무것도 걸리지 않던 것).
+        _is_lucid = _bk == "nt8" and _dc_name_info("nt8", _aid0)[0] == "eval"      # Lucid 이름 패턴(내장 + 서버, 3차 마무리 1)
+        _dc_on = _bk in _DAYCAP_FIRMS and not _daycap_off() and (_bk == "projectx" or _is_lucid)
         ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
-                  text=("통과 목표 잔고를 정해 놓으시면 그 잔고에 이를 때 계좌 포지션을 시장가로 정리합니다." if ko else
-                        "If you set a pass target balance, this account's positions are closed at market when the balance reaches it.")
+                  text=((("통과 목표 잔고에 이르면 이 계좌 포지션을 정리합니다. 평가 계좌는 비워 두면 실제로 통과하는 잔고(계좌 규모 + 이익 목표, "
+                           "하루 최고 이익이 크면 그만큼 올림)보다 " + _money(_dc_margin()) + " 높은 금액(포지션이 크면 2틱 x 계약 수만큼)을 "
+                           "날마다 다시 계산해 씁니다.")
+                         if ko else
+                         ("When the balance reaches the pass target, this account's positions are closed. On an evaluation "
+                          "account, leaving it blank uses the balance that actually passes (account size + profit target, raised "
+                          "when the best day is large) plus a " + _money(_dc_margin()) + " margin (2 ticks x contracts for a large "
+                          "position), recalculated every day.")) if _dc_on else
+                        ("통과 목표 잔고를 정해 놓으시면 그 잔고에 이를 때 계좌 포지션을 시장가로 정리합니다." if ko else
+                         "If you set a pass target balance, this account's positions are closed at market when the balance reaches it."))
                   ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        if _bk == "nt8" and not _dc_on and _aid0 and not _daycap_off():
+            ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                      text=("계좌 이름이 Lucid 형식이 아니라 평가 계좌 익절을 쓰지 않습니다." if ko else
+                            "The account name is not in the Lucid format, so the evaluation take-profit is not used.")
+                      ).grid(row=14, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        # ── 평가 계좌 익절(대표 2026-10-14 "사용성 좋게 해"): 회원이 아무것도 안 해도 규모 기본값으로 켜진다. 여기는 보고 고치는 곳.
+        #    계좌 규모(자동 = 계좌 이름이나 잔고로 앱이 알아냄, 모를 때만 고르면 된다), 하루 이익 상한 칸 하나, 설명 한 줄.
+        #    자동값은 평가 계좌에만 칸에 채운다 - 펀디드, 아직 안 답한 Lucid, 통과 표시 계좌는 칸을 비우고 '평가 계좌에만 적용'이라고 쓴다
+        #    (2차 리뷰 P2: 걸리지 않는 159,000, 4,500이 켜진 값처럼 보이던 것). 비운 칸 그대로 저장 = 자동(종전과 같다). ──
+        size_v = tk.IntVar(value=_daycap_norm_size(pr.get("size")))
+        _dc_shown = {"cap": None, "pass": None}            # 앱이 칸에 채운 자동값 글자 - 그대로 저장하면 '자동'으로 남긴다
+        cap_e = None
+        _stg0 = self._daycap_stage_flag(_bk, _aid0, pr) if (_dc_on and _bk == "nt8") else None
+        stg_v = tk.StringVar(value=_stg0 or "")             # Lucid 단계(평가/펀디드/모름) - 저장 때 같은 계좌 모든 행에
+        if _dc_on:
+            _dcf = _DAYCAP_FIRMS[_bk]
+            _st0 = self._dc_state()
+            _k0 = self._daycap_key(_bk, _aid0)
+            _det = (_daycap_size_from_name(_bk, _st0["names"].get(_k0) or _aid0)
+                    or _daycap_norm_size(_st0["sizes"].get(_k0)) or 0)
+            _lplan = _daycap_lucid_plan(_aid0) if _bk == "nt8" else None
+            _cap_rule = _bk == "projectx" or _lplan in _dc_cap_plans()      # 자동 하루 상한이 있는 요금제(서버 값 > 내장)
+            _sg_tp = self._daycap_stage_cfg(_bk, _aid0, pr)[0] if _bk == "projectx" else None
+
+            def _is_eval():
+                return (stg_v.get() == "eval") if _bk == "nt8" else (_sg_tp == "eval")
+
+            def _auto_of(sz):
+                _tg = float(_dc_targets(_bk).get(int(sz or 0), 0.0))
+                if not _tg:
+                    return None, None
+                try:
+                    _bst = self._dc_best(_bk, _aid0, _daycap_day_start()[1])[0]
+                except Exception:
+                    _bst = None
+                _need = _dc_pass_need(_bk, int(sz), _tg, _bst, _aid0)
+                return ((_dc_cap_amount(_bk, _tg) if _cap_rule else None), ((_need + _dc_margin()) if _need else None))
+
+            def _fmt(v):
+                return "" if v is None else f"{v:g}"
+            _pass_auto0 = (not pr.get("pass_set")) and _as_float(pr.get("pass_tp"), 0.0) <= 0
+            _cap_auto0 = _daycap_norm(pr.get("day_cap")) is None
+            _a0 = _auto_of(size_v.get() or _det) if _is_eval() else (None, None)
+            if _pass_auto0:
+                ents["pass_tp"].delete(0, "end")
+                _dc_shown["pass"] = _fmt(_a0[1])
+                ents["pass_tp"].insert(0, _dc_shown["pass"])
+            ttk.Label(frm, text=("평가 계좌 익절" if ko else "Evaluation take-profit"),
+                      font=("", 0, "bold")).grid(row=14, column=0, columnspan=4, sticky="w", pady=(6, 2))
+            ttk.Label(frm, text=("계좌 규모" if ko else "Account size")).grid(row=15, column=0, sticky="w")
+            _szf = ttk.Frame(frm)
+            _szf.grid(row=15, column=1, columnspan=3, sticky="w")
+            _auto_txt = ((f"자동({_det // 1000}K)" if _det else "자동(모름)") if ko else
+                         (f"Auto ({_det // 1000}K)" if _det else "Auto (unknown)"))
+            _hint = ttk.Label(frm, foreground="#888", text="")
+
+            def _refresh_auto():
+                """규모나 Lucid 단계를 바꾸면 자동값 칸을 다시 쓴다(회원이 고친 칸은 그대로). 평가가 아니면 자동값 칸을 비우고 안내를 단다."""
+                _new = _auto_of(size_v.get() or _det) if _is_eval() else (None, None)
+                if _cap_auto0 and cap_e is not None and cap_e.get().strip() == (_dc_shown["cap"] or ""):
+                    cap_e.delete(0, "end")
+                    _dc_shown["cap"] = _fmt(_new[0])
+                    cap_e.insert(0, _dc_shown["cap"])
+                if _pass_auto0 and ents["pass_tp"].get().strip() == (_dc_shown["pass"] or ""):
+                    ents["pass_tp"].delete(0, "end")
+                    _dc_shown["pass"] = _fmt(_new[1])
+                    ents["pass_tp"].insert(0, _dc_shown["pass"])
+                try:
+                    _hint.config(text=("" if _is_eval() else ("(자동값은 평가 계좌에만 적용)" if ko else
+                                                              "(auto values apply to evaluation accounts only)")))
+                except Exception:
+                    pass
+            _on_size = _refresh_auto
+            ttk.Radiobutton(_szf, text=_auto_txt, variable=size_v, value=0, command=_on_size).pack(side="left")
+            for _sz in sorted(_dc_targets(_bk)):
+                ttk.Radiobutton(_szf, text=f"{_sz // 1000}K", variable=size_v, value=_sz,
+                                command=_on_size).pack(side="left", padx=(6, 0))
+            ttk.Label(frm, text=("하루 이익 상한 $ (0=끔)" if ko else "Daily profit cap $ (0=off)")
+                      ).grid(row=16, column=0, sticky="w", pady=1)
+            cap_e = ttk.Entry(frm, width=10)
+            if _cap_auto0:
+                _dc_shown["cap"] = _fmt(_a0[0])
+                cap_e.insert(0, _dc_shown["cap"])
+            else:
+                cap_e.insert(0, f"{float(_daycap_norm(pr.get('day_cap'))):g}")
+            cap_e.grid(row=16, column=1, sticky="w", pady=1)
+            _hint.grid(row=16, column=2, columnspan=2, sticky="w", padx=(6, 0))
+            _pc = _dc_pct(_bk) * 100
+            _cn = int(round(_dc_cons(_bk, _aid0) * 100))           # 그 요금제 일관성 선(서버 값 > 내장, 3차 마무리 1)
+            if _bk == "projectx" or _cap_rule:
+                _fn = "Topstep" if _bk == "projectx" else {"D": "LucidDaily", "F": "LucidFlex", "P": "LucidPro"}.get(_lplan, "Lucid")
+                _rule_t = ((f"{_fn} 평가는 하루 최고 이익이 목표의 {_cn}%를 넘으면 "
+                            + ("목표가 올라가므로" if _bk == "projectx" else "통과에 이익이 더 필요하므로")
+                            + f", 그날 이익이 이 금액(목표의 {_pc:.1f}%)에 닿으면 앱이 이 계좌 포지션을 정리합니다. {_cn}% 선보다 조금 낮게 "
+                              f"잡은 차이가 청산 미끄러짐 여유입니다. 0이면 끕니다. 통과 목표 잔고와 둘 중 가까운 쪽에서 정리하며, 평가 계좌에만 "
+                              f"적용됩니다.") if ko else
+                           (f"In a {_fn} evaluation, a day's profit above {_cn}% of the target "
+                            + ("raises the target" if _bk == "projectx" else "means more profit is needed to pass")
+                            + f", so when the day's profit reaches this amount ({_pc:.1f}% of the target) the app closes this "
+                              f"account's positions. The gap below the {_cn}% line is the margin for closing slippage. 0 turns it "
+                              f"off. The nearer of this and the pass target balance is used, on evaluation accounts only."))
+            else:
+                _fn = {"P": "LucidPro", "F": "LucidFlex"}.get(_lplan, "Lucid")
+                _rule_t = ((f"{_fn} 평가에는 하루 이익 상한을 걸지 않습니다(통과 목표 잔고에서만 정리). 금액을 넣으시면 그날 이익이 그 금액에 "
+                            f"닿을 때 정리합니다.") if ko else
+                           (f"No daily profit cap is used on a {_fn} evaluation (it closes only at the pass target balance). If "
+                            f"you enter an amount, it closes when the day's profit reaches it."))
+            ttk.Label(frm, foreground="#888", wraplength=380, justify="left", text=_rule_t
+                      ).grid(row=17, column=0, columnspan=4, sticky="w", pady=(2, 8))
+            # 계좌 단계(결정 4, 2026-10-14): Topstep은 계좌 이름으로 판별해 보여 주기만 하고, Lucid는 이름에 단계가 없어 여기서 고른다.
+            ttk.Label(frm, text=((f"{_dcf['firm']} 계좌 단계(익절 상한용)") if ko else
+                                 (f"{_dcf['firm']} account stage (for the cap)"))).grid(row=18, column=0, sticky="w")
+            if _bk == "nt8":
+                _sf = ttk.Frame(frm)
+                _sf.grid(row=18, column=1, columnspan=3, sticky="w")
+                for _sv, _skt, _set in (("eval", "평가", "Evaluation"), ("funded", "펀디드", "Funded"),
+                                        ("", "모름(익절 꺼짐)", "Unknown (take-profit off)")):
+                    ttk.Radiobutton(_sf, text=(_skt if ko else _set), variable=stg_v, value=_sv,
+                                    command=_refresh_auto).pack(side="left", padx=(0, 6))
+            else:
+                _sg, _ssz = self._daycap_stage_cfg(_bk, _aid0, pr)
+                _sg_t = {"eval": ((f"평가 {_ssz // 1000}K (계좌 이름으로 판별)") if ko else
+                                  (f"Evaluation {_ssz // 1000}K (from the account name)")),
+                         "passed": ("평가 통과로 표시됨(익절 상한 꺼짐)" if ko else "Marked as passed (take-profit off)"),
+                         "funded": ("펀디드 (계좌 이름으로 판별, 익절 상한 없음)" if ko else
+                                    "Funded (from the account name, no take-profit cap)"),
+                         "practice": ("연습 계좌 (익절 상한 없음)" if ko else "Practice account (no take-profit cap)")}.get(
+                    _sg, ("계좌 이름으로 판별하지 못함(익절 상한 꺼짐)" if ko else
+                          "Not recognized from the account name (take-profit off)"))
+                ttk.Label(frm, foreground="#555", text=_sg_t).grid(row=18, column=1, columnspan=3, sticky="w")
+            _refresh_auto()
 
         # ── [시뮬 기준값 채우기] — 홈피 시뮬레이션이 쓰는 브로커별 정본 상수를 회원이
         #    버튼으로 불러온다(전 회원 동일 공개 상수 + 회원 클릭 = 개인화 아님). ──
@@ -6943,6 +8665,19 @@ class App:
             # 칸 이름과 이유를 보여 준다(창은 열린 채 - 회원이 친 글자가 그대로 보인다). 빈 칸 = 0.
             _vals, _bad = _prop_parse_fields({k: ents[k].get() for k in ents}, dict(_rows), ko)
             newp.update(_vals)
+            # 평가 계좌 익절 칸(2026-10-14): 빈 칸이나 앱이 채운 자동값 그대로 = 자동(규모가 바뀌면 따라간다), 숫자 = 회원 값(0=끔).
+            _dc_cap, _dc_pass_auto = None, False
+            if _dc_on:
+                _ctxt = cap_e.get().strip() if cap_e is not None else ""
+                if _ctxt and not (_cap_auto0 and _ctxt == (_dc_shown["cap"] or "")):
+                    _cv = _parse_amount(_ctxt)
+                    if _cv is None:
+                        _bad.append(f"{'하루 이익 상한' if ko else 'Daily profit cap'}: '{_ctxt}' - {_amount_why(_ctxt, ko)}")
+                    else:
+                        _dc_cap = float(_cv)
+                _ptxt = ents["pass_tp"].get().strip()
+                # 빈 칸 = 자동(규모 + 이익 목표) - 전에 값을 저장한 적이 있어도 그렇다(리뷰 P2: 설명대로 비우면 자동이 되게). 0만 끔이다.
+                _dc_pass_auto = (not _ptxt) or (_pass_auto0 and _ptxt == (_dc_shown["pass"] or ""))
             if _bad:
                 messagebox.showwarning("EQ", (("저장하지 않았습니다 - 읽지 못한 칸:\n" if ko else
                                                "Not saved - these fields could not be read:\n")
@@ -6967,7 +8702,52 @@ class App:
                                        else "1R values must be > 0.")
                 return
             newp["set"] = True       # 회원이 이 창에서 저장한 값 - 기동 이행이 건드리지 않는다(Q)
+            if _dc_on:
+                newp["size"] = _daycap_norm_size(size_v.get())
+                newp["day_cap"] = _dc_cap
+                if _dc_pass_auto:
+                    newp["pass_tp"], newp["pass_set"] = 0.0, False
+                else:
+                    newp["pass_set"] = True
+                newp["stage"] = ((stg_v.get() or None) if _bk == "nt8" else pr.get("stage"))
+                newp["stage_for"] = ((_aid0.casefold() if newp["stage"] else None) if _bk == "nt8" else pr.get("stage_for"))
+            else:
+                for _kk in ("day_cap", "size", "pass_set", "stage", "stage_for"):   # 다른 브로커 행: 값만 들고 간다(쓰이지 않음)
+                    if _kk in pr:
+                        newp[_kk] = pr.get(_kk)
             acct["prop"] = newp
+            if _dc_on:
+                try:
+                    # 같은 계좌의 다른 자산 행(NQ, GC)에도 규모, 하루 상한을 맞춘다 - 하루 상한은 계좌 단위다(출금 횟수 동기화와 같은 방식).
+                    _aidm = str(acct.get("id") or "").strip()
+                    if _aidm:
+                        for _am in _ASSETS:
+                            for _rw in ((self._acfg.get(_am) or {}).get("accounts") or []):
+                                if (_rw is not acct and str(_rw.get("id") or "").strip() == _aidm
+                                        and self._acct_broker(_am, _rw) == _bk):
+                                    _rp = _rw.setdefault("prop", dict(_PROP_DEFAULTS))
+                                    _rp["size"], _rp["day_cap"] = newp["size"], newp["day_cap"]
+                    # 상한을 바꿨으면 오늘 닿음 표시를 푼다(올린 상한이 바로 적용되게).
+                    if newp["day_cap"] != _daycap_norm(pr.get("day_cap")) or newp["size"] != _daycap_norm_size(pr.get("size")):
+                        with _DAYCAP_STATE_LOCK:
+                            self._dc_state()["hit"].pop(self._daycap_key(_bk, _aidm), None)
+                        self._dc_save()
+                    # 규모나 통과 목표 설정을 바꿨으면 '평가 통과' 표시를 푼다(회원이 다시 정한 것 - 다음 진입 때 잔고로 다시 본다).
+                    if (newp["size"] != _daycap_norm_size(pr.get("size"))
+                            or bool(newp.get("pass_set")) != bool(pr.get("pass_set"))
+                            or float(newp.get("pass_tp") or 0) != _as_float(pr.get("pass_tp"), 0.0)):
+                        self._daycap_clear_passed(_bk, _aidm)
+                    # Lucid 단계를 이 창에서 골랐으면(결정 4) 같은 계좌 모든 자산 행에 저장하고 다시 묻지 않는다.
+                    # 통과로 표시된 Lucid 계좌에서 '평가'를 다시 고르고 저장해도 같은 경로 - 통과 표시를 푼다(통과 표시 로그가 안내하는 길).
+                    _lu_passed = _bk == "nt8" and self._daycap_key("nt8", _aidm) in self._dc_state()["passed"]
+                    if _bk == "nt8" and _aidm and ((newp.get("stage") or None) != (_stg0 or None)
+                                                   or (_lu_passed and newp.get("stage") == "eval")):
+                        import time as _tsg
+                        with _DAYCAP_STATE_LOCK:
+                            self._dc_state()["asked"][self._daycap_key("nt8", _aidm)] = _tsg.time()
+                        self._lucid_stage_set(_aidm, newp.get("stage"))
+                except Exception:
+                    pass
             try:      # pass_tp 변경 시 이번 가동의 발동·안내 래치 리셋 → 감시 재개(2026-08-18 감사 ⑥)
                 _aidl = str(acct.get("id") or "").lower()
                 for _st in ("_passtp_done", "_passtp_note", "_passtp_failwarn"):
@@ -6989,10 +8769,11 @@ class App:
             except Exception:
                 pass
             self._save_acct_widgets()
+            self._daycap_rows_refresh()
             win.destroy()
 
-        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=13, column=1, pady=(4, 0))
-        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=13, column=2, pady=(4, 0))
+        ttk.Button(frm, text=("저장" if ko else "Save"), command=_ok).grid(row=30, column=1, pady=(4, 0))
+        ttk.Button(frm, text=("취소" if ko else "Cancel"), command=win.destroy).grid(row=30, column=2, pady=(4, 0))
 
     def _sync_pick_hint(self):
         """자산을 하나도 안 고른 상태에서만 선택 안내를 보인다."""
@@ -7149,10 +8930,16 @@ class App:
                     except Exception:
                         pass
                     return
+                # 새 계좌 행이면 1R 칸에 권장 1R을 미리 채운다(대표 2026-10-14 결정 6 - 150K Topstep 평가/펀디드, Lucid는 단계 답 뒤).
+                self._reco_prefill_row(i, self._acct_widgets.get(i))
                 self._save_acct_widgets()
                 try:
                     if _bk is not None and (self._accts_of(self._asset)[i].get("id") or "").strip():
                         _bk.config(state="disabled")
+                except Exception:
+                    pass
+                try:                                 # 단계 답이 없는 Lucid 계좌면 한 번 묻는다(결정 4)
+                    self.root.after(200, self._lucid_stage_check)
                 except Exception:
                     pass
             id_cb.bind("<<ComboboxSelected>>", _pick)
@@ -7183,6 +8970,18 @@ class App:
                     r_e.config(state="readonly")
             except Exception:
                 pass
+        # 평가 계좌 익절 상태 한 줄(대표 2026-10-14 "사용성 좋게 해"): Topstep, Lucid 평가 계좌 행 아래에만. 펀디드, 라이브, 다른 브로커는 없음.
+        # 라벨은 Topstep, Lucid 행이면 늘 만들어 두고 글자가 있을 때만 보인다(리뷰 P2: 저장 뒤 평가 계좌가 된 행도 바로 보이게).
+        try:
+            if self._acct_broker(self._asset, acct) in _DAYCAP_FIRMS and not _daycap_off():
+                _dct = self._daycap_row_text(self._asset, acct)
+                _dl = ttk.Label(parent, text=_dct, foreground="#555")
+                if _dct:
+                    _dl.pack(anchor="w", padx=(30, 0))
+                self._acct_widgets[idx]["daycap_lbl"] = _dl
+                self._acct_widgets[idx]["row"] = row
+        except Exception:
+            pass
 
     def _bk_configured(self, asset, bk) -> bool:
         """그 자산에서 bk 연결이 설정돼 있는가(아이디가 있음, IBKR는 Host 또는 Port). 읽기 전용."""
@@ -7978,6 +9777,14 @@ class App:
                  "Entries, stops and exits run automatically on each signal.\n\n"
                  "Start live? (connection tests run automatically)")):
             return
+        try:   # 평가 통과로 이번 실행에서 멈췄던 계좌는 새 [라이브 시작]부터 다시 진입한다(통과 표시는 남아 상한, 통과 익절은 꺼진 채, 2026-10-14)
+            self._dc_map("_dc_passed_run").clear()
+            # 남은 발동 래치는 포지션 정리를 멈춘다(남은 주문 걷기만) - 지난 실행의 래치가 새 진입을 닫지 않게(2차 리뷰 P1)
+            self._daycap_latch_halt_all()
+            self._dc_cache_clear()                          # 감시 캐시(계좌 목록, 포지션, 시세, 호출 한도 셈)는 새 실행에서 새로(3차)
+            self._daycap_mode_notice()                      # 그림자 모드, 시험용 스위치 안내(3차 결정 E, 3차 마무리 3)
+        except Exception:
+            pass
         if not self._consent_ok():
             return
         if not self._token:
@@ -8198,6 +10005,11 @@ class App:
             pass
         self._sig_on = False
         self._auto_on = False
+        try:   # 평가 계좌 감시(2026-10-14): 회원이 포지션을 넘겨받는다 - 앱 진입 감시 기록을 지우고 정리 중이던 계좌의 포지션 정리를 멈춘다.
+            # 정리한 계약의 남은 손절 걷기는 끝날 때까지 이어 간다(2차 리뷰 P0). 재시작은 기록이 남아 계속 지켜본다.
+            self._daycap_mon_clear()
+        except Exception:
+            pass
         self._alive_ping(armed=False, force=True)   # 정상 종료 신고 - 다운 경보 대상 제외
         self._set_auto_ind(False, [])
         self._set_sig_ind(False, [])
@@ -8756,6 +10568,19 @@ class App:
             tp = _as_float(pr.get("pass_tp"), 0.0)
             if pr.get("type") != "test" or tp <= 0:
                 continue
+            try:
+                # 평가로 판별된 계좌(그리고 통과로 표시된 계좌)는 평가 계좌 감시(_daycap_mon_*)가 통과 목표까지 맡는다(2026-10-14 2차) -
+                # 두 감시가 같은 계좌를 같이 닫지 않게 여기서 뺀다. 그 밖(이름을 모르는 계좌, 펀디드 등)은 종전 그대로.
+                # 확인 모드(Operator)는 평가 계좌 감시가 무장 행을 보지 않는다(2차 리뷰 P1) - 그때는 회원이 넣은 통과 목표를 종전(12e)처럼
+                # 여기서 지켜본다(3차 결정 F: 14a에서 Operator 평가 계좌의 통과 목표를 아무도 보지 않던 회귀). 앱 진입 기록이 남은 계좌만 빼고.
+                _bk0, _sc0 = cfg.get("broker"), str(cfg.get("acct") or "")
+                if (_bk0 in _DAYCAP_FIRMS and not _daycap_off()
+                        and (getattr(self, "_watch_only", False) is not True
+                             or self._daycap_key(_bk0, _sc0.strip()) in self._dc_map("_dc_mon"))
+                        and self._daycap_stage_cfg(_bk0, _sc0, pr)[0] in ("eval", "passed")):
+                    continue
+            except Exception:
+                pass
             wk = (cfg.get("broker"), str(cfg.get("acct") or "").strip().lower())
             if cfg.get("manual"):
                 if ("manual",) + wk not in warned:
@@ -8895,6 +10720,20 @@ class App:
                         pass
             except Exception:
                 pass
+        # 청산 보고(리뷰 P2, 2026-10-14): 통과 익절 청산을 앱이 직접 보고한다(why=cap_tp = 평가 계좌 익절). 종전엔 아무것도 보고하지 않아
+        # 나중에 _check_stop_closed가 '손절 추정' 청산으로 보고했고, 진입 10분 안이면 서버가 '손절에 닿은 적 없는 청산'으로 의심했다.
+        # 자산 맥락이 이 계좌일 때만 보고한다(다른 계좌가 맥락이면 그 계좌는 아직 열려 있다).
+        try:
+            _ids = {str(aid_cfg).strip().casefold()} | ({str(_aid).strip().casefold()} if _aid is not None else set())
+            for _a in sorted({self._fill_asset(p.symbol) for p in poss} - {None}):
+                self._send_ev("exit_ok", _a, why="cap_tp")
+                _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(_a))
+                if _ctx and str(_ctx.get("aid") or "").strip().casefold() in _ids:
+                    self._open_ctx.pop(str(_a), None)
+                    self._forget_open_ctx(_a)
+                    self._send_fill(_a, closed=True, why="cap_tp")
+        except Exception:
+            pass
         done = getattr(self, "_passtp_done", None)
         if done is None:
             done = self._passtp_done = {}
@@ -9082,6 +10921,3557 @@ class App:
                 self._passtp_close_account(b, cfg, aid_cfg, key, tp, total)
             except Exception as e:
                 self.log(f"  , 통과 익절 감시 오류({asset}/{aid_cfg}): {e}")
+
+    # ── 평가 계좌 익절: 하루 이익 상한 + 통과 목표(대표 2026-10-14, 2차 "앱이 보다가 정리하는 방식 고") ──────────────────────────
+    # 규칙과 숫자는 모듈의 _DAYCAP_FIRMS 설명에. 여기는 실행 쪽이다. 설계 불변식:
+    #   ① 평가 계좌만(_daycap_stage == 'eval'). 펀디드, 연습, 라이브, 모르는 계좌, 프롭이 아닌 브로커는 진입, 손절, 청산 경로가 종전 그대로다.
+    #   ② 브로커에 익절 주문을 걸지 않는다 - 고아 주문이 생길 수 없다. 앱이 계좌의 오늘 손익(오늘 실현 + 열린 포지션 미실현)을 지켜보다
+    #      하루 상한(여유를 뺀 값) 또는 통과 목표(여유를 더한 값)에 닿으면 그 계좌만 시장가로 정리한다. 통과 익절 감시와 같은 규약:
+    #      confirm-after-act(청산 → 플랫 확인 → 그 계좌 남은 주문 취소 → 표시, 보고), 한 번에 하나(감시 스레드 하나 + 계좌별 발동 래치),
+    #      발사 직전 포지션 다시 확인, 거래일(17:00 CT) 단위 닿음 표시, 그 계좌만.
+    #   ③ 모르면 판단하지 않는다: 실현 손익, 잔고, 시세 가운데 필요한 것을 못 읽으면 그 회차는 닫지 않는다(진입도 막지 않는다).
+    #   ④ 경보가 아니다: 상한에 닿아 건너뛰는 진입, 상한 정리는 차분한 로그와 서버 기록(entry_skip, exit_ok)뿐.
+    #   ⑤ 재시작: 앱이 진입한 평가 계좌는 감시 기록(.daycap_mon.json)이 남아, 다시 켠 뒤 [라이브 시작] 전에도 그 포지션을 지켜본다.
+    #   ⑥ 통과: 통과 목표에 어느 경로로든 닿으면 그 계좌를 '통과'로 표시한다(상한, 통과 익절 끔). 이번 실행에서는 더 진입하지 않는다
+    #      (Topstep은 이름이 아직 Combine인 동안 계속 - 펀디드는 새 계좌로 열린다). Lucid는 같은 계좌가 펀디드가 되므로 다음 [라이브 시작]부터
+    #      상한 없이 종전대로 진입한다.
+    @staticmethod
+    def _daycap_key(broker, acct) -> str:
+        return f"{broker}|{str(acct or '').strip().casefold()}"
+
+    def _dc_state(self) -> dict:
+        st = getattr(self, "_dc_st", None)
+        if isinstance(st, dict):
+            return st
+        with _DAYCAP_INIT_LOCK:                      # 진입 스레드 여럿이 처음 동시에 불러도 한 벌만(_DAYCAP_STATE_LOCK과 따로 - 안에서 다시 잡지 않게)
+            st = getattr(self, "_dc_st", None)
+            if not isinstance(st, dict):
+                st = _load_daycap_state()
+                for _k in ("names", "sizes", "hit", "nt8_base", "status", "passed", "asked", "pass_prompted",
+                           "days", "hist", "tp_fired", "daybal",      # 3차: 거래일별 손익 원장, Topstep 거래 기록, 통과 익절 발동 금액, 그날 첫 잔고
+                           "nt8_bases", "tchg", "pass_hold"):         # 3차 리뷰: Lucid 거래일 시작 잔고 이력, 서버 목표 바뀐 날, 통과 확인 대기
+                    if not isinstance(st.get(_k), dict):
+                        st[_k] = {}
+                self._dc_st = st
+        return st
+
+    def _dc_save(self) -> None:
+        with _DAYCAP_STATE_LOCK:
+            _save_daycap_state(self._dc_state())
+
+    def _dc_map(self, name) -> dict:
+        """감시가 쓰는 메모리 표(발동 래치, 다음 확인 시각 등) - 없으면 만든다."""
+        d = getattr(self, name, None)
+        if not isinstance(d, dict):
+            d = {}
+            setattr(self, name, d)
+        return d
+
+    def _daycap_ui_refresh(self) -> None:
+        try:
+            self.root.after(0, self._daycap_rows_refresh)
+        except Exception:
+            pass
+
+    def _daycap_learn(self, broker, acct, name=None, size=None) -> None:
+        """진입, 감시 때 본 계좌 이름(행에 숫자 id만 있을 때 Topstep 판별), 알아낸 규모를 기억한다 - 화면 상태 줄과 판별이 쓴다."""
+        try:
+            _k = self._daycap_key(broker, acct)
+            st = self._dc_state()
+            _ch = False
+            with _DAYCAP_STATE_LOCK:
+                if name and str(name) != str(acct) and st["names"].get(_k) != str(name):
+                    st["names"][_k] = str(name)
+                    _ch = True
+                if size and st["sizes"].get(_k) != int(size):
+                    st["sizes"][_k] = int(size)
+                    _ch = True
+            if _ch:
+                self._dc_save()
+                self._daycap_ui_refresh()
+        except Exception:
+            pass
+
+    def _daycap_hit_today(self, broker, acct, day) -> bool:
+        return self._dc_state()["hit"].get(self._daycap_key(broker, acct)) == day
+
+    def _daycap_set_hit(self, broker, acct, day) -> None:
+        with _DAYCAP_STATE_LOCK:
+            self._dc_state()["hit"][self._daycap_key(broker, acct)] = day
+        self._dc_save()
+        self._daycap_ui_refresh()
+
+    def _daycap_set_status(self, broker, acct, *, day, room, cap, pass_tp, unknown=False) -> None:
+        """화면 상태 줄 재료(오늘 남은 한도). 메모리는 늘 갱신, 디스크는 바뀐 날, 처음 값, 60초마다만(감시는 5초 주기라).
+        unknown = 열린 포지션이 있는데 오늘 실현 손익을 못 읽어 하루 상한을 지금 못 본다(상태 줄이 낡은 금액 대신 그렇다고 말한다)."""
+        import time as _t
+        try:
+            _k = self._daycap_key(broker, acct)
+            st = self._dc_state()
+            _old = st["status"].get(_k) or {}
+            _new = {"day": day, "room": (round(float(room), 2) if room is not None else None),
+                    "cap": float(cap or 0), "pass_tp": float(pass_tp or 0), "ts": _t.time(), "unknown": bool(unknown)}
+            with _DAYCAP_STATE_LOCK:
+                st["status"][_k] = _new
+            if (_old.get("day") != day or (_old.get("room") is None) != (_new["room"] is None)
+                    or bool(_old.get("unknown")) != _new["unknown"] or _t.time() - float(_old.get("ts") or 0) >= 60):
+                self._dc_save()
+            if (_old.get("room") != _new["room"] or _old.get("day") != day
+                    or bool(_old.get("unknown")) != _new["unknown"]):
+                self._daycap_ui_refresh()
+        except Exception:
+            pass
+
+    def _daycap_stage_flag(self, broker, acct, pr=None):
+        """회원이 답한 Lucid 단계('eval'/'funded') - 이 행 프롭 값, 없으면 같은 계좌의 다른 자산 행. 모르면 None.
+        답은 그 답을 받은 계좌(stage_for)에만 붙는다 - 행의 계좌를 바꾸면 새 계좌는 다시 묻는다(2차 리뷰 P1)."""
+        want = str(acct or "").strip().casefold()
+
+        def _mine(p):
+            _sf = str((p or {}).get("stage_for") or "").strip().casefold()
+            return not _sf or _sf == want
+        v = (pr or {}).get("stage")
+        if v in ("eval", "funded") and _mine(pr):
+            return v
+        if not want:
+            return None
+        try:
+            for _a in _ASSETS:
+                for _rw in (((self._acfg or {}).get(_a) or {}).get("accounts") or []):
+                    if (str(_rw.get("id") or "").strip().casefold() == want
+                            and self._acct_broker(_a, _rw) == broker):
+                        _s = (_rw.get("prop") or {}).get("stage")
+                        if _s in ("eval", "funded") and _mine(_rw.get("prop")):
+                            return _s
+        except Exception:
+            pass
+        return None
+
+    def _daycap_passed_rec(self, broker, acct, bal=None, size=None):
+        """통과 표시 기록 또는 None. Topstep은 잔고가 규모 이하로 돌아오면(초기화, 새로 시작) 표시를 푼다 - Combine은 통과 뒤 그 계좌로
+        더 거래하지 않으므로 이 경우는 새 평가다. Lucid는 같은 계좌가 펀디드가 되므로 풀지 않는다(프롭 설정에서 단계를 다시 고르면 풀린다)."""
+        _k = self._daycap_key(broker, acct)
+        rec = self._dc_state()["passed"].get(_k)
+        if not isinstance(rec, dict):
+            return None
+        # 3차 리뷰 P1: 자동 통과 표시는 그때 쓴 이익 목표를 들고 있다 - 지금 목표(서버 값 정정 등)가 그보다 높으면 통과가 아니었다. 표시를 푼다.
+        try:
+            _rt, _rs = float(rec.get("target") or 0), int(rec.get("size") or size or 0)
+            _tn = float(_dc_targets(broker).get(_rs) or 0) if broker in _DAYCAP_FIRMS else 0.0
+            if rec.get("src") == "auto" and _rt > 0 and _tn > _rt + 0.5:
+                self._daycap_clear_passed(broker, acct)
+                self.log((f"   [{acct}] 지금 이익 목표({self._daycap_money(_tn)})가 통과로 표시할 때 쓴 목표({self._daycap_money(_rt)})보다 "
+                          f"높아 통과 표시를 풀었습니다. 다시 평가로 봅니다.") if self.lang == "ko" else
+                         (f"   [{acct}] The profit target now ({self._daycap_money(_tn)}) is higher than the target used when the "
+                          f"account was marked as passed ({self._daycap_money(_rt)}), so the passed mark is cleared and it is "
+                          f"treated as an evaluation again."))
+                return None
+        except (TypeError, ValueError):
+            pass
+        if broker == "projectx" and bal is not None and size:
+            try:
+                if float(bal) <= float(size):
+                    self._daycap_clear_passed(broker, acct)
+                    self.log((f"   [{acct}] 잔고 {self._daycap_money(bal)}가 계좌 규모 이하라 새로 시작한 평가로 보고 통과 표시를 풀었습니다.")
+                             if self.lang == "ko" else
+                             (f"   [{acct}] The balance {self._daycap_money(bal)} is at or below the account size, so this is "
+                              f"treated as a fresh evaluation and the passed mark is cleared."))
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return rec
+
+    def _daycap_stage_cfg(self, broker, acct, pr, name=None, bal=None):
+        """(단계, 이름의 규모) - _daycap_stage + 앱이 알아 둔 계좌 이름 + 회원이 답한 Lucid 단계 + 통과 표시('passed')."""
+        st = self._dc_state()
+        _k = self._daycap_key(broker, acct)
+        prx = dict(pr or {})
+        if broker == "nt8":
+            prx["stage"] = self._daycap_stage_flag(broker, acct, pr)
+            prx["stage_for"] = None                     # 위에서 계좌로 이미 골랐다(이름 표기와 id가 달라도 다시 거르지 않게)
+        stage, size = _daycap_stage(broker, prx, name or st["names"].get(_k) or acct, bal)
+        # 통과 표시는 잔고 띠 판정(mismatch)보다 먼저 본다(2차 리뷰 P2: 통과 뒤 잔고가 규모 +10%를 넘으면 표시가 가려져 다시 거래하던 것).
+        if stage in ("eval", "mismatch") and self._daycap_passed_rec(broker, acct, bal=bal, size=size):
+            stage = "passed"
+        return stage, size
+
+    def _daycap_resolve_cfg(self, broker, acct, pr, name=None, bal=None, today=None):
+        """_daycap_resolve + 앱이 알아 둔 계좌 이름, 규모 + 회원이 답한 Lucid 단계 + 통과 표시 + 지금까지 최고일(3차 결정 B: 오늘 전 거래일과
+        오늘 지금까지 손익 today 가운데 큰 값). 평가가 아니면(통과 포함) None. r['best_src'] = 최고일 출처('hist', 'local', None = 모름)."""
+        st = self._dc_state()
+        _k = self._daycap_key(broker, acct)
+        stage, _sz = self._daycap_stage_cfg(broker, acct, pr, name=name, bal=bal)
+        if stage != "eval":
+            return None
+        prx = dict(pr or {})
+        if broker == "nt8":
+            prx["stage"], prx["stage_for"] = "eval", None
+        _, day = _daycap_day_start()
+        best, src = self._dc_best(broker, acct, day, today)
+        r = _daycap_resolve(broker, prx, name or st["names"].get(_k) or acct, bal, learned_size=st["sizes"].get(_k), best=best)
+        if r is not None:
+            r["best_src"] = src
+        return r
+
+    @staticmethod
+    def _daycap_pass_plausible(r) -> bool:
+        """회원이 넣은 통과 목표가 이 계좌 규모에 말이 되는가(규모 < 목표 ≤ 규모 + 이익 목표 x 1.5). 규모를 모르면 판단 못 함 = False.
+        말이 안 되는 값(다른 규모 계좌에서 남은 53,000 등)으로 계좌를 '통과'로 표시하거나 닫지 않게 한다(리뷰 P1)."""
+        try:
+            size, tgt, ptp = float(r.get("size") or 0), float(r.get("target") or 0), float(r.get("pass_tp") or 0)
+            return bool(size and tgt and size < ptp <= size + tgt * 1.5)
+        except (TypeError, ValueError):
+            return False
+
+    def _daycap_money(self, v) -> str:
+        return _money(v)                                    # -$120(부호는 $ 앞, 3차 결정 H) - 종전엔 '$-120'
+
+    def _daycap_note_once(self, key, ko_txt, en_txt) -> None:
+        """같은 안내를 이번 실행에서 한 번만 로그로 남긴다."""
+        seen = self.__dict__.get("_dc_noted")
+        if not isinstance(seen, set):
+            seen = self._dc_noted = set()
+        if key in seen:
+            return
+        seen.add(key)
+        self.log(ko_txt if self.lang == "ko" else en_txt)
+
+    def _daycap_mark_passed(self, broker, acct, *, bal, pass_tp, lbl, size, via, target=None, src="auto") -> None:
+        """평가 계좌를 '통과'로 표시한다(대표 2026-10-14 결정 3 P1-a, 결정 4): 상한과 통과 익절을 끄고, 이번 실행에서는 더 진입하지 않으며,
+        한 번 1R 제안 창을 띄운다(결정 6). via = 'watch'(감시가 통과 목표에서 정리), 'entry'(진입 직전 잔고), 'balance'(감시가 본 잔고).
+        target, src = 그때 쓴 이익 목표와 통과 금액 출처('auto' 자동, 'set' 회원 값) - 목표가 나중에 올라가면 자동 표시를 푼다(3차 리뷰 P1)."""
+        import time as _t
+        _k = self._daycap_key(broker, acct)
+        _, day = _daycap_day_start()
+        with _DAYCAP_STATE_LOCK:
+            _new = _k not in self._dc_state()["passed"]
+            self._dc_state()["passed"][_k] = {"day": day, "bal": (float(bal) if bal is not None else None),
+                                              "pass_tp": float(pass_tp or 0), "size": int(size or 0), "ts": _t.time(),
+                                              "via": str(via), "target": (float(target) if target else None),
+                                              "src": str(src or "auto")}
+            self._dc_state()["pass_hold"].pop(_k, None)
+        self._dc_save()
+        self._dc_map("_dc_passed_run")[_k] = _t.time()
+        self._daycap_ui_refresh()
+        if _new:
+            _firm = (_DAYCAP_FIRMS.get(broker) or {}).get("firm", "")
+            # 무엇이 멈추는지와 아직 통과가 아닐 때 푸는 길을 같이 말한다(2차 리뷰 P1: 일관성 규칙으로 목표가 올라간 평가는 잔고가 규모 + 목표여도
+            # 통과가 아니다 - Topstep은 프롭 설정의 통과 목표 잔고를 올리면, Lucid는 단계를 '평가'로 다시 고르면 표시가 풀린다).
+            if broker == "projectx":
+                _tail_ko = ("이 계좌로는 더 진입하지 않습니다(펀디드는 새 계좌로 열립니다). 아직 통과하지 않았다면(목표가 올라간 경우) "
+                            "프롭 설정에서 통과 목표 잔고를 올리십시오. 그러면 다시 평가로 진입합니다.")
+                _tail_en = ("This account takes no more entries (the funded account opens as a new account). If it has not "
+                            "passed yet (the target was raised), please raise the pass target balance in the prop settings; it "
+                            "then trades as an evaluation again.")
+            else:
+                _tail_ko = ("이번 실행에서는 이 계좌로 더 진입하지 않고, 다음 [라이브 시작]부터 하루 이익 상한 없이 진입합니다. 아직 평가라면 "
+                            "프롭 설정에서 단계를 '평가'로 다시 고르십시오.")
+                _tail_en = ("It takes no more entries in this run, and from the next Go Live it enters without the daily profit "
+                            "cap. If it is still an evaluation, please pick 'Evaluation' again in the prop settings.")
+            self.log((f"   [{lbl}] 평가 통과 목표 잔고({self._daycap_money(pass_tp)})에 닿아 이 계좌를 평가 통과로 표시했습니다. 하루 이익 상한과 "
+                      f"통과 익절을 끕니다. {_tail_ko} {_firm} 화면에서 통과 여부를 확인하십시오.")
+                     if self.lang == "ko" else
+                     (f"   [{lbl}] This account reached its pass target balance ({self._daycap_money(pass_tp)}) and is marked as "
+                      f"passed. The daily profit cap and the pass take-profit are off. {_tail_en} Please check the pass status "
+                      f"on {_firm}."))
+            self._daycap_pass_prompt(broker, acct, lbl, size)
+
+    def _daycap_pass_skip_ev(self, broker, acct, asset) -> None:
+        """통과로 표시된 계좌의 건너뜀 보고: 계좌마다 처음 한 번만 'pass_reached'(서버가 회원에게 한 번 알린다), 그 뒤는 'pass_done'
+        (기록만, 알림 없음 - 2차 리뷰 P2: 통과한 Combine이 신호마다 '진입되지 않았습니다' 알림을 보내던 것)."""
+        _k = self._daycap_key(broker, acct)
+        why = "pass_reached"
+        try:
+            with _DAYCAP_STATE_LOCK:
+                rec = self._dc_state()["passed"].get(_k)
+                if isinstance(rec, dict):
+                    if rec.get("told"):
+                        why = "pass_done"
+                    else:
+                        rec["told"] = True
+            if why == "pass_reached":
+                self._dc_save()
+        except Exception:
+            pass
+        self._entry_skip_ev(asset, why)
+
+    def _daycap_clear_passed(self, broker, acct) -> None:
+        _k = self._daycap_key(broker, acct)
+        try:
+            with _DAYCAP_STATE_LOCK:
+                _had = self._dc_state()["passed"].pop(_k, None) is not None
+                _had = (self._dc_state()["tp_fired"].pop(_k, None) is not None) or _had   # 새로 시작한 평가 = 통과 익절 금액 기록도 새로
+            self._dc_map("_dc_passed_run").pop(_k, None)
+            if _had:
+                self._dc_save()
+                self._daycap_ui_refresh()
+        except Exception:
+            pass
+
+    # ── 통과 표시를 해도 되는가(3차 리뷰 P0, P1, P2) ──
+    def _dc_pass_markable(self, broker, r, name=""):
+        """(통과로 표시해도 되는가, 사유 'best' | 'target' | ''). 회원이 넣은 통과 목표, 최고일 규칙이 없는 요금제(LucidPro)는 된다.
+        자동 통과 금액은 지금까지 최고일을 다 알 때만(Topstep = 오늘 다시 읽은 거래 기록 전부 'hist', Lucid = 처음부터 빈 날 없는 시작 잔고
+        원장 'ledger') - 모르는 날이 있으면 실제 통과 금액이 더 높을 수 있다(통과 표시는 상한을 끈다). 서버가 오늘 바꾼 이익 목표로도 표시하지
+        않는다(하루 지나 안정된 뒤에만)."""
+        r = r or {}
+        if r.get("pass_src") != "auto":
+            return True, ""
+        if _dc_cons_applies(broker, name) and r.get("best_src") not in ("hist", "ledger"):
+            return False, "best"
+        if not self._dc_target_stable(broker, r.get("size")):
+            return False, "target"
+        return True, ""
+
+    def _dc_pass_hold(self, broker, acct, lbl, bal, need, why, firm) -> None:
+        """통과 금액 이상인데 표시하지 않을 때(_dc_pass_markable False): 그 거래일 한 번 차분히 알리고 기록해 둔다(진입은 하지 않는다)."""
+        _k = self._daycap_key(broker, acct)
+        _, day = _daycap_day_start()
+        try:
+            with _DAYCAP_STATE_LOCK:
+                _h = self._dc_state()["pass_hold"].get(_k)
+                if not isinstance(_h, dict) or _h.get("day") != day:
+                    _h = dict(_h) if isinstance(_h, dict) else {}       # 'told'(회원에게 한 번 알림)은 날이 바뀌어도 둔다
+                    _h.update({"day": day, "bal": (float(bal) if bal is not None else None), "need": float(need or 0),
+                               "why": str(why)})
+                    self._dc_state()["pass_hold"][_k] = _h
+        except Exception:
+            pass
+        if why == "target":
+            _ko = "서버가 오늘 바꾼 이익 목표라"
+            _en = "the profit target was changed by the server today"
+        else:
+            _ko = "지금까지 하루 최고 이익을 앱이 다 알지 못해(앱이 보지 못한 거래일이 있음)"
+            _en = "the app does not know every trading day's result so far (there are days it did not see)"
+        self._daycap_note_once(("pass_hold", _k, day, why),
+                               (f"   [{lbl}] 잔고 {self._daycap_money(bal)}가 통과 금액({self._daycap_money(need)}) 이상이지만 {_ko} 통과로 "
+                                f"표시하지 않았습니다. 하루 이익 상한은 그대로 두고, 이 계좌로는 새로 진입하지 않습니다. {firm} 화면에서 "
+                                f"통과 여부를 확인하십시오. 아직 통과 전이면 프롭 설정에서 통과 목표 잔고를 넣으십시오. 그 금액까지 다시 "
+                                f"진입합니다."),
+                               (f"   [{lbl}] The balance {self._daycap_money(bal)} is at or above the pass amount "
+                                f"({self._daycap_money(need)}), but {_en}, so the account is not marked as passed. The daily profit "
+                                f"cap stays on and this account takes no new entries. Please check the pass status on {firm}. If it "
+                                f"has not passed yet, enter a pass target balance in the prop settings; it then enters again up to "
+                                f"that amount."))
+
+    def _daycap_pass_hold_ev(self, broker, acct, asset) -> None:
+        """통과 확인 대기 계좌의 건너뜀 보고: 계좌마다 처음 한 번 'pass_reached'(서버가 회원에게 한 번 알린다), 그 뒤 'pass_check'(기록만)."""
+        _k = self._daycap_key(broker, acct)
+        why = "pass_check"
+        try:
+            with _DAYCAP_STATE_LOCK:
+                _h = self._dc_state()["pass_hold"].setdefault(_k, {})
+                if not _h.get("told"):
+                    _h["told"] = True
+                    why = "pass_reached"
+            if why == "pass_reached":
+                self._dc_save()
+        except Exception:
+            pass
+        self._entry_skip_ev(asset, why)
+
+    def _dc_tchg_update(self) -> None:
+        """규모별 이익 목표가 바뀐 거래일을 적는다(내장값과 같으면 날짜 없음 = 늘 안정). 서버 하트비트마다 부른다."""
+        try:
+            _, day = _daycap_day_start()
+            st = self._dc_state()
+            _ch = False
+            with _DAYCAP_STATE_LOCK:
+                tc = st["tchg"]
+                for bk, f in _DAYCAP_FIRMS.items():
+                    for sz, base in f["targets"].items():
+                        v = float(_dc_targets(bk).get(sz, base))
+                        key = f"{bk}|{sz}"
+                        rec = tc.get(key)
+                        if not isinstance(rec, dict) or abs(float(rec.get("v", -1.0)) - v) > 0.005:
+                            tc[key] = {"v": v, "day": ("" if abs(v - float(base)) < 0.005 else day)}
+                            _ch = True
+            if _ch:
+                self._dc_save()
+        except Exception:
+            pass
+
+    def _dc_target_stable(self, broker, size) -> bool:
+        """이 규모의 이익 목표가 내장값이거나, 서버 값이 바뀐 지 한 거래일이 지났는가."""
+        try:
+            sz = int(size or 0)
+            base = (_DAYCAP_FIRMS.get(broker) or {}).get("targets", {}).get(sz)
+            v = _dc_targets(broker).get(sz) if broker in _DAYCAP_FIRMS else None
+            if v is None or base is None or abs(float(v) - float(base)) < 0.005:
+                return True
+            rec = self._dc_state()["tchg"].get(f"{broker}|{sz}")
+            if not isinstance(rec, dict) or abs(float(rec.get("v", -1.0)) - float(v)) > 0.005:
+                self._dc_tchg_update()
+                return False
+            _, day = _daycap_day_start()
+            return str(rec.get("day") or "") < day
+        except Exception:
+            return False
+
+    # ── 서버 권장 값(3차 결정 I) ──
+    @staticmethod
+    def _prop_reco_leaves(raw) -> int:
+        """숫자 칸 수(서버가 보낸 것 가운데 몇 칸을 버렸는지 세려고)."""
+        if isinstance(raw, dict):
+            return sum(App._prop_reco_leaves(v) for v in raw.values())
+        if isinstance(raw, (list, tuple)):                  # 프롭 규칙의 표(XFA 줄, 상한 요금제)는 통째로 한 칸(3차 마무리 1)
+            return 1 if raw else 0
+        return 1 if (isinstance(raw, (int, float, str)) and not isinstance(raw, bool)) else 0
+
+    def _prop_reco_desc(self, ko) -> str:
+        """지금 쓰는 값 한 줄(서버 값 + 내장값)."""
+        _ts, _lu = _dc_pct("projectx"), _dc_pct("nt8")
+        tb = _reco_table()
+        _parts = []
+        for bk, fn in (("projectx", "Topstep"), ("nt8", "Lucid")):
+            for sz in sorted(set((tb.get(bk) or {}).get("eval", {})) | set((tb.get(bk) or {}).get("funded", {}))):
+                _e, _f = _reco_one_r(bk, "eval", sz), _reco_one_r(bk, "funded", sz)
+                _parts.append((f"{fn} {sz // 1000}K 평가 {_money(_e) if _e else '-'}, 펀디드 {_money(_f) if _f else '-'}") if ko else
+                              (f"{fn} {sz // 1000}K evaluation {_money(_e) if _e else '-'}, funded {_money(_f) if _f else '-'}"))
+        _t150 = (_dc_targets("projectx").get(150000), _dc_targets("nt8").get(150000))
+        # 프롭 규칙(3차 마무리 1): 어느 묶음을 서버 값으로 쓰는지만 말한다(값 자체는 로그에 적지 않는다)
+        _rg = _srv_rules()
+        _rn = [(ko_, en_) for k_, ko_, en_ in (("cons", "일관성 선", "consistency line"), ("cap_plans", "상한 요금제", "cap plans"),
+                                              ("names", "계좌 이름 형식", "account name formats"),
+                                              ("limits", "계약 한도", "contract limits"), ("margin", "증거금 표", "margin table"),
+                                              ("day_start", "거래일 시작", "trading day start")) if _rg.get(k_)]
+        if ko:
+            return (f"하루 이익 상한 Topstep 목표의 {_ts * 100:.1f}%, Lucid {_lu * 100:.1f}%, 150K 이익 목표 Topstep {_money(_t150[0])}, "
+                    f"Lucid {_money(_t150[1])}, 통과 익절 여유 {_money(_dc_margin())}, 권장 1R " + "; ".join(_parts)
+                    + ((", 계좌 규칙 서버 값(" + ", ".join(x[0] for x in _rn) + ")") if _rn else ""))
+        return (f"daily profit cap Topstep {_ts * 100:.1f}% of the target, Lucid {_lu * 100:.1f}%, 150K profit target Topstep "
+                f"{_money(_t150[0])}, Lucid {_money(_t150[1])}, pass take-profit margin {_money(_dc_margin())}, recommended 1R "
+                + "; ".join(_parts) + ((", account rules from the server (" + ", ".join(x[1] for x in _rn) + ")") if _rn else ""))
+
+    def _prop_reco_apply(self, raw) -> None:
+        """하트비트의 prop_reco를 검증해 쓴다(범위 밖, 빠진 칸 = 그 칸만 내장값). 바뀌었을 때만 디스크에 두고 로그 한 줄. 회원이 저장한 1R은
+        바꾸지 않는다 - 권장값과 상한, 통과 익절 계산만 바뀐다.
+        3차 마무리 리뷰: 정상 하트비트에 prop_reco가 없으면(서버 파일 없음 - 인계된 보조서버, 손으로 고치다 깨진 파일) 마지막 정상 값을 그대로
+        쓴다(종전에는 내장값으로 돌아가며 디스크의 마지막 정상 값까지 지웠다 - 지켜야 할 바로 그 장애에서). 내장값으로 되돌리는 것은 서버가
+        {"reset": true}를 보낼 때뿐이다."""
+        global _DAYCAP_SRV
+        if raw is None or (isinstance(raw, dict) and not raw):
+            self._dc_tchg_update()
+            return                                          # 서버가 아무것도 안 보냄 = 지금 값(마지막 정상 값) 그대로
+        if isinstance(raw, dict) and raw.get("reset") is True:
+            if _DAYCAP_SRV:
+                _DAYCAP_SRV = {}
+                self._dc_tchg_update()
+                _save_prop_reco({})
+                ko = self.lang == "ko"
+                self.log(("   서버가 권장 값을 앱에 들어 있는 값으로 되돌렸습니다: " + self._prop_reco_desc(True)
+                          + ". 회원이 저장한 1R은 바뀌지 않습니다.") if ko else
+                         ("   The server reset the recommended values to the app's built-in values: "
+                          + self._prop_reco_desc(False) + ". Your saved 1R does not change."))
+                self._daycap_ui_refresh()
+            else:
+                self._dc_tchg_update()
+            return
+        _bad = _prop_reco_core_bad(raw) if isinstance(raw, dict) else []
+        if _bad:
+            # 3차 리뷰 P1: 상한 비율, 이익 목표 가운데 하나라도 회사, 규모별 범위를 벗어났다(오타 등) - 이 서버 값은 통째로 쓰지 않고
+            # 마지막 정상 값을 그대로 쓴다(그 칸만 내장값으로 바꾸면 나머지 서버 값과 섞인다).
+            import json as _json
+            self._daycap_note_once(("srv_reco_core_bad", hashlib.sha1(_json.dumps(raw, sort_keys=True, default=str).encode("utf-8")).hexdigest()),
+                                   (f"   서버가 보낸 핵심 값(하루 상한 비율, 이익 목표, 일관성 선, 거래일 시작)이 허용 범위를 벗어나"
+                                    f"({', '.join(_bad[:3])}) 이번 서버 값은 쓰지 않고 마지막으로 받은 정상 값을 그대로 씁니다."),
+                                   (f"   A core value sent by the server (daily cap ratio, profit target, consistency line or trading day "
+                                    f"start) is outside the allowed range ({', '.join(_bad[:3])}), so these server values are not used "
+                                    f"and the last good values stay in use."))
+            self._dc_tchg_update()
+            return
+        new = _prop_reco_validate(raw) if isinstance(raw, dict) else {}
+        _drop = (self._prop_reco_leaves(raw) - self._prop_reco_leaves(new)) if isinstance(raw, dict) else 0
+        if _drop > 0:
+            import json as _json
+            self._daycap_note_once(("srv_reco_drop", hashlib.sha1(_json.dumps(raw, sort_keys=True, default=str).encode("utf-8")).hexdigest()),   # 같은 서버 값이면 한 번
+                                   f"   서버 권장 값 가운데 {_drop}칸은 범위를 벗어나거나 읽을 수 없어 앱에 들어 있는 값을 씁니다.",
+                                   f"   {_drop} of the server's recommended values are out of range or unreadable, so the app's "
+                                   f"built-in values are used for them.")
+        if new == _DAYCAP_SRV:
+            self._dc_tchg_update()
+            return
+        _DAYCAP_SRV = new
+        self._dc_tchg_update()                              # 이익 목표가 바뀐 거래일(바뀐 날은 자동 통과 표시를 하지 않는다, 3차 리뷰 P1)
+        _save_prop_reco(new)                                # 규모 키(정수)는 JSON에서 글자가 되고 읽을 때 다시 숫자로 검증한다
+        ko = self.lang == "ko"
+        self.log((("   서버 권장 값을 받았습니다: " if new else "   서버가 보낸 권장 값이 없어 앱에 들어 있는 값을 씁니다: ")
+                  + self._prop_reco_desc(True) + ". 회원이 저장한 1R은 바뀌지 않습니다.") if ko else
+                 (("   Received the server's recommended values: " if new else
+                   "   The server sent no recommended values, so the app's built-in values are used: ")
+                  + self._prop_reco_desc(False) + ". Your saved 1R does not change."))
+        self._daycap_ui_refresh()
+
+    # ── 최고일(3차 결정 B): 평가 계좌마다 거래일별 손익 원장 ──
+    def _dc_ledger_note(self, broker, acct, day, pnl) -> None:
+        """그 거래일 실현 손익(지금까지)을 앱 원장에 적는다. Topstep = 오늘 실현(Trade/search), Lucid = 지금 현금 - 거래일 시작 잔고(NT8 실현).
+        메모리는 늘, 디스크는 새 날이거나 60초마다."""
+        import time as _t
+        try:
+            v = round(float(pnl), 2)
+        except (TypeError, ValueError):
+            return
+        _k = self._daycap_key(broker, acct)
+        st = self._dc_state()
+        with _DAYCAP_STATE_LOCK:
+            dd = st["days"].setdefault(_k, {})
+            _new = day not in dd
+            if dd.get(day) == v:
+                return
+            dd[day] = v
+            if len(dd) > 400:
+                for _d in sorted(dd)[:len(dd) - 400]:
+                    dd.pop(_d, None)
+        _ls = self._dc_map("_dc_ledger_saved")
+        if _new or _t.time() - float(_ls.get(_k, 0) or 0) >= 60:
+            _ls[_k] = _t.time()
+            self._dc_save()
+
+    def _dc_hist_refresh(self, b, broker, acct, aid, day) -> None:
+        """Topstep 거래 기록(Trade/search, 지난 365일 = 사실상 계좌 첫 거래부터)을 거래일마다 한 번 읽어 날마다 손익(수수료 전 profitAndLoss 합,
+        취소 제외)을 둔다 - 최고일을 크게 잡는 쪽(통과 익절을 늦게 잡아 통과 못 한 채 닫지 않게). 못 읽으면 10분 뒤 다시, 그날 로그 한 번."""
+        import time as _t
+        if broker != "projectx" or not hasattr(b, "trades"):
+            return
+        _k = self._daycap_key(broker, acct)
+        st = self._dc_state()
+        h = st["hist"].get(_k) if isinstance(st["hist"].get(_k), dict) else None
+        if h and h.get("day") == day:
+            return
+        _fail = self._dc_map("_dc_hist_fail")
+        if _t.time() - float(_fail.get(_k, 0) or 0) < _DAYCAP_HIST_RETRY_S:
+            return
+        g = self._dc_gate(b)
+        if g is not None and not g.take("other"):
+            return
+        _start = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=_DAYCAP_HIST_DAYS)).isoformat()
+        try:
+            rows = b.trades(aid, _start, timeout=_DAYCAP_ENTRY_TIMEOUT)
+        except Exception as _e:
+            if g is not None:
+                g.note_error(_e)
+            _fail[_k] = _t.time()
+            self._daycap_note_once(("hist_fail", _k, day),
+                                   (f"   [{acct}] 거래 기록을 읽지 못해({str(_e)[:80]}) 지금까지 최고일을 앱이 본 날로만 셉니다. 10분 뒤 다시 읽어 봅니다."),
+                                   (f"   [{acct}] The trade history could not be read ({str(_e)[:80]}), so the best day so far counts only "
+                                    f"the days the app saw. It tries again in 10 minutes."))
+            return
+        days, bad = {}, 0
+        for t in rows or []:
+            if not isinstance(t, dict) or t.get("voided"):
+                continue
+            try:
+                ts = _iso_utc(t.get("creationTimestamp"))         # 소수 초 자릿수가 달라도(파이썬 3.9 맥 빌드, 3차 리뷰 P1)
+                d = _daycap_day_start(ts)[1]
+                days[d] = round(days.get(d, 0.0) + float(t.get("profitAndLoss") or 0.0), 2)
+            except (TypeError, ValueError, AttributeError):
+                bad += 1                                         # 못 읽은 행 - 이 기록은 완전하지 않다(통과 표시에 쓰지 않는다)
+                continue
+        with _DAYCAP_STATE_LOCK:
+            st["hist"][_k] = {"day": day, "ts": _t.time(), "days": days, "bad": bad}
+        _fail.pop(_k, None)
+        self._dc_save()
+        if bad:
+            self._daycap_note_once(("hist_bad", _k, day),
+                                   (f"   [{acct}] 거래 기록 {bad}행의 시각을 읽지 못했습니다. 지금까지 최고일을 다 안다고 보지 않아 이 계좌를 "
+                                    f"자동으로 통과로 표시하지 않습니다."),
+                                   (f"   [{acct}] The time of {bad} trade history row(s) could not be read. The best day so far is not "
+                                    f"treated as complete, so this account is not marked as passed automatically."))
+
+    @staticmethod
+    def _dc_next_tday(d) -> str:
+        """다음 거래일 키(주말 건너뜀): 금요일 → 월요일. 공휴일은 모른다(그 사이 날은 빈 날로 본다 - 보수적)."""
+        try:
+            x = _dt.date.fromisoformat(str(d)) + _dt.timedelta(days=1)
+        except (TypeError, ValueError):
+            return ""
+        while x.weekday() >= 5:
+            x += _dt.timedelta(days=1)
+        return x.isoformat()
+
+    def _dc_lucid_complete(self, acct, day) -> bool:
+        """Lucid 계좌의 거래일 손익을 처음부터 다 아는가(3차 리뷰 P0): 처음 본 날의 시작 잔고가 계좌 규모(수수료 차이 $300 안 = 그 전 거래일
+        없음)이고, 그날부터 오늘까지 거래일마다 시작 잔고가 빠짐없이 있다(이웃한 두 시작 잔고의 차 = 그 거래일의 끝 손익). 하나라도 빈 날이면
+        False - 앱이 꺼져 있던 날의 손익은 모른다."""
+        _k = self._daycap_key("nt8", acct)
+        st = self._dc_state()
+        bs = st["nt8_bases"].get(_k) if isinstance(st["nt8_bases"].get(_k), dict) else {}
+        days = sorted(d for d in bs if d <= day)
+        if not days or days[-1] != day:
+            return False
+        size = (_daycap_size_from_name("nt8", st["names"].get(_k) or acct)
+                or _daycap_norm_size(st["sizes"].get(_k)))
+        try:
+            if not size or abs(float(bs[days[0]]) - float(size)) > 300.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return all(self._dc_next_tday(a) == b2 for a, b2 in zip(days, days[1:]))
+
+    def _dc_best(self, broker, acct, day, today=None):
+        """(최고일, 출처) - 오늘 전 거래일 가운데 가장 큰 하루 손익과 오늘 지금까지 손익 가운데 큰 값(음수면 0). 출처:
+        'hist' = Topstep 거래 기록을 오늘 다시 읽었고 모든 행을 읽었다(+ 앱 원장), 'ledger' = Lucid 시작 잔고 원장이 처음부터 빈 날 없음,
+        'partial' = Topstep 기록이 낡았거나(오늘 못 읽음) 못 읽은 행이 있음, 'local' = 앱이 본 날만, None = 지난날을 모름(통과 익절은 목표로).
+        통과 표시는 'hist', 'ledger'에서만 한다(3차 리뷰 P0, P2). Topstep 초기화(리셋) 전 거래가 기록에 남아 있으면 최고일이 커질 수 있다 -
+        통과 익절이 늦어지는 쪽이라 그대로 둔다."""
+        _k = self._daycap_key(broker, acct)
+        st = self._dc_state()
+        h = st["hist"].get(_k) if isinstance(st["hist"].get(_k), dict) else None
+        merged = {}
+        for src in (((h or {}).get("days") or {}), (st["days"].get(_k) or {})):
+            for d, v in src.items():
+                if d < day:
+                    try:
+                        merged[d] = max(float(v), merged.get(d, float("-inf")))
+                    except (TypeError, ValueError):
+                        continue
+        try:
+            td = float(today) if today is not None else None
+        except (TypeError, ValueError):
+            td = None
+        if h is not None:
+            src = "hist" if (h.get("day") == day and not int(h.get("bad") or 0)) else "partial"
+        elif broker == "nt8" and self._dc_lucid_complete(acct, day):
+            src = "ledger"
+        elif merged:
+            src = "local"
+        else:
+            src = None
+        if src is None:
+            return ((max(0.0, td) if (td is not None and td > 0) else None), None)
+        best = max([0.0] + list(merged.values()) + ([td] if td is not None else []))
+        return best, src
+
+    def _dc_best_note(self, broker, acct, lbl, day, src, r, line=None) -> None:
+        """자동 통과 익절의 최고일을 모를 때(또는 앱이 본 날로만 셀 때) 그 거래일 한 번 차분히 알린다. line = 감시가 실제로 닫는 잔고(통과 잔고 +
+        max(여유, 2틱 x 계약) + 지난 모자람, 3차 마무리 4) - 없으면 r['pass_tp']."""
+        if not r or r.get("pass_src") != "auto" or float(r.get("pass_tp") or 0) <= 0 or src in ("hist", "ledger"):
+            return
+        _k = self._daycap_key(broker, acct)
+        _m = self._daycap_money(line if line else r["pass_tp"])
+        if src == "partial":
+            return                                          # 거래 기록을 못 읽었거나(그 로그는 _dc_hist_refresh가 남긴다) 오늘 아직 안 읽음
+        if src is None:
+            self._daycap_note_once(("best_unknown", _k, day),
+                                   (f"   [{lbl}] 지금까지 하루 최고 이익을 몰라 통과 익절을 이익 목표 기준({_m})으로 잡습니다. 하루 이익 상한이 "
+                                    f"새 날을 일관성 선 아래로 지킵니다."),
+                                   (f"   [{lbl}] The best day so far is not known, so the pass take-profit uses the profit target "
+                                    f"({_m}). The daily profit cap keeps new days under the consistency line."))
+        else:
+            self._daycap_note_once(("best_local", _k, day),
+                                   (f"   [{lbl}] 지금까지 하루 최고 이익은 앱이 이 계좌를 본 날로만 셉니다(통과 익절 {_m})."),
+                                   (f"   [{lbl}] The best day so far counts only the days the app saw this account (pass "
+                                    f"take-profit {_m})."))
+
+    def _dc_gate(self, b):
+        """ProjectX 로그인 하나의 감시 호출 한도(_DcGate). NT8, 그 밖은 None(로컬 브리지 - 한도 없음)."""
+        if getattr(b, "name", "") != "projectx":
+            return None
+        gs = self._dc_map("_dc_gates")                      # 감시 브로커는 로그인마다 하나(_passtp_broker 캐시)라 객체로 센다
+        g = gs.get(id(b))
+        if g is None:
+            g = gs[id(b)] = _DcGate()
+        return g
+
+    def _dc_day_bal(self, broker, acct, bal, day):
+        """그 거래일 처음 본 잔고와 지금 잔고 가운데 작은 쪽(XFA Scaling Plan은 그날 시작 잔고 기준이라 장중에 늘지 않는다). 처음 본 값은 둔다."""
+        try:
+            b = float(bal)
+        except (TypeError, ValueError):
+            return None
+        _k = self._daycap_key(broker, acct)
+        st = self._dc_state()
+        with _DAYCAP_STATE_LOCK:
+            r = st["daybal"].get(_k)
+            if not isinstance(r, dict) or r.get("day") != day:
+                st["daybal"][_k] = {"day": day, "bal": b}
+                _first = b
+                _ch = True
+            else:
+                try:                                        # 처음 본 잔고 $0.00(새 XFA)도 그 값 그대로(3차 리뷰 P1 - 'or'가 0을 지금 잔고로 바꾸던 것)
+                    _first = float(r["bal"]) if r.get("bal") is not None else b
+                except (TypeError, ValueError):
+                    _first = b
+                _ch = False
+        if _ch:
+            self._dc_save()
+        return min(_first, b)
+
+    def _daycap_plan(self, b, cap, arow, aid, resolved, asset, live, risk_usd=None):
+        """진입 직전 평가 계좌 익절 계획. None = 대상 아님(종전 그대로), {"skip": True} = 이번 신호 진입 안 함,
+        그 밖 {"monitor": True, ...} = 진입하고 앱이 지켜본다(브로커 익절 주문 없음).
+        risk_usd = 이번 진입의 손절 위험(1R x 배수, 결정 2) - 남은 하루 한도가 그 0.5배보다 작으면 건너뛴다(사유 cap_room)."""
+        ko = self.lang == "ko"
+        bk = str(cap.get("broker") or "")
+        pr = cap.get("pr") or {}
+        lbl = cap.get("lbl") or ""
+        sc = str(cap.get("sc") or "")
+        name = str((arow or {}).get("name") or sc)
+        if name != sc:
+            self._daycap_learn(bk, sc, name=name)
+        _k = self._daycap_key(bk, sc)
+        # 시험용 스위치의 연습 계좌(3차 마무리 3)는 건너뜀 사실을 서버 증거 원장에 보내지 않는다(시험 정리의 exit_ok와 같게 - 3차 마무리 리뷰: 연습
+        # 계좌의 cap_room 건너뜀이 대표 실계좌가 들어간 날 그 자산 원장에 섞이고, 10분 묶음이 실제 Combine의 건너뜀을 가렸다).
+        _test = _daycap_test_acct(bk, name)
+
+        def _skip_ev(why):
+            if not _test:
+                self._entry_skip_ev(asset, why)
+        # 감시가 지금 이 계좌 포지션을 정리하는 중(플랫 확인 전, 멈추지 않은 발동 래치)이면 이번 신호에 들어가지 않는다(2차 리뷰 P2: 정리 중에
+        # 들어간 진입의 새 손절을 마무리가 걷거나, 다음 회차가 새 포지션을 이어서 닫던 것). 오늘 상한, 통과에 닿아 정리하는 중이므로 그 사유다.
+        _fl = self._dc_map("_dc_fired").get(_k)
+        if isinstance(_fl, dict) and not _fl.get("done") and not _fl.get("halt"):
+            _pass = _fl.get("mode") == "pass"
+            self.log((f"   [{lbl}] 이 계좌는 " + ("통과 목표" if _pass else "하루 이익 상한") + "에 닿아 앱이 포지션을 정리하는 중이라 "
+                      "이번 신호에 진입하지 않습니다.") if ko else
+                     (f"   [{lbl}] The app is closing this account's positions at the "
+                      + ("pass target" if _pass else "daily profit cap") + ", so this signal is not entered."))
+            if _pass and not _test:
+                self._daycap_pass_skip_ev(bk, sc, asset)
+            elif not _pass:
+                _skip_ev("day_cap")
+            return {"skip": True}
+        # 먼저 이름(과 Lucid 답)만으로 본다 - 평가로 보이지 않는 계좌(펀디드, 연습, 모르는 이름, Lucid 미답)는 브로커를 더 읽지 않고
+        # 종전 그대로 진입한다(NT8 잔고 읽기도 하지 않는다 - 비대상 경로의 브로커 호출이 12e와 같다).
+        stage0, _ = self._daycap_stage_cfg(bk, sc, pr, name=name)
+        if stage0 == "unanswered":
+            self._daycap_note_once(("unanswered", _k),
+                                   (f"   [{lbl}] 이 Lucid 계좌가 평가인지 펀디드인지 아직 답을 받지 못해 평가 계좌 익절 없이 종전대로 진입합니다. "
+                                    f"프롭 설정에서 고르시면 켜집니다."),
+                                   (f"   [{lbl}] It is not known yet whether this Lucid account is an evaluation or funded, so it "
+                                    f"enters as before without the evaluation take-profit. Pick it in the prop settings to turn it on."))
+            return None
+        if stage0 not in ("eval", "passed"):
+            return None
+        bal = (arow or {}).get("balance") if bk == "projectx" else None
+        if bk == "nt8":
+            try:
+                bal = b.account_balance(name)
+            except Exception:
+                bal = None
+        try:
+            bal = float(bal) if bal is not None else None
+        except (TypeError, ValueError):
+            bal = None
+        stage, nsize = self._daycap_stage_cfg(bk, sc, pr, name=name, bal=bal)
+        if stage == "passed":
+            if bk == "projectx" or _k in self._dc_map("_dc_passed_run"):
+                self.log((f"   [{lbl}] 이 계좌는 평가 통과 목표에 닿아 통과로 표시된 계좌라 이번 신호에 진입하지 않습니다"
+                          + (". 펀디드 계좌가 열리면 계좌 설정에서 그 계좌로 바꾸십시오. 아직 통과하지 않았다면 프롭 설정에서 통과 목표 "
+                             "잔고를 올리십시오." if bk == "projectx" else
+                             "(다음 [라이브 시작]부터 하루 상한 없이 진입합니다). 아직 평가라면 프롭 설정에서 단계를 '평가'로 다시 "
+                             "고르십시오.")) if ko else
+                         (f"   [{lbl}] This account is marked as passed (it reached its pass target), so this signal is not "
+                          f"entered"
+                          + (". When the funded account opens, switch the account setting to it. If it has not passed yet, "
+                             "please raise the pass target balance in the prop settings." if bk == "projectx" else
+                             " (from the next Go Live it enters without the daily cap). If it is still an evaluation, please "
+                             "pick 'Evaluation' again in the prop settings.")))
+                self._daycap_pass_skip_ev(bk, sc, asset)
+                return {"skip": True}
+            return None                                     # Lucid 통과 뒤(같은 계좌 펀디드) - 상한, 통과 익절 없이 종전대로
+        if stage == "mismatch":
+            self._daycap_note_once(("mismatch", _k),
+                                   (f"   [{lbl}] 계좌 이름의 규모({nsize // 1000}K)와 잔고({self._daycap_money(bal)})가 맞지 않아 이 계좌에는 "
+                                    f"평가 계좌 익절을 걸지 않습니다(진입은 종전대로)."),
+                                   (f"   [{lbl}] The size in the account name ({nsize // 1000}K) does not match the balance "
+                                    f"({self._daycap_money(bal) if bal is not None else '?'}), so no evaluation take-profit is used "
+                                    f"on this account (entries go in as before)."))
+            return None
+        if stage != "eval":
+            return None
+        r = self._daycap_resolve_cfg(bk, sc, pr, name=name, bal=bal)
+        if r is None:
+            return None
+        if r["size_src"] in ("name", "balance"):
+            self._daycap_learn(bk, sc, size=r["size"])
+        if r.get("size_conflict"):
+            self._daycap_note_once(("size_conflict", _k, r["size_conflict"]),
+                                   (f"   [{lbl}] 프롭 설정의 계좌 규모({int(r['size_conflict']) // 1000}K)가 계좌 이름의 규모"
+                                    f"({r['size'] // 1000}K)와 달라 이름의 규모로 하루 상한과 통과 목표를 정합니다."),
+                                   (f"   [{lbl}] The account size in the prop settings ({int(r['size_conflict']) // 1000}K) differs "
+                                    f"from the size in the account name ({r['size'] // 1000}K), so the daily cap and the pass target "
+                                    f"follow the name."))
+        if r["cap"] <= 0 and r["pass_tp"] <= 0:
+            return None                                    # 회원이 둘 다 껐다 - 종전 그대로
+        s_utc, day = _daycap_day_start()
+        if self._daycap_hit_today(bk, sc, day):
+            self.log((f"   [{lbl}] 오늘 하루 이익 상한({self._daycap_money(r['cap'])})에 닿아 이 계좌는 오늘 더 진입하지 않습니다. "
+                      f"다음 {r['firm']} 거래일({_dc_day_txt()})부터 다시 진입합니다.") if ko else
+                     (f"   [{lbl}] This account reached its daily profit cap ({self._daycap_money(r['cap'])}) today, so it takes no "
+                      f"more entries today. It enters again from the next {r['firm']} trading day ({_dc_day_txt()})."))
+            _skip_ev("day_cap")
+            return {"skip": True}
+        # Topstep 최고일(3차 결정 B): 거래 기록은 감시가 거래일마다 한 번 미리 읽어 둔다. 진입에서는 잔고가 규모 + 목표 이상이라 통과 판정이
+        # 최고일에 달렸는데 오늘 기록을 아직 못 읽었을 때만 읽는다(평소 진입 경로의 브로커 호출은 2차와 같다).
+        if (bk == "projectx" and r.get("pass_src") == "auto" and bal is not None and r.get("size") and r.get("target")
+                and bal >= float(r["size"]) + float(r["target"])):
+            try:
+                self._dc_hist_refresh(b, bk, sc, aid, day)
+            except Exception:
+                pass
+        real = None
+        if r["cap"] > 0:
+            try:
+                if bk == "projectx":
+                    real = float(b.day_realized(aid, s_utc.isoformat(), timeout=_DAYCAP_ENTRY_TIMEOUT))
+                else:
+                    real = self._daycap_nt8_daypnl(b, name, s_utc, day, cash=bal)
+            except Exception as _re:
+                real = None
+                self.log((f"   [{lbl}] 오늘 실현 손익을 읽지 못해({str(_re)[:80]}) 진입 전 하루 이익 상한 확인을 건너뜁니다. 진입 뒤에는 "
+                          f"감시가 다시 읽어 봅니다.") if ko else
+                         (f"   [{lbl}] Today's realized P&L could not be read ({str(_re)[:80]}), so the daily profit cap check "
+                          f"before entry is skipped. After entry the watch tries again."))
+            if real is None and bk == "nt8":
+                self.log((f"   [{lbl}] Lucid 오늘 손익을 읽지 못해(NT8 연결 또는 NetLiq) 진입 전 하루 이익 상한 확인을 건너뜁니다.") if ko else
+                         (f"   [{lbl}] Today's Lucid P&L could not be read (NT8 connection or NetLiq), so the daily profit cap "
+                          f"check before entry is skipped."))
+        # 거래일별 손익 원장(최고일 재료) + 오늘 손익을 넣어 통과 익절을 다시 계산한다(오늘이 최고일이면 그만큼 올라간다).
+        if real is not None:
+            if bk == "projectx":
+                self._dc_ledger_note(bk, sc, day, real)
+            elif bal is not None:
+                _b0 = (self._dc_state()["nt8_base"].get(self._daycap_key(bk, name)) or {})
+                if _b0.get("day") == day and _b0.get("base") is not None:
+                    self._dc_ledger_note(bk, sc, day, float(bal) - float(_b0["base"]))
+        r = self._daycap_resolve_cfg(bk, sc, pr, name=name, bal=bal, today=real) or r
+        if r.get("pass_src") == "auto" and r["pass_tp"] > 0 and r.get("pass_need"):
+            # 표시용 통과 익절 = 통과 잔고 + max(여유, 2틱 x 이번 계약) + 지난 모자람 - 감시가 닫는 금액과 같게(3차 리뷰 P0, P1)
+            try:
+                _pl = self._dc_auto_pass_line(bk, sc, r, [(c, q) for _s, q, c in (resolved or [])], day)
+                if _pl:
+                    r = dict(r, pass_tp=_pl)
+            except (TypeError, ValueError):
+                pass
+        self._dc_best_note(bk, sc, lbl, day, r.get("best_src"), r)          # 위에서 고친 실제 금액으로(3차 마무리 4)
+        _m_cap, _m_pass = self._daycap_money(r["cap"]), self._daycap_money(r["pass_tp"])
+        cap_room = (r["cap"] - real) if (r["cap"] > 0 and real is not None) else None
+        pass_room = (r["pass_tp"] - bal) if (r["pass_tp"] > 0 and bal is not None) else None
+        # ── 통과 잔고에 이미 닿음(어느 경로로든, 결정 3 P1-a) - 실제로 통과하는 잔고(자동이면 여유 $50을 뺀 금액)로 본다 ──
+        _need = float(r.get("pass_need") or r["pass_tp"] or 0)
+        if r["pass_tp"] > 0 and bal is not None and bal >= _need:
+            _mk, _mwhy = self._dc_pass_markable(bk, r, name)
+            if r["pass_src"] == "auto" and not _mk:
+                # 3차 리뷰 P0, P2: 지금까지 최고일을 다 알지 못하거나(앱이 못 본 날) 서버가 오늘 바꾼 목표 - 통과로 표시하지 않는다(표시는 상한을
+                # 끈다). 통과 금액 이상이라 이번 신호에는 들어가지 않는다(들어가면 통과 익절이 곧바로 닫는 일을 되풀이한다).
+                self._dc_pass_hold(bk, sc, lbl, bal, _need, _mwhy, r["firm"])
+                self._daycap_pass_hold_ev(bk, sc, asset)
+                return {"skip": True}
+            if r["pass_src"] == "auto" or self._daycap_pass_plausible(r):
+                self._daycap_mark_passed(bk, sc, bal=bal, pass_tp=_need, lbl=lbl, size=r["size"], via="entry",
+                                         target=r.get("target"), src=r.get("pass_src"))
+                self.log((f"   [{lbl}] 잔고 {self._daycap_money(bal)}가 통과 잔고({self._daycap_money(_need)}) 이상이라 이번 신호에 진입하지 "
+                          f"않습니다.") if ko else
+                         (f"   [{lbl}] The balance {self._daycap_money(bal)} is at or above the pass balance "
+                          f"({self._daycap_money(_need)}), so this signal is not entered."))
+                self._daycap_pass_skip_ev(bk, sc, asset)
+                return {"skip": True}
+            # 회원이 넣은 값이 이 계좌 규모에 맞지 않는다(다른 계좌에서 남은 값 등) - 막지 않고 통과 목표만 빼고 진입한다(안내 한 번).
+            self._daycap_note_once(("pass_odd", _k, round(float(r["pass_tp"]), 2)),
+                                   (f"   [{lbl}] 프롭 설정의 통과 목표 잔고({_m_pass})가 이 계좌 잔고({self._daycap_money(bal)}) 이하이고 "
+                                    f"계좌 규모에도 맞지 않아 보여, 통과 목표 없이 하루 이익 상한만 씁니다. 프롭 설정에서 통과 목표 잔고를 "
+                                    f"확인하십시오."),
+                                   (f"   [{lbl}] The pass target balance in the prop settings ({_m_pass}) is at or below this account's "
+                                    f"balance ({self._daycap_money(bal)}) and does not look like it fits the account size, so only the "
+                                    f"daily profit cap is used. Please check the pass target balance in the prop settings."))
+            r = dict(r, pass_tp=0.0, pass_need=0.0)
+            pass_room = None
+            _m_pass = self._daycap_money(0)
+        self._daycap_set_status(bk, sc, day=day, room=cap_room, cap=r["cap"], pass_tp=r["pass_tp"])
+        # ── 하루 이익 상한: 이미 닿음(오늘 표시, day_cap), 손절 위험에 비해 너무 작음(이번 신호만, cap_room) ──
+        # 상한 금액이 곧 감시가 닫는 선이다(3차 결정 A - 여유를 더 빼지 않는다). 남은 한도 = 상한 - 오늘 실현.
+        if cap_room is not None and cap_room <= 0:
+            self._daycap_set_hit(bk, sc, day)
+            _tk, _te = ("[시험 모드] ", "[Test mode] ") if r.get("test") else ("", "")
+            self.log((f"   [{lbl}] {_tk}오늘 하루 이익 상한({_m_cap})에 닿아 이 계좌는 오늘 더 진입하지 않습니다"
+                      f"(오늘 실현 {self._daycap_money(real)}). 다음 {r['firm']} 거래일({_dc_day_txt()})부터 다시 진입합니다.") if ko else
+                     (f"   [{lbl}] {_te}This account reached its daily profit cap ({_m_cap}) today (realized "
+                      f"{self._daycap_money(real)}), so it takes no more entries today. It enters again from the next "
+                      f"{r['firm']} trading day ({_dc_day_txt()})."))
+            _skip_ev("day_cap")
+            return {"skip": True}
+        try:
+            _risk = float(risk_usd) if risk_usd is not None else None
+        except (TypeError, ValueError):
+            _risk = None
+        if (cap_room is not None and _risk and _risk > 0 and (pass_room is None or cap_room <= pass_room)
+                and cap_room < _DAYCAP_MIN_ROOM_R * _risk):
+            # 결정 2: 하루 상한이 묶는 쪽인데 남은 한도가 이번 손절 위험(1R x 배수)의 절반보다 작다 - 이번 신호만 건너뛴다(닿음 표시 없음).
+            _tk, _te = ("[시험 모드] ", "[Test mode] ") if r.get("test") else ("", "")
+            self.log((f"   [{lbl}] {_tk}오늘 남은 하루 이익 한도({self._daycap_money(cap_room)})가 이번 진입 손절 위험"
+                      f"({self._daycap_money(_risk)})의 절반보다 작아 이번 신호에는 진입하지 않습니다(하루 이익 상한 {_m_cap}).")
+                     if ko else
+                     (f"   [{lbl}] {_te}Today's remaining daily profit room ({self._daycap_money(cap_room)}) is less than half of "
+                      f"this entry's stop risk ({self._daycap_money(_risk)}), so this signal is not entered "
+                      f"(daily profit cap {_m_cap})."))
+            _skip_ev("cap_room")
+            return {"skip": True}
+        plan = {"skip": False, "monitor": True, "lbl": lbl, "firm": r["firm"], "day": day, "sc": sc, "stage": "eval",
+                "cap": r["cap"], "pass_tp": r["pass_tp"], "cap_room": cap_room, "pass_room": pass_room, "broker": bk,
+                "risk": _risk}
+        _parts_ko, _parts_en = [], []
+        if r["cap"] > 0:
+            _parts_ko.append(f"하루 상한 {_m_cap}" + (f"(오늘 남은 {self._daycap_money(cap_room)})" if cap_room is not None else ""))
+            _parts_en.append(f"daily cap {_m_cap}" + (f" ({self._daycap_money(cap_room)} left today)" if cap_room is not None else ""))
+        if r["pass_tp"] > 0:
+            _parts_ko.append(f"통과 {_m_pass}" + (f"(남은 {self._daycap_money(pass_room)})" if pass_room is not None else ""))
+            _parts_en.append(f"pass {_m_pass}" + (f" ({self._daycap_money(pass_room)} to go)" if pass_room is not None else ""))
+        _shd = _daycap_shadow() and not r.get("test")
+        self.log((f"   [{lbl}] " + ("[시험 모드] " if r.get("test") else "") + "평가 계좌 익절(앱 감시): " + ", ".join(_parts_ko)
+                  + " 가운데 먼저 닿는 쪽에서 이 계좌 포지션을 정리합니다(브로커 익절 주문 없음)." + (" 그림자 모드라 정리 주문은 내지 않고 로그만 "
+                                                                                         "남깁니다." if _shd else ""))
+                 if ko else
+                 (f"   [{lbl}] " + ("[Test mode] " if r.get("test") else "") + "Evaluation take-profit (watched by the app): this "
+                  "account's positions are closed at whichever comes first of " + " and ".join(_parts_en)
+                  + " (no broker take-profit order)."
+                  + (" Shadow mode is on, so no close order is sent; it only writes the log." if _shd else "")))
+        return plan
+
+    # ── 앱 감시(Topstep, Lucid 공통) ──
+    def _daycap_mon_note(self, asset, b, cap, aid, con, stop, direction, size, plan) -> None:
+        """앱이 평가 계좌에 진입한 leg를 감시 기록에 더한다 - 재시작 뒤에도 그 계좌를 지켜보고, 다른 계좌가 먼저 닫혀도 자산 맥락을
+        넘겨받을 재료다. 메모리(브로커 객체 포함) + 디스크(비밀 없음)."""
+        import time as _t
+        bk = str((cap or {}).get("broker") or getattr(b, "name", "") or "")
+        sc = str((cap or {}).get("sc") or aid)
+        _k = self._daycap_key(bk, sc)
+        try:
+            _stop = float(stop) if stop is not None else None
+        except (TypeError, ValueError):
+            _stop = None
+        with _DAYCAP_LOCK:
+            m = self._dc_map("_dc_mon")
+            rec = dict(m.get(_k) or {"broker": bk, "sc": sc, "legs": []})
+            legs = [l for l in (rec.get("legs") or []) if isinstance(l, dict)
+                    and not (l.get("asset") == asset and str(l.get("con")) == str(con))]
+            legs.append({"asset": str(asset), "con": str(con), "stop": _stop, "dir": str(direction).upper(),
+                         "size": abs(int(size or 0)), "ts": _t.time()})
+            _rk = [x for x in (rec.get("risk"), (plan or {}).get("risk")) if isinstance(x, (int, float)) and x > 0]
+            rec.update({"broker": bk, "sc": sc, "aid": str(aid), "lbl": (plan or {}).get("lbl") or sc, "legs": legs,
+                        "day": (plan or {}).get("day"), "ts": _t.time(), "stage": (plan or {}).get("stage") or "eval", "b": b,
+                        "risk": (max(_rk) if _rk else None)})          # 이번 진입 손절 위험(1R x 배수) - 1초 감시 구간을 정한다(3차 결정 C)
+            m[_k] = rec
+            _save_daycap_mon(m)
+        self._dc_map("_dc_due")[_k] = 0
+        self._dc_map("_dc_flatn").pop(_k, None)
+        try:                                                # 진입 전에 읽어 둔 포지션 목록은 버린다 - 다음 회차가 낡은 '플랫'으로 이 기록을 놓지 않게(3차 마무리 5)
+            _ids = {str(aid), str(sc)}
+            for _c in list(self._dc_map("_dc_acache").values()):
+                for _a in (_c[1] if isinstance(_c, tuple) and len(_c) > 1 else []) or []:
+                    if isinstance(_a, dict) and str(_a.get("name") or "").strip().casefold() == str(sc).strip().casefold():
+                        _ids.add(str(_a.get("id")))
+            _pcs = self._dc_map("_dc_pcache")
+            for _pk in [x for x in list(_pcs) if str(x[1]) in _ids]:
+                _pcs.pop(_pk, None)
+        except Exception:
+            pass
+        self._daycap_ui_refresh()                           # 상태 줄의 통과 익절 금액이 앱이 든 계약의 여유를 반영하게(3차 마무리 4)
+
+    def _daycap_mon_drop(self, key, force=False) -> None:
+        """감시 기록을 놓는다. 정리 중 기록('fired' - 정리한 계약의 남은 주문을 아직 다 걷지 못함)은 force일 때만(마무리, 정리 멈춤이 다 걷은
+        뒤) 지운다(2차 리뷰 P0: 기록을 먼저 지우면 걷기 실패 뒤 재시작, [전체 정지]에서 고아 손절이 남았다)."""
+        try:
+            with _DAYCAP_LOCK:
+                m = self._dc_map("_dc_mon")
+                rec = m.get(key)
+                if rec is None:
+                    return
+                if not force and isinstance(rec, dict) and isinstance(rec.get("fired"), dict):
+                    return
+                m.pop(key, None)
+                _save_daycap_mon(m)
+        except Exception:
+            pass
+
+    def _daycap_fired_save(self, key) -> None:
+        """발동 래치(_dc_fired[key])를 디스크 감시 기록 'fired'에 적는다(브로커 객체 빼고) - 재시작 뒤에도 정리와 남은 주문 걷기를 이어 가게
+        (2차 리뷰 P0). 감시 기록이 없던 계좌(무장만 된 계좌)면 기록을 만든다. 플랫 확인(done) 뒤에는 발동 전에 들어간 leg를 지운다 - 다른
+        계좌가 닫힐 때 자산 맥락을 이미 플랫인 이 계좌로 넘기지 않게."""
+        import time as _t
+        info = self._dc_map("_dc_fired").get(key)
+        if not isinstance(info, dict):
+            return
+        try:
+            with _DAYCAP_LOCK:
+                m = self._dc_map("_dc_mon")
+                rec = m.get(key)
+                if not isinstance(rec, dict):
+                    rec = {"broker": info.get("broker"), "sc": info.get("sc"), "aid": str(info.get("aid") or ""),
+                           "lbl": info.get("lbl"), "legs": [], "day": info.get("day"), "ts": _t.time(), "stage": "eval"}
+                    m[key] = rec
+                rec["fired"] = {k: v for k, v in info.items() if k != "b"}
+                if info.get("done"):
+                    _f_ts = float(info.get("ts") or 0)
+                    rec["legs"] = [l for l in (rec.get("legs") or []) if isinstance(l, dict) and float(l.get("ts") or 0) > _f_ts]
+                rec["ts"] = max(float(rec.get("ts") or 0), float(info.get("ts") or 0))
+                _save_daycap_mon(m)
+        except Exception:
+            pass
+
+    def _daycap_fired_clear(self, key) -> None:
+        """정리를 다 마쳤다(남은 주문 0): 래치를 풀고 디스크 기록의 'fired'를 지운다. 발동 뒤에 새로 들어간 leg가 있으면 기록은 남긴다(그
+        포지션은 계속 지켜본다), 없으면 기록째 놓는다."""
+        info = self._dc_map("_dc_fired").pop(key, None)
+        try:
+            _f_ts = float((info or {}).get("ts") or 0)
+            with _DAYCAP_LOCK:
+                m = self._dc_map("_dc_mon")
+                rec = m.get(key)
+                if not isinstance(rec, dict):
+                    return
+                _new = [l for l in (rec.get("legs") or []) if isinstance(l, dict) and float(l.get("ts") or 0) > _f_ts]
+                if _new:
+                    rec.pop("fired", None)
+                    rec["legs"] = _new
+                else:
+                    m.pop(key, None)
+                _save_daycap_mon(m)
+        except Exception:
+            pass
+
+    def _daycap_fired_restore(self) -> None:
+        """디스크 감시 기록의 'fired'를 메모리 발동 래치로 되살린다(재시작 뒤 - 이미 있으면 그대로)."""
+        fired = self._dc_map("_dc_fired")
+        for _k, rec in list(self._dc_map("_dc_mon").items()):
+            if isinstance(rec, dict) and isinstance(rec.get("fired"), dict) and _k not in fired:
+                fired[_k] = dict(rec["fired"])
+
+    def _daycap_latch_halt_all(self) -> None:
+        """[전체 정지], [라이브 시작]: 발동 래치의 포지션 정리를 멈춘다(halt) - 정리한 계약의 남은 주문 걷기만 이어 간다. 멈춘 래치는 어떤
+        포지션도 더 닫지 않는다(2차 리뷰 P1: 메모리에 남은 래치가 다음 날 새 진입을 상한 확인 없이 닫던 것)."""
+        try:
+            self._daycap_fired_restore()
+            for _k, info in list(self._dc_map("_dc_fired").items()):
+                if isinstance(info, dict) and not info.get("halt"):
+                    info["halt"] = True
+                    self._daycap_fired_save(_k)
+        except Exception:
+            pass
+
+    def _daycap_mon_clear(self) -> None:
+        """[전체 정지]: 회원이 포지션을 넘겨받는다 - 앱 진입 감시 기록을 지우고, 정리 중인 계좌는 포지션 정리를 멈춘다. 정리한 계약의 남은
+        주문(손절) 걷기는 끝날 때까지 이어 간다 - 그 기록('fired')은 지우지 않는다(2차 리뷰 P0)."""
+        try:
+            self._daycap_latch_halt_all()
+            with _DAYCAP_LOCK:
+                m = self._dc_map("_dc_mon")
+                _keep = {k: v for k, v in m.items() if isinstance(v, dict) and isinstance(v.get("fired"), dict)}
+                if len(_keep) != len(m):
+                    m.clear()
+                    m.update(_keep)
+                    _save_daycap_mon(m)
+        except Exception:
+            pass
+
+    def _daycap_tick(self):
+        """1초 주기(root.after): 평가 계좌 감시를 백그라운드 스레드 하나로 돌린다(한 번에 하나 - 계좌마다 다음 확인 시각은 감시가 정한다:
+        선 가까이 1초, 포지션 있으면 5초, 없으면 30초 - 3차 결정 C). 거래일이 바뀌면 상태 줄을 다시 쓴다."""
+        try:
+            if (not _daycap_off() and getattr(self, "_dc_busy", False) is not True
+                    and (any((c or {}).get("broker") in _DAYCAP_FIRMS
+                             for c in list((getattr(self, "_sig_accts", None) or {}).values()))
+                         or self._dc_map("_dc_mon"))):
+                self._dc_busy = True
+                try:
+                    threading.Thread(target=self._daycap_mon_wrap, daemon=True).start()
+                except Exception:
+                    self._dc_busy = False
+            _d = _daycap_day_start()[1]
+            if getattr(self, "_dc_day_seen", None) != _d:
+                if getattr(self, "_dc_day_seen", None) is not None:
+                    self._daycap_rows_refresh()             # 17:00 CT가 지났다 - 어제의 '닿음', 남은 한도 줄을 걷는다
+                self._dc_day_seen = _d
+        except Exception as _e:
+            self._dc_exc_note("tick", _e)
+        finally:
+            try:
+                self.root.after(_DAYCAP_POLL_FAST_S * 1000, self._daycap_tick)
+            except Exception:
+                pass
+
+    def _daycap_mon_wrap(self):
+        """감시 스레드 한 회차. 예외는 감시를 멈추지 않고(다음 회차는 1초 뒤 그대로) 종류마다 한 시간에 한 줄로 남긴다 - 종전엔 모두 말없이
+        삼켜 감시가 무엇을 못 하는지 로그로 알 수 없었다(2026-10-15 대표 PC NT8 미정리 조사)."""
+        try:
+            self._daycap_mon_scan()
+        except Exception as _e:
+            self._dc_exc_note("scan", _e)
+        finally:
+            self._dc_busy = False
+
+    def _dc_note_hourly(self, key, ko_txt, en_txt) -> bool:
+        """같은 안내를 한 시간(_DAYCAP_NOTE_EVERY_S)에 한 번만 로그로 남긴다. 남겼으면 True."""
+        import time as _t
+        seen = self._dc_map("_dc_hourly")
+        now = _t.time()
+        last = seen.get(key)
+        if last is not None and now - float(last) < _DAYCAP_NOTE_EVERY_S:
+            return False
+        seen[key] = now
+        self.log(ko_txt if self.lang == "ko" else en_txt)
+        return True
+
+    def _dc_exc_note(self, where, e) -> None:
+        """감시 길에서 난 예상하지 못한 예외: 감시는 그대로 돌고, (자리, 예외 종류)마다 한 시간에 한 줄만 차분히 남긴다. 이 함수는 절대 예외를
+        내지 않는다(로그가 감시를 멈추면 안 된다)."""
+        try:
+            import traceback as _tb
+            _fr = _tb.extract_tb(e.__traceback__)[-1] if getattr(e, "__traceback__", None) else None
+            _at = f", {_fr.name}:{_fr.lineno}" if _fr else ""
+            _what = f"{type(e).__name__}: {str(e)[:120]}{_at}"
+            self._dc_note_hourly(("exc", str(where), type(e).__name__),
+                                 (f"   평가 계좌 감시 중 예상하지 못한 오류가 났습니다({where}, {_what}). 감시는 계속 돕니다. "
+                                  f"같은 오류는 한 시간에 한 번만 적습니다."),
+                                 (f"   The evaluation watch hit an unexpected error ({where}, {_what}). The watch keeps running. "
+                                  f"The same error is logged at most once an hour."))
+        except Exception:
+            pass
+
+    def _daycap_watch_only(self) -> bool:
+        """확인 모드(Operator - 신호 표시만, 자동 진입 없음)인가. 무장 중이면 그 실행의 값, 아니면 서버 권한(사용 O, 자동 진입 X)."""
+        if getattr(self, "_watch_only", False) is True:
+            return True
+        g = getattr(self, "_gate", None)
+        if not isinstance(g, dict):
+            return False
+        caps = g.get("caps") if isinstance(g.get("caps"), dict) else {}
+        return bool(g.get("ok") and g.get("enabled") and caps.get("use") and not caps.get("autoentry"))
+
+    def _daycap_mon_targets(self):
+        """지켜볼 평가 계좌 [{key, broker, sc, cfg, pr, lbl, armed, keys}] - 계좌 하나에 한 칸(NQ, GC 행이 같은 계좌면 하나).
+        ① 무장된 라이브 Topstep, Lucid 계좌(수동 모드 아님, 확인 모드 아님) ② 앱이 진입해 감시 기록이 남은 계좌(재시작 뒤 [라이브 시작] 전에도),
+        정리 중 기록('fired')이 남은 계좌(남은 주문 걷기). 네트워크 없이(계좌 id, 앱이 알아 둔 이름, Lucid 단계 답) 평가로 보이는 계좌만
+        남긴다 - 펀디드, 연습, 모르는 계좌, 통과 계좌는 브로커 호출을 하나도 더하지 않는다(종전 그대로). 잔고 확인(이름과 규모)은 감시가 매번 한다.
+        확인 모드(Operator)는 무장 행을 보지 않는다(2차 리뷰 P1: 회원이 손으로 연 포지션을 앱이 하루 상한, 통과 목표에서 닫던 것 - Operator는
+        자동 진입이 없고 청산은 시간 청산뿐이다). 앱이 진입한 기록이 있는 계좌는 그대로 지켜본다."""
+        out = {}
+        if _daycap_off():
+            return []
+        _fired = self._dc_map("_dc_fired")
+        _wo = getattr(self, "_watch_only", False) is True
+        for (asset, idx), cfg in list((getattr(self, "_sig_accts", None) or {}).items()):
+            bk = cfg.get("broker")
+            if _wo or not cfg.get("live") or bk not in _DAYCAP_FIRMS or cfg.get("manual"):
+                continue
+            sc = str(cfg.get("acct") or "").strip()
+            if not sc:
+                continue
+            _k = self._daycap_key(bk, sc)
+            pr = dict(_PROP_DEFAULTS)
+            try:
+                pr.update((((self._acfg.get(asset) or {}).get("accounts") or [])[idx] or {}).get("prop") or {})
+            except Exception:
+                pr.update(cfg.get("prop") or {})
+            if _k not in out and _k not in _fired and self._daycap_stage_cfg(bk, sc, pr)[0] != "eval":
+                continue
+            t = out.setdefault(_k, {"key": _k, "broker": bk, "sc": sc, "cfg": cfg, "pr": pr,
+                                    "lbl": cfg.get("label") or sc, "armed": True, "keys": []})
+            t["keys"].append((asset, idx))
+        for _k, rec in list(self._dc_map("_dc_mon").items()):
+            if _k in out or not isinstance(rec, dict):
+                continue
+            bk, sc = str(rec.get("broker") or ""), str(rec.get("sc") or "")
+            if bk not in _DAYCAP_FIRMS or not sc:
+                continue
+            pr, _row_asset = dict(_PROP_DEFAULTS), None
+            for _a in _ASSETS:
+                for _rw in (((self._acfg or {}).get(_a) or {}).get("accounts") or []):
+                    if str(_rw.get("id") or "").strip().casefold() == sc.casefold() and self._acct_broker(_a, _rw) == bk:
+                        pr.update(_rw.get("prop") or {})
+                        _row_asset = _a
+                        break
+                if _row_asset:
+                    break
+            if _row_asset is None and bk == "nt8" and rec.get("stage") == "eval":
+                pr["stage"], pr["stage_for"] = "eval", sc.casefold()   # 행이 지워졌어도 앱이 평가로 진입한 포지션은 마저 지켜본다
+            if (_k not in _fired and not isinstance(rec.get("fired"), dict)
+                    and self._daycap_stage_cfg(bk, sc, pr)[0] != "eval"):
+                continue
+            _assets = [l.get("asset") for l in (rec.get("legs") or []) if isinstance(l, dict)] + list(_ASSETS)
+            cfg = None
+            for _a in ([_row_asset] if _row_asset else []) + _assets:
+                if not _a:
+                    continue
+                _cr = self._creds_peek(_a, bk) or {}
+                _f1 = str(_cr.get("f1") or "").strip()
+                if _f1 or bk == "nt8":
+                    cfg = {"broker": bk, "f1": _f1, "f2": (_f2_load(_f1) or "") if _f1 else "", "f3": _cr.get("f3", ""),
+                           "acct": sc, "label": rec.get("lbl") or sc, "live": True}
+                    break
+            if cfg is None:
+                continue
+            out[_k] = {"key": _k, "broker": bk, "sc": sc, "cfg": cfg, "pr": pr, "lbl": rec.get("lbl") or sc,
+                       "armed": False, "keys": []}
+        return list(out.values())
+
+    def _daycap_mon_broker(self, t):
+        """감시용 브로커(로그인마다 하나, 계좌 목록 거르지 않음 - 통과 익절 감시와 같은 캐시)."""
+        try:
+            return self._passtp_broker(t["cfg"])
+        except Exception as _e:
+            self._daycap_note_once(("mon_broker", t.get("key")),
+                                   f"   [{t.get('lbl')}] 평가 계좌 감시: 브로커 연결을 만들지 못했습니다({str(_e)[:80]}). 1분 뒤 다시 시도합니다.",
+                                   f"   [{t.get('lbl')}] Evaluation watch: the broker connection could not be built ({str(_e)[:80]}). "
+                                   f"Retrying in a minute.")
+            return None
+
+    @staticmethod
+    def _dc_f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _daycap_mon_snap(self, b, bk, sc, acache=None, fresh=False, fresh_accts=False):
+        """이 계좌의 지금 모습 {"name", "bal", "aid", "poss": [{"con", "qty"(롱 +, 숏 -), "avg", "acct"}], "nl"} 또는 None(못 읽음 -
+        그 회차는 판단하지 않는다). ProjectX 호출 한도(3차 결정 C): 계좌 목록(잔고)은 로그인마다 몇 초 다시 쓰고(포지션 구성이 바뀌면 바로 다시
+        읽는다), 포지션은 계좌마다 1초에 한 번, 감시 몫(_DcGate)을 넘으면 잠깐 전 값을 쓰거나 그 회차는 건너뛴다. fresh = 발사 직전 확인,
+        청산 확인처럼 꼭 새로 읽어야 하는 때(한도와 상관없이 읽는다). 짧은 시간 제한으로 읽는다(2차 리뷰 P2)."""
+        import time as _t
+        want = str(sc).strip().casefold()
+        _DC_TLS.snap_why = None                             # None을 돌려줄 때 그 이유(감시가 오래 못 읽으면 알리는 데 쓴다, _dc_snap_miss)
+        if bk == "nt8":
+            # 2026-10-15 대표 PC 실사고: 감시 브로커는 _passtp_broker가 새로 만든 인스턴스라 아직 브리지 상태에 안 붙어 있었고, 맨 앞의
+            # snapshot_fresh()만 붙이지 않아 늘 False였다 - NT8 계좌를 매번 말없이 건너뛰었다. 먼저 붙인다(이미 붙었으면 아무것도 안 한다).
+            # 붙이지 못하면(토큰이 애드온과 다름, 포트 사용 중) 예외 그대로 - 회차가 '평가 계좌 감시 오류'로 알리고 5초 뒤 다시 본다.
+            _au = getattr(b, "authenticate", None)
+            if callable(_au):
+                _au()
+            if hasattr(b, "snapshot_fresh") and not b.snapshot_fresh():
+                _DC_TLS.snap_why = "stale"
+                return None
+            if hasattr(b, "account_connected") and not b.account_connected(sc):
+                _DC_TLS.snap_why = "acct"
+                return None                                 # 연결 blip 중엔 계좌가 빠져 '플랫'으로 오독된다
+            if hasattr(b, "snapshot_pair"):
+                # 3차 리뷰 P0: 현금, NetLiq, 미실현, 포지션을 한 push에서 읽는다(서로 다른 push가 섞이지 않게) + 그 push 시각.
+                sp = b.snapshot_pair(sc)
+                if sp is None:
+                    _DC_TLS.snap_why = "acct"
+                    return None
+                ts, cash, nl, u, praw = sp
+                # 정리 명령의 계좌는 NT8이 보낸 이름 그대로(애드온 FindAccount는 대소문자까지 같아야 찾는다 - 행에 적은 이름과 대소문자만 달라도
+                # 감시는 계좌를 보는데 정리 주문은 '계좌 없음'으로 실패했다).
+                poss = [{"con": str(p.get("instrument") or ""), "qty": int(p.get("net_qty") or 0),
+                         "avg": self._dc_f(p.get("avg_price")), "acct": str(p.get("account") or "").strip() or sc}
+                        for p in praw if int(p.get("net_qty") or 0)]
+                bal, nl, u = self._dc_f(cash), self._dc_f(nl), self._dc_f(u)
+            else:
+                poss = [{"con": str(p.symbol), "qty": int(p.net_qty), "avg": self._dc_f((p.raw or {}).get("avg_price")),
+                         "acct": (p.raw or {}).get("_accountId") or p.account_id}
+                        for p in self._passtp_filter(b.list_open_positions(), sc) if int(p.net_qty or 0)]
+                bal = self._dc_f(b.account_balance(sc))
+                nl = self._dc_f(b.account_netliq(sc)) if hasattr(b, "account_netliq") else None
+                u = self._dc_f(b.account_unrealized(sc)) if hasattr(b, "account_unrealized") else None
+                ts = self._dc_nt8_ts(b)
+            if nl == 0.0 and bal and bal > 0:
+                nl = None                                   # 피드가 NetLiq를 안 줌(0 고정)
+            return {"name": sc, "bal": bal, "aid": sc, "poss": poss, "nl": nl, "u": u, "ts": ts}
+        g = self._dc_gate(b)
+        _acs = self._dc_map("_dc_acache")
+
+        def _read_accts():
+            try:
+                try:
+                    _a = b._accounts(timeout=_DAYCAP_ENTRY_TIMEOUT)
+                except TypeError:
+                    _a = b._accounts()
+            except Exception as _e:
+                if g is not None:
+                    g.note_error(_e)
+                raise
+            _acs[id(b)] = (_t.time(), _a)
+            if isinstance(acache, dict):
+                acache[id(b)] = _a
+            return _a
+        accts = acache.get(id(b)) if (isinstance(acache, dict) and not fresh_accts) else None
+        _read_now = False
+        if fresh_accts:
+            if g is not None:
+                g.take("other", force=True)
+            accts, _read_now = _read_accts(), True
+        if accts is None:
+            _c = _acs.get(id(b))
+            if _c and _t.time() - float(_c[0]) < _DAYCAP_ACCT_TTL_S:
+                accts = _c[1]
+            elif g is None or g.take("other", force=fresh):
+                accts, _read_now = _read_accts(), True
+            elif _c and _t.time() - float(_c[0]) < 60:
+                accts = _c[1]
+            else:
+                _DC_TLS.snap_why = "busy"
+                return None
+            if isinstance(acache, dict):
+                acache[id(b)] = accts
+        a = next((x for x in (accts or []) if str(x.get("name", "")).strip().casefold() == want
+                  or str(x.get("id")).strip().casefold() == want), None)
+        if a is None:
+            _DC_TLS.snap_why = "acct"
+            return None
+        aid = a.get("id")
+        _pk = (id(b), str(aid))
+        _pcs = self._dc_map("_dc_pcache")
+        _pc = _pcs.get(_pk)
+        if not fresh and _pc and _t.time() - float(_pc[0]) < _DAYCAP_MARK_TTL_S:
+            raw = _pc[1]
+        elif fresh or g is None or g.take("other"):
+            if fresh and g is not None:
+                g.take("other", force=True)
+            try:
+                raw = list(b.open_positions(aid, timeout=_DAYCAP_ENTRY_TIMEOUT) or [])
+            except Exception as _e:
+                if g is not None:
+                    g.note_error(_e)
+                raise
+            _pcs[_pk] = (_t.time(), raw)
+        elif _pc and _t.time() - float(_pc[0]) < (_DAYCAP_POS_STALE_LOW_S if _dc_low() else
+                                                  (_DAYCAP_POS_STALE_BUSY_S if (g is not None and any((g.reserve or {}).values()))
+                                                   else _DAYCAP_POS_STALE_S)):
+            raw = _pc[1]                                    # 1초 구간 계좌가 여럿이라 몫이 모자라면 10초, 미룬 먼 계좌는 15초 안 포지션 + 새 시세로 본다(정리 직전에는 늘 새로 읽는다)
+        else:
+            return None
+        poss = []
+        for p in raw:
+            _ty = p.get("type")
+            try:
+                _sz = abs(int(p.get("size") or 0))
+            except (TypeError, ValueError):
+                return None
+            if not _sz:
+                continue
+            if _ty not in (1, 2):
+                return None                                 # 방향을 못 믿는 응답(통과 익절 감시와 같은 방어)
+            poss.append({"con": str(p.get("contractId")), "qty": _sz if _ty == 1 else -_sz,
+                         "avg": self._dc_f(p.get("averagePrice")), "acct": aid})
+        # 포지션 구성이 바뀌었으면(체결, 손절, 청산) 잔고도 바뀌었다 - 계좌 목록을 다시 읽는다(낡은 잔고로 통과를 판단하지 않게). 이번 호출에서
+        # 계좌 목록을 포지션보다 먼저 읽었어도 다시 읽는다(3차 리뷰 P0: 두 읽기 사이 손절 체결이면 손실 전 잔고 + 손실 뒤 포지션이 짝지어졌다).
+        _sig = tuple(sorted((p["con"], int(p["qty"])) for p in poss))
+        _sgs = self._dc_map("_dc_possig")
+        _old = _sgs.get(_pk)
+        _sgs[_pk] = _sig
+        if _old is not None and _old != _sig:
+            if g is None or g.take("other", force=(fresh or _read_now)):
+                accts = _read_accts()
+                a = next((x for x in (accts or []) if str(x.get("id")) == str(aid)), a)
+            else:
+                _acs.pop(id(b), None)
+                return None
+        return {"name": str(a.get("name") or sc), "bal": self._dc_f(a.get("balance")), "aid": aid, "poss": poss, "nl": None}
+
+    def _dc_cache_clear(self) -> None:
+        """감시 캐시(계좌 목록, 포지션, 시세, 호출 한도 셈)를 비운다 - [라이브 시작], 시험."""
+        for _n in ("_dc_acache", "_dc_pcache", "_dc_possig", "_dc_mcache", "_dc_gates", "_dc_mgood", "_dc_mcand", "_dc_pos_ts",
+                   "_dc_snapmiss"):                 # 못 읽음 시계도 [라이브 시작]마다 새로(지난 실행의 시각으로 바로 알리지 않게)
+            self._dc_map(_n).clear()
+
+    @staticmethod
+    def _dc_nt8_ts(b):
+        """NT8 브리지 마지막 push 시각(모르면 None)."""
+        try:
+            if hasattr(b, "state_ts"):
+                v = b.state_ts()
+            else:
+                v = getattr(getattr(b, "_state", None), "last_state_ts", None)
+            return float(v) if v else None
+        except Exception:
+            return None
+
+    def _dc_orders_ok(self, test=False) -> bool:
+        """감시가 실제 주문(청산, 주문 걷기)을 내도 되는가(3차 리뷰 P1): 그림자 모드가 아니고, 어드민 라이브 잠금(force_dry_run)이 아니거나
+        서버 불통 폴백(마감 청산과 같은 규칙, _close_mode)일 때. 아니면 '정리했을 경우' 로그만 남긴다.
+        test = 시험용 스위치의 연습 계좌(3차 마무리 3) - 그림자 모드여도 실제로 정리한다(라이브 잠금은 따른다)."""
+        if _daycap_shadow() and not (test and _daycap_test_on()):
+            return False
+        try:
+            return bool(self._live_now(True) or self._fallback_kind())
+        except Exception:
+            return False
+
+    def _dc_mark_check(self, key, mk, bts=None, avg=None):
+        """시세 한 번이 믿을 만한가(3차 리뷰 P0). 0 이하, 숫자 아님 = 버림. 15초 안 마지막 정상 시세에서 1.5% 넘게(없으면 평균 진입가에서 3%
+        넘게) 떨어진 값은 바로 쓰지 않고, 1초 넘게 지나 다시 읽은 다른 값(새 봉 또는 새 종가)이 0.3% 안으로 같을 때만 새 수준으로 받는다.
+        반환 = 쓸 시세 또는 None(그 회차는 판단하지 않는다)."""
+        import math as _m
+        import time as _t
+        try:
+            f = float(mk)
+        except (TypeError, ValueError):
+            return None
+        if not _m.isfinite(f) or f <= 0:
+            return None
+        now = _t.time()
+        good = self._dc_map("_dc_mgood").get(key)
+        ref, band = None, None
+        if good and now - float(good[0]) <= 15.0:
+            ref, band = float(good[1]), _DAYCAP_MARK_JUMP
+        else:
+            try:
+                if avg is not None and float(avg) > 0:
+                    ref, band = float(avg), _DAYCAP_MARK_FAR
+            except (TypeError, ValueError):
+                ref = None
+        if ref and abs(f / ref - 1.0) > band:
+            cands = self._dc_map("_dc_mcand")
+            c = cands.get(key)
+            if c and now - float(c[0]) <= 30.0 and abs(f / float(c[1]) - 1.0) <= 0.003:
+                _newer = (bts is None or c[2] is None or bts != c[2] or f != float(c[1]))
+                if now - float(c[0]) >= 1.0 and _newer:
+                    cands.pop(key, None)                    # 1초 넘게 지나 다른 값으로 같은 수준 - 새 수준으로 받는다
+                else:
+                    return None
+            else:
+                cands[key] = (now, f, bts)
+                _log_to_file(f"daycap mark jump {key[1]} {ref:.4f}->{f:.4f}")
+                return None
+        self._dc_map("_dc_mgood")[key] = (now, f)
+        self._dc_map("_dc_mcand").pop(key, None)            # 정상 수준으로 돌아온 값 - 앞서 튄 값은 확인되지 않은 것으로 놓는다
+        return f
+
+    def _daycap_close_cost(self, poss) -> float:
+        """청산 비용 여유 = 통과 익절 버퍼와 같은 표(계약당 마이크로 $4, 미니/풀 $40, 최소 $20). 회원이 넣은 통과 목표 잔고에만 쓴다(종전 규약 -
+        그 잔고를 넘겨 닫으려고). 자동 하루 상한, 자동 통과 익절은 여유가 금액 안에 있다(3차 결정 A, B)."""
+        from types import SimpleNamespace as _NS
+        return float(self._passtp_buffer([_NS(symbol=p["con"], net_qty=p["qty"]) for p in (poss or [])]))
+
+    def _daycap_trigger(self, cap, poss=None) -> float:
+        """하루 상한 감시가 닫는 오늘 손익 = 상한 그대로(3차 결정 A: 상한 비율이 이미 일관성 선 아래 - 청산 비용, 움직임 여유를 더 빼지 않는다)."""
+        return float(cap)
+
+    def _dc_price(self, b, con, fam_cons=None, fresh=False, avg=None):
+        """계약 시세(1분봉 종가) - 같은 로그인, 같은 자산, 같은 월물(미니, 마이크로)은 1초에 한 번만 읽어 나눠 쓴다(계좌마다, leg마다 읽지 않는다,
+        3차 결정 C - 미니와 마이크로는 같은 지수, 같은 금 값이라 시세가 같다).
+        시세 몫(_DcGate 'bars')을 넘으면 5초 안의 값을 쓰고, 그보다 낡으면 None(그 회차는 판단하지 않는다).
+        3차 리뷰 P0: ProjectX는 mark_price(봉 시각과 함께, 2분 넘은 봉, 0 이하는 버림)를 쓰고, 값마다 _dc_mark_check로 튐을 거른다.
+        fresh = 발사 직전 두 번째 읽기 - 캐시를 쓰지 않고, 읽기에 실패하면 None(앞 값으로 대신하지 않는다)."""
+        import time as _t
+        fam = self._fill_asset(con) or _daycap_root(con)
+        _parts = str(con or "").upper().split(".")
+        _mon = _parts[4] if (len(_parts) >= 5 and _parts[0] == "CON") else ""     # 월물(Z26) - 넘김 날 다른 월물끼리는 나눠 쓰지 않는다
+        _k = (id(b), fam, _mon)
+        _mc = self._dc_map("_dc_mcache")
+        _c = _mc.get(_k)
+        if not fresh and _c and _t.time() - float(_c[0]) < _DAYCAP_MARK_TTL_S:
+            return _c[1]
+        g = self._dc_gate(b)
+        if g is None or g.take("bars", force=fresh):
+            mk, bts = None, None
+            try:
+                if hasattr(b, "mark_price"):
+                    _r = b.mark_price(con, max_age_s=_DAYCAP_MARK_AGE_S)
+                    if _r:
+                        mk, bts = _r[0], _r[1]
+                else:
+                    mk = b.current_market_price(con)
+            except Exception as _e:
+                if g is not None:
+                    g.note_error(_e)
+                mk = None
+            mk = self._dc_mark_check(_k, mk, bts, avg) if mk is not None else None
+            if mk is not None:
+                _mc[_k] = (_t.time(), mk, con)
+                return mk
+            if fresh:
+                return None
+        if not fresh and _c and _t.time() - float(_c[0]) < _DAYCAP_MARK_STALE_S:
+            return _c[1]
+        return None
+
+    def _daycap_mon_pnl(self, b, t, snap, s_utc, day, marks=None):
+        """(오늘 손익, 잔고 + 미실현, 오늘 실현) - 각각 모르면 None. 오늘 손익과 잔고 + 미실현 둘 다 모르면 None.
+        NT8(Lucid) = NetLiq - 거래일 시작 잔고, NetLiq, 현금 - 시작 잔고. ProjectX = 오늘 실현(60초 캐시, 포지션 구성이 바뀌면 다시) + 미실현,
+        잔고 + 미실현, 오늘 실현. 미실현 = Σ (시세 - 평균가) x 방향 있는 수량 x 포인트 가치 - 한 leg라도 값을 못 읽으면 그 회차는 판단하지 않는다.
+        시세는 자산마다 한 번(_dc_price - 미니를 먼저 읽고 같은 자산 마이크로는 그 값을 쓴다). 오늘 실현은 거래일별 손익 원장에도 적는다(최고일)."""
+        import time as _t
+        bk, _k = t["broker"], t["key"]
+        if bk == "nt8":
+            nl = snap.get("nl")
+            if nl is None:
+                self._daycap_note_once(("nt8_nl", _k),
+                                       f"   [{t.get('lbl')}] 평가 계좌 감시: NT8 NetLiq를 읽지 못합니다. 앱 패키지의 새 EQAutopilotBridge.cs로 "
+                                       f"브리지를 바꿔야 Lucid 하루 상한, 통과 익절이 작동합니다.",
+                                       f"   [{t.get('lbl')}] Evaluation watch: the NT8 NetLiq cannot be read. Replace the bridge with the "
+                                       f"new EQAutopilotBridge.cs from the app package for the Lucid daily cap and pass take-profit to work.")
+                return None
+            if snap.get("poss") and not self._dc_nl_consistent(t, snap):
+                return None                                 # NetLiq와 브리지 미실현이 서로 맞지 않는 스냅샷 - 이 회차는 판단하지 않는다
+            base = self._daycap_nt8_base(b, t["sc"], s_utc, day, cash=snap.get("bal"))
+            real = (float(snap["bal"]) - base) if (base is not None and snap.get("bal") is not None) else None
+            if real is not None:
+                self._dc_ledger_note(bk, t["sc"], day, real)
+            return ((float(nl) - base) if base is not None else None), float(nl), real
+        upnl = 0.0
+        _pv0 = lambda p: float(self._passtp_pv(p["con"]) or 0) * abs(int(p["qty"]))   # noqa: E731
+        for p in sorted(snap["poss"], key=_pv0, reverse=True):
+            pv = self._passtp_pv(p["con"])
+            if not pv or p.get("avg") is None or float(p["avg"]) <= 0:
+                return None
+            mk = self._dc_price(b, p["con"], avg=p.get("avg"))
+            if mk is None:
+                return None
+            upnl += (float(mk) - float(p["avg"])) * int(p["qty"]) * float(pv)
+        sig = tuple(sorted((p["con"], int(p["qty"])) for p in snap["poss"]))
+        cache = self._dc_map("_dc_real").get(_k)
+        now = _t.time()
+        real = None
+        if cache and cache[0] == day and cache[2] == sig and now - cache[1] < _DAYCAP_REAL_TTL_S:
+            real = cache[3]
+        else:
+            g = self._dc_gate(b)
+            if g is None or g.take("other"):
+                try:
+                    real = float(b.day_realized(snap["aid"], s_utc.isoformat(), timeout=_DAYCAP_ENTRY_TIMEOUT))
+                    self._dc_map("_dc_real")[_k] = (day, now, sig, real)
+                    self._dc_sod_note(_k, day, snap.get("bal"), real, first_only=True)
+                except Exception as _e:
+                    if g is not None:
+                        g.note_error(_e)
+                    real = cache[3] if (cache and cache[0] == day and cache[2] == sig) else None
+            else:
+                real = cache[3] if (cache and cache[0] == day and cache[2] == sig) else None
+        if real is not None:
+            self._dc_ledger_note(bk, t["sc"], day, real)
+        dp = (real + upnl) if real is not None else None
+        eq = (float(snap["bal"]) + upnl) if snap.get("bal") is not None else None
+        if dp is None and eq is None:
+            return None
+        return dp, eq, real
+
+    # ── 정리 직전 교차 확인(3차 리뷰 P0) ──
+    def _dc_sod_note(self, key, day, bal, real, first_only=False) -> None:
+        """ProjectX: 잔고 - 오늘 실현 = 그 거래일 시작 잔고(거래일 안에서는 변하지 않아야 한다). first_only = 그 거래일 처음 값만 둔다."""
+        try:
+            if bal is None or real is None:
+                return
+            v = round(float(bal) - float(real), 2)
+        except (TypeError, ValueError):
+            return
+        sd = self._dc_map("_dc_sod")
+        rec = sd.get(key)
+        if first_only and rec and rec[0] == day:
+            return
+        sd[key] = (day, v)
+
+    def _dc_sod_check(self, t, day, bal, real) -> bool:
+        """정리 직전: 잔고 - 오늘 실현이 그 거래일 앞서 본 값과 $100 넘게 다르면 False(잔고나 실현 손익 응답 하나가 틀렸다) - 이번엔 닫지 않고
+        지금 값을 새 기준으로 둔다(한 번 틀린 기준이 그날 내내 막지 않게). 처음 보는 거래일이면 지금 값을 기준으로 두고 True."""
+        _k = t["key"]
+        try:
+            v = round(float(bal) - float(real), 2)
+        except (TypeError, ValueError):
+            return False
+        sd = self._dc_map("_dc_sod")
+        rec = sd.get(_k)
+        if rec and rec[0] == day and abs(v - float(rec[1])) > _DAYCAP_XCHK_USD:
+            sd[_k] = (day, v)
+            lbl = t.get("lbl") or t["sc"]
+            self._daycap_note_once(("xchk", _k, day),
+                                   (f"   [{lbl}] 잔고({self._daycap_money(bal)})와 오늘 실현 손익({self._daycap_money(real)})이 앞서 읽은 값과 "
+                                    f"맞지 않아(잔고 - 오늘 실현 {self._daycap_money(v)}, 앞서 {self._daycap_money(rec[1])}) 이번에는 "
+                                    f"정리하지 않고 다시 읽어 확인합니다."),
+                                   (f"   [{lbl}] The balance ({self._daycap_money(bal)}) and today's realized P&L "
+                                    f"({self._daycap_money(real)}) do not agree with the earlier reads (balance minus realized "
+                                    f"{self._daycap_money(v)}, earlier {self._daycap_money(rec[1])}), so it does not close this time "
+                                    f"and reads again to check."))
+            _log_to_file(f"daycap xchk {t['sc'][-4:]} v={v} ref={rec[1]}")
+            return False
+        if not rec or rec[0] != day:
+            sd[_k] = (day, v)
+        return True
+
+    def _dc_nl_consistent(self, t, snap) -> bool:
+        """NT8: 한 스냅샷의 (NetLiq - 현금)과 브리지 미실현이 max($25, 2%) 안으로 같은가. 미실현을 못 받으면 False(판단하지 않는다)."""
+        nl, cash, u = snap.get("nl"), snap.get("bal"), snap.get("u")
+        lbl = t.get("lbl") or t["sc"]
+        if nl is None or cash is None:
+            return False
+        if u is None:
+            self._daycap_note_once(("nl_no_u", t["key"]),
+                                   (f"   [{lbl}] NT8 브리지가 미실현 손익을 보내지 않아 NetLiq를 맞춰 볼 수 없습니다. 이 계좌는 하루 상한, 통과 익절에서 "
+                                    f"정리하지 않습니다. 앱 패키지의 새 EQAutopilotBridge.cs로 바꾸십시오."),
+                                   (f"   [{lbl}] The NT8 bridge does not send the open P&L, so the NetLiq cannot be cross-checked. This "
+                                    f"account is not closed at the daily cap or the pass take-profit. Please replace the bridge with the "
+                                    f"new EQAutopilotBridge.cs from the app package."))
+            return False
+        try:
+            diff = abs((float(nl) - float(cash)) - float(u))
+            ok = diff <= max(_DAYCAP_NL_TOL_USD, 0.02 * abs(float(u)))
+        except (TypeError, ValueError):
+            return False
+        if not ok:
+            self._daycap_note_once(("nl_mismatch", t["key"], _daycap_day_start()[1]),
+                                   (f"   [{lbl}] NT8 NetLiq({self._daycap_money(nl)})에서 현금({self._daycap_money(cash)})을 뺀 값이 브리지 미실현 "
+                                    f"손익({self._daycap_money(u)})과 맞지 않아 이번 값으로는 판단하지 않습니다."),
+                                   (f"   [{lbl}] NT8 NetLiq ({self._daycap_money(nl)}) minus cash ({self._daycap_money(cash)}) does not "
+                                    f"match the bridge's open P&L ({self._daycap_money(u)}), so this reading is not used."))
+            _log_to_file(f"daycap nl mismatch {t['sc'][-4:]} nl={nl} cash={cash} u={u}")
+        return ok
+
+    def _daycap_mon_flat_status(self, b, t, r, snap, s_utc, day) -> None:
+        """포지션이 없을 때 화면 '오늘 남은' 금액(ProjectX는 5분에 한 번 실현 손익, Lucid는 NetLiq - 시작 잔고) + 거래일별 손익 원장."""
+        import time as _t
+        bk, _k = t["broker"], t["key"]
+        try:
+            if bk == "nt8":
+                if snap.get("nl") is None:
+                    return
+                base = self._daycap_nt8_base(b, t["sc"], s_utc, day, cash=snap.get("bal"))
+                if base is None:
+                    return
+                dp = float(snap["nl"]) - base
+                if snap.get("bal") is not None:
+                    self._dc_ledger_note(bk, t["sc"], day, float(snap["bal"]) - base)
+            else:
+                cache = self._dc_map("_dc_real").get(_k)
+                now = _t.time()
+                if cache and cache[0] == day and cache[2] == () and now - cache[1] < _DAYCAP_FLAT_REAL_TTL_S:
+                    dp = cache[3]
+                else:
+                    g = self._dc_gate(b)
+                    if g is not None and not g.take("other"):
+                        return
+                    dp = float(b.day_realized(snap["aid"], s_utc.isoformat(), timeout=_DAYCAP_ENTRY_TIMEOUT))
+                    self._dc_map("_dc_real")[_k] = (day, now, (), dp)
+                    self._dc_sod_note(_k, day, snap.get("bal"), dp, first_only=True)
+                self._dc_ledger_note(bk, t["sc"], day, dp)
+            if r.get("cap", 0) > 0:
+                self._daycap_set_status(bk, t["sc"], day=day, room=r["cap"] - dp, cap=r["cap"], pass_tp=r["pass_tp"])
+        except Exception as _e:
+            self._dc_exc_note("status", _e)                # 화면 '오늘 남은' 줄을 못 쓴 이유를 남긴다(감시 판단은 그대로)
+
+    def _daycap_mon_still(self, t) -> bool:
+        """발사 직전: 아직 지켜볼 계좌인가 - 앱 진입 기록이 있거나, 신호 대기가 켜져 있고 그 계좌 행이 아직 무장돼 있다."""
+        if t.get("key") in self._dc_map("_dc_mon"):
+            return True
+        if not getattr(self, "_sig_on", False):
+            return False
+        return any(kk in (getattr(self, "_sig_accts", None) or {}) for kk in (t.get("keys") or []))
+
+    def _daycap_mon_scan(self) -> None:
+        """한 회차: 계좌마다 판단하고, 닿은 계좌는 곧바로 청산을 발주만 한다. 플랫 확인, 남은 주문 걷기, 마무리는 판단을 다 마친 뒤 한꺼번에
+        (_daycap_mon_confirm) - 같은 회차에 닿은 계좌들이 앞 계좌의 확인(최대 8초)을 기다리지 않는다(2차 리뷰 P1)."""
+        import time as _t
+        self._daycap_fired_restore()                        # 재시작 뒤: 디스크의 정리 중 기록을 래치로
+        tg = self._daycap_mon_targets()
+        if not tg:
+            return
+        s_utc, day = _daycap_day_start()
+        fired, due = self._dc_map("_dc_fired"), self._dc_map("_dc_due")
+        acache, marks = {}, {}                              # 이번 회차 한정: 로그인별 계좌 목록(시세는 _dc_price가 로그인, 자산마다 1초)
+        pend, hits = [], []
+        # 3차 마무리 5: 정리 중, 1초 구간, 막 진입한 계좌 먼저(포지션을 오래전에 읽은 계좌부터), 그 밖은 기한 순서로 0.5초 안에서만
+        fastk, gap, kb = self._dc_map("_dc_fastk"), self._dc_map("_dc_gap"), self._dc_map("_dc_kb")
+        _now0 = _t.time()
+
+        def _recent(k):
+            try:
+                return any(isinstance(lg, dict) and _now0 - float(lg.get("ts") or 0) < _DAYCAP_RECENT_ENTRY_S
+                           for lg in ((self._dc_map("_dc_mon").get(k) or {}).get("legs") or []))
+            except (TypeError, ValueError):
+                return False
+        prio = {t["key"] for t in tg if t["key"] in fired or fastk.get(t["key"]) or _recent(t["key"])}
+        _nf = {}
+        for k in prio:
+            if fastk.get(k) and kb.get(k) is not None:
+                _nf[kb[k]] = _nf.get(kb[k], 0) + 1
+        for _bid, _g in list(self._dc_map("_dc_gates").items()):
+            _n = _nf.get(_bid, 0)
+            _g.reserve = ({"other": min(90, 60 * _n + 14), "bars": min(30, 30 * _n)} if _n else {"bars": 0, "other": 0})
+        _pts = self._dc_map("_dc_pos_ts")
+        order = ((sorted((t for t in tg if t["key"] in prio),     # 정리 중 먼저, 그다음 포지션을 가장 오래전에 읽은 계좌부터(몫이 모자라도 고르게)
+                         key=lambda t: (0 if t["key"] in fired else 1, float(_pts.get(t["key"], 0.0)),
+                                        float(gap.get(t["key"], 1e18))))
+                  + sorted((t for t in tg if t["key"] not in prio), key=lambda t: float(due.get(t["key"], 0) or 0)))
+                 if prio else list(tg))                     # 먼저 볼 계좌가 없으면 종전 순서 그대로
+        _evt = self._dc_map("_dc_eval_ts")                 # 마지막으로 손익을 본 때(굶은 계좌 판단, 3차 마무리 리뷰 P1)
+        _lop, _mon = self._dc_map("_dc_lastopen"), self._dc_map("_dc_mon")
+        for t in tg:
+            _evt.setdefault(t["key"], _now0)
+        _starve_done = False
+        for t in order:
+            _k = t["key"]
+            if _k not in fired and _t.time() < float(due.get(_k, 0) or 0):
+                continue
+            _is_p = _k in prio
+            _st = False
+            if prio and not _is_p and not _starve_done:
+                _busy = bool(_lop.get(_k)) or _k in _mon
+                _st = _t.time() - float(_evt.get(_k, _now0)) >= (_DAYCAP_STARVE_S if _busy else _DAYCAP_STARVE_IDLE_S)
+            if not _is_p and prio and _t.time() - _now0 >= _DAYCAP_SCAN_BUDGET_S and not _st:
+                continue                                    # 1초 구간 계좌를 위해 다음 회차로 미룬다(기한은 그대로) - 굶은 계좌만 회차마다 하나
+            _DC_TLS.low = bool(prio) and not _is_p and not _st
+            _DC_TLS.starve = _st
+            _DC_TLS.refused = False
+            _DC_TLS.evald = False
+            try:
+                _p = self._daycap_mon_one(t, s_utc, day, acache, marks)
+                if getattr(_DC_TLS, "evald", False):
+                    _evt[_k] = _t.time()
+                if _st:
+                    _starve_done = True
+                if _p and _p[0] == "fire":
+                    hits.append(_p[1:])
+                elif _p:
+                    pend.append(_p[1:])
+            except Exception as _e:
+                # 포지션이 열려 있던 계좌(또는 앱 진입 기록, 정리 중)는 5초 뒤 다시 본다 - 일시 오류 한 번에 30초 넘게 눈을 감지 않게(2차 리뷰 P2).
+                _busy = (bool(self._dc_map("_dc_lastopen").get(_k)) or _k in self._dc_map("_dc_mon") or _k in fired)
+                _wait = _DAYCAP_POLL_OPEN_S if _busy else 30
+                due[_k] = _t.time() + _wait
+                self._daycap_note_once(("mon_err", _k, type(_e).__name__),
+                                       f"   평가 계좌 감시 오류({t.get('lbl')}): {str(_e)[:120]}. {_wait}초 뒤 다시 봅니다.",
+                                       f"   Evaluation watch error ({t.get('lbl')}): {str(_e)[:120]}. Looking again in {_wait} seconds.")
+            finally:
+                _DC_TLS.low = False
+                _DC_TLS.starve = False
+                _DC_TLS.refused = False
+                _DC_TLS.evald = False
+        if len(hits) == 1:
+            _p = self._daycap_mon_fire(*hits[0])
+            if _p:
+                pend.append(_p)
+        elif hits:
+            # 같은 회차에 여러 계좌가 닿았다(같은 신호로 들어간 Combine 여럿이 흔한 경우) - 계좌마다 스레드 하나로 동시에 마지막 확인과 청산 발주를
+            # 한다. 한 계좌씩 차례로 하면 뒤 계좌는 앞 계좌들의 호출 시간만큼 늦게 닫혀 상한을 넘었다(2차 리뷰 P1).
+            _res, _ths = [], []
+
+            def _fire_one(h):
+                try:
+                    _res.append(self._daycap_mon_fire(*h))
+                except Exception as _fe:
+                    self._dc_exc_note("fire", _fe)         # 스레드 예외는 종전엔 화면에 아무것도 남기지 않았다
+            for _h in hits:
+                _th = threading.Thread(target=_fire_one, args=(_h,), daemon=True)
+                _ths.append(_th)
+                _th.start()
+            for _th in _ths:
+                _th.join(30)
+            pend.extend(p for p in list(_res) if p)
+        if pend:
+            self._daycap_mon_confirm(pend)
+
+    @staticmethod
+    def _dc_remaining(info, con, qty) -> int:
+        """발동 래치가 이 계약에서 아직 닫을 수량(0 = 끝남). 목표 수량(tgt)까지 닫는다 - 전부 정리는 0까지, 앱 몫만 정리(3차 리뷰 P0)는 회원이
+        손으로 더한 수량까지. 발동 계약 표(pos)가 없는 옛 기록은 그 계약 전부."""
+        fp = (info or {}).get("pos") or {}
+        if not fp:
+            return abs(int(qty or 0))
+        if con not in fp:
+            return 0
+        try:
+            q0, q = int(fp[con]), int(qty or 0)
+            tgt = int(((info or {}).get("tgt") or {}).get(con, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        d = 1 if (q0 - tgt) > 0 else -1
+        return max(0, (q - tgt) * d)
+
+    @staticmethod
+    def _daycap_may_close(info, poss, day) -> bool:
+        """발동 래치가 이 포지션을 이어서 닫아도 되는가: 아직 플랫 확인 전(done 아님), 멈추지 않음(halt 아님), 같은 거래일, 그리고 지금 열린
+        발동 계약 포지션이 발동 때 본 것의 부분(같은 방향, 수량이 같거나 작음)이고 아직 닫을 수량이 남았을 때만. 그 밖(새 진입, 늘린 수량,
+        다음 날)은 닫지 않는다(2차 리뷰 P1)."""
+        if not isinstance(info, dict) or info.get("done") or info.get("halt") or info.get("day") != day:
+            return False
+        fp = info.get("pos") or {}
+        mine = [p for p in (poss or []) if p["con"] in fp]
+        if not mine:
+            return False
+        for p in mine:
+            try:
+                q0, q = int(fp[p["con"]]), int(p["qty"])
+            except (TypeError, ValueError):
+                return False
+            if q0 * q <= 0 or abs(q) > abs(q0):
+                return False
+        return any(App._dc_remaining(info, p["con"], p["qty"]) > 0 for p in mine)
+
+    def _dc_risk_of(self, t) -> float:
+        """이 계좌 포지션의 손절 위험(1R x 배수) - 앱 진입 기록의 값, 없으면 그 계좌 행의 1R(배수 모름 = 1). 모르면 0."""
+        rec = self._dc_map("_dc_mon").get(t.get("key")) or {}
+        try:
+            if float(rec.get("risk") or 0) > 0:
+                return float(rec["risk"])
+        except (TypeError, ValueError):
+            pass
+        best = 0.0
+        for asset, idx in (t.get("keys") or []):
+            try:
+                v = self._planned_one_r(self._accts_of(asset)[idx]) or 0.0
+                best = max(best, float(v))
+            except Exception:
+                continue
+        return best
+
+    def _dc_fast(self, t, r, dp, eq, real, bal, pass_trig) -> bool:
+        """1초 감시 구간인가(3차 결정 C): 가까운 선(하루 상한, 통과 익절)까지 남은 거리가 max(남은 한도의 25%, 1R x 배수) 안. 남은 한도 = 선 - 오늘
+        실현(상한), 선 - 잔고(통과 익절) - 열린 포지션이 쓸 수 있는 거리."""
+        risk = self._dc_risk_of(t)
+        if r.get("cap", 0) > 0 and dp is not None and real is not None:
+            room, gap = float(r["cap"]) - float(real), float(r["cap"]) - float(dp)
+            if gap <= max(_DAYCAP_FAST_ROOM_PCT * max(room, 0.0), risk):
+                return True
+        if pass_trig and eq is not None and bal is not None:
+            room, gap = float(pass_trig) - float(bal), float(pass_trig) - float(eq)
+            if gap <= max(_DAYCAP_FAST_ROOM_PCT * max(room, 0.0), risk):
+                return True
+        return False
+
+    def _dc_tp_fired_amt(self, broker, acct, day=None):
+        """이 계좌가 그 거래일 통과 익절로 정리한 금액(같은 날 같은 금액에서 다시 정리하지 않는다) 또는 None. 3차 리뷰 P1: 막는 것은 그 거래일
+        뿐이다 - 다음 거래일에는 다시 계산한 금액(모자랐던 만큼 여유를 더한 금액)에서 다시 닫는다."""
+        rec = self._dc_state()["tp_fired"].get(self._daycap_key(broker, acct))
+        if not isinstance(rec, dict) or (day is not None and rec.get("day") != day):
+            return None
+        try:
+            return float(rec.get("amt"))
+        except (TypeError, ValueError):
+            return None
+
+    def _dc_tp_extra(self, broker, acct, day) -> float:
+        """지난 거래일 통과 익절이 통과 금액에 모자랐던 만큼(최대 $500) - 다음 거래일 여유에 더한다."""
+        rec = self._dc_state()["tp_fired"].get(self._daycap_key(broker, acct))
+        if not isinstance(rec, dict) or rec.get("day") == day:
+            return 0.0
+        try:
+            return min(_DAYCAP_PASS_EXTRA_MAX, max(0.0, float(rec.get("short") or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    # ── 앱이 넣은 포지션만(3차 리뷰 P0, 대표 '앱이 넣은 포지션만 정리(수동 우선)') ──
+    @staticmethod
+    def _dc_dir(v) -> int:
+        return 1 if str(v or "").upper() in ("LONG", "BUY", "0") else -1
+
+    def _dc_app_legs(self, key) -> dict:
+        """앱 진입 기록의 leg를 계약별로 {계약: {"dir": +1/-1, "qty": 앱 수량, "stops": [앱 손절가]}}. 같은 계약에 방향이 엇갈린 기록은 뺀다."""
+        rec = self._dc_map("_dc_mon").get(key) or {}
+        out, bad = {}, set()
+        for l in rec.get("legs") or []:
+            if not isinstance(l, dict):
+                continue
+            con = str(l.get("con") or "")
+            try:
+                q = abs(int(l.get("size") or 0))
+            except (TypeError, ValueError):
+                continue
+            d = self._dc_dir(l.get("dir"))
+            o = out.setdefault(con, {"dir": d, "qty": 0, "stops": []})
+            if o["dir"] != d:
+                bad.add(con)
+            o["qty"] += q
+            try:
+                if l.get("stop") is not None:
+                    o["stops"].append(float(l["stop"]))
+            except (TypeError, ValueError):
+                pass
+        return {c: v for c, v in out.items() if c not in bad and v["qty"] > 0}
+
+    def _dc_closing(self, key, poss) -> list:
+        """지금 포지션 가운데 앱 몫 [(계약, 수량)] - 같은 방향 앱 leg 수량과 지금 수량 가운데 작은 쪽."""
+        legs = self._dc_app_legs(key)
+        out = []
+        for p in poss or []:
+            lg = legs.get(str(p["con"]))
+            q = int(p["qty"])
+            if lg and q and lg["dir"] == (1 if q > 0 else -1):
+                out.append((str(p["con"]), min(abs(q), int(lg["qty"]))))
+        return out
+
+    def _dc_prune_legs(self, key, poss) -> None:
+        """앱 몫이 끝난 leg를 기록에서 뺀다: 들어간 지 20초가 지났는데 그 계약이 플랫이거나 반대 방향이면 그 leg를 지우고, 지금 수량보다 크면
+        지금 수량으로 줄인다(손절, 손으로 일부 청산). 그 뒤 회원이 같은 계약을 손으로 열어도 앱 몫으로 보지 않는다. leg가 하나도 안 남으면
+        기록을 놓는다(정리 중 기록은 건드리지 않는다)."""
+        import time as _t
+        now = _t.time()
+        try:
+            with _DAYCAP_LOCK:
+                m = self._dc_map("_dc_mon")
+                rec = m.get(key)
+                if not isinstance(rec, dict) or isinstance(rec.get("fired"), dict):
+                    return
+                legs = [l for l in (rec.get("legs") or []) if isinstance(l, dict)]
+                if not legs:
+                    return
+                net = {str(p["con"]): int(p["qty"]) for p in poss or []}
+                by = {}
+                for l in legs:
+                    by.setdefault(str(l.get("con") or ""), []).append(l)
+                keep, changed = [], False
+                for con, ls in by.items():
+                    if any(now - float(l.get("ts") or 0) < _DAYCAP_LEG_GRACE_S for l in ls):
+                        keep.extend(ls)
+                        continue
+                    q = net.get(con, 0)
+                    d = self._dc_dir(ls[0].get("dir"))
+                    if q == 0 or (1 if q > 0 else -1) != d:
+                        changed = True
+                        continue
+                    room = abs(q)
+                    for l in sorted(ls, key=lambda x: float(x.get("ts") or 0), reverse=True):
+                        s = abs(int(l.get("size") or 0))
+                        if room <= 0 or s <= 0:
+                            changed = True
+                            continue
+                        if s > room:
+                            l = dict(l, size=room)
+                            changed = True
+                        room -= min(s, room)
+                        keep.append(l)
+                if not changed:
+                    return
+                if keep:
+                    m[key] = dict(rec, legs=keep)
+                else:
+                    m.pop(key, None)
+                _save_daycap_mon(m)
+        except Exception:
+            pass
+
+    def _dc_close_plan(self, t, b, poss, mode, r):
+        """정리 계획 → (plan {계약: {net0, tgt, how, app, stops}}, 범위, 손으로 둔 [(계약, 수량)], 따로 못 닫는 [(계약, 앱 수량, 회원 수량)]).
+        회원이 프롭 설정에 넣은 통과 목표(종전 12e 규약, 화면 문구 '그 잔고에 이를 때 계좌 포지션을 시장가로 정리합니다') = 계좌 전체.
+        그 밖(자동 하루 상한, 자동 통과 익절) = 앱이 넣은 수량만: 앱 leg와 같은 방향인 계약에서 min(지금 수량, 앱 수량). 지금 수량이 앱 수량과
+        같으면 계약째(closeContract), 회원이 더한 수량이 있으면 ProjectX는 앱 수량만(partialCloseContract), NT8은 종목 전체 정리뿐이라 닫지
+        않는다. 앱 leg가 없는 계약은 절대 닫지 않는다."""
+        if (mode == "pass" and (r or {}).get("pass_src") == "set") or (r or {}).get("test"):
+            # 회원 통과 목표(12e 규약) = 계좌 전체. 시험용 스위치의 연습 계좌(3차 마무리 3) = 손으로 연 포지션까지 계좌 전체(그 연습 계좌에서만).
+            return ({str(p["con"]): {"net0": int(p["qty"]), "tgt": 0, "how": "all", "app": abs(int(p["qty"])), "stops": []}
+                     for p in poss or [] if int(p["qty"])}, "account", [], [])
+        legs = self._dc_app_legs(t["key"])
+        plan, manual, skipped = {}, [], []
+        _part = hasattr(b, "partial_close_contract")
+        for p in poss or []:
+            con, q = str(p["con"]), int(p["qty"])
+            if not q:
+                continue
+            sgn = 1 if q > 0 else -1
+            lg = legs.get(con)
+            if not lg or lg["dir"] != sgn:
+                manual.append((con, abs(q)))
+                continue
+            app = min(abs(q), int(lg["qty"]))
+            if app == abs(q):
+                plan[con] = {"net0": q, "tgt": 0, "how": "all", "app": app, "stops": list(lg["stops"])}
+            elif _part:
+                plan[con] = {"net0": q, "tgt": q - sgn * app, "how": "part", "app": app, "stops": list(lg["stops"])}
+                manual.append((con, abs(q) - app))
+            else:
+                skipped.append((con, app, abs(q) - app))
+        return plan, "app", manual, skipped
+
+    def _dc_plan_txt(self, plan, manual, skipped, ko):
+        """(정리할 것 'GC 2, MNQ 3', 손으로 둔 것 한 문장, 따로 못 닫는 것 한 문장) - 로그 문구."""
+        _r = _daycap_root
+        legs = ", ".join(f"{_r(c)} {v['app']}" for c, v in (plan or {}).items())
+        man = ", ".join(f"{_r(c)} {q}" for c, q in (manual or []))
+        mt = ((f" 손으로 연 포지션({man})은 그대로 둡니다." if ko else f" Positions opened by hand ({man}) stay as they are.")
+              if man else "")
+        sk = ", ".join(f"{_r(c)} {a}" for c, a, _m in (skipped or []))
+        st = ((f" 앱 몫({sk})은 손으로 더한 수량과 같은 종목에 섞여 있어 따로 정리하지 않습니다(NT8은 종목 전체만 정리할 수 있습니다)." if ko else
+               f" The app's part ({sk}) shares an instrument with contracts added by hand, so it is not closed separately (NT8 "
+               f"can only close a whole instrument).") if sk else "")
+        return legs, mt, st
+
+    def _dc_no_app_close(self, t, r, mode, dp, eq, line, manual, skipped, day) -> None:
+        """선에 닿았는데 앱이 닫을 포지션이 없다(무장만 된 계좌, 앱 leg가 끝난 기록, NT8 종목이 섞임): 주문을 내지 않는다. 하루 상한이면 오늘 닿음
+        표시(앱은 오늘 더 진입하지 않는다), 통과 익절이면 알리기만 한다. 그 거래일, 그 선에 한 번."""
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        lbl = t.get("lbl") or sc
+        _, mt, st = self._dc_plan_txt({}, manual, skipped, True)
+        _, mte, ste = self._dc_plan_txt({}, manual, skipped, False)
+        _why_ko = "" if skipped else " 앱이 넣은 포지션이 없어 정리하지 않습니다."
+        _why_en = "" if skipped else " There is no position entered by the app, so nothing is closed."
+        if mode == "cap":
+            self._daycap_set_hit(bk, sc, day)
+            _over = dp is not None and line is not None and dp - line >= 0.5
+            self._daycap_note_once(("noapp", _k, day, "cap"),
+                                   (f"   [{lbl}] 오늘 손익 {self._daycap_money(dp)}가 하루 이익 상한({self._daycap_money(line)})"
+                                    + ("을 넘었습니다." if _over else "에 닿았습니다.") + _why_ko + st + mt
+                                    + f" 이 계좌는 오늘 더 진입하지 않습니다. 다음 {r['firm']} 거래일({_dc_day_txt()})부터 다시 진입합니다."),
+                                   (f"   [{lbl}] Today's P&L {self._daycap_money(dp)} " + ("went over" if _over else "reached")
+                                    + f" the daily profit cap ({self._daycap_money(line)})." + _why_en + ste + mte
+                                    + f" This account takes no more entries today. It enters again from the next {r['firm']} "
+                                      f"trading day ({_dc_day_txt()})."))
+        else:
+            self._daycap_note_once(("noapp", _k, day, "pass", round(float(line or 0), 2)),
+                                   (f"   [{lbl}] 잔고와 미실현 손익을 더한 {self._daycap_money(eq)}가 통과 익절 잔고"
+                                    f"({self._daycap_money(line)})에 닿았습니다." + _why_ko + st + mt),
+                                   (f"   [{lbl}] Balance plus open profit {self._daycap_money(eq)} reached the pass take-profit "
+                                    f"balance ({self._daycap_money(line)})." + _why_en + ste + mte))
+
+    def _dc_pos_seen(self, key, poss) -> dict:
+        """감시가 이 계좌 포지션을 처음 본 때(3차 마무리 리뷰 - 1분봉 다시 셈의 창 시작): 계약마다 (수량, 그 수량을 처음 본 시각), 계좌 전체로
+        (포지션 구성, 처음 본 시각). 구성이 바뀌면(진입, 더함, 일부 청산, 다른 계약 청산 = 오늘 실현이 바뀜) 그때부터 새로 센다. 메모리만(재시작 뒤엔
+        그때 처음 본 시각 - 창이 늦게 시작할 뿐 '늦음'으로 잘못 나오지 않는다). 반환 {"sig_ts": 시각, "con": {계약: 시각}}."""
+        import time as _t
+        now = _t.time()
+        mp = self._dc_map("_dc_pseen")
+        rec = mp.get(key) or {"sig": None, "sig_ts": now, "con": {}}
+        sig = tuple(sorted((str(p.get("con")), int(p.get("qty") or 0)) for p in (poss or []) if int(p.get("qty") or 0)))
+        if rec.get("sig") != sig:
+            _old, _new = rec.get("con") or {}, {}
+            for c, q in sig:
+                _pv = _old.get(c)
+                _new[c] = _pv if (_pv and _pv[0] == q) else (q, now)      # 같은 계약 같은 수량이면 처음 본 시각 그대로
+            rec = {"sig": sig, "sig_ts": now, "con": _new}
+            mp[key] = rec
+        return {"sig_ts": float(rec["sig_ts"]), "con": {c: float(v[1]) for c, v in (rec.get("con") or {}).items()}}
+
+    def _dce_on(self) -> bool:
+        """감시 사건을 서버로 보고하는가: 서버 하트비트가 'dce'를 켰을 때만(지금은 대표 토큰만 - 사건에 오늘 손익, 잔고 금액이 들어가는데 개인정보
+        처리방침 5.4는 회원의 잔고와 계좌 전체 손익을 앱이 보고하지 않는다고 말한다). 끄면 쌓지도 보내지도 않는다."""
+        return bool((getattr(self, "_gate", None) or {}).get("dce") is True)
+
+    def _dce_note(self, t, r, mode, line, dp, eq, real, snap, d, how) -> None:
+        """감시 사건 하나를 서버 보고 줄에 쌓고(3차 마무리 2) 생존 핑을 한 번 바로 보낸다. how = 'real'(정리함), 'shadow'(그림자 모드),
+        'lock'(라이브 잠금), 'test'(시험용 스위치의 연습 계좌 정리). 계좌는 끝 4자리만. 서버 스위치(_dce_on)가 꺼져 있으면 아무것도 하지 않는다.
+        실패해도 감시는 그대로."""
+        if not self._dce_on():
+            return
+        try:
+            import hashlib as _hl
+            import time as _t
+            bk, sc, _k = t["broker"], str(t["sc"]), t["key"]
+            r = r or {}
+            d = d or {}
+            day = str(d.get("day") or _daycap_day_start()[1])
+            a4 = sc[-4:]
+            name = (snap or {}).get("name") or sc
+            plan = (_daycap_lucid_plan(name) or "") if bk == "nt8" else ""
+            legs = [lg for lg in ((self._dc_map("_dc_mon").get(_k) or {}).get("legs") or []) if isinstance(lg, dict)]
+            _ots, _lts = [], {}
+            for lg in legs:
+                try:
+                    _ots.append(float(lg.get("ts")))
+                    _c = str(lg.get("con") or "")
+                    _lts[_c] = max(_lts.get(_c, 0.0), float(lg.get("ts")))
+                except (TypeError, ValueError):
+                    continue
+            # 3차 마무리 리뷰: 1분봉 다시 셈은 지금 포지션을 그 포지션이 생긴 뒤부터만 값을 매겨야 한다 - 계약마다 연 시각(앱 leg면 그 계약의 마지막
+            # 앱 진입, 아니면 감시가 그 수량을 처음 본 때 가운데 늦은 쪽)과 계좌 포지션 구성이 마지막으로 바뀐 때(pos_ts)를 같이 보낸다.
+            _seen = self._dc_pos_seen(_k, (snap or {}).get("poss") or [])
+            pos = []
+            for p in list((snap or {}).get("poss") or [])[:8]:
+                try:
+                    _c = str(p.get("con") or "")
+                    _o = max(float(_seen["con"].get(_c) or 0.0), float(_lts.get(_c) or 0.0)) or None
+                    pos.append({"c": _c[:32], "q": int(p.get("qty") or 0),
+                                "avg": (round(float(p["avg"]), 6) if p.get("avg") is not None else None),
+                                "pv": float(self._passtp_pv(p.get("con")) or 0.0), "o": (round(_o, 3) if _o else None)})
+                except (TypeError, ValueError):
+                    continue
+
+            def _f(v):
+                try:
+                    return round(float(v), 2) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
+            kind = "pass" if mode == "pass" else "cap"
+            ev = {"ts": round(_t.time(), 3), "t0": (round(float(d["t0"]), 3) if d.get("t0") else None), "day": day, "bk": bk,
+                  "firm": str(r.get("firm") or "")[:16], "stage": ("test" if r.get("test") else "eval"), "plan": plan,
+                  "size": int(r.get("size") or 0), "kind": kind, "line": _f(line), "val": _f(eq if kind == "pass" else dp),
+                  "real": _f(real), "bal": _f((snap or {}).get("bal")), "pos": pos,
+                  "open_ts": (round(min(_ots), 3) if _ots else None), "pos_ts": round(float(_seen["sig_ts"]), 3),
+                  "mode": str(how), "a4": a4}
+            ev["id"] = _hl.sha1(f"{bk}|{a4}|{day}|{kind}|{float(line or 0):.2f}|{how}".encode("utf-8")).hexdigest()[:16]
+            if _dce_add(ev) and str(getattr(self, "_token", "") or "").strip():
+                self._alive_ping(force=True)
+        except Exception as _e:
+            self._dc_exc_note("dce", _e)                   # 사건 보고가 빠진 이유를 남긴다(감시는 그대로)
+
+    def _dc_shadow_log(self, t, mode, dp, eq, line, scope, plan, manual, skipped, day, test=False) -> None:
+        """그림자 모드(3차 결정 E)나 어드민 라이브 잠금(3차 리뷰 P1): 두 번 읽어 확인까지 마친 뒤 주문 대신 '정리했을 경우' 한 줄(센트까지, 그 거래일,
+        그 선에 한 번). 같은 선에서는 다시 확인 읽기를 하지 않는다. test = 시험용 스위치의 연습 계좌 - 이유는 _dc_orders_ok와 같은 규칙으로 고른다
+        (시험 모드는 그림자 모드보다 우선이라 그 계좌를 막은 것은 라이브 잠금이다, 3차 마무리 리뷰), 앞에 [시험 모드]를 붙인다."""
+        _k = t["key"]
+        lbl = t.get("lbl") or t["sc"]
+        self._dc_map("_dc_shadow_seen")[(_k, day, mode, round(float(line or 0), 2))] = True
+        _sh = _daycap_shadow() and not (test and _daycap_test_on())
+        _wk, _we = ("그림자 모드라", "Shadow mode is on") if _sh else ("라이브 잠금 중이라", "The live lock is on")
+        _tk, _te = ("[시험 모드] ", "[Test mode] ") if test else ("", "")
+        legs, mt, st = self._dc_plan_txt(plan, manual, skipped, True)
+        _, mte, ste = self._dc_plan_txt(plan, manual, skipped, False)
+        _what_ko = "이 계좌 포지션" if scope == "account" else "앱이 넣은 포지션"
+        _what_en = "this account's positions" if scope == "account" else "the positions the app entered"
+        if mode == "cap":
+            _over = dp - line >= 0.5
+            self._daycap_note_once(("shadow", _k, day, "cap"),
+                                   (f"   [{lbl}] {_tk}정리했을 경우: 오늘 손익 {_money(dp, True)}가 하루 이익 상한({_money(line, True)})"
+                                    + ("을 넘어" if _over else "에 닿아") + f" {_what_ko}({legs})을 시장가로 정리했을 것입니다." + st + mt
+                                    + f" {_wk} 주문은 내지 않았습니다."),
+                                   (f"   [{lbl}] {_te}Would have closed: today's P&L {_money(dp, True)} "
+                                    + ("went over" if _over else "reached") + f" the daily profit cap ({_money(line, True)}), so "
+                                    f"{_what_en} ({legs}) would have been closed at market." + ste + mte
+                                    + f" {_we}, so no order was sent."))
+        else:
+            self._daycap_note_once(("shadow", _k, day, "pass", round(float(line), 2)),
+                                   (f"   [{lbl}] {_tk}정리했을 경우: 잔고와 미실현 손익을 더한 {_money(eq, True)}가 통과 익절 잔고"
+                                    f"({_money(line, True)})에 닿아 {_what_ko}({legs})을 시장가로 정리했을 것입니다." + st + mt
+                                    + f" {_wk} 주문은 내지 않았습니다."),
+                                   (f"   [{lbl}] {_te}Would have closed: balance plus open profit {_money(eq, True)} reached the pass "
+                                    f"take-profit balance ({_money(line, True)}), so {_what_en} ({legs}) would have been closed at "
+                                    f"market." + ste + mte + f" {_we}, so no order was sent."))
+
+    def _dc_lines(self, t, r, poss, dp, eq, day):
+        """(상한 선, 청산 비용 여유, 통과 익절 선, 상한 닿음, 통과 닿음, 같은 날 같은 금액이라 막은 금액 또는 None).
+        자동 통과 익절 선 = 실제로 통과하는 잔고 + max(여유 $50, 2틱 x 앱이 정리할 계약 수) + 지난 거래일 모자람(3차 리뷰 P0, P1).
+        회원이 넣은 통과 목표 = 그 잔고 + 청산 비용 여유(종전 규약)."""
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        trig = self._daycap_trigger(r["cap"], poss) if r["cap"] > 0 else None
+        buf = self._daycap_close_cost(poss)
+        if r["pass_tp"] > 0 and r["pass_src"] == "auto":
+            pass_trig = self._dc_auto_pass_line(bk, sc, r, self._dc_closing(_k, poss), day) or float(r["pass_tp"])
+        elif r["pass_tp"] > 0:
+            pass_trig = float(r["pass_tp"]) + buf
+        else:
+            pass_trig = 0.0
+        _plaus = r["pass_src"] == "auto" or self._daycap_pass_plausible(r)
+        cap_hit = trig is not None and dp is not None and dp >= trig
+        pass_hit = bool(pass_trig) and _plaus and eq is not None and eq >= pass_trig
+        blocked = None
+        if pass_hit:
+            _amt0 = self._dc_tp_fired_amt(bk, sc, day)
+            if _amt0 is not None and pass_trig <= _amt0 + 0.5:
+                pass_hit, blocked = False, _amt0
+        return trig, buf, pass_trig, cap_hit, pass_hit, blocked
+
+    def _dc_auto_pass_line(self, broker, acct, r, closing, day):
+        """자동 통과 익절이 실제로 닫는 잔고 = 통과 잔고 + max(여유 $50, 2틱 x 정리할 계약) + 지난 거래일 모자람(3차 리뷰 P0, P1). 감시, 진입 로그,
+        상태 줄, 최고일 안내가 모두 이 금액을 쓴다(3차 마무리 4 - 상태 줄이 여유 $50만 더한 금액을 보이던 것). 자동이 아니면 None."""
+        try:
+            if not r or r.get("pass_src") != "auto" or float(r.get("pass_tp") or 0) <= 0 or not r.get("pass_need"):
+                return None
+            _mg = max(float(r.get("margin") or 0), _dc_slip_margin(closing)) + self._dc_tp_extra(broker, acct, day)
+            return round(float(r["pass_need"]) + _mg, 2)
+        except (TypeError, ValueError):
+            return None
+
+    def _dc_app_closing(self, key) -> list:
+        """화면용: 앱 진입 기록의 계약별 앱 수량 [(계약, 수량)] - 포지션을 읽지 않고 감시가 정리할 몫을 어림한다(감시가 수량을 줄여 둔다)."""
+        try:
+            return [(c, int(v.get("qty") or 0)) for c, v in self._dc_app_legs(key).items()]
+        except Exception:
+            return []
+
+    def _dc_login_busy(self, b, key) -> bool:
+        """같은 로그인(브로커 객체)의 다른 계좌가 1초 구간에 있나 - 그동안은 거래 기록 같은 긴 조회를 하지 않는다(3차 리뷰 P2)."""
+        kb, fk = self._dc_map("_dc_kb"), self._dc_map("_dc_fastk")
+        return any(v and k2 != key and kb.get(k2) == id(b) for k2, v in list(fk.items()))
+
+    def _daycap_mon_one(self, t, s_utc, day, acache, marks):
+        """한 계좌 한 회차(읽기와 판단). 반환: None, ("fire", t, b, snap, d) = 문턱에 닿음(두 번째 읽기, 마지막 확인과 청산 발주는 _daycap_mon_fire -
+        여러 계좌면 동시에), ("pend", b, t, snap) = 발동 래치가 이어서 청산을 발주함(확인은 회차 끝에 한꺼번에)."""
+        import time as _t
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        lbl = t.get("lbl") or sc
+        fired, due = self._dc_map("_dc_fired"), self._dc_map("_dc_due")
+        now = _t.time()
+        _due_prev = due.get(_k)
+        b = self._daycap_mon_broker(t)
+        if b is None:
+            due[_k] = now + 60
+            return None
+        self._dc_map("_dc_kb")[_k] = id(b)
+        # 정리 중(발동 래치)인 계좌는 포지션을 늘 새로 읽는다 - 1초 재사용, 호출 한도 때문에 잠깐 전 목록을 쓰다 플랫으로 잘못 보고 마무리하지 않게.
+        snap = self._daycap_mon_snap(b, bk, sc, acache, fresh=(_k in fired))
+        if snap is None:
+            self._dc_snap_miss(t, getattr(_DC_TLS, "snap_why", None))
+            if not _dc_deferred():                          # 호출 몫 때문에 미뤘으면 기한을 늦추지 않는다(다음 회차에 다시, 3차 마무리 5, 리뷰 P1)
+                due[_k] = now + (_DAYCAP_POLL_FAST_S if self._dc_map("_dc_fastk").get(_k) else _DAYCAP_POLL_OPEN_S)
+            return None
+        self._dc_snap_back(t)
+        _DC_TLS.evald = True                                # 포지션을 읽었다(손익을 못 매기면 아래에서 되돌린다)
+        if snap.get("name") and str(snap["name"]) != str(sc):
+            self._daycap_learn(bk, sc, name=snap["name"])
+        _pc0 = self._dc_map("_dc_pcache").get((id(b), str(snap.get("aid"))))
+        self._dc_map("_dc_pos_ts")[_k] = float(_pc0[0]) if _pc0 else now     # 포지션을 마지막으로 읽은 때(회차 순서를 고르게, 3차 마무리 5)
+        poss = snap["poss"]
+        self._dc_map("_dc_lastopen")[_k] = bool(poss)
+        self._dc_pos_seen(_k, poss)                         # 포지션 구성이 바뀐 때(사건의 1분봉 다시 셈 창, 3차 마무리 리뷰)
+        if _k in fired:
+            # 발동한 뒤다: 발동 때 정한 수량이 아직 남았으면 조건(_daycap_may_close)이 맞을 때만 이어서 닫고, 다 닫혔으면 마무리,
+            # 조건이 안 맞으면(멈춤, 다음 날, 새 포지션) 닫지 않고 남은 주문만 걷고 래치를 놓는다.
+            info = fired[_k]
+            fp = info.get("pos") or {}
+            fopen = [p for p in poss if self._dc_remaining(info, p["con"], p["qty"]) > 0] if fp else list(poss)
+            due[_k] = _t.time() + _DAYCAP_POLL_OPEN_S
+            if not fopen:
+                self._daycap_mon_finish(b, t, snap)
+                return None
+            if self._daycap_may_close(info, poss, day):
+                if self._daycap_mon_send(b, t, snap):
+                    return ("pend", b, t, snap)
+                return None
+            self._daycap_latch_stop(b, t, snap, day)
+            return None
+        self._dc_prune_legs(_k, poss)
+        stage, _nsz = self._daycap_stage_cfg(bk, sc, t["pr"], name=snap.get("name"), bal=snap.get("bal"))
+        r = (self._daycap_resolve_cfg(bk, sc, t["pr"], name=snap.get("name"), bal=snap.get("bal"))
+             if stage == "eval" else None)
+        if r is None or (r["cap"] <= 0 and r["pass_tp"] <= 0):
+            if not poss:
+                self._daycap_mon_drop(_k)                   # 평가가 아님(펀디드, 연습, 통과, 모름) - 지켜볼 것 없다
+            due[_k] = now + 60
+            return None
+        if r["size_src"] in ("name", "balance"):
+            self._daycap_learn(bk, sc, size=r["size"])
+        if (bk == "projectx" and not r.get("test") and not (poss and self._dc_map("_dc_fastk").get(_k))
+                and not self._dc_login_busy(b, _k)):
+            # Topstep 최고일 재료(거래일마다 한 번, 3차 결정 B). 선 가까이(1초 구간)에서는 읽지 않는다 - 이 계좌든 같은 로그인의 다른 계좌든
+            # (3차 리뷰 P2: 긴 기록 조회가 감시 스레드를 붙잡아 1초 구간 계좌가 몇 초 눈을 감았다).
+            try:
+                self._dc_hist_refresh(b, bk, sc, snap["aid"], day)
+            except Exception:
+                pass
+        _plaus = r["pass_src"] == "auto" or self._daycap_pass_plausible(r)
+        bal = snap.get("bal")
+        if (bal is not None and r.get("size") and bal <= float(r["size"])
+                and self._dc_tp_fired_amt(bk, sc) is not None):
+            # 잔고가 규모 이하로 돌아왔다(초기화, 새로 시작한 평가) - 지난 평가의 통과 익절 금액 기록은 새 평가를 막지 않게 놓는다.
+            with _DAYCAP_STATE_LOCK:
+                self._dc_state()["tp_fired"].pop(_k, None)
+            self._dc_save()
+        if not poss:
+            self._dc_map("_dc_fastk").pop(_k, None)
+            r0 = self._daycap_resolve_cfg(bk, sc, t["pr"], name=snap.get("name"), bal=bal,
+                                          today=((self._dc_state()["days"].get(_k) or {}).get(day))) or r
+            _need0 = float(r0.get("pass_need") or r0.get("pass_tp") or 0)
+            if bal is not None and r0["pass_tp"] > 0 and _plaus and _need0 > 0 and bal >= _need0:
+                # 통과 잔고에 닿아 있다(손으로 닫았거나 다른 경로) - 최고일을 다 알 때만 통과로 표시(결정 3 P1-a, 3차 리뷰 P0, P2).
+                _mk, _mwhy = self._dc_pass_markable(bk, r0, snap.get("name") or sc)
+                if _mk:
+                    self._daycap_mark_passed(bk, sc, bal=bal, pass_tp=_need0, lbl=lbl, size=r0["size"], via="balance",
+                                             target=r0.get("target"), src=r0.get("pass_src"))
+                    self._daycap_mon_drop(_k)
+                    due[_k] = now + 60
+                    return None
+                self._dc_pass_hold(bk, sc, lbl, bal, _need0, _mwhy, r0["firm"])
+            _n = self._dc_map("_dc_flatn")[_k] = int(self._dc_map("_dc_flatn").get(_k, 0)) + 1
+            _rec = _k in self._dc_map("_dc_mon")
+            _young = any(isinstance(lg, dict) and now - float(lg.get("ts") or 0) < _DAYCAP_LEG_GRACE_S
+                         for lg in ((self._dc_map("_dc_mon").get(_k) or {}).get("legs") or []))
+            if _n >= 2 and _rec and not _young:
+                self._daycap_mon_drop(_k)                   # 앱이 연 포지션이 닫혔다(손절, 시간 청산, 직접 청산) - 기록을 놓는다(막 들어간 leg는 20초 기다린다)
+            self._dc_map("_dc_realmiss").pop(_k, None)
+            self._daycap_mon_flat_status(b, t, r, snap, s_utc, day)
+            due[_k] = now + (_DAYCAP_POLL_OPEN_S if _rec else _DAYCAP_POLL_IDLE_S)
+            return None
+        self._dc_map("_dc_flatn").pop(_k, None)
+        due[_k] = now + _DAYCAP_POLL_OPEN_S
+        if self._daycap_hit_today(bk, sc, day):
+            return None                                     # 오늘 이미 닿은 뒤 열린 포지션 = 회원이 직접 연 것(수동이 우선)
+        pnl = self._daycap_mon_pnl(b, t, snap, s_utc, day, marks)
+        if pnl is None:
+            _DC_TLS.evald = False
+            if self._dc_map("_dc_fastk").get(_k):
+                due[_k] = now + _DAYCAP_POLL_FAST_S
+            elif _dc_deferred():
+                due[_k] = float(_due_prev or 0)              # 호출 몫 때문에 미뤘다 - 기한을 늦추지 않는다(3차 마무리 5, 리뷰 P1)
+            return None
+        dp, eq, real = pnl
+        # 통과 익절은 오늘 지금까지 손익까지 넣은 최고일로 다시 계산한다(3차 결정 B - 오늘이 최고일이면 실제로 통과하는 잔고가 그만큼 올라간다).
+        r = self._daycap_resolve_cfg(bk, sc, t["pr"], name=snap.get("name"), bal=bal,
+                                     today=(dp if dp is not None else real)) or r
+        self._dc_best_note(bk, sc, lbl, day, r.get("best_src"), r,
+                           line=self._dc_auto_pass_line(bk, sc, r, self._dc_closing(_k, poss), day))   # 실제로 닫는 금액(3차 마무리 4)
+        if r["cap"] > 0 and dp is not None:
+            self._dc_map("_dc_realmiss").pop(_k, None)
+            self._daycap_set_status(bk, sc, day=day, room=r["cap"] - dp, cap=r["cap"], pass_tp=r["pass_tp"])
+        elif r["cap"] > 0:
+            # 오늘 실현 손익을 못 읽는다 - 하루 상한은 지금 볼 수 없다(통과 목표는 계속 본다). 한 주기(60초)를 넘기면 차분히 한 번 알리고
+            # 상태 줄을 '못 읽음'으로 바꾼다(2차 리뷰 P2: 낡은 '오늘 남은' 금액이 보호하는 것처럼 보이던 것).
+            _m0 = self._dc_map("_dc_realmiss").setdefault(_k, now)
+            if now - float(_m0) >= _DAYCAP_REAL_TTL_S:
+                self._daycap_set_status(bk, sc, day=day, room=None, cap=r["cap"], pass_tp=r["pass_tp"], unknown=True)
+                self._daycap_note_once(("real_unknown", _k, day),
+                                       (f"   [{lbl}] 오늘 실현 손익을 읽지 못해 지금은 하루 이익 상한을 확인하지 못합니다(통과 목표는 계속 봅니다). "
+                                        f"다시 읽히면 그때부터 확인합니다."),
+                                       (f"   [{lbl}] Today's realized P&L cannot be read, so the daily profit cap is not being "
+                                        f"checked right now (the pass target still is). It is checked again once it can be read."))
+        trig, buf, pass_trig, cap_hit, pass_hit, _blk = self._dc_lines(t, r, poss, dp, eq, day)
+        if _blk is not None:
+            # 같은 거래일 같은 금액에서 두 번 정리하지 않는다(3차 결정 B): 그 금액에서 닫았는데 통과로 이어지지 않았다 - 오늘은 금액이 다시 계산돼
+            # 달라질 때까지 통과 익절은 쉬고 하루 상한만 본다. 다음 거래일에는 모자란 만큼 여유를 더해 다시 본다(3차 리뷰 P1).
+            self._daycap_note_once(("tp_refire", _k, day, round(pass_trig, 2)),
+                                   (f"   [{lbl}] 통과 익절은 오늘 이미 {self._daycap_money(_blk)}에서 한 번 정리했습니다. 오늘은 같은 금액에서 다시 "
+                                    f"정리하지 않고, 금액이 새로 계산돼 바뀌거나 다음 거래일이 되면 다시 봅니다."),
+                                   (f"   [{lbl}] The pass take-profit already closed once today at {self._daycap_money(_blk)}. It "
+                                    f"does not close again at the same amount today; it watches again once the amount is recalculated "
+                                    f"or on the next trading day."))
+        _gaps = ([float(trig) - float(dp)] if (trig is not None and dp is not None) else []) + \
+                ([float(pass_trig) - float(eq)] if (pass_trig and eq is not None) else [])
+        self._dc_map("_dc_gap")[_k] = min(_gaps) if _gaps else 1e18    # 1초 구간 계좌끼리 선에 가까운 순서(3차 마무리 5)
+        _fast = self._dc_fast(t, r, dp, eq, real, bal, pass_trig if pass_trig else None)
+        if _fast:
+            self._dc_map("_dc_fastk")[_k] = True
+            due[_k] = now + _DAYCAP_POLL_FAST_S
+        else:
+            self._dc_map("_dc_fastk").pop(_k, None)
+        if not (cap_hit or pass_hit):
+            return None
+        mode = "pass" if pass_hit else "cap"
+        line = pass_trig if pass_hit else trig
+        plan, scope, manual, skipped = self._dc_close_plan(t, b, poss, mode, r)
+        if not plan:
+            self._dc_no_app_close(t, r, mode, dp, eq, line, manual, skipped, day)
+            return None
+        if not self._dc_orders_ok(bool(r.get("test"))) and (_k, day, mode, round(float(line), 2)) in self._dc_map("_dc_shadow_seen"):
+            return None                                     # 그림자 모드, 라이브 잠금: 이 선은 이미 '정리했을 경우'를 남겼다
+        return ("fire", t, b, snap, {"mode": mode, "dp": dp, "eq": eq, "real": real, "r": r, "trig": trig, "buf": buf,
+                                     "day": day, "s_utc": s_utc, "pass_trig": pass_trig, "line": line, "t0": _t.time()})
+
+    def _dc_snap_miss(self, t, why) -> None:
+        """감시가 이 계좌를 계속 못 읽는다(_daycap_mon_snap이 None): _DAYCAP_SNAP_MISS_S(30초) 넘게 이어지면 이유와 함께 한 줄 알린다(같은 이유는
+        한 시간에 한 번). 종전엔 아무 말 없이 5초마다 건너뛰기만 해서, 2026-10-15 대표 PC에서 NT8 계좌 넷을 7분 넘게 하나도 보지 못했는데 로그가
+        한 줄도 없었다. NinjaTrader 브리지가 멈춘 것(stale)은 계좌마다가 아니라 브리지 하나로 한 줄. 호출 몫 때문에 미룬 회차(_dc_deferred)는 세지
+        않는다. 다시 읽히면 _dc_snap_back이 한 줄로 알린다."""
+        import time as _t
+        if _dc_deferred():
+            return
+        _k = t["key"]
+        mp = self._dc_map("_dc_snapmiss")
+        now = _t.time()
+        t0 = float(mp.setdefault(_k, now))
+        if now - t0 < _DAYCAP_SNAP_MISS_S:
+            return
+        lbl = t.get("lbl") or t["sc"]
+        sc = t["sc"]
+        _n = int(_DAYCAP_SNAP_MISS_S)                      # 알리는 문턱(실제로는 그보다 오래 못 읽었다)
+        _id = _k
+        if t["broker"] == "nt8" and why == "stale":
+            _id = "nt8|*bridge"
+            ko = (f"   평가 계좌 감시: NinjaTrader 브리지에서 {_n}초 넘게 새 값이 오지 않아 NinjaTrader 평가 계좌를 보지 못하고 있습니다. "
+                  f"NinjaTrader가 켜져 있고 EQAutopilotBridge 애드온이 연결돼 있는지 확인하십시오. 새 값이 오면 바로 이어서 봅니다.")
+            en = (f"   Evaluation watch: no new data has come from the NinjaTrader bridge for over {_n} seconds, so the NinjaTrader "
+                  f"evaluation accounts are not being watched. Please check that NinjaTrader is running and the EQAutopilotBridge "
+                  f"add-on is connected. The watch resumes as soon as new data arrives.")
+        elif why == "acct":
+            _src_ko, _src_en = (("NinjaTrader가 보내는 계좌 목록", "the account list NinjaTrader sends") if t["broker"] == "nt8"
+                                else ("브로커 계좌 목록", "the broker's account list"))
+            ko = (f"   [{lbl}] 평가 계좌 감시: {_src_ko}에 {sc} 계좌가 {_n}초 넘게 없어 이 계좌를 보지 못하고 있습니다. "
+                  f"그 계좌가 연결돼 있는지, 계좌 이름이 앱에 적은 것과 같은지 확인하십시오. 계좌가 보이면 바로 이어서 봅니다.")
+            en = (f"   [{lbl}] Evaluation watch: the account {sc} has been missing from {_src_en} for over {_n} seconds, so this "
+                  f"account is not being watched. Please check that the account is connected and that its name matches the one "
+                  f"in the app. The watch resumes as soon as the account shows up.")
+        else:
+            ko = (f"   [{lbl}] 평가 계좌 감시: {_n}초 넘게 이 계좌의 잔고와 포지션을 읽지 못하고 있습니다. 읽히면 바로 이어서 봅니다.")
+            en = (f"   [{lbl}] Evaluation watch: this account's balance and positions could not be read for over {_n} seconds. "
+                  f"The watch resumes as soon as they can be read.")
+        if self._dc_note_hourly(("snapmiss", _id, str(why)), ko, en):
+            self._dc_map("_dc_snapmiss_told")[_id] = True
+
+    def _dc_snap_back(self, t) -> None:
+        """감시가 이 계좌를 다시 읽었다: 못 읽음 시계를 놓고, 못 읽는다고 알렸던 계좌(또는 NinjaTrader 브리지)면 한 줄로 알린다."""
+        _k = t["key"]
+        self._dc_map("_dc_snapmiss").pop(_k, None)
+        told = self._dc_map("_dc_snapmiss_told")
+        ko = self.lang == "ko"
+        if t["broker"] == "nt8" and told.pop("nt8|*bridge", None):
+            self.log("   평가 계좌 감시: NinjaTrader 브리지에서 다시 값이 옵니다. 감시를 이어 갑니다." if ko else
+                     "   Evaluation watch: data is coming from the NinjaTrader bridge again. The watch continues.")
+        if told.pop(_k, None):
+            lbl = t.get("lbl") or t["sc"]
+            self.log((f"   [{lbl}] 평가 계좌 감시: 이 계좌를 다시 읽고 있습니다. 감시를 이어 갑니다.") if ko else
+                     (f"   [{lbl}] Evaluation watch: this account can be read again. The watch continues."))
+
+    def _dc_recheck(self, t, b, snap0, d):
+        """발사 직전 두 번째 읽기(3차 리뷰 P0): 첫 읽기에서 1초 넘게 지난 뒤 캐시 없이 모두 다시 읽어 다시 계산한다. 그래도 선에 닿았을 때만
+        {snap, mode, dp, eq, real, r, line}, 아니면 None(이번엔 닫지 않는다).
+        ProjectX: 포지션 → 계좌 목록(잔고) → 오늘 실현 → 포지션 순으로 읽고 두 포지션이 같고 첫 읽기와도 같아야 한다(그 사이 체결이면 다음 회차),
+        시세도 새로 읽고 튐을 거른다, 잔고 - 오늘 실현이 그날 앞서 본 값과 맞아야 한다.
+        NT8: 첫 읽기와 다른 push(브리지 시각이 다름)를 기다려 읽고, 포지션이 같고 (NetLiq - 현금)과 브리지 미실현이 맞아야 한다."""
+        import time as _t
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        day = d["day"]
+        s_utc = d.get("s_utc") or _daycap_day_start()[0]
+
+        def _sig(ps):
+            return tuple(sorted((str(p["con"]), int(p["qty"])) for p in (ps or [])))
+        if bk == "nt8":
+            ts0 = snap0.get("ts")
+            _end = _t.time() + 5.0
+            while True:
+                s1 = self._daycap_mon_snap(b, bk, sc, None, fresh=True)
+                if s1 is None:
+                    return None
+                if ts0 is None or s1.get("ts") is None or s1.get("ts") != ts0:
+                    break
+                if _t.time() >= _end:
+                    return None                             # 브리지가 새 값을 보내지 않는다 - 낡은 값으로 닫지 않는다
+                _t.sleep(0.5)
+            if _sig(s1["poss"]) != _sig(snap0["poss"]) or not self._dc_nl_consistent(t, s1):
+                return None
+            base = self._daycap_nt8_base(b, sc, s_utc, day, cash=s1.get("bal"))
+            if base is None or s1.get("nl") is None:
+                return None
+            dp, eq = float(s1["nl"]) - base, float(s1["nl"])
+            real = (float(s1["bal"]) - base) if s1.get("bal") is not None else None
+            fresh = s1
+        else:
+            g = self._dc_gate(b)
+            aid = snap0.get("aid")
+
+            def _pos():
+                if g is not None:
+                    g.take("other", force=True)
+                out = []
+                for p in list(b.open_positions(aid, timeout=_DAYCAP_ENTRY_TIMEOUT) or []):
+                    _sz = abs(int(p.get("size") or 0))
+                    if not _sz:
+                        continue
+                    if p.get("type") not in (1, 2):
+                        return None
+                    out.append({"con": str(p.get("contractId")), "qty": _sz if p.get("type") == 1 else -_sz,
+                                "avg": self._dc_f(p.get("averagePrice")), "acct": aid})
+                return out
+            try:
+                p1 = _pos()
+                if g is not None:
+                    g.take("other", force=True)
+                try:
+                    accts = b._accounts(timeout=_DAYCAP_ENTRY_TIMEOUT)
+                except TypeError:
+                    accts = b._accounts()
+                if g is not None:
+                    g.take("other", force=True)
+                try:
+                    real = float(b.day_realized(aid, s_utc.isoformat(), timeout=_DAYCAP_ENTRY_TIMEOUT))
+                except Exception as _re:
+                    if g is not None:
+                        g.note_error(_re)
+                    real = None                             # 하루 상한은 못 본다(통과 익절은 잔고 + 미실현으로 계속 본다)
+                p2 = _pos()
+            except Exception as _e:
+                if g is not None:
+                    g.note_error(_e)
+                return None
+            if p1 is None or p2 is None or _sig(p1) != _sig(p2) or _sig(p2) != _sig(snap0["poss"]):
+                return None
+            a = next((x for x in (accts or []) if str(x.get("id")) == str(aid)), None)
+            bal = self._dc_f((a or {}).get("balance"))
+            if bal is None:
+                return None
+            upnl = 0.0
+            for p in sorted(p2, key=lambda x: float(self._passtp_pv(x["con"]) or 0) * abs(int(x["qty"])), reverse=True):
+                pv = self._passtp_pv(p["con"])
+                if not pv or p.get("avg") is None or float(p["avg"]) <= 0:
+                    return None
+                mk = self._dc_price(b, p["con"], fresh=True, avg=p.get("avg"))
+                if mk is None:
+                    return None
+                upnl += (float(mk) - float(p["avg"])) * int(p["qty"]) * float(pv)
+            if real is not None:
+                self._dc_map("_dc_real")[_k] = (day, _t.time(), _sig(p2), real)
+                if not self._dc_sod_check(t, day, bal, real):
+                    return None
+            dp, eq = ((real + upnl) if real is not None else None), bal + upnl
+            fresh = {"name": str((a or {}).get("name") or snap0.get("name") or sc), "bal": bal, "aid": aid, "poss": p2,
+                     "nl": None}
+        r = self._daycap_resolve_cfg(bk, sc, t["pr"], name=fresh.get("name"), bal=fresh.get("bal"),
+                                     today=(dp if dp is not None else real)) or d["r"]
+        trig, _buf, pass_trig, cap_hit, pass_hit, _blk = self._dc_lines(t, r, fresh["poss"], dp, eq, day)
+        if pass_hit:
+            return {"snap": fresh, "mode": "pass", "dp": dp, "eq": eq, "real": real, "r": r, "line": pass_trig, "buf": _buf}
+        if cap_hit:
+            return {"snap": fresh, "mode": "cap", "dp": dp, "eq": eq, "real": real, "r": r, "line": trig, "buf": _buf}
+        return None
+
+    def _daycap_mon_fire(self, t, b, snap, d):
+        """문턱에 닿은 계좌 하나: 아직 지켜볼 계좌인가 → 두 번째 읽기로 다시 확인(_dc_recheck) → 앱이 넣은 수량만 정리 계획 → (그림자 모드, 라이브
+        잠금이면 '정리했을 경우' 로그만) → 발동 래치(디스크에 먼저) → 청산 발주. 반환 (b, t, snap) = 확인할 것, None = 이번엔 닫지 않음."""
+        import time as _t
+        ko = self.lang == "ko"
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        lbl = t.get("lbl") or sc
+        fired = self._dc_map("_dc_fired")
+        day = d["day"]
+        if not self._daycap_mon_still(t):
+            return None
+        _w = 1.0 - (_t.time() - float(d.get("t0") or 0))
+        if _w > 0:
+            _t.sleep(_w)
+        chk = self._dc_recheck(t, b, snap, d)
+        if chk is None:
+            return None
+        fresh, mode, dp, eq, r, line = chk["snap"], chk["mode"], chk["dp"], chk["eq"], chk["r"], chk["line"]
+        _test = bool(r.get("test"))                         # 시험용 스위치의 연습 계좌(3차 마무리 3)
+        plan, scope, manual, skipped = self._dc_close_plan(t, b, fresh["poss"], mode, r)
+        if not plan:
+            self._dc_no_app_close(t, r, mode, dp, eq, line, manual, skipped, day)
+            return None
+        if not self._dc_orders_ok(_test):
+            _seen = (_k, day, mode, round(float(line or 0), 2)) in self._dc_map("_dc_shadow_seen")
+            self._dc_shadow_log(t, mode, dp, eq, line, scope, plan, manual, skipped, day, test=_test)
+            if not _seen:                                   # 서버로 보고(3차 마무리 2) - 그 선에서 처음 한 번
+                self._dce_note(t, r, mode, line, dp, eq, chk.get("real"), fresh, d,
+                               "shadow" if (_daycap_shadow() and not (_test and _daycap_test_on())) else "lock")
+            return None
+        now = _t.time()
+        legs_txt, mt, st = self._dc_plan_txt(plan, manual, skipped, ko)
+        _what_ko = "이 계좌 포지션" if scope == "account" else f"앱이 넣은 포지션({legs_txt})"
+        _what_en = "this account's positions" if scope == "account" else f"the positions the app entered ({legs_txt})"
+        _tk, _te = (("[시험 모드] ", "[Test mode] ") if _test else ("", ""))
+        if mode == "cap":
+            _over = dp - r["cap"] >= 0.5
+            self.log((f"\n[{lbl}] {_tk}오늘 손익 {self._daycap_money(dp)}가 하루 이익 상한({self._daycap_money(r['cap'])})"
+                      + ("을 넘어 " if _over else "에 닿아 ") + _what_ko + "을 정리합니다." + st + mt
+                      + (" 손으로 연 포지션도 정리하고 남은 손절 주문을 걷습니다(연습 계좌 시험)." if _test else "")) if ko else
+                     (f"\n[{lbl}] {_te}Today's P&L {self._daycap_money(dp)} " + ("went over" if _over else "reached")
+                      + f" the daily profit cap ({self._daycap_money(r['cap'])}), so {_what_en} are being closed." + st + mt
+                      + (" Positions opened by hand are closed too and the leftover stop orders are cancelled (practice "
+                         "account test)." if _test else "")))
+        else:
+            _need = float(r.get("pass_need") or r["pass_tp"])
+            self.log((f"\n[{lbl}] 잔고와 미실현 손익을 더한 {self._daycap_money(eq)}가 통과 익절 잔고({self._daycap_money(line)}, "
+                      f"통과 잔고 {self._daycap_money(_need)} + 여유 {self._daycap_money(line - _need)})에 닿아 " + _what_ko
+                      + "을 정리합니다." + st + mt) if ko else
+                     (f"\n[{lbl}] Balance plus open profit {self._daycap_money(eq)} reached the pass take-profit balance "
+                      f"({self._daycap_money(line)}: pass balance {self._daycap_money(_need)} + margin "
+                      f"{self._daycap_money(line - _need)}), so {_what_en} are being closed." + st + mt))
+            try:                                            # 같은 날 같은 금액에서 다시 정리하지 않게 금액을 먼저 적는다(3차 결정 B)
+                with _DAYCAP_STATE_LOCK:
+                    self._dc_state()["tp_fired"][_k] = {"amt": round(line, 2), "day": day, "ts": now}
+                self._dc_save()
+            except Exception:
+                pass
+        _mk, _mwhy = self._dc_pass_markable(bk, r, fresh.get("name") or sc)
+        fired[_k] = {"mode": mode, "day": day, "dp": dp, "eq": eq, "lbl": lbl, "sc": sc, "aid": fresh.get("aid"),
+                     "broker": bk, "firm": r["firm"], "cap": r["cap"], "pass_tp": r["pass_tp"], "size": r["size"],
+                     "pass_need": float(r.get("pass_need") or r["pass_tp"] or 0), "pass_src": r.get("pass_src"),
+                     "target": r.get("target"), "best_src": r.get("best_src"), "markable": bool(_mk), "mwhy": _mwhy,
+                     "buf": chk.get("buf", d.get("buf")), "assets": sorted({self._fill_asset(c) for c in plan} - {None}),
+                     "done": False, "halt": False, "scope": scope, "psent": {},
+                     "pos": {c: int(v["net0"]) for c, v in plan.items()}, "tgt": {c: int(v["tgt"]) for c, v in plan.items()},
+                     "app": {c: int(v["app"]) for c, v in plan.items()}, "stops": {c: list(v["stops"]) for c, v in plan.items()},
+                     "ts": now, "test": _test}
+        self._daycap_fired_save(_k)                         # 디스크에 먼저 - 정리 도중 앱이 꺼져도 다시 켜면 이어서 정리하고 남은 주문을 걷는다
+        self._daycap_mon_send(b, t, fresh)
+        self._dce_note(t, r, mode, line, dp, eq, chk.get("real"), fresh, d, "test" if _test else "real")   # 서버로 보고(3차 마무리 2)
+        return (b, t, fresh)
+
+    def _daycap_cleanup(self, b, aid, info=None) -> int:
+        """ProjectX: 정리한 계약의 남은 주문(손절)을 걷는다. 주문 목록을 먼저, 포지션을 나중에 읽는다 - 그 사이 새 진입이 손절을 걸었다면 그
+        포지션도 이미 보이므로 걷지 않는다(2차 리뷰 P2). 반환 = 걷지 못한 주문 수(목록, 포지션을 못 읽거나 주문을 낼 수 없으면 1 이상).
+        범위 'account'(회원이 넣은 통과 목표, 옛 기록) = 지금 플랫인 정리 계약의 주문 전부(종전 규약).
+        범위 'app'(3차 리뷰 P0) = 앱 포지션을 지키던 손절 모양(정지 주문, 닫는 쪽)만: 계약이 플랫이면 그 계약의 닫는 쪽 손절(회원이 옮긴 앱 손절
+        포함 - 플랫 계약의 손절은 반대 포지션을 연다), 회원 수량이 남은 계약이면 앱 손절 자리와 같은 주문만 앱 수량까지. 지정가, 진입 쪽 주문은
+        회원이 건 것일 수 있어 건드리지 않는다."""
+        if not hasattr(b, "_open_orders"):
+            return 0
+        info = info if isinstance(info, dict) else {}
+        if not self._dc_orders_ok(bool(info.get("test"))):
+            lbl = info.get("lbl") or str(aid)
+            self._daycap_note_once(("cleanup_blocked", str(aid), info.get("ts")),
+                                   f"   [{lbl}] 그림자 모드나 라이브 잠금이라 남은 주문을 걷지 않았습니다. 풀리면 다시 걷습니다.",
+                                   f"   [{lbl}] Shadow mode or the live lock is on, so the leftover orders were not cancelled. "
+                                   f"They are cancelled once it is off.")
+            return 1
+        fp = info.get("pos") or {}
+        tg = info.get("tgt") or {}
+        cons = set(fp) or None
+        scope = info.get("scope") or "account"
+        try:
+            ords = [o for o in (b._open_orders(aid) or [])
+                    if cons is None or str(o.get("contractId") or "") in cons]
+        except Exception:
+            return 1
+        if not ords:
+            return 0
+        try:
+            net = {}
+            for p in (b.open_positions(aid, timeout=_DAYCAP_ENTRY_TIMEOUT) or []):
+                _sz = abs(int(p.get("size") or 0))
+                if _sz:
+                    net[str(p.get("contractId"))] = (_sz if p.get("type") == 1 else (-_sz if p.get("type") == 2 else None))
+        except Exception:
+            return len(ords)
+        budget = {c: int((info.get("app") or {}).get(c, 0) or 0) for c in fp}
+        left = 0
+        for o in ords:
+            con = str(o.get("contractId") or "")
+            q = net.get(con, 0)
+            if scope == "account":
+                if q != 0:
+                    continue                                # 다시 열린 계약 - 그 손절은 포지션을 지킨다
+            else:
+                if q is None:
+                    continue
+                try:
+                    q0, tgt = int(fp.get(con, 0)), int(tg.get(con, 0) or 0)
+                    _ty, _sd = int(o.get("type") or 0), int(o.get("side"))
+                except (TypeError, ValueError):
+                    continue
+                d_app = 1 if (q0 - tgt) > 0 else -1
+                if _ty not in (4, 5) or _sd != (1 if d_app > 0 else 0):
+                    continue                                # 지정가, 진입 쪽 정지 주문 = 회원 것일 수 있다
+                if q == 0:
+                    pass                                    # 플랫 계약의 닫는 쪽 손절 = 고아
+                elif tgt != 0 and q * d_app > 0 and (q - tgt) * d_app <= 0:
+                    try:
+                        _px, _sz = float(o.get("stopPrice")), abs(int(o.get("size") or 0))
+                    except (TypeError, ValueError):
+                        continue
+                    _hit = any(abs(_px - float(s)) <= max(1e-9, 1e-5 * abs(float(s))) for s in ((info.get("stops") or {}).get(con) or []))
+                    if not _hit or _sz > budget.get(con, 0):
+                        continue                            # 회원 포지션의 손절일 수 있다 - 앱 손절 자리와 같은 것만
+                    budget[con] = budget.get(con, 0) - _sz
+                else:
+                    continue                                # 아직 정리 전(또는 다시 열린 포지션) - 손절 유지
+            try:
+                b._cancel_order(aid, o.get("id"))
+            except Exception:
+                left += 1
+        return left
+
+    def _daycap_mon_send(self, b, t, snap) -> int:
+        """청산 발주만 한다(기다리지 않는다). 발동 때 정한 계약에서 아직 남은 수량만 - 전부 정리는 closeContract(같은 것을 다시 보내도 플랫이면
+        아무것도 안 닫는다), 앱 몫만 정리는 partialCloseContract를 한 번만(다시 보내면 회원 수량을 닫을 수 있다). 그 밖의 포지션은 건드리지
+        않는다. 그림자 모드, 라이브 잠금이면 주문을 내지 않는다(3차 리뷰 P1). 반환 = 낸 주문 수."""
+        import time as _t
+        sc, _k = t["sc"], t["key"]
+        info = self._dc_map("_dc_fired").get(_k) or {}
+        lbl = info.get("lbl") or t.get("lbl") or sc
+        if not self._dc_orders_ok(bool(info.get("test"))):
+            self._daycap_note_once(("send_blocked", _k, info.get("ts")),
+                                   f"   [{lbl}] 그림자 모드나 라이브 잠금이라 정리 주문을 내지 않았습니다. 포지션은 그대로 있습니다.",
+                                   f"   [{lbl}] Shadow mode or the live lock is on, so no close order was sent. The positions stay "
+                                   f"as they are.")
+            return 0
+        fp = info.get("pos") or {}
+        tg = info.get("tgt") or {}
+        psent = info.setdefault("psent", {})
+        mine = [p for p in snap["poss"] if self._dc_remaining(info, p["con"], p["qty"]) > 0] if fp else list(snap["poss"])
+        info["assets"] = sorted(set(info.get("assets") or []) | ({self._fill_asset(p["con"]) for p in mine} - {None}))
+        n = 0
+        for p in mine:
+            con = p["con"]
+            acct = p.get("acct") or snap.get("aid")
+            tgt = int(tg.get(con, 0) or 0)
+            try:
+                if tgt == 0:
+                    b.close_contract(acct, con)
+                    n += 1
+                else:
+                    if con in psent:
+                        continue                            # 앱 몫만 정리하는 주문은 한 번만
+                    psent[con] = _t.time()
+                    self._daycap_fired_save(_k)
+                    b.partial_close_contract(acct, con, self._dc_remaining(info, con, p["qty"]))
+                    n += 1
+            except Exception as _ce:
+                self._daycap_note_once(("close_fail", _k, info.get("ts"), con),     # 5초마다 다시 하므로 같은 정리에선 한 번만
+                                       f"   [{lbl}] {con} 청산 발주 실패: {str(_ce)[:100]}",
+                                       f"   [{lbl}] {con}: close order failed: {str(_ce)[:100]}")
+        return n
+
+    def _daycap_mon_confirm(self, pend) -> None:
+        """이번 회차에 청산을 발주한 계좌들의 정리를 함께 확인한다(1초마다, 최대 8초). 발동 때 정한 수량이 다 닫혔으면 마무리(_daycap_mon_finish).
+        끝까지 아니면 다 닫힌 계약의 주문만 걷고(살아 있는 leg의 손절은 둔다) 래치를 남긴다 - 다음 회차가 이어서 정리하고, 늦게라도 다 닫힌 것이
+        보이면 그때 마무리한다."""
+        import time as _t
+        fired = self._dc_map("_dc_fired")
+        wait = list(pend or [])
+        for _ in range(8):
+            if not wait:
+                break
+            _t.sleep(1)
+            nxt, ac = [], {}
+            for b, t, snap in wait:
+                info = fired.get(t["key"])
+                if not isinstance(info, dict):
+                    continue
+                try:
+                    s2 = self._daycap_mon_snap(b, t["broker"], t["sc"], ac, fresh=True)
+                except Exception:
+                    s2 = None
+                if s2 is None:
+                    nxt.append((b, t, snap))
+                    continue
+                if not [p for p in s2["poss"] if self._dc_remaining(info, p["con"], p["qty"]) > 0]:
+                    self._daycap_mon_finish(b, t, s2)
+                else:
+                    nxt.append((b, t, snap))
+            wait = nxt
+        for b, t, snap in wait:
+            _k = t["key"]
+            info = fired.get(_k) or {}
+            lbl = info.get("lbl") or t.get("lbl") or t["sc"]
+            if t["broker"] == "projectx":
+                self._daycap_cleanup(b, snap.get("aid") or info.get("aid"), info)
+            if info.get("psent"):
+                self._daycap_note_once(("part_unconf", _k, info.get("ts")),
+                                       f"   [{lbl}] 앱 몫만 정리하는 주문의 체결을 아직 확인하지 못했습니다. 회원 수량을 닫지 않도록 같은 주문을 "
+                                       f"다시 내지 않고 지켜봅니다. 브로커 화면에서 확인하십시오.",
+                                       f"   [{lbl}] The order closing only the app's part is not confirmed yet. It is not sent again, "
+                                       f"so the contracts added by hand are never closed; the app keeps watching. Please check at "
+                                       f"your broker.")
+            self._daycap_note_once(("close_unconf", _k, info.get("ts")),
+                                   f"   [{lbl}] 평가 계좌 익절 청산이 아직 확인되지 않았습니다. 남은 leg의 손절은 그대로 두고 5초마다 이어서 정리합니다.",
+                                   f"   [{lbl}] The evaluation take-profit close is not confirmed yet. The stops of the remaining legs stay "
+                                   f"in place, and it keeps going every 5 seconds.")
+
+    def _daycap_latch_stop(self, b, t, snap, day) -> None:
+        """발동 래치가 지금 포지션을 더 닫지 않는다(멈춤, 다음 거래일, 플랫 확인 뒤 다시 열린 포지션, 새 진입이나 늘린 수량): 닫지 않고 다 닫힌 발동
+        계약의 남은 주문만 걷은 뒤 래치를 놓는다. 걷지 못한 주문이 있으면 멈춘 래치로 남겨 다음 회차에 다시 걷는다."""
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        fired = self._dc_map("_dc_fired")
+        info = fired.get(_k)
+        if not isinstance(info, dict):
+            return
+        lbl = info.get("lbl") or t.get("lbl") or sc
+        if not info.get("halt"):
+            if info.get("day") != day:
+                _why_ko, _why_en = "거래일이 바뀌었습니다", "the trading day changed"
+            elif info.get("done"):
+                _why_ko, _why_en = "플랫을 확인한 뒤 다시 열린 포지션입니다", "the position opened again after the flat was confirmed"
+            else:
+                _why_ko, _why_en = "정리하던 포지션이 바뀌었습니다", "the positions being closed changed"
+            info["halt"] = True
+            self._daycap_note_once(("latch_stop", _k, info.get("ts")),
+                                   (f"   [{lbl}] 평가 계좌 익절 정리를 멈춥니다({_why_ko}). 지금 열린 포지션과 그 손절은 그대로 둡니다."),
+                                   (f"   [{lbl}] The evaluation take-profit close stops here ({_why_en}). The positions open now and "
+                                    f"their stops stay as they are."))
+        _left = self._daycap_cleanup(b, snap.get("aid") or info.get("aid"), info) if bk == "projectx" else 0
+        if _left:
+            self._daycap_fired_save(_k)
+            if self._dc_orders_ok(bool(info.get("test"))):
+                self._daycap_note_once(("left_orders", _k, info.get("ts")),
+                                       f"   [{lbl}] 플랫인 계약에 남은 주문 {_left}개를 걷지 못했습니다. 5초 뒤 다시 걷습니다.",
+                                       f"   [{lbl}] {_left} leftover order(s) on the flat contracts could not be cancelled. Retrying in "
+                                       f"5 seconds.")
+            return
+        self._daycap_fired_clear(_k)
+
+    def _daycap_mon_finish(self, b, t, snap) -> None:
+        """발동 때 정한 수량이 다 닫힌 뒤: 그 계약들의 남은 주문 걷기(ProjectX - NT8 close는 종목 Flatten이라 주문까지 걷는다) → 처음 한 번만 하루
+        상한이면 오늘 닿음 표시, 통과 목표면 통과 표시(최고일을 다 알 때만) → 닫은 자산마다 exit_ok(why=cap_tp) 한 번 + 자산 맥락이 이 계좌면
+        다른 평가 계좌로 넘기거나 청산 보고. 주문을 다 못 걷으면 래치와 디스크 기록을 남겨 다음 회차(재시작 뒤 포함)가 주문 정리만 다시 한다(표시와
+        보고는 한 번만)."""
+        ko = self.lang == "ko"
+        bk, sc, _k = t["broker"], t["sc"], t["key"]
+        fired = self._dc_map("_dc_fired")
+        info = fired.get(_k)
+        if info is None:
+            return
+        lbl = info.get("lbl") or t.get("lbl") or sc
+        _left = (self._daycap_cleanup(b, snap.get("aid") or info.get("aid"), info) if bk == "projectx" else 0)
+        if not info.get("done"):
+            info["done"] = True
+            day = info.get("day") or _daycap_day_start()[1]
+            if info.get("mode") == "pass":
+                bal2 = None
+                try:
+                    bal2 = self._dc_f(b.account_netliq(sc) if bk == "nt8" else (snap.get("bal")))
+                    if bk == "projectx":
+                        _s3 = self._daycap_mon_snap(b, bk, sc, None, fresh=True, fresh_accts=True)
+                        bal2 = _s3.get("bal") if _s3 else bal2
+                except Exception:
+                    pass
+                # 통과 판정 잔고: 자동 통과 익절 = 실제로 통과하는 잔고(여유 뺀 금액, 3차 결정 B), 회원 값 = 그 값 - 청산 비용 여유(종전 규약).
+                _ptp = float(info.get("pass_need") or info.get("pass_tp") or 0)
+                _low = _ptp if info.get("pass_src") == "auto" else _ptp - float(info.get("buf") or 0)
+                if bal2 is not None and bal2 < _low:
+                    self.log((f"   [{lbl}] 통과 목표 익절을 마쳤지만 실현 잔고 {self._daycap_money(bal2)}가 통과 목표 잔고 "
+                              f"{self._daycap_money(_ptp)}에 조금 못 미쳐 통과로 표시하지 않았습니다. {info.get('firm')} 화면에서 "
+                              f"확인하십시오.") if ko else
+                             (f"   [{lbl}] The pass take-profit close is done, but the realized balance "
+                              f"{self._daycap_money(bal2)} landed slightly below the pass target balance {self._daycap_money(_ptp)}, "
+                              f"so the account is not marked as passed. Please check on {info.get('firm')}."))
+                    if info.get("pass_src") == "auto":       # 모자란 만큼 다음 거래일 여유에 더한다(3차 리뷰 P1)
+                        try:
+                            with _DAYCAP_STATE_LOCK:
+                                _tf = self._dc_state()["tp_fired"].get(_k)
+                                if isinstance(_tf, dict):
+                                    _tf["short"] = round(float(_low) - float(bal2), 2)
+                            self._dc_save()
+                        except Exception:
+                            pass
+                elif not info.get("markable", True):
+                    self.log((f"   [{lbl}] 통과 목표 익절을 마쳤습니다(플랫 확인"
+                              + (f", 실현 잔고 {self._daycap_money(bal2)}" if bal2 is not None else "") + ").") if ko else
+                             (f"   [{lbl}] The pass target take-profit is done (flat confirmed"
+                              + (f", realized balance {self._daycap_money(bal2)}" if bal2 is not None else "") + ")."))
+                    self._dc_pass_hold(bk, sc, lbl, (bal2 if bal2 is not None else info.get("eq")), _ptp,
+                                       info.get("mwhy") or "best", info.get("firm"))
+                else:
+                    self.log((f"   [{lbl}] 통과 목표 익절을 마쳤습니다(플랫 확인"
+                              + (f", 실현 잔고 {self._daycap_money(bal2)}" if bal2 is not None else "") + ").") if ko else
+                             (f"   [{lbl}] The pass target take-profit is done (flat confirmed"
+                              + (f", realized balance {self._daycap_money(bal2)}" if bal2 is not None else "") + ")."))
+                    self._daycap_mark_passed(bk, sc, bal=bal2, pass_tp=_ptp, lbl=lbl, size=info.get("size"), via="watch",
+                                             target=info.get("target"), src=info.get("pass_src") or "auto")
+            else:
+                self._daycap_set_hit(bk, sc, day)
+                _dp = info.get("dp")
+                self.log((f"   [{lbl}] " + ("[시험 모드] " if info.get("test") else "") + "하루 이익 상한 익절을 마쳤습니다"
+                          + (f"(오늘 손익 약 {self._daycap_money(_dp)})" if _dp is not None else "")
+                          + f". 이 계좌는 오늘 더 진입하지 않습니다. 다음 {info.get('firm')} 거래일({_dc_day_txt()})부터 다시 진입합니다.")
+                         if ko else
+                         (f"   [{lbl}] " + ("[Test mode] " if info.get("test") else "") + "The daily profit cap take-profit is done"
+                          + (f" (today's P&L about {self._daycap_money(_dp)})" if _dp is not None else "")
+                          + f". This account takes no more entries today. It enters again from the next {info.get('firm')} "
+                            f"trading day ({_dc_day_txt()})."))
+                try:
+                    if _dp is not None:
+                        self._daycap_set_status(bk, sc, day=day, room=float(info.get("cap") or 0) - float(_dp),
+                                                cap=info.get("cap"), pass_tp=info.get("pass_tp"))
+                except (TypeError, ValueError):
+                    pass
+            _ids = {str(sc).strip().casefold(), str(info.get("aid") or "").strip().casefold()} - {""}
+            for _a in sorted(set(info.get("assets") or [])):
+                if not info.get("test"):                     # 시험용 스위치의 연습 계좌 정리는 증거 원장에 싣지 않는다(서버 보고는 daycap 사건으로, 3차 마무리 3)
+                    self._send_ev("exit_ok", _a, why="cap_tp")  # 자산마다 한 번(leg마다 아님, 리뷰 P2)
+                self._daycap_ctx_release(_a, _ids, _k)
+            self._dc_map("_dc_real").pop(_k, None)
+        if _left:
+            self._daycap_fired_save(_k)                     # 래치와 디스크 기록 유지 - 다음 회차(재시작 뒤 포함)에 주문 정리만 다시
+            if self._dc_orders_ok(bool(info.get("test"))):
+                self._daycap_note_once(("left_orders", _k, info.get("ts")),
+                                       f"   [{lbl}] 플랫인 계좌에 남은 주문 {_left}개를 걷지 못했습니다. 5초 뒤 다시 걷습니다.",
+                                       f"   [{lbl}] {_left} leftover order(s) on the flat account could not be cancelled. Retrying in "
+                                       f"5 seconds.")
+            return
+        self._daycap_fired_clear(_k)
+
+    def _daycap_mode_notice(self) -> None:
+        """[라이브 시작] 때 숨은 설정 안내: 시험판(_TEST_BUILD), 그림자 모드(3차 결정 E), 시험용 스위치(3차 마무리 3) - 켜져 있을 때만 한 줄씩."""
+        if _TEST_BUILD:
+            self.log("   이 앱은 시험판입니다(회원 배포본이 아닙니다). 평가 계좌 익절 그림자 모드가 기본으로 켜져 있습니다"
+                     "(config.yaml에 daycap_shadow: false를 넣으면 꺼집니다)."
+                     if self.lang == "ko" else
+                     "   This is a test build (not the member release). Evaluation take-profit shadow mode is on by default "
+                     "(add daycap_shadow: false to config.yaml to turn it off).")
+        if _daycap_shadow():
+            self.log("   평가 계좌 익절 그림자 모드가 켜져 있습니다. 감시가 선에 닿아도 정리 주문을 내지 않고 '정리했을 경우' 로그만 남깁니다."
+                     if self.lang == "ko" else
+                     "   Evaluation take-profit shadow mode is on. When the watch reaches a line it sends no close order and "
+                     "only writes a 'Would have closed' log line.")
+        if _daycap_test_on():                           # 시험용 스위치(3차 마무리 3)
+            _tc, _traw = _daycap_test_cap(), _daycap_test_cap_raw()
+            _tbad = _traw is not None and _srv_num(_traw, *_DAYCAP_TEST_CAP_RANGE) is None
+            self.log(("   평가 계좌 익절 시험 모드가 켜져 있습니다(daycap_test). 연습 계좌(Topstep PRAC, NinjaTrader Sim101)만 평가처럼 보고, "
+                      f"오늘 손익이 {_money(_tc)}에 닿으면 그 계좌 포지션을 손으로 연 것까지 시장가로 정리하고 남은 손절 주문을 걷습니다. 그날은 "
+                      "그 계좌로 더 진입하지 않습니다. 그림자 모드여도 이 연습 계좌는 실제로 정리합니다. 다른 계좌에는 걸리지 않습니다."
+                      + (f" daycap_test_cap 값({str(_traw)[:12]})이 10~500 밖이라 $50을 씁니다." if _tbad else ""))
+                     if self.lang == "ko" else
+                     ("   Evaluation take-profit test mode is on (daycap_test). Only practice accounts (Topstep PRAC, NinjaTrader "
+                      f"Sim101) are treated as evaluations: when today's P&L reaches {_money(_tc)}, every position on that "
+                      "account, including ones opened by hand, is closed at market and the leftover stop orders are cancelled. "
+                      "That account takes no more entries that day. These practice accounts are closed for real even in shadow "
+                      "mode. No other account is affected."
+                      + (f" The daycap_test_cap value ({str(_traw)[:12]}) is outside 10 to 500, so $50 is used." if _tbad
+                         else "")))
+
+    def _daycap_ctx_release(self, asset, ids, key) -> None:
+        """감시가 닫은 계좌가 그 자산의 맥락(ctx)이면: 같은 자산을 든 다른 평가 계좌(앱 진입 기록)로 맥락을 넘기고, 없으면 청산을
+        보고한다(why=cap_tp). 맥락이 다른 계좌면 손대지 않는다(그 계좌는 아직 열려 있다)."""
+        _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(asset))
+        if _ctx is None and self._restore_open_ctx(asset):
+            _ctx = (getattr(self, "_open_ctx", {}) or {}).get(str(asset))
+        if not _ctx or str(_ctx.get("aid") or "").strip().casefold() not in ids:
+            return
+        for _k2, rec in list(self._dc_map("_dc_mon").items()):
+            if _k2 == key or not isinstance(rec, dict):
+                continue
+            for leg in rec.get("legs") or []:
+                if not isinstance(leg, dict) or leg.get("asset") != asset:
+                    continue
+                b2 = rec.get("b") or self._daycap_rec_broker(rec)
+                if b2 is None:
+                    continue
+                self._open_ctx[str(asset)] = {"b": b2, "sym": leg.get("con"), "stop": leg.get("stop"),
+                                              "app_stop": leg.get("stop"), "aid": rec.get("aid"), "dir": leg.get("dir"),
+                                              "size": leg.get("size"), "cap": True}
+                self._persist_open_ctx(str(asset))
+                return
+        self._open_ctx.pop(str(asset), None)
+        self._forget_open_ctx(asset)
+        self._send_fill(asset, closed=True, why="cap_tp")
+
+    def _daycap_rec_broker(self, rec):
+        """감시 기록의 계좌로 브로커를 다시 짓는다(재시작 뒤 - 설정 + 키체인, 계좌 목록은 그 계좌만)."""
+        bk, sc = str(rec.get("broker") or ""), str(rec.get("sc") or "")
+        for _a in [l.get("asset") for l in (rec.get("legs") or []) if isinstance(l, dict)] + list(_ASSETS):
+            try:
+                _cr = self._creds_peek(_a, bk) or {}
+                _f1 = str(_cr.get("f1") or "").strip()
+                if not _f1 and bk != "nt8":
+                    continue
+                return _build_broker(bk, _f1, (_f2_load(_f1) or "") if _f1 else "", _cr.get("f3", ""), [sc] if sc else [])
+            except Exception:
+                continue
+        return None
+
+    # ── Lucid(NT8) 오늘 손익 재료 ──
+    def _daycap_nt8_base(self, b, acct, s_utc, day, cash=None):
+        """Lucid 거래일 시작 잔고(그날 처음 볼 때 한 번 잡고 디스크에 둔다): 지금 현금 잔고 − 오늘 실현 손익(NT8 체결 기록).
+        재시작해도 같은 거래일이면 같은 값을 쓴다. 현금 잔고를 못 읽으면 None(그 회차는 판단하지 않는다)."""
+        _k = self._daycap_key("nt8", acct)
+        st = self._dc_state()
+        _r = st["nt8_base"].get(_k)
+        if isinstance(_r, dict) and _r.get("day") == day:
+            try:
+                _b = float(_r.get("base"))
+                with _DAYCAP_STATE_LOCK:
+                    if not isinstance(st["nt8_bases"].get(_k), dict):
+                        st["nt8_bases"][_k] = {}
+                    st["nt8_bases"][_k].setdefault(day, round(_b, 2))
+                return _b
+            except (TypeError, ValueError):
+                pass
+        if cash is None:
+            try:
+                cash = b.account_balance(acct)
+            except Exception:
+                cash = None
+        try:
+            cash = float(cash)
+        except (TypeError, ValueError):
+            return None
+        real = 0.0
+        try:
+            for f in b.closed_fills(int(s_utc.timestamp() * 1000)) or []:
+                if str(f.get("acct") or "").strip().casefold() == str(acct).strip().casefold():
+                    real += float(f.get("pnl") or 0.0)
+        except Exception as _e:
+            self._dc_exc_note("nt8_fills", _e)             # 오늘 실현을 못 더했다 - 시작 잔고가 그만큼 틀릴 수 있어 남긴다
+        base = cash - real
+        with _DAYCAP_STATE_LOCK:
+            st["nt8_base"][_k] = {"day": day, "base": round(base, 2)}
+            # 3차 리뷰 P0: 거래일마다 시작 잔고를 남긴다. 바로 앞 거래일의 시작 잔고가 있으면 그 차가 앞 거래일의 끝 손익이다 - 앱이 그날 중간에
+            # 꺼져 원장에 덜 적힌 값이 남았어도 끝 손익으로 고친다(크게 잡는 쪽, 통과 익절을 일찍 잡지 않게). 이웃하지 않은 날은 모르는 날로 둔다.
+            bs = st["nt8_bases"].get(_k)
+            if not isinstance(bs, dict):
+                bs = st["nt8_bases"][_k] = {}
+            bs[day] = round(base, 2)
+            if len(bs) > 400:
+                for _d in sorted(bs)[:len(bs) - 400]:
+                    bs.pop(_d, None)
+            _prev = max((d for d in bs if d < day), default=None)
+            if _prev and self._dc_next_tday(_prev) == day:
+                try:
+                    _full = round(float(base) - float(bs[_prev]), 2)
+                    dd = st["days"].setdefault(_k, {})
+                    dd[_prev] = max(float(dd.get(_prev, _full)), _full)
+                except (TypeError, ValueError):
+                    pass
+        self._dc_save()
+        _fm = "NinjaTrader" if _daycap_test_acct("nt8", acct) else "Lucid"     # 시험 모드의 Sim101은 Lucid 계좌가 아니다
+        self.log((f"   [{acct}] {_fm} 거래일 시작 잔고를 {self._daycap_money(base)}로 잡았습니다"
+                  f"(지금 잔고 {self._daycap_money(cash)}, 오늘 실현 {self._daycap_money(real)}).") if self.lang == "ko" else
+                 (f"   [{acct}] The {_fm} trading-day starting balance is set to {self._daycap_money(base)} "
+                  f"(balance now {self._daycap_money(cash)}, realized today {self._daycap_money(real)})."))
+        return base
+
+    def _daycap_nt8_daypnl(self, b, acct, s_utc, day, cash=None):
+        """Lucid 오늘 손익 = NetLiq − 거래일 시작 잔고. 스냅샷이 낡았거나 NetLiq를 못 읽으면 None."""
+        if hasattr(b, "snapshot_fresh") and not b.snapshot_fresh():
+            return None
+        try:
+            nl = b.account_netliq(acct)
+            nl = float(nl) if nl is not None else None
+        except Exception:
+            nl = None
+        if nl is None:
+            return None
+        if cash is None:
+            try:
+                cash = b.account_balance(acct)
+            except Exception:
+                cash = None
+        try:
+            if nl == 0.0 and cash and float(cash) > 0:
+                return None                                 # 피드가 NetLiq를 안 줌(0 고정)
+        except (TypeError, ValueError):
+            pass
+        base = self._daycap_nt8_base(b, acct, s_utc, day, cash=cash)
+        return None if base is None else nl - base
+
+    # ── 권장 1R(결정 6): 기존 1R은 말없이 바꾸지 않는다 - 새 계좌 미리 채움, [권장 1R로 맞추기] 한 번, 통과 뒤 한 번 묻기 ──
+    def _reco_for_row(self, asset, acct, bal=None):
+        """이 계좌 행의 (권장 1R 또는 None, 단계, 규모). 권장은 권장 1R 표에 있는 규모만(_reco_one_r, 지금은 150K). Topstep 펀디드 이름
+        (EXPRESS-…)에는 규모가 없어 회원이 고른 규모, 없으면 150K로 본다(3차 결정 G). 프롭 '라이브 초기' 계좌는 권하지 않는다."""
+        bk = self._acct_broker(asset, acct)
+        if bk not in _DAYCAP_FIRMS:
+            return None, "none", 0
+        pr = dict(_PROP_DEFAULTS)
+        pr.update((acct or {}).get("prop") or {})
+        if pr.get("on") and pr.get("type") == "live":
+            return None, "live", 0
+        aid = str((acct or {}).get("id") or "").strip()
+        stage, size = self._daycap_stage_cfg(bk, aid, pr, bal=bal)
+        if stage == "funded" and not size:
+            # Topstep 펀디드 이름(EXPRESS-…)에는 규모가 없다 - 회원이 고른 규모, 없으면 150K로 본다(3차 결정 G, 대표 "회원들은 설정 안 바꾼다").
+            size = _daycap_norm_size(pr.get("size")) or (_XFA_DEFAULT_SIZE if bk == "projectx" else 0)
+        return _reco_one_r(bk, stage, size), stage, size
+
+    @staticmethod
+    def _apply_reco_row(acct, reco, stage) -> bool:
+        """한 행에 권장 1R을 넣는다(회원이 누른 뒤에만 불린다). 프롭 자동 사이징이 켜진 행은 판별된 단계의 1R 칸과 유형을 맞추고
+        (평가 = 테스트기 r_test, 펀디드 = r_steady), 꺼진 행은 1R 칸(one_r). 라이브 초기 유형은 건드리지 않는다."""
+        pr = (acct or {}).get("prop")
+        if isinstance(pr, dict) and pr.get("on"):
+            if pr.get("type") == "live":
+                return False
+            if stage == "eval":
+                pr["type"], pr["r_test"] = "test", float(reco)
+            else:
+                pr["type"] = "funded"
+                pr["r_steady"] = pr["r_buffer"] = float(reco)
+            pr["set"] = True
+        else:
+            acct["one_r"] = float(reco)
+        return True
+
+    def _apply_reco_rows(self, rows) -> list:
+        """[권장 1R로 맞추기]: rows = [{asset, idx, id, lbl, before, after, stage}] 그대로 바꾼다(창에 보인 전후). 행이 그 사이 바뀌었으면
+        건너뛴다. 반환 = 실제로 바꾼 [(자산, 라벨, 전, 후)]."""
+        done = []
+        for r in rows or []:
+            try:
+                acct = ((self._acfg.get(r["asset"]) or {}).get("accounts") or [])[int(r["idx"])]
+            except Exception:
+                continue
+            if str(acct.get("id") or "").strip() != str(r.get("id") or "").strip():
+                continue
+            _before = self._planned_one_r(acct)
+            if self._apply_reco_row(acct, r["after"], r["stage"]):
+                done.append((r["asset"], r.get("lbl") or "", _before, self._planned_one_r(acct)))
+        if done:
+            self._save_cfg()
+            for _a, _l, _b, _af in done:
+                self.log((f"   1R 권장 값 적용: [{_a}, {_l}] ${float(_b or 0):,.0f} → ${float(_af or 0):,.0f} (회원이 [권장 1R로 맞추기]를 누름)")
+                         if self.lang == "ko" else
+                         (f"   Recommended 1R applied: [{_a}, {_l}] ${float(_b or 0):,.0f} → ${float(_af or 0):,.0f} (you pressed "
+                          f"[Apply recommended 1R])"))
+            try:
+                self._build()
+            except Exception:
+                pass
+        return done
+
+    def _apply_reco_account(self, broker, acct_id, reco, stage) -> list:
+        """같은 계좌(브로커 + id)의 모든 자산 행에 권장 1R(통과 뒤 [바꾸기]). 반환 = [(자산, 라벨, 전, 후)]."""
+        rows = []
+        want = str(acct_id or "").strip().casefold()
+        for _a in _ASSETS:
+            for _i, _rw in enumerate(((self._acfg.get(_a) or {}).get("accounts") or [])):
+                if str(_rw.get("id") or "").strip().casefold() == want and self._acct_broker(_a, _rw) == broker:
+                    rows.append({"asset": _a, "idx": _i, "id": _rw.get("id"), "lbl": _rw.get("label") or str(_rw.get("id"))[-4:],
+                                 "after": float(reco), "stage": stage})
+        return self._apply_reco_rows(rows)
+
+    def _reco_prefill_row(self, i, w) -> None:
+        """새 계좌 행에서 계좌를 처음 고르는 순간(결정 6): 1R 칸이 새 계좌 기본값($500) 그대로면 권장 1R을 칸에 미리 채운다 - 회원이 보는
+        칸이고 저장은 종전 행 저장 그대로다. 이미 계좌가 있던 행, 프롭 자동 사이징 행, 회원이 이미 고친 칸은 건드리지 않는다.
+        Lucid는 단계를 물어 답을 받은 뒤 채운다(_lucid_stage_set)."""
+        try:
+            acct = self._accts_of(self._asset)[i]
+            if str(acct.get("id") or "").strip() or (acct.get("prop") or {}).get("on"):
+                return
+            _icb, _re_ = (w or {}).get("acct_id"), (w or {}).get("one_r")
+            if _icb is None or _re_ is None:
+                return
+            v = str(_icb.get()).strip()
+            if not v or v.startswith("…") or v in ("계좌 선택", "pick"):
+                return
+            if (_as_float(acct.get("one_r"), 0.0) != DEFAULT_ONE_R
+                    or str(_re_.get()).strip() != f"{DEFAULT_ONE_R:g}"):
+                return
+            bk = self._acct_broker(self._asset, acct)
+            # 같은 계좌의 다른 행이 이미 받은 Lucid 답도 본다(2차 리뷰 P2: 빈 프롭으로 보면 Lucid는 늘 '미답'이라 답이 있는 계좌도 채우지 않고
+            # 표시만 남겼다 - 그 표시가 나중에 기존 행 1R을 바꾸는 씨앗이었다).
+            stage, size = self._daycap_stage_cfg(bk, v, {})
+            if bk == "nt8" and stage == "unanswered":
+                # 답을 받은 뒤 이 행(그 행 객체 하나)만 채운다(2차 리뷰 P0). 이미 물었던 계좌(창을 닫음)면 다시 묻지 않으므로 표시도 남기지 않는다.
+                if not self._dc_state()["asked"].get(self._daycap_key(bk, v)):
+                    self._dc_map("_dc_fresh").setdefault(self._daycap_key(bk, v), []).append(
+                        {"asset": self._asset, "idx": i, "row": acct})
+                return
+            if stage not in ("eval", "funded"):
+                return
+            _assumed = False
+            if stage == "funded" and not size and bk == "projectx":
+                size, _assumed = _XFA_DEFAULT_SIZE, True    # EXPRESS 이름에는 규모가 없다 - 150K로 본다(3차 결정 G)
+            reco = _reco_one_r(bk, stage, size)
+            if reco is None:
+                return
+            _entry_set_text(_re_, f"{reco:g}")
+            _firm = (_DAYCAP_FIRMS.get(bk) or {}).get("firm", "")
+            _sk = {"eval": "평가", "funded": "펀디드"}.get(stage, stage)
+            _se = {"eval": "evaluation", "funded": "funded"}.get(stage, stage)
+            _src_k, _src_e = (("계좌 이름으로 판별", "from the account name") if bk == "projectx" else
+                              ("이 계좌에 앞서 고른 단계", "from the stage chosen earlier for this account"))
+            if _assumed:
+                _src_k, _src_e = ("계좌 이름에 규모가 없어 150K로 봄", "the account name has no size, so 150K is assumed")
+            self.log((f"   새 계좌 1R 칸에 권장 값 ${reco:,.0f}을 넣었습니다({_firm} {size // 1000}K {_sk}, {_src_k}). "
+                      f"다른 값을 쓰시려면 1R 칸을 고치십시오.") if self.lang == "ko" else
+                     (f"   The new account's 1R field is prefilled with the recommended ${reco:,.0f} ({_firm} {size // 1000}K "
+                      f"{_se}, {_src_e}). Edit the 1R field to use another amount."))
+        except Exception:
+            pass
+
+    def _daycap_pass_prompt(self, broker, acct, lbl, size) -> None:
+        """평가 통과 뒤 한 번(결정 6): '평가를 통과했습니다. 펀디드 권장 1R $450로 바꿀까요?' [바꾸기] [그대로]. 150K가 아니면 권장
+        값이 없어 통과 안내만 한다. 1R은 [바꾸기]를 누를 때만 바뀐다."""
+        import time as _t
+        _k = self._daycap_key(broker, acct)
+        st = self._dc_state()
+        with _DAYCAP_STATE_LOCK:
+            if st["pass_prompted"].get(_k):
+                return
+            st["pass_prompted"][_k] = _t.time()
+        self._dc_save()
+        reco = _reco_one_r(broker, "funded", size)
+        try:
+            self.root.after(0, lambda: self._daycap_pass_prompt_show(broker, acct, lbl, reco))
+        except Exception:
+            pass
+
+    def _daycap_pass_prompt_show(self, broker, acct, lbl, reco) -> None:
+        ko = self.lang == "ko"
+        _firm = (_DAYCAP_FIRMS.get(broker) or {}).get("firm", "")
+        if reco is None:
+            messagebox.showinfo("EQ Autopilot",
+                                (f"[{lbl}] 평가 통과 목표에 닿았습니다. 이 계좌는 하루 이익 상한과 통과 익절을 끕니다.\n"
+                                 f"{_firm} 화면에서 통과 여부를 확인하십시오.") if ko else
+                                (f"[{lbl}] The evaluation pass target was reached. The daily profit cap and the pass "
+                                 f"take-profit are off for this account.\nPlease check the pass status on {_firm}."))
+            return
+        win = tk.Toplevel(self.root)
+        win.title("EQ Autopilot")
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=f"[{lbl}]", font=("", 0, "bold")).pack(anchor="w")
+        ttk.Label(frm, wraplength=380, justify="left",
+                  text=(f"평가를 통과했습니다. 펀디드 권장 1R ${reco:,.0f}로 바꿀까요?" if ko else
+                        f"The evaluation has passed. Change to the recommended funded 1R of ${reco:,.0f}?")
+                  ).pack(anchor="w", pady=(4, 2))
+        ttk.Label(frm, foreground="#888", wraplength=380, justify="left",
+                  text=(f"앱이 본 잔고 기준입니다. {_firm} 화면에서도 통과 여부를 확인하십시오. 1R은 [바꾸기]를 누를 때만 바뀝니다." if ko else
+                        f"This is based on the balance the app saw. Please also check the pass status on {_firm}. The 1R changes "
+                        f"only when you press [Change].")
+                  ).pack(anchor="w", pady=(0, 8))
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e")
+
+        def _yes():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            if not self._apply_reco_account(broker, acct, reco, "funded"):
+                self.log(f"   [{lbl}] 1R을 바꿀 계좌 행을 찾지 못했습니다." if ko else f"   [{lbl}] No account row to change was found.")
+
+        def _no():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self.log((f"   [{lbl}] 1R은 그대로 둡니다. [전 계좌 1R 조회]의 [권장 1R로 맞추기]로 언제든 바꿀 수 있습니다.") if ko else
+                     (f"   [{lbl}] The 1R stays as it is. You can change it any time with [Apply recommended 1R] in "
+                      f"[Check 1R (all)]."))
+        ttk.Button(btns, text=("바꾸기" if ko else "Change"), command=_yes).pack(side="left")
+        ttk.Button(btns, text=("그대로" if ko else "Keep"), command=_no).pack(side="left", padx=(6, 0))
+        win.protocol("WM_DELETE_WINDOW", _no)
+
+    def _one_r_window(self, title, msg, reco_rows) -> None:
+        """[전 계좌 1R 조회] 결과 창(메인 스레드). 권장 1R과 다른 계좌가 있으면 전후를 보여 주고, [권장 1R로 맞추기] 한 번으로 그대로 바꾼다
+        (결정 6 - 창에 보인 전후 그대로, 누르기 전에는 아무것도 바뀌지 않는다)."""
+        ko = self.lang == "ko"
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=msg, justify="left").pack(anchor="w")
+        btns = ttk.Frame(frm)
+        if reco_rows:
+            ttk.Label(frm, font=("", 0, "bold"),
+                      text=("권장 1R과 다른 계좌(아래 버튼을 누르면 이렇게 바뀝니다)" if ko else
+                            "Accounts that differ from the recommended 1R (the button below changes them as shown)")
+                      ).pack(anchor="w", pady=(10, 2))
+            for r in reco_rows:
+                ttk.Label(frm, justify="left", text=self._reco_line(r)).pack(anchor="w")
+            ttk.Label(frm, foreground="#888", wraplength=460, justify="left",
+                      text=("권장 값은 계좌 회사, 규모, 단계별 시뮬 기준값입니다(각 줄 화살표 오른쪽). 1R은 회원이 정하며, 누르기 전에는 바뀌지 "
+                            "않습니다." if ko else
+                            "The recommended values are the simulation baseline for each firm, size and stage (the right side of "
+                            "each arrow). You decide the 1R; nothing changes until you press the button.")
+                      ).pack(anchor="w", pady=(4, 0))
+            res_lbl = ttk.Label(frm, foreground="#1d4ed8", justify="left", text="")
+
+            def _apply():
+                done = self._apply_reco_rows(reco_rows)
+                try:
+                    b_apply.config(state="disabled")
+                    res_lbl.config(text=(("맞췄습니다: " if ko else "Applied: ")
+                                         + "; ".join(f"{_a} {_l} ${float(_b or 0):,.0f} → ${float(_af or 0):,.0f}"
+                                                     for _a, _l, _b, _af in done))
+                                   if done else ("바꾼 계좌가 없습니다(그 사이 계좌 설정이 바뀌었습니다)." if ko else
+                                                 "Nothing was changed (the account settings changed in the meantime)."))
+                    res_lbl.pack(anchor="w", pady=(6, 0))
+                except Exception:
+                    pass
+            b_apply = ttk.Button(btns, text=("권장 1R로 맞추기" if ko else "Apply recommended 1R"), command=_apply)
+            b_apply.pack(side="left")
+        btns.pack(anchor="e", pady=(10, 0))
+        ttk.Button(btns, text=("닫기" if ko else "Close"), command=win.destroy).pack(side="left", padx=(6, 0))
+
+    def _reco_line(self, r) -> str:
+        ko = self.lang == "ko"
+        _firm = (_DAYCAP_FIRMS.get(r.get("broker")) or {}).get("firm", "")
+        _sk = {"eval": "평가", "funded": "펀디드", "passed": "평가 통과"}.get(r.get("stage"), "")
+        _se = {"eval": "evaluation", "funded": "funded", "passed": "passed evaluation"}.get(r.get("stage"), "")
+        _ty = ""
+        if r.get("type_from") and r.get("type_to") and r["type_from"] != r["type_to"]:
+            _tk = {"test": "테스트기", "funded": "펀디드", "live": "라이브 초기"}
+            _te = {"test": "challenge", "funded": "funded", "live": "live-early"}
+            _ty = ((f", 프롭 유형 {_tk.get(r['type_from'], r['type_from'])} → {_tk.get(r['type_to'], r['type_to'])}") if ko else
+                   (f", prop type {_te.get(r['type_from'], r['type_from'])} → {_te.get(r['type_to'], r['type_to'])}"))
+        _b = _money(r["before"]) if r.get("before") is not None else "-"
+        _szk = f"{int(r.get('size') or 150000) // 1000}K"
+        return ((f"   [{r['asset']}, {r.get('lbl')}] 1R {_b} → {_money(r['after'])} ({_firm} {_szk} {_sk}{_ty})") if ko else
+                (f"   [{r['asset']}, {r.get('lbl')}] 1R {_b} → {_money(r['after'])} ({_firm} {_szk} {_se}{_ty})"))
+
+    # ── Lucid 단계 한 번 묻기(결정 4) ──
+    def _lucid_stage_check(self) -> None:
+        """단계 답이 없는 Lucid 계좌(이름 L + 요금제 + 드로다운 + 규모)가 있으면 한 번 묻는다: 평가입니까, 펀디드입니까. 계좌마다 한 번만
+        묻고(창을 닫아도 다시 묻지 않는다 - 프롭 설정에서 언제든 고른다), 답하기 전에는 그 계좌에 상한을 걸지 않는다(안전 쪽)."""
+        import time as _t
+        if _daycap_off() or getattr(self, "_lucid_asking", False) is True:
+            return
+        try:
+            st = self._dc_state()
+            for _a in _ASSETS:
+                for _rw in (((self._acfg or {}).get(_a) or {}).get("accounts") or []):
+                    if self._acct_broker(_a, _rw) != "nt8":
+                        continue
+                    aid = str(_rw.get("id") or "").strip()
+                    if not aid or _dc_name_info("nt8", aid)[0] != "eval":
+                        continue
+                    if self._daycap_stage_flag("nt8", aid, _rw.get("prop")):
+                        continue
+                    _k = self._daycap_key("nt8", aid)
+                    if st["asked"].get(_k):
+                        continue
+                    with _DAYCAP_STATE_LOCK:
+                        st["asked"][_k] = _t.time()
+                    self._dc_save()
+                    self._lucid_asking = True
+                    self._lucid_stage_ask(aid, str(_rw.get("label") or ""))
+                    return
+        except Exception:
+            self._lucid_asking = False
+
+    @staticmethod
+    def _lucid_rule_text(aid, ko) -> str:
+        """Lucid 평가 계좌에서 앱이 하는 일 한 문장 - 요금제(이름 둘째 글자)마다 사실대로(2차 리뷰 P1: LucidPro, LucidFlex 평가에 LucidDaily의
+        50% 규칙을 말하고 걸던 것)."""
+        _pl = _daycap_lucid_plan(aid)
+        if _pl in _dc_cap_plans():
+            _pc = _dc_pct("nt8") * 100
+            _pd = {"D": "LucidDaily", "F": "LucidFlex", "P": "LucidPro"}.get(_pl, "Lucid")
+            _cn = int(round(_dc_cons_plan("nt8", _pl) * 100))     # 그 요금제 일관성 선(서버 값 > 내장, 3차 마무리 1)
+            return ((f"평가 계좌면 하루 이익 상한(목표의 {_pc:.1f}%, {_pd} {_cn}% 규칙 바로 아래)과 통과 익절에서 앱이 그 계좌 포지션을 "
+                     f"정리합니다.") if ko else
+                    (f"On an evaluation account the app closes that account's positions at the daily profit cap ({_pc:.1f}% of "
+                     f"the target, just under the {_pd} {_cn}% rule) and at the pass take-profit."))
+        _pn = {"P": "LucidPro", "F": "LucidFlex"}.get(_pl, "Lucid")
+        return ((f"평가 계좌면 통과 목표에서 앱이 그 계좌 포지션을 정리합니다({_pn} 평가에는 하루 이익 상한을 걸지 않습니다).") if ko else
+                (f"On an evaluation account the app closes that account's positions at the pass target (no daily profit cap "
+                 f"on a {_pn} evaluation)."))
+
+    def _lucid_stage_ask(self, aid, lbl) -> None:
+        ko = self.lang == "ko"
+        try:
+            win = tk.Toplevel(self.root)
+        except Exception:
+            self._lucid_asking = False
+            return
+        win.title("EQ Autopilot")
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        _mt = _dc_name_info("nt8", aid)[3]
+        _nm = (f"{_mt} …{aid[-4:]}" if _mt else f"…{aid[-4:]}")
+        ttk.Label(frm, text=f"Lucid {_nm}" + (f" ({lbl})" if lbl and lbl.strip() and lbl.strip() not in aid else ""),
+                  font=("", 0, "bold")).pack(anchor="w")
+        ttk.Label(frm, text=("이 Lucid 계좌는 평가입니까, 펀디드입니까?" if ko else
+                             "Is this Lucid account an evaluation or funded?")).pack(anchor="w", pady=(4, 2))
+        ttk.Label(frm, foreground="#888", wraplength=360, justify="left",
+                  text=(self._lucid_rule_text(aid, ko)
+                        + (" 답하기 전에는 걸지 않습니다. 프롭 설정에서 언제든 바꿀 수 있습니다." if ko else
+                           " Nothing is applied until you answer. You can change it any time in the prop settings."))
+                  ).pack(anchor="w", pady=(0, 8))
+        # 이 계좌를 새 행에 막 고른 참이면(1R 칸이 새 계좌 기본값) 답에 따라 그 행 1R 칸에 무엇이 채워지는지 미리 말한다(2차 리뷰 P1).
+        _sz = _daycap_size_from_name("nt8", aid) or 0
+        _re_e, _re_f = _reco_one_r("nt8", "eval", _sz), _reco_one_r("nt8", "funded", _sz)
+        if self._dc_map("_dc_fresh").get(self._daycap_key("nt8", aid)) and _re_e and _re_f:
+            ttk.Label(frm, foreground="#888", wraplength=360, justify="left",
+                      text=((f"평가를 고르시면 새로 추가한 행의 1R 칸에 권장 ${_re_e:,.0f}이, 펀디드를 고르시면 ${_re_f:,.0f}이 채워집니다. "
+                             f"다른 값은 1R 칸에서 고치십시오.") if ko else
+                            (f"Choosing Evaluation fills the new row's 1R field with the recommended ${_re_e:,.0f}, and Funded "
+                             f"with ${_re_f:,.0f}. Edit the 1R field for another amount."))).pack(anchor="w", pady=(0, 8))
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e")
+
+        def _done(v):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._lucid_asking = False
+            if v is None:
+                self._dc_map("_dc_fresh").pop(self._daycap_key("nt8", aid), None)     # 답이 없으면 새 행 1R도 그대로 둔다
+                self.log((f"   Lucid {_nm}: 단계를 답하지 않으셨습니다. 이 계좌는 평가 계좌 익절 없이 종전대로 진입하며, 프롭 설정에서 언제든 "
+                          f"고를 수 있습니다.") if ko else
+                         (f"   Lucid {_nm}: no stage was chosen. This account enters as before without the evaluation "
+                          f"take-profit; you can pick it any time in the prop settings."))
+            else:
+                self._lucid_stage_set(aid, v)
+            try:
+                self.root.after(300, self._lucid_stage_check)
+            except Exception:
+                pass
+        ttk.Button(btns, text=("평가" if ko else "Evaluation"), command=lambda: _done("eval")).pack(side="left")
+        ttk.Button(btns, text=("펀디드" if ko else "Funded"), command=lambda: _done("funded")).pack(side="left", padx=(6, 0))
+        win.protocol("WM_DELETE_WINDOW", lambda: _done(None))
+
+    def _lucid_stage_set(self, aid, stage) -> None:
+        """Lucid 단계 답을 그 계좌의 모든 자산 행에 저장한다(stage = 'eval' / 'funded' / None, 답을 받은 계좌 id = stage_for). 통과 표시는
+        푼다(회원이 다시 정했다). 이 계좌를 막 고른 새 행(그 행 객체, 1R이 아직 새 계좌 기본값)에만 권장 1R을 넣는다(결정 6, 150K만) - 그 계좌의
+        다른 행은 1R이 $500이어도 건드리지 않는다(2차 리뷰 P0: 단계 답 한 번이 기존 행 1R을 4.4배로 올리던 것). Lucid 이름이 아니면 아무것도
+        하지 않는다(그 계좌에는 평가 계좌 익절이 없다)."""
+        if _dc_name_info("nt8", aid)[0] != "eval":
+            return
+        stage = stage if stage in ("eval", "funded") else None
+        want = str(aid or "").strip().casefold()
+        n = 0
+        for _a in _ASSETS:
+            for _rw in (((self._acfg or {}).get(_a) or {}).get("accounts") or []):
+                if str(_rw.get("id") or "").strip().casefold() == want and self._acct_broker(_a, _rw) == "nt8":
+                    _p = _rw.setdefault("prop", dict(_PROP_DEFAULTS))
+                    _p["stage"], _p["stage_for"] = stage, (want if stage else None)
+                    n += 1
+        if not n:
+            return
+        self._daycap_clear_passed("nt8", aid)
+        _k = self._daycap_key("nt8", aid)
+        _fresh = self._dc_map("_dc_fresh").pop(_k, None) or []
+        _mt = _dc_name_info("nt8", aid)[3]
+        _nm = (f"{_mt} …{str(aid)[-4:]}" if _mt else f"…{str(aid)[-4:]}")
+        ko = self.lang == "ko"
+        _filled = 0
+        if _fresh and stage:
+            _sz = _daycap_size_from_name("nt8", aid) or 0
+            reco = _reco_one_r("nt8", stage, _sz)
+            if reco is not None:
+                for _ent in (_fresh if isinstance(_fresh, list) else []):
+                    try:
+                        _rows = ((self._acfg or {}).get(_ent.get("asset")) or {}).get("accounts") or []
+                        _row = _ent.get("row")
+                        _ix = next((i for i, r in enumerate(_rows) if r is _row), None)
+                        if (_ix is None or str(_row.get("id") or "").strip().casefold() != want
+                                or (_row.get("prop") or {}).get("on")
+                                or _as_float(_row.get("one_r"), 0.0) != DEFAULT_ONE_R):
+                            continue
+                        _row["one_r"] = float(reco)
+                        _filled += 1
+                        _aw = getattr(self, "_acct_widgets", None)
+                        if getattr(self, "_asset", None) == _ent.get("asset") and isinstance(_aw, dict):
+                            _w = _aw.get(_ix) or {}
+                            if _w.get("one_r") is not None:
+                                _entry_set_text(_w["one_r"], f"{reco:g}")
+                    except Exception:
+                        continue
+                if _filled:
+                    self.log((f"   Lucid {_nm}: 새로 추가한 행의 1R 칸에 권장 값 ${reco:,.0f}을 넣었습니다(Lucid {_sz // 1000}K "
+                              f"{'평가' if stage == 'eval' else '펀디드'}). 다른 값을 쓰시려면 1R 칸을 고치십시오.") if ko else
+                             (f"   Lucid {_nm}: the newly added row's 1R field is prefilled with the recommended ${reco:,.0f} "
+                              f"(Lucid {_sz // 1000}K {'evaluation' if stage == 'eval' else 'funded'}). Edit the 1R field to "
+                              f"use another amount."))
+        try:
+            self._save_cfg()
+        except Exception:
+            pass
+        self.log((f"   Lucid {_nm}: 단계를 " + {"eval": "평가로 저장했습니다. " + self._lucid_rule_text(aid, True),
+                                               "funded": "펀디드로 저장했습니다. 평가 계좌 익절을 쓰지 않습니다."}.get(
+                      stage, "모름으로 두었습니다. 평가 계좌 익절을 쓰지 않습니다.")) if ko else
+                 (f"   Lucid {_nm}: stage saved as " + {"eval": "evaluation. " + self._lucid_rule_text(aid, False),
+                                                           "funded": "funded. The evaluation take-profit is not used."}.get(
+                      stage, "unknown. The evaluation take-profit is not used.")))
+        if stage == "funded":
+            # 옛 통과 익절(프롭 유형 테스트기 + 통과 목표 잔고)은 이 답과 상관없이 돈다 - 펀디드라고 답했어도 그 값이 남아 있으면 그대로 말한다
+            # (2차 리뷰 P2: '평가 계좌 익절을 쓰지 않습니다'만 말하고 옛 감시가 펀디드 계좌를 그 잔고에서 닫던 것). 말없이 지우지 않는다.
+            _ptps = sorted({_as_float((_rw.get("prop") or {}).get("pass_tp"), 0.0)
+                            for _a in _ASSETS for _rw in (((self._acfg or {}).get(_a) or {}).get("accounts") or [])
+                            if str(_rw.get("id") or "").strip().casefold() == want and self._acct_broker(_a, _rw) == "nt8"
+                            and (_rw.get("prop") or {}).get("type", "test") == "test"
+                            and _as_float((_rw.get("prop") or {}).get("pass_tp"), 0.0) > 0})
+            for _ptp in _ptps:
+                self.log((f"   Lucid {_nm}: 프롭 설정의 통과 목표 잔고 {self._daycap_money(_ptp)}는 그대로 켜져 있어 잔고가 그 금액에 이르면 "
+                          f"이 계좌 포지션을 정리합니다. 펀디드라면 프롭 설정에서 0으로 바꾸십시오.") if ko else
+                         (f"   Lucid {_nm}: the pass target balance {self._daycap_money(_ptp)} in the prop settings is still on, "
+                          f"so this account's positions are closed when the balance reaches it. If it is funded, please set it "
+                          f"to 0 in the prop settings."))
+        try:
+            if _filled:
+                self._build()
+            else:
+                self._daycap_rows_refresh()
+        except Exception:
+            pass
+
+    def _daycap_reset_row(self, asset, row, old_id, new_id) -> None:
+        """행의 계좌를 다른 계좌로 바꿨다: 옛 계좌에 붙은 평가 계좌 익절 설정(Lucid 단계 답, 고른 규모, 하루 상한)을 새 계좌로 들고 가지 않는다
+        (2차 리뷰 P1: 평가 답, 150K 규모가 새 펀디드, 50K 계좌로 넘어가 상한, 통과 목표가 잘못 걸리던 것). 통과 목표 잔고는 옛 계좌가 평가 이름
+        (Combine, Lucid)이었을 때만 되돌린다 - 그 값은 그 평가 계좌의 것이다. 바꾼 것이 있으면 한 줄 남긴다."""
+        try:
+            if self._acct_broker(asset, row) not in _DAYCAP_FIRMS:
+                return
+            pr = row.get("prop")
+            if not isinstance(pr, dict):
+                return
+            _was = []
+            if pr.get("stage") or pr.get("stage_for"):
+                _was.append("Lucid 단계" if self.lang == "ko" else "Lucid stage")
+                pr["stage"], pr["stage_for"] = None, None
+            if _daycap_norm_size(pr.get("size")):
+                _was.append("계좌 규모" if self.lang == "ko" else "account size")
+                pr["size"] = 0
+            if _daycap_norm(pr.get("day_cap")) is not None:
+                _was.append("하루 이익 상한" if self.lang == "ko" else "daily profit cap")
+                pr["day_cap"] = None
+            if ((_dc_name_info("projectx", old_id)[0] == "eval" or _dc_name_info("nt8", old_id)[0] == "eval")
+                    and (pr.get("pass_set") or _as_float(pr.get("pass_tp"), 0.0) > 0)):
+                _was.append("통과 목표 잔고" if self.lang == "ko" else "pass target balance")
+                pr["pass_tp"], pr["pass_set"] = 0.0, False
+            if _was:
+                self.log((f"   [{asset}] 이 행의 계좌를 …{old_id[-4:]}에서 …{str(new_id)[-4:]}로 바꿔 옛 계좌의 평가 계좌 익절 설정("
+                          + ", ".join(_was) + ")을 새 계좌 기준(자동)으로 되돌렸습니다.") if self.lang == "ko" else
+                         (f"   [{asset}] This row's account changed from …{old_id[-4:]} to …{str(new_id)[-4:]}, so the old "
+                          "account's evaluation take-profit settings (" + ", ".join(_was) + ") are back to automatic for the "
+                          "new account."))
+        except Exception:
+            pass
+
+    # ── 화면: 계좌 행 아래 상태 한 줄 ──
+    def _daycap_row_text(self, asset, acct) -> str:
+        """평가 계좌 행 아래 한 줄(KO/EN). 평가 아님(펀디드, 연습, 라이브, 모르는 이름, 다른 브로커) = 빈 문자열(아무것도 안 그린다).
+        수동 모드 행, 꺼 둔 행, 확인 모드(Operator)도 빈 문자열 - 앱이 진입하지 않아 익절도 하지 않는다(없는 보호를 있다고 말하지 않게)."""
+        try:
+            ko = self.lang == "ko"
+            if (acct or {}).get("manual") or not (acct or {}).get("on", True) or self._daycap_watch_only():
+                return ""
+            bk = self._acct_broker(asset, acct)
+            if bk not in _DAYCAP_FIRMS or _daycap_off():
+                return ""
+            aid = str((acct or {}).get("id") or "").strip()
+            pr = dict(_PROP_DEFAULTS)
+            pr.update((acct or {}).get("prop") or {})
+            stage, _sz = self._daycap_stage_cfg(bk, aid, pr)
+            if stage == "unanswered":
+                return ("Lucid 계좌가 평가인지 펀디드인지 아직 모릅니다. 프롭 설정에서 고르시면 평가 계좌 익절이 켜집니다" if ko else
+                        "Not known yet whether this Lucid account is an evaluation or funded. Pick it in the prop settings "
+                        "to turn on the evaluation take-profit")
+            if stage == "passed":
+                if bk == "projectx":                        # Combine은 통과 뒤 그 계좌로 더 진입하지 않는다 - 화면이 그렇다고 말한다(2차 리뷰 P2)
+                    return ("평가 통과 목표에 닿았습니다. 이 계좌로는 더 진입하지 않습니다(아직 통과 전이면 프롭 설정에서 통과 목표 잔고를 "
+                            "올리십시오)" if ko else
+                            "Evaluation pass target reached. This account takes no more entries (if it has not passed yet, "
+                            "raise the pass target balance in the prop settings)")
+                return ("평가 통과 목표에 닿았습니다. 이 계좌는 하루 상한과 통과 익절을 쓰지 않습니다(아직 평가라면 프롭 설정에서 단계를 "
+                        "'평가'로 다시 고르십시오)" if ko else
+                        "Evaluation pass target reached. This account no longer uses the daily cap or the pass take-profit (if "
+                        "it is still an evaluation, pick 'Evaluation' again in the prop settings)")
+            st = self._dc_state()
+            _k = self._daycap_key(bk, aid)
+            _, day = _daycap_day_start()
+            # 통과 익절 금액은 오늘 손익(원장)까지 넣은 최고일로(감시가 쓰는 금액과 같게, 3차 결정 B)
+            r = (self._daycap_resolve_cfg(bk, aid, pr, today=(st["days"].get(_k) or {}).get(day))
+                 if stage == "eval" else None)
+            if r is None:
+                return ""
+            if r.get("test"):                               # 시험용 스위치(3차 마무리 3) - 시험 모드라고 분명히 말한다
+                _mt = self._daycap_money(r["cap"])
+                if st["hit"].get(_k) == day:
+                    return ((f"시험 모드: 시험 상한({_mt})에 닿아 이 연습 계좌는 다음 거래일({_dc_day_txt()})부터 다시 진입합니다") if ko else
+                            (f"Test mode: the test cap ({_mt}) was reached, so this practice account enters again from the next "
+                             f"trading day ({_dc_day_txt()})"))
+                _s0 = st["status"].get(_k) or {}
+                _rm = _s0.get("room") if _s0.get("day") == day else None
+                t_ko = (f"시험 모드: 이 연습 계좌를 평가처럼 봅니다. 오늘 손익이 {_mt}에 닿으면 손으로 연 포지션까지 이 계좌를 정리합니다"
+                        + (f" (오늘 남은 {self._daycap_money(max(0.0, float(_rm)))})" if _rm is not None else ""))
+                t_en = (f"Test mode: this practice account is treated as an evaluation. When today's P&L reaches {_mt}, every "
+                        f"position on it is closed, including ones opened by hand"
+                        + (f" ({self._daycap_money(max(0.0, float(_rm)))} left today)" if _rm is not None else ""))
+                return t_ko if ko else t_en
+            if st["hit"].get(_k) == day:
+                return (f"오늘 하루 이익 상한에 닿아 이 계좌는 다음 거래일({_dc_day_txt()})부터 다시 진입합니다" if ko else
+                        f"Daily profit cap reached today. This account enters again from the next trading day ({_dc_day_txt()})")
+            _ph = st["pass_hold"].get(_k)
+            if isinstance(_ph, dict) and _ph.get("day") == day:     # 3차 리뷰: 통과 금액 이상이지만 표시하지 못함(최고일을 다 모름)
+                return ("잔고가 통과 금액 이상입니다. 통과 여부를 프롭 회사 화면에서 확인하십시오(그동안 이 계좌로는 진입하지 않습니다)" if ko else
+                        "The balance is at or above the pass amount. Please check the pass status on the prop firm's site "
+                        "(this account takes no entries meanwhile)")
+            _s = st["status"].get(_k) or {}
+            _room = _s.get("room") if _s.get("day") == day else None
+            _unk = bool(_s.get("unknown")) and _s.get("day") == day
+            _m = self._daycap_money
+            _pl = self._dc_auto_pass_line(bk, aid, r, self._dc_app_closing(_k), day)
+            if _pl:
+                r = dict(r, pass_tp=_pl)                    # 감시가 실제로 닫는 금액(앱이 든 계약의 2틱 여유 포함, 3차 마무리 4)
+            if r["cap"] > 0 and r["pass_tp"] > 0:
+                t_ko = f"익절: 하루 상한 {_m(r['cap'])}, 통과 {_m(r['pass_tp'])} 중 가까운 쪽"
+                t_en = f"Take-profit: the nearer of daily cap {_m(r['cap'])} and pass {_m(r['pass_tp'])}"
+            elif r["cap"] > 0:
+                t_ko, t_en = f"익절: 하루 상한 {_m(r['cap'])}", f"Take-profit: daily cap {_m(r['cap'])}"
+            elif r["pass_tp"] > 0:
+                t_ko, t_en = f"익절: 통과 {_m(r['pass_tp'])}", f"Take-profit: pass {_m(r['pass_tp'])}"
+            else:
+                return ""
+            if _unk and r["cap"] > 0:
+                t_ko += " (오늘 손익을 지금 읽지 못해 남은 금액을 모릅니다)"
+                t_en += " (today's P&L cannot be read right now, so the room left is unknown)"
+            elif _room is not None and r["cap"] > 0:
+                t_ko += f" (오늘 남은 {_m(max(0.0, float(_room)))})"
+                t_en += f" ({_m(max(0.0, float(_room)))} left today)"
+            return t_ko if ko else t_en
+        except Exception:
+            return ""
+
+    def _daycap_rows_refresh(self) -> None:
+        """지금 보이는 계좌 행들의 상태 줄을 다시 쓴다(메인 스레드). 글자가 생기면 행 바로 아래에 보이고, 비면 숨긴다
+        (리뷰 P2: 저장 뒤 평가 계좌가 된 행에도 탭을 바꾸거나 재시작하지 않고 바로 보이게)."""
+        try:
+            for _i, _wd in list((getattr(self, "_acct_widgets", None) or {}).items()):
+                _lb = (_wd or {}).get("daycap_lbl")
+                if _lb is None:
+                    continue
+                try:
+                    _ac = ((self._acfg.get(self._asset) or {}).get("accounts") or [])[_i]
+                except Exception:
+                    continue
+                _txt = self._daycap_row_text(self._asset, _ac)
+                try:
+                    _lb.config(text=_txt)
+                    _shown = bool(_lb.winfo_manager())
+                    if _txt and not _shown:
+                        _row = (_wd or {}).get("row")
+                        if _row is not None:
+                            _lb.pack(anchor="w", padx=(30, 0), after=_row)
+                        else:
+                            _lb.pack(anchor="w", padx=(30, 0))
+                    elif not _txt and _shown:
+                        _lb.pack_forget()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _prop_in_use(self) -> bool:
         """켜진 계좌 중 프롭 계열 브로커(projectx=Topstep 계열, nt8=Lucid)가 있는가.
@@ -9619,6 +15009,10 @@ class App:
                          f" ({_broker_label(cfg.get('broker'))}, T-{window_min}분)")
             self._send_ev("preflight_ok", asset, broker=str(cfg.get("broker") or "")[:16],
                           win=int(window_min), warns=len(warns))
+            try:                       # 증거금 경고(결정 7) - 경고만이라 여기서 무엇이 실패해도 사전 점검 결과(통과)는 그대로다
+                self._margin_precheck(asset, cfg.get("broker"), entry_label)
+            except Exception:
+                pass
         except Exception as e:
             _em = str(e)[:300]
             _hint = _entry_fail_hint(_em, ko)
@@ -9642,6 +15036,90 @@ class App:
                  if ko else
                  f"The pre-entry API check for {asset} ({entry_label}), {window_min} minutes out, "
                  f"failed:\n\n{_em}\n\n{_hint}")))
+
+    def _margin_warns(self, asset, bk):
+        """증거금 사전 점검(대표 2026-10-14 결정 7): 이 (브로커, 자산)으로 무장된 계좌마다 잔고(NT8 = 브리지 현금, 없으면 NetLiq /
+        ProjectX = 잔고)가 이번 세션 증거금(_margin_need, 모듈 설명의 표)보다 적어 보이거나 0 이하면 경고 한 건.
+        반환 [(KO 문장, EN 문장, KO 근거, EN 근거, (브로커, 계좌))]. 경고만 - 막지 않는다. NT8, ProjectX만(다른 브로커는 종전 그대로).
+        Topstep 펀디드(EXPRESS, 잔고가 $0에서 시작하는 이익 잔고)와 프롭 '라이브 초기' 계좌는 0 이하가 정상이라 보지 않는다.
+        잔고를 못 읽으면 말하지 않는다(연결은 위 점검이 본다)."""
+        out = []
+        if bk not in ("nt8", "projectx"):
+            return out
+        seen = set()
+        for (a, idx), cfg in list((getattr(self, "_sig_accts", None) or {}).items()):
+            if a != asset or cfg.get("broker") != bk or cfg.get("manual"):
+                continue
+            sc = str(cfg.get("acct") or "").strip()
+            if not sc or sc.casefold() in seen:
+                continue
+            seen.add(sc.casefold())
+            try:
+                ac = ((self._acfg.get(a) or {}).get("accounts") or [])[idx]
+            except Exception:
+                ac = None
+            if not isinstance(ac, dict):
+                continue
+            _pr = ac.get("prop") or {}
+            if _pr.get("on") and _pr.get("type") == "live":
+                continue
+            if bk == "projectx":
+                _nm = self._dc_state()["names"].get(self._daycap_key(bk, sc)) or sc
+                if _dc_name_info("projectx", _nm)[0] == "funded":
+                    continue
+            try:
+                b = self._passtp_broker(cfg)
+                bal = self._dc_f(b.account_balance(sc))
+                if bal is None and bk == "nt8" and hasattr(b, "account_netliq"):
+                    bal = self._dc_f(b.account_netliq(sc))
+            except Exception:
+                bal = None
+            if bal is None:
+                continue
+            n, need = _margin_need(asset, self._planned_one_r(ac))
+            if bal <= 0 or (need > 0 and bal < need):
+                _tail = "…" + sc[-4:]
+                if need <= 0:                               # 1R을 모름 - 잔고만 말한다
+                    _dko, _den = f"(잔고 {self._daycap_money(bal)})", f"(balance {self._daycap_money(bal)})"
+                elif _margin_est(asset):
+                    _dko = (f"(잔고 {self._daycap_money(bal)}, 이번 세션 예상 최대 마이크로 환산 {n}계약의 증거금 약 "
+                            f"{self._daycap_money(need)})")
+                    _den = (f"(balance {self._daycap_money(bal)}, margin for up to {n} micro-equivalent contracts expected this "
+                            f"session about {self._daycap_money(need)})")
+                else:                                       # 계약 수를 어림하지 않음(서버 값 없음) - 마이크로 한 계약과 비교
+                    _dko = f"(잔고 {self._daycap_money(bal)}, 마이크로 한 계약의 증거금 약 {self._daycap_money(need)})"
+                    _den = f"(balance {self._daycap_money(bal)}, margin for one micro contract about {self._daycap_money(need)})"
+                out.append((f"계좌 {_tail}의 잔고가 주문에 필요한 증거금보다 적어 보입니다. 브로커에서 확인하시거나 이 계좌를 꺼 두십시오.",
+                            f"The balance of account {_tail} looks lower than the margin the order needs. Please check it at "
+                            f"your broker or turn this account off.",
+                            _dko, _den, (bk, sc.casefold())))
+        return out
+
+    def _margin_precheck(self, asset, bk, entry_label) -> None:
+        """사전 점검 안에서: 증거금 경고를 로그(매번)와 경고 창(계좌, 진입 시각마다 한 번)으로 알린다. 실패해도 점검은 그대로."""
+        try:
+            mw = self._margin_warns(asset, bk)
+        except Exception:
+            mw = []
+        if not mw:
+            return
+        ko = self.lang == "ko"
+        _pop = []
+        _seen = self._dc_map("_margin_popped")
+        for _ko, _en, _dko, _den, _key in mw:
+            self.log(f"   {asset}: " + (f"{_ko} {_dko}" if ko else f"{_en} {_den}"))
+            _pk = _key + (str(asset), str(entry_label))
+            if _pk not in _seen:
+                _seen[_pk] = True
+                _pop.append((_ko + "\n" + _dko) if ko else (_en + "\n" + _den))
+        if _pop:
+            try:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "EQ Autopilot",
+                    ((f"{asset} 진입({entry_label}) 전 점검:\n\n" if ko else f"Pre-entry check for {asset} ({entry_label}):\n\n")
+                     + "\n\n".join(_pop))))
+            except Exception:
+                pass
 
     # ── 공개 트랙레코드 푸시 (Phase B 2단계) ─────────────────────────────────
     @staticmethod
@@ -10297,7 +15775,7 @@ class App:
         active = next((c.get("id") for c in cs if c.get("activeContract")), None)
         return active or cs[0].get("id")
 
-    _APP_VER = "2026.10.12e"
+    _APP_VER = "2026.10.14a"
     _srv_aead = False   # 서버가 hb에 광고한 AEAD(v2) 지원 - 앱→서버 전송 포맷 선택(2026-09-23)
 
     # ── 체결 수량 보고 (#53, 대표 2026-08-08 "앱은 몇 거래 체결했는지만 보내면 대") ────
@@ -10476,7 +15954,7 @@ class App:
                 pass
         _th.Thread(target=w, daemon=True).start()
 
-    def _remember_open(self, asset, b, sym, *, stop=None, aid=None, direction=None, size=None):
+    def _remember_open(self, asset, b, sym, *, stop=None, aid=None, direction=None, size=None, cap=False):
         """진입에 쓴 브로커, 심볼을 기억한다 - _check_stop_closed가 이걸로 조회한다.
 
         2026-09-21부터 **손절 재거치에 필요한 것**까지 같이 든다(stop/aid/direction/size).
@@ -10488,6 +15966,17 @@ class App:
         try:
             if not hasattr(self, "_open_ctx"):
                 self._open_ctx = {}
+            # 평가 계좌 익절 leg(cap=True, 2026-10-14)는 같은 진입 회차(15분 안)에 먼저 확정된 **일반 계좌**의 맥락을 덮지 않는다:
+            # 자산 맥락은 하나뿐이라, 평가 계좌가 익절로 먼저 닫히면 그 계좌가 맥락일 때 아직 열린 다른 계좌까지 '청산'으로 보고된다.
+            import time as _tro
+            _ats = getattr(self, "_ctx_at", None)
+            if not isinstance(_ats, dict):
+                _ats = self._ctx_at = {}
+            if cap:
+                _prev = self._open_ctx.get(str(asset))
+                if (_prev and not _prev.get("cap")
+                        and _tro.time() - float(_ats.get(str(asset), 0) or 0) < 900):
+                    return
             _c = {"b": b, "sym": str(sym)}
             if stop is not None:
                 try:
@@ -10504,7 +15993,10 @@ class App:
                     _c["size"] = abs(int(size)) or None
                 except (TypeError, ValueError):
                     _c["size"] = size
+            if cap:
+                _c["cap"] = True
             self._open_ctx[str(asset)] = _c
+            _ats[str(asset)] = _tro.time()
             getattr(self, "_flat_seen", {}).pop(str(asset), None)
             getattr(self, "_nostop_seen", {}).pop(str(asset), None)
             self._persist_open_ctx(str(asset))
@@ -10714,7 +16206,7 @@ class App:
                               "app_stop": _c.get("app_stop"), "manual": bool(_c.get("manual")),
                               # B(2026-10-06): 미확인 진입 표시도 재시작을 넘긴다 - 빠지면 끝내 없던 포지션을
                               # 재시작 뒤 '손절 청산'으로 서버에 보고한다.
-                              **{_f: True for _f in ("unconfirmed", "unconf_added") if _c.get(_f)},
+                              **{_f: True for _f in ("unconfirmed", "unconf_added", "cap") if _c.get(_f)},
                               "ts": _t.time()}
             _save_open_ctx(_d)
         except Exception:
@@ -10763,7 +16255,7 @@ class App:
                               "dir": _r.get("dir"), "size": _r.get("size"),
                               "aid": _r.get("aid"), "app_stop": _r.get("app_stop"),
                               "manual": bool(_r.get("manual"))}
-        for _f in ("unconfirmed", "unconf_added"):           # B(2026-10-06) - 있을 때만 단다
+        for _f in ("unconfirmed", "unconf_added", "cap"):    # B(2026-10-06), 평가 익절 leg(2026-10-14) - 있을 때만 단다
             if _r.get(_f):
                 self._open_ctx[_k][_f] = True
         self.log(f"   · {_k} 감시 맥락 복구({_bk}) — 손절 감시를 이어갑니다.")
@@ -10841,6 +16333,11 @@ class App:
                     getattr(self, "_stop_chk_at", {}).pop(str(_a), None)
                     self.log(f"   · {_a} 확인하지 못했던 진입의 포지션이 브로커에 보입니다 — 보호 손절을 확인합니다.")
                 self._check_stop_alive(_a, _hit)
+                continue
+            if _daycap_ctx_closing(self, _ctx):
+                # 평가 계좌 감시(2026-10-14 2차)가 지금 이 계좌를 하루 상한, 통과 목표로 정리하는 중이다 - 청산 보고(사유 cap_tp)는 감시가 한다.
+                # 여기서 먼저 보고하면 사유 없는 청산이 되어 서버가 진입 10분 안의 익절을 '손절에 닿은 적 없는 청산'으로 의심한다.
+                self._flat_seen.pop(str(_a), None)
                 continue
             _n = int(self._flat_seen.get(str(_a), 0)) + 1
             self._flat_seen[str(_a)] = _n
@@ -11186,7 +16683,7 @@ class App:
             + (" For BTC the session-close auto-flatten does not run while the position is "
                "held, so the stop is the only protection." if _k == "BTC" else ""))
 
-    def _send_fill(self, asset, closed=False):
+    def _send_fill(self, asset, closed=False, why=None):
         """자산 하나의 진입이 끝난 뒤 1회 전송. closed=True면 수량 0(청산 알림).
         (2026-08-11) closed면 열린 포지션 흔적 해제 - 청산 버튼 자동 숨김.
         Autopilot(autoentry) 전용(대표 2026-08-09 '오토파일럿한테만 앱에서 서버로') —
@@ -11224,6 +16721,10 @@ class App:
                     # 서버의 역방향 폴백이 여전히 열린 버킷을 닫아 준다(재설치 대비).
                     body = {"tok_id": tid, "inst": str(asset), "mid": MACHINE_ID,
                             "qty_micro": 0, "qty_btc": 0}
+                    if why:
+                        # 청산 사유(2026-10-14): 'cap_tp' = 평가 계좌 익절(앱이 하루 이익 상한, 통과 목표에서 그 계좌를 정리). 서버는 이 사유의
+                        # 청산을 '손절에 닿은 적 없는 청산'으로 의심하지 않는다. 옛 서버는 모르는 키를 무시한다. 사유 없는 청산(손절, 시간 청산)은 종전 본문 그대로.
+                        body["why"] = str(why)[:16]
                 else:
                     if not hasattr(self, "_fill_lock"):
                         return              # 이 자산에서 체결된 게 없다
@@ -11409,7 +16910,40 @@ class App:
         self.log(f"   🎲 [{lbl}] 손절 지터 +{j}틱 넓힘 → {new:g} (주문 프라이버시, 조기이탈 없음, 추가리스크 ≤0.5%)")
         return new
 
-    def _run_futures_entry(self, b, sc, legs, direction, stop, sig, live, recv, asset, pub):
+    def _size_clamp(self, bk, sc, arow, legs, cap):
+        """계좌 한도(3차 결정 D, 모듈 _size_limit 표)로 legs를 줄인다. 반환 (legs, cap) - 줄였으면 cap['risk'](이번 진입 손절 위험)도 같은
+        비율로 줄인다(남은 하루 한도 비교가 실제 위험을 쓰게). XFA는 그날 처음 본 잔고와 지금 잔고 가운데 작은 쪽으로 단계를 고른다."""
+        name = str((arow or {}).get("name") or sc)
+        bal = None
+        if bk == "projectx" and _dc_name_info("projectx", name, builtin_only=True)[0] == "funded":     # XFA 표는 내장 펀디드 이름만(3차 마무리 리뷰)
+            _, day = _daycap_day_start()
+            bal = self._dc_day_bal(bk, sc, (arow or {}).get("balance"), day)
+        _hint = _daycap_norm_size(((cap or {}).get("pr") or {}).get("size"))
+        if not _hint:
+            try:
+                _hint = _daycap_norm_size(self._dc_state()["sizes"].get(self._daycap_key(bk, sc)))
+            except Exception:
+                _hint = 0
+        lim, d_ko, d_en = _size_limit(bk, name, bal, _hint)
+        if not lim:
+            return legs, cap
+        new, before, after = _clamp_legs(legs, lim)
+        if after >= before:
+            return legs, cap
+        lbl = (cap or {}).get("lbl") or (sc[-4:] if sc else bk)
+        self.log((f"   [{lbl}] 계좌 한도에 맞춰 줄였습니다: 마이크로 환산 {before}계약 → {after}계약({d_ko}). "
+                  + " + ".join(f"{q} {s}" for s, q in new) + "로 진입합니다.") if self.lang == "ko" else
+                 (f"   [{lbl}] Reduced to the account limit: {before} → {after} micro-equivalent contracts ({d_en}). Entering "
+                  + " + ".join(f"{q} {s}" for s, q in new) + "."))
+        _log_to_file(f"size_limit {bk} {name[-4:]} {before}->{after} lim={lim}")
+        if isinstance(cap, dict) and cap.get("risk"):
+            try:
+                cap = dict(cap, risk=float(cap["risk"]) * float(after) / float(before))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return new, cap
+
+    def _run_futures_entry(self, b, sc, legs, direction, stop, sig, live, recv, asset, pub, cap=None):
         """선물 진입 — 계약수 10개 이상이면 미니/마이크로 legs로 분할 체결(대표 2026-07-16).
         legs = [(심볼, 수량), ...]. 예: NQ 23계약 → [('NQ',2),('MNQ',3)], 5계약 → [('MNQ',5)].
         미니가 커미션이 3배 싸서 백테스트(costs._blended_commission)도 같은 규칙으로 계산한다.
@@ -11434,6 +16968,13 @@ class App:
                 self._report_error(f"entry:{asset}", f"account missing: {sc}")
             return
         _aid = match[0]["id"]
+        # 계좌 한도(3차 결정 D): Topstep Combine, XFA(Scaling Plan), Lucid 계좌는 계획 계약이 한도를 넘으면 한도까지만 진입한다(차분한 로그 한 줄).
+        # 브로커를 더 읽지 않는다(위 계좌 목록의 이름과 잔고만). 그 밖 계좌와 한도 안의 진입은 종전 그대로.
+        if str(getattr(b, "name", "") or "") in ("projectx", "nt8", "tradovate"):
+            try:
+                legs, cap = self._size_clamp(str(getattr(b, "name", "")), sc, match[0], legs, cap)
+            except Exception:
+                pass
         # leg 심볼별 활성 계약 조회
         resolved = []
         for _sym, _qty in legs:
@@ -11447,9 +16988,31 @@ class App:
                 self._report_error(f"entry:{asset}",
                                    f"no active contract: {[s for s, _ in legs]} ({sc})")
             return
-        if len(resolved) > 1:
+        # ── 평가 계좌 익절(대표 2026-10-14): cap은 Topstep(ProjectX), Lucid(NT8) 계좌에서만 온다. 평가가 아니면 계획 None = 종전 그대로.
+        # 오늘 하루 이익 상한이나 통과 목표에 이미 닿았으면 이번 신호는 이 계좌만 건너뛴다(차분한 로그 + 서버 기록, 경보 아님).
+        # 브로커에 익절 주문은 걸지 않는다(2차 결정) - 진입 뒤 앱이 계좌의 오늘 손익을 지켜보다 닿으면 그 계좌만 정리한다.
+        # 계산이 실패하면 종전대로 진입한다 - 이 기능이 정상 진입을 막지 않는다.
+        _cplan = None
+        if cap is not None:
+            # 이번 진입의 손절 위험($) = 1R x 배수(결정 2) - 남은 하루 한도가 이것에 비해 너무 작으면 건너뛴다.
+            try:
+                _risk_usd = float(cap.get("risk")) if cap.get("risk") is not None else None
+            except (TypeError, ValueError):
+                _risk_usd = None
+            try:
+                _cplan = self._daycap_plan(b, cap, match[0], _aid, resolved, asset, live, risk_usd=_risk_usd)
+            except Exception as _cpe:
+                _cplan = None
+                self.log((f"   [{cap.get('lbl') or sc}] 평가 계좌 익절 계산 오류({str(_cpe)[:100]}). 이번 진입은 익절 없이 종전대로 합니다.")
+                         if self.lang == "ko" else
+                         (f"   [{cap.get('lbl') or sc}] Evaluation take-profit calculation error ({str(_cpe)[:100]}). This entry "
+                          f"goes in without it, as before."))
+            if _cplan and _cplan.get("skip"):
+                return
+        if len(resolved) > 1:                                # 건너뛰는 계좌는 '분할 진입' 줄을 찍지 않는다(3차 결정 H - 종전엔 건너뜀 앞에 찍혔다)
             self.log("   🧩 분할 진입: " + " + ".join(f"{q} {s}" for s, q, _ in resolved)
                      + " (미니 묶음 — 커미션 절감)")
+        _cap_mon = bool(_cplan and _cplan.get("monitor"))         # 평가 계좌 = 앱이 지켜본다(브로커 익절 주문 없음)
         # ── 서버 진입 클레임(2026-08-22): 같은 토큰의 다른 기기가 이 계좌를 선점했으면 양보 ──
         # 선물은 프로세스 단위 클레임(버그 조사 재검증 2026-10-06 6) - 같은 PC의 다른 실행도 '다른 기기'처럼 양보시킨다.
         if live and not self._claim_entry(sig, _aid, per_process=True):
@@ -11834,6 +17397,12 @@ class App:
                            "checks for a protective stop and places one if there is none." if _watch else ""))
                 continue
             if not live:
+                if _cap_mon:
+                    self.log((f"   DRY-RUN {_sym} 평가 계좌 익절: 진입했다면 앱이 이 계좌의 오늘 손익을 지켜보다 하루 상한이나 통과 목표에서 "
+                              f"정리합니다(브로커 익절 주문 없음, 실제 주문 없음).") if self.lang == "ko" else
+                             (f"   DRY-RUN {_sym} evaluation take-profit: had it entered, the app would watch this account's P&L "
+                              f"for the day and close it at the daily cap or the pass target (no broker take-profit order, no "
+                              f"real order)."))
                 _ok += 1; continue
             res = _res_ok or {}
             # ── 확정 체결 보고 경로(위 확인 루프에서 포지션 실확인된 계좌만) ──
@@ -11847,9 +17416,21 @@ class App:
             # 선물은 reduceOnly가 없어 발동하면 남은 것을 닫고 **반대 포지션까지 연다**.
             # 2026-09-04 NT8 진입 누락과 같은 집안이다. 기억이 주문 수량이면 재거치·수량
             # 교정까지 같이 틀리므로 여기서 실측을 든다(_check_stop_size가 180초 안에 교정).
-            self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
-                                aid=_aid, direction=direction,
-                                size=(_seen_qty or _qty))   # 감지+재거치용
+            if _cap_mon:
+                # 평가 계좌 leg(2026-10-14): 같은 회차에 먼저 확정된 일반 계좌 맥락을 덮지 않는다(_remember_open 설명). 감시 기록에도 더한다 -
+                # 재시작 뒤에도 이 계좌 포지션을 계속 지켜보게(브로커 익절 주문은 없다).
+                self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
+                                    aid=_aid, direction=direction,
+                                    size=(_seen_qty or _qty), cap=True)
+                try:
+                    self._daycap_mon_note(asset, b, cap, _aid, _con, (res.get("stop_price") or stop), direction,
+                                          (_seen_qty or _qty), _cplan)
+                except Exception:
+                    pass
+            else:
+                self._remember_open(asset, b, _con, stop=(res.get("stop_price") or stop),
+                                    aid=_aid, direction=direction,
+                                    size=(_seen_qty or _qty))   # 감지+재거치용
             # 같은 (자산, 계좌, 계약)에 남은 미확인 감시가 있으면 놓는다(버그 조사 재검증 2026-10-06 2) - 이 자리 포지션은
             # 이제 확정된 이번 진입이고 위 자산 ctx가 본다. 남겨 두면 옛 손절 자리로 새 포지션의 손절을 판단한다.
             self._unconf_watch_drop(asset, _aid, _con)
@@ -12554,57 +18135,65 @@ class App:
                     import autopilot_crypto as _ac
                     # 종료 경로(sync)는 짧게 - 메인스레드가 락 대기+POST를 동기로 하므로
                     # 불통 네트워크에서 8초 타임아웃은 최악 16초 동결을 만들었다(R20 P2-5).
-                    _ok = _rq.post(PUSH_BASE + "eqalive", timeout=(3 if sync else 8),
-                             json={"t": self._token,
-                                   "armed": bool(self._sig_accts or self._auto_accts),
-                                   "v": self._APP_VER,
-                                   "m": _machine_id(),
-                                   # AEAD(v2 AES-GCM) 복호화 가능 광고(2026-09-23): 서버는 이
-                                   # 기기들이 **전부** True인 토큰에만 v2 피드를 쓴다. 번들에
-                                   # cryptography가 빠진 빌드는 False를 보내 v1을 계속 받는다 -
-                                   # 버전 문자열 추정이 아니라 실제 import 결과다.
-                                   "aead": _ac.aead_available(),
-                                   # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
-                                   # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
-                                   # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
-                                   # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
-                                   "a": self._connected_assets(),
-                                   # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
-                                   # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
-                                   # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
-                                   # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
-                                   "arm": self._armed_assets(),
-                                   # 확인 모드(2026-09-24 R44 P0 곁가지, v2026.09.23g): 무장은 맞지만 자동 진입은
-                                   # 하지 않는 상태(Operator 등급·1R 미설정 등). 웹 무장 칩이 라임 '무장'과
-                                   # 구분해 '확인 모드'라고 말하게 한다 - 화면이 사실과 반대를 말하던 자리.
-                                   # 신호 대기가 꺼지고 마감 청산만 남은 상태도 '자동 진입 안 함'이다(오픈 준비 버그
-                                   # 조사 2026-10-06 E) - 서버 불통·권한 상실 뒤 칩이 '무장'으로 남던 자리.
-                                   "wo": bool(getattr(self, "_watch_only", False))
-                                         or bool(self._auto_accts and not self._sig_accts),
-                                   # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
-                                   "bk": self._asset_brokers(),
-                                   "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
-                                   # 앱 화면 언어(2026-09-29): 서버가 회원 DM(진입 실패·T-10)을 회원 언어로 쓰게. 서버는 회원 언어를 모른다.
-                                   "lg": "en" if self.lang == "en" else "ko",
-                                   # 프롭 150K 확인(2026-09-28, 2026-10-02부터 전 등급): 150K로 판별된 계좌의 브로커·끝4만
-                                   "p150": self._prop150_report(),
-                                   "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
-                                   "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
-                                   # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
-                                   # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
-                                   # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
-                                   "inc": self._included_assets(),
-                                   # 종료 표식(2026-08-28): 창을 닫으면 칩이 15분
-                                   # 신선도 창을 기다리지 않고 즉시 꺼짐으로 바뀐다.
-                                   # armed는 실상태 그대로 보낸다 - 무장 중 종료는
-                                   # 다운 경보 대상이 맞기 때문이다(R14 P1).
-                                   # (옛 "demo" 표식은 모의 모드 폐지(2026-09-07)로 안 싣는다 -
-                                   #  서버는 키 없음 = 실무장으로 본다.)
-                                   # NT8 브리지 상태(2026-09-28): ok/down/off + 마지막 확인·끊긴 시각. 서버가 장중 5분 끊김 판정.
-                                   "n8": self._nt8_ping_state(),
-                                   "closed": bool(getattr(self, "_closing", False))})
+                    _dce = [] if (sync or not self._dce_on()) else _dce_pending()   # 감시 사건 보고(3차 마무리 2) - 서버 스위치가 켤 때만, 종료 핑은 싣지 않는다
+                    _body = {"t": self._token,
+                             "armed": bool(self._sig_accts or self._auto_accts),
+                             "v": self._APP_VER,
+                             "m": _machine_id(),
+                             # AEAD(v2 AES-GCM) 복호화 가능 광고(2026-09-23): 서버는 이
+                             # 기기들이 **전부** True인 토큰에만 v2 피드를 쓴다. 번들에
+                             # cryptography가 빠진 빌드는 False를 보내 v1을 계속 받는다 -
+                             # 버전 문자열 추정이 아니라 실제 import 결과다.
+                             "aead": _ac.aead_available(),
+                             # 연결된 자산 목록(2026-08-27 대표 지시): 세 자산을 모두
+                             # 연결하면 Autopilot 14일 체험 버튼이 회원 화면에서 바로
+                             # 열리도록, 서버가 '무엇이 연결됐는지'만 알게 한다.
+                             # ⚠️자격 정보는 절대 보내지 않는다 - 자산 심볼뿐이다.
+                             "a": self._connected_assets(),
+                             # 무장 중인 자산(2026-08-28 대표 "무장 안 하면 꺼진 걸로,
+                             # 자산별로"): 앱이 떠 있어도 무장 자산이 없으면 회원 화면은
+                             # '꺼짐'으로 보여야 한다. 신호 대기와 자동 청산
+                             # 둘 다 무장으로 센다(리뷰 P1 - Operator는 자동 청산만 쓴다).
+                             "arm": self._armed_assets(),
+                             # 확인 모드(2026-09-24 R44 P0 곁가지, v2026.09.23g): 무장은 맞지만 자동 진입은
+                             # 하지 않는 상태(Operator 등급·1R 미설정 등). 웹 무장 칩이 라임 '무장'과
+                             # 구분해 '확인 모드'라고 말하게 한다 - 화면이 사실과 반대를 말하던 자리.
+                             # 신호 대기가 꺼지고 마감 청산만 남은 상태도 '자동 진입 안 함'이다(오픈 준비 버그
+                             # 조사 2026-10-06 E) - 서버 불통·권한 상실 뒤 칩이 '무장'으로 남던 자리.
+                             "wo": bool(getattr(self, "_watch_only", False))
+                                   or bool(self._auto_accts and not self._sig_accts),
+                             # 자산별 브로커명+동의 스탬프(2026-09-03 증거 원장·로그 페이지)
+                             "bk": self._asset_brokers(),
+                             "bkl": self._asset_brokers_multi(),   # 자산별 브로커 목록(R34 P2-#15)
+                             # 앱 화면 언어(2026-09-29): 서버가 회원 DM(진입 실패·T-10)을 회원 언어로 쓰게. 서버는 회원 언어를 모른다.
+                             "lg": "en" if self.lang == "en" else "ko",
+                             # 프롭 150K 확인(2026-09-28, 2026-10-02부터 전 등급): 150K로 판별된 계좌의 브로커·끝4만
+                             "p150": self._prop150_report(),
+                             "cv": ((self._profile or {}).get("consent") or {}).get("ver") or "",
+                             "ct": ((self._profile or {}).get("consent") or {}).get("at") or 0,
+                             # 실행 자산 체크(2026-08-28 리뷰 P1): 서버가 "붙였는데
+                             # 무장 안 됨" 경고를 띄울 때 일부러 안 돌리는 자산을
+                             # 제외하기 위한 것. 이게 없으면 정상 구성이 상시 경고가 된다.
+                             "inc": self._included_assets(),
+                             # 종료 표식(2026-08-28): 창을 닫으면 칩이 15분
+                             # 신선도 창을 기다리지 않고 즉시 꺼짐으로 바뀐다.
+                             # armed는 실상태 그대로 보낸다 - 무장 중 종료는
+                             # 다운 경보 대상이 맞기 때문이다(R14 P1).
+                             # (옛 "demo" 표식은 모의 모드 폐지(2026-09-07)로 안 싣는다 -
+                             #  서버는 키 없음 = 실무장으로 본다.)
+                             # NT8 브리지 상태(2026-09-28): ok/down/off + 마지막 확인·끊긴 시각. 서버가 장중 5분 끊김 판정.
+                             "n8": self._nt8_ping_state(),
+                             "closed": bool(getattr(self, "_closing", False))}
+                    if _dce:
+                        _body["dce"] = _dce
+                    _ok = _rq.post(PUSH_BASE + "eqalive", timeout=(3 if sync else 8), json=_body)
                     if getattr(_ok, "ok", False) and _sig is not None:
                         self._alive_sig = _sig      # **전송 성공 뒤에만** 기억한다
+                    try:                            # 서버가 'dce:N'으로 받았다고 답한 사건만 지운다(옛 서버는 답이 없어 남는다)
+                        if _dce and getattr(_ok, "ok", False) and "dce:" in str(getattr(_ok, "text", "") or ""):
+                            _dce_ack([e.get("id") for e in _dce])
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         # ⚠️종료 경로는 **동기 전송**(대표 2026-08-31 "앱 끄고 나서는 한참 모르네").
@@ -12687,8 +18276,10 @@ class App:
 
         def w():
             blocks = []
+            reco_rows = []                   # 권장 1R과 다른 계좌(결정 6) - 창이 전후를 보여 주고 [권장 1R로 맞추기] 한 번으로 바꾼다
             for asset in assets:
-                accts = [a for a in self._accts_of(asset) if a.get("on", True)]
+                _all_rows = self._accts_of(asset)
+                accts = [a for a in _all_rows if a.get("on", True)]
                 if not accts:
                     blocks.append(f"● {asset}: " + ("켜진 계좌 없음" if ko else "no active accounts"))
                     continue
@@ -12744,13 +18335,27 @@ class App:
                     else:                                          # 고정
                         mode = ("고정" if ko else "Fixed")
                         r = _as_float(ac.get("one_r"), _LEGACY_ONE_R); note = ("수동" if ko else "manual")
-                    balstr = (f"${bal:,.0f}" if bal is not None else ("조회 실패" if ko else "n/a"))
-                    rstr = (f"${r:,.0f}" if r is not None else ("진입 안 함" if ko else "no entry"))
-                    self.log(f"   ⚙ [{asset}, {lbl}] 잔고 {balstr}, {mode} 1R {rstr} ({note})")
-                    rows.append(f"   [{lbl}] {mode}, {'잔고' if ko else 'Bal'} {balstr}  |  1R {rstr}")
+                    balstr = (_money(bal) if bal is not None else ("조회 실패" if ko else "n/a"))      # -$120(3차 결정 H, 종전 '$-120')
+                    rstr = (_money(r) if r is not None else ("진입 안 함" if ko else "no entry"))
+                    _reco_txt = ""
+                    try:
+                        _reco, _rstage, _rsz = self._reco_for_row(asset, ac, bal=bal)
+                        if _reco is not None and r is not None and abs(float(r) - float(_reco)) >= 0.5:
+                            _to = None
+                            if _pr.get("on"):
+                                _to = "test" if _rstage == "eval" else "funded"
+                            reco_rows.append({"asset": asset, "idx": next(_ix for _ix, _x in enumerate(_all_rows) if _x is ac), "id": ac.get("id"), "lbl": lbl,
+                                              "before": float(r), "after": float(_reco), "stage": _rstage, "broker": bk, "size": _rsz,
+                                              "type_from": (_pr.get("type") or "test") if _pr.get("on") else None,
+                                              "type_to": _to})
+                            _reco_txt = (f"  (권장 ${_reco:,.0f})" if ko else f"  (recommended ${_reco:,.0f})")
+                    except Exception:
+                        pass
+                    self.log(f"   ⚙ [{asset}, {lbl}] 잔고 {balstr}, {mode} 1R {rstr} ({note})" + _reco_txt)
+                    rows.append(f"   [{lbl}] {mode}, {'잔고' if ko else 'Bal'} {balstr}  |  1R {rstr}" + _reco_txt)
                 blocks.append("\n".join(rows))
             msg = "\n\n".join(blocks) if blocks else ("계좌 없음" if ko else "no accounts")
-            self.root.after(0, lambda m=msg, t=title: messagebox.showinfo(t, m))
+            self.root.after(0, lambda m=msg, t=title, rr=list(reco_rows): self._one_r_window(t, m, rr))
         _th.Thread(target=w, daemon=True).start()
 
     def _preview_one_r(self, asset):
@@ -13219,7 +18824,14 @@ class App:
                 # 진입·손절 전부 leg-aware 헬퍼가 그 계좌(sc)에서 처리(대표 2026-07-16).
                 if stop is not None:                      # 손절 지터(넓힘만) — 계좌·진입마다 무작위
                     stop = self._jitter_stop(asset, sig.get("entry_ref"), stop, lbl)
-                self._run_futures_entry(b, sc, _legs, direction, stop, sig, live, _recv, asset, _pub)
+                if _broker in _DAYCAP_FIRMS and not _daycap_off():
+                    # 평가 계좌 익절(대표 2026-10-14): Topstep(ProjectX), Lucid(NT8)만 재료를 넘긴다. 평가인지는 계좌 이름, 잔고, Lucid 단계 답을
+                    # 본 뒤 _run_futures_entry 안에서 가린다 - 평가가 아니면 거기서 아무것도 하지 않고 종전 그대로 진입한다.
+                    # risk = 이번 진입 손절 위험 1R x 배수(결정 2: 남은 하루 한도가 이것의 0.5배보다 작으면 건너뜀).
+                    self._run_futures_entry(b, sc, _legs, direction, stop, sig, live, _recv, asset, _pub,
+                                            cap={"broker": _broker, "pr": dict(_pr), "lbl": lbl, "sc": sc, "risk": _eff_r})
+                else:
+                    self._run_futures_entry(b, sc, _legs, direction, stop, sig, live, _recv, asset, _pub)
                 return
             # ── 크립토(Bybit/Bitget): symbol·qty만, stopLoss는 주문에 첨부 ──
             _mysym = b._symbol(sym)

@@ -50,6 +50,17 @@ _CLOSE_RETRY_WAIT = 1.0
 _RECHECK_WAIT = 1.5
 
 
+def _parse_iso(s):
+    """ISO 시각 → aware datetime. 소수 초를 6자리로 맞춘 뒤 읽는다 - .NET이 끝의 0을 지운 '.52329'를 파이썬 3.9의 fromisoformat이
+    거절해 거래 행이 조용히 빠지던 것(평가 계좌 익절 3차 리뷰 P1, 맥 빌드는 3.9). 3.11 이상에서는 종전과 같은 값. 못 읽으면 ValueError."""
+    import re as _re
+    from datetime import datetime, timezone
+    t = str(s or "").strip().replace("Z", "+00:00")
+    t = _re.sub(r"(\.\d+)", lambda m: (m.group(1) + "000000")[:7], t, count=1)
+    d = datetime.fromisoformat(t)
+    return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+
+
 def _side_code(side):
     s = side.upper() if isinstance(side, str) else side
     if s not in _SIDE:
@@ -106,12 +117,15 @@ class ProjectXBroker(BrokerAdapter):
         with _TOK_LOCK:
             _TOK_CACHE.pop(_tok_key(self.cfg), None)
 
-    def _post(self, path: str, body: dict):
+    def _post(self, path: str, body: dict, timeout=None):
+        # timeout: 기본은 종전 _TIMEOUT. 진입 직전의 하루 실현 손익 조회(day_realized)만 짧은 값을 넘긴다 -
+        # 느린 조회가 진입을 붙잡지 않게(평가 계좌 익절, 2026-10-14).
+        _to = timeout or _TIMEOUT
         self._ensure_token()
         r = requests.post(f"{self.base}{path}",
                           headers={"Authorization": f"Bearer {self._token}",
                                    "Content-Type": "application/json"},
-                          json=body, timeout=_TIMEOUT)
+                          json=body, timeout=_to)
         # 토큰이 무효면 한 번 다시 받아서 재시도한다(2026-09-18): 종전엔 주문 직전에 새로 로그인해
         # 이 창이 거의 없었지만, 토큰을 나눠 쓰면 그 사이에 서버가 세션을 끊는 창이 생긴다. 그때
         # 401을 그대로 raise하면 그 계좌는 **진입을 놓친다**. 재시도는 1회뿐이고, 실패하면 종전대로
@@ -122,7 +136,7 @@ class ProjectXBroker(BrokerAdapter):
             r = requests.post(f"{self.base}{path}",
                               headers={"Authorization": f"Bearer {self._token}",
                                        "Content-Type": "application/json"},
-                              json=body, timeout=_TIMEOUT)
+                              json=body, timeout=_to)
         r.raise_for_status()
         d = r.json()
         # ProjectX returns HTTP 200 even on logical failures — the response's success/errorCode
@@ -134,11 +148,14 @@ class ProjectXBroker(BrokerAdapter):
         return d
 
     # ── reads ─────────────────────────────────────────────────────────────
-    def _accounts(self, active_only: bool = True) -> list[dict]:
+    def _accounts(self, active_only: bool = True, timeout=None) -> list[dict]:
         # POST /api/Account/search {onlyActiveAccounts} -> {accounts:[{id,name,balance,canTrade,
         # isVisible}], ...}. active_only=False면 로테이션으로 닫힌 계좌까지 포함(트랙레코드용,
         # 대표 2026-07-29: 프롭 로테이션으로 빠진 계좌의 과거 체결이 트랙레코드에서 누락되던 버그).
-        d = self._post("/api/Account/search", {"onlyActiveAccounts": bool(active_only)})
+        # timeout: 기본(None)은 종전 _TIMEOUT 그대로. 평가 계좌 감시만 짧은 값을 넘긴다(2026-10-14 2차 리뷰 P2 - 느린 한 번이 감시를 붙잡지 않게).
+        _body = {"onlyActiveAccounts": bool(active_only)}
+        d = (self._post("/api/Account/search", _body, timeout=timeout) if timeout is not None
+             else self._post("/api/Account/search", _body))
         accts = d.get("accounts", d if isinstance(d, list) else [])
         want = {a.lower() for a in (self.cfg.accounts or [])}
         if want:
@@ -339,7 +356,7 @@ class ProjectXBroker(BrokerAdapter):
                     continue
                 try:
                     ts = t.get("creationTimestamp") or ""
-                    ts_ms = int(datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp() * 1000)
+                    ts_ms = int(_parse_iso(ts).timestamp() * 1000)
                     out.append({
                         "tid": str(t.get("id") or ""),
                         "ts_ms": ts_ms,
@@ -485,3 +502,80 @@ class ProjectXBroker(BrokerAdapter):
         rejected (so we never sit unprotected)."""
         return self._post("/api/Position/closeContract",
                           {"accountId": int(account_id), "contractId": contract_id})
+
+    # ── 평가 계좌 익절(하루 이익 상한 + 통과 목표, 대표 2026-10-14 "앱이 보다가 정리하는 방식 고") ─────────────────
+    # 브로커에 익절 주문을 걸지 않는다(손절과 OCO가 아닌 독립 지정가는 한쪽 체결 뒤 남은 주문이 반대 포지션을 열 수 있다).
+    # 앱(eqgui 평가 계좌 감시)이 오늘 실현 손익 + 열린 포지션 미실현으로 계좌의 오늘 손익을 보고, 닿으면 closeContract로 그 계좌만 닫는다.
+    # 아래 두 메서드는 읽기 전용이고 새로 추가된 것이다 - 기존 진입·손절·청산 경로는 이것들을 부르지 않는다.
+    def day_realized(self, account_id, start_iso: str, timeout=None) -> float:
+        """start_iso 이후 이 계좌의 실현 순손익 = Σ profitAndLoss(반턴은 null→0) − Σ fees(진입 반턴 수수료 포함),
+        voided 제외(POST /api/Trade/search). 실패하면 예외 - 호출측이 '모름'으로 다룬다(조용한 0 금지)."""
+        d = self._post("/api/Trade/search", {"accountId": int(account_id), "startTimestamp": start_iso},
+                       timeout=timeout)
+        tot = 0.0
+        for t in d.get("trades", []) or []:
+            if t.get("voided"):
+                continue
+            tot += float(t.get("profitAndLoss") or 0.0) - float(t.get("fees") or 0.0)
+        return tot
+
+    def trades(self, account_id, start_iso: str, timeout=None) -> list:
+        """이 계좌의 start_iso 이후 거래 기록 원본(POST /api/Trade/search) - [{id, creationTimestamp, profitAndLoss, fees, voided, ...}].
+        평가 계좌 통과 익절의 '지금까지 최고일'(거래일별 손익의 최대) 재료다(3차 결정 B, 2026-10-14). 읽기 전용. 실패하면 예외 - 호출측이 '모름'으로
+        다룬다."""
+        d = self._post("/api/Trade/search", {"accountId": int(account_id), "startTimestamp": start_iso}, timeout=timeout)
+        return [t for t in (d.get("trades", []) or []) if isinstance(t, dict)]
+
+    def mark_price(self, contract_id, max_age_s: float = 120.0, timeout=None):
+        """평가 계좌 감시용 시세(3차 리뷰 P0) = (가장 최근 1분봉 종가, 그 봉 시각 UTC 초) 또는 None. current_market_price(지정가 경로가 쓰는
+        종전 함수, 그대로 둔다)와 같은 봉을 읽되 0 이하, 숫자 아님, max_age_s보다 오래된 봉(시장이 쉬는 동안 남은 몇 시간 전 봉)은 버린다 -
+        잘못된 값 한 번으로 계좌를 닫지 않게. 실패하면 None(그 회차는 판단하지 않는다)."""
+        import math as _m
+        from datetime import datetime, timedelta, timezone
+        try:
+            now = datetime.now(timezone.utc)
+            body = {"contractId": contract_id, "live": False,
+                    "startTime": (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "unit": 2, "unitNumber": 1, "limit": 3, "includePartialBar": True}
+            d = (self._post("/api/History/retrieveBars", body, timeout=timeout) if timeout is not None
+                 else self._post("/api/History/retrieveBars", body))
+            bars = d.get("bars", d if isinstance(d, list) else []) or []
+            best = None
+            for b in bars:
+                try:
+                    ts = _parse_iso(b.get("t") or b.get("timestamp")).timestamp()
+                    px = float(b.get("c"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if best is None or ts > best[1]:
+                    best = (px, ts)
+            if best is None:
+                return None
+            px, ts = best
+            if not _m.isfinite(px) or px <= 0 or (now.timestamp() - ts) > float(max_age_s):
+                return None
+            return px, ts
+        except Exception:
+            return None
+
+    def partial_close_contract(self, account_id, contract_id, size: int) -> dict:
+        """그 계좌, 그 계약 포지션 가운데 size만 시장가로 닫는다(POST /api/Position/partialCloseContract {accountId, contractId,
+        size} - gateway.docs.projectx.com 'Partially Close Positions'). 평가 계좌 감시가 회원이 손으로 더한 수량은 두고 앱 몫만 정리할 때
+        쓴다(3차 리뷰 P0 '앱이 넣은 포지션만'). 실패하면 예외."""
+        return self._post("/api/Position/partialCloseContract",
+                          {"accountId": int(account_id), "contractId": contract_id, "size": int(size)})
+
+    def open_positions(self, account_id, timeout=None) -> list:
+        """이 계좌 하나의 열린 포지션 원본(POST /api/Position/searchOpen) - [{contractId, type, size, averagePrice, ...}],
+        수량 0은 뺀다. list_open_positions와 달리 계좌 목록(Account/search)을 다시 읽지 않는다(5초 감시의 호출 수를 줄인다).
+        실패하면 예외 - 호출측이 '모름'으로 다룬다."""
+        d = self._post("/api/Position/searchOpen", {"accountId": int(account_id)}, timeout=timeout)
+        out = []
+        for p in d.get("positions", []) or []:
+            try:
+                if isinstance(p, dict) and int(p.get("size", 0) or 0) != 0:
+                    out.append(p)
+            except (TypeError, ValueError):
+                continue
+        return out

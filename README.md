@@ -1,5 +1,11 @@
 # EQ Autopilot
 
+> **Test build, not a release (2026-10-15)**
+>
+> This branch, `test-1014c`, holds the source of an internal test build
+> (EQ Autopilot 2026.10.14a test build) made for bug testing before release.
+> Members should not install it. The current release is on the `main` branch.
+
 The desktop app that executes EdgeQuant signals on your own broker accounts.
 This is the **full source of the app we ship** — published so you can check that the
 program does what the screen says it does.
