@@ -322,6 +322,28 @@ class NT8Broker(BrokerAdapter):
         return bool(st and st.last_state_ts
                     and (time.time() - st.last_state_ts) <= max_age)
 
+    def state_ts(self) -> float:
+        """마지막 push를 받은 시각(time.time 초, 없으면 0). 평가 계좌 감시가 서로 다른 두 스냅샷에서만 정리를 확정하는 데 쓴다
+        (3차 리뷰 P0 - NetLiq 한 번 튄 값으로 닫지 않게). 읽기 전용."""
+        st = self._state
+        return float(st.last_state_ts) if (st and st.last_state_ts) else 0.0
+
+    def snapshot_pair(self, acct):
+        """한 스냅샷에서 (push 시각, 현금, NetLiq, 미실현, [포지션 dict]) - 이 계좌만. 현금과 NetLiq, 포지션을 서로 다른 push에서 섞어
+        읽지 않게(3차 리뷰 P0). 계좌가 없으면 None."""
+        self.authenticate()
+        with self._state.lock:
+            snap = dict(self._state.last_state)
+            ts = float(self._state.last_state_ts or 0.0)
+        want = str(acct or "").strip().lower()
+        row = next((a for a in snap.get("accounts", []) or []
+                    if str(a.get("name") or "").strip().lower() == want), None)
+        if row is None:
+            return None
+        poss = [dict(p) for p in snap.get("positions", []) or []
+                if str(p.get("account") or "").strip().lower() == want and int(p.get("net_qty") or 0)]
+        return ts, row.get("cash_value"), row.get("net_liq"), row.get("unrealized_pnl"), poss
+
     def account_connected(self, acct) -> bool:
         """이 계정이 현재 push에 존재(=NT8 연결됨)하는가(2026-08-20 D2) - 연결 blip 중엔
         계정이 push에서 통째로 빠져 빈 포지션이 '플랫'으로 오독된다."""

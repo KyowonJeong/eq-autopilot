@@ -53,7 +53,7 @@ def ck(n, c, d=""):
         FAIL.append(n)
 
 
-ck("0 버전 2026.10.12e", eqgui.App._APP_VER == "2026.10.12e", eqgui.App._APP_VER)
+ck("0 버전 2026.10.12e 이상", eqgui.App._APP_VER >= "2026.10.12e", eqgui.App._APP_VER)
 
 # ── 1 NT8 풀사이즈 표기 ───────────────────────────────────────────────────────
 fa = eqgui.App._fill_asset
