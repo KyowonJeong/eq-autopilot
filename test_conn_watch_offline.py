@@ -66,7 +66,7 @@ def _build(broker_ok, held=()):
     return t, sent
 
 
-SEEN = {("nt8", "ACC1"): ("NQ", {"f1": "", "f2": "", "f3": ""})}
+SEEN = {("projectx", "ACC1"): ("NQ", {"f1": "", "f2": "", "f3": ""})}   # NT8은 1분 확인이 알린다(2026-11-02) - 10분 감시는 ProjectX로 시험
 
 
 def main():

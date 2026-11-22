@@ -330,6 +330,8 @@ class Stub:
         if n.startswith("__"):
             raise AttributeError(n)
         return lambda *a, **k: None
+for _n in ("_ui", "_on_main", "_dm_kind"):   # 2026-10-20 화면 줄 대기열(_ui) - 가짜 객체의 __getattr__가 삼키지 않게
+    setattr(Stub, _n, eqgui.App.__dict__[_n])
 
 
 for _n in ("_unconf_watch_add", "_unconf_watch_drop", "_unconf_save", "_unconf_clear_state", "_unconf_restore_broker",
@@ -659,9 +661,9 @@ ck("3 실제 스레드: 진입 도중 정지→시작해도 같은 신호 진입
 # 주석·문구의 '이중 진입 없음' 과장 정정
 _src = io.open(os.path.join(HERE, "eqgui.py"), encoding="utf-8").read()
 _seg = {n.name: ast.get_source_segment(_src, n) for n in ast.walk(ast.parse(_src))
-        if isinstance(n, ast.FunctionDef) and n.name in ("_sig_loop", "_start_sig_loop")}
+        if isinstance(n, ast.FunctionDef) and n.name in ("_sig_loop_body", "_start_sig_loop")}
 ck("3 신호 루프 주석이 세대 확인의 한계를 사실대로(공유 처리 기록이 재처리를 막음)",
-   "과장" in _seg["_sig_loop"] and "루프는 늘 하나다" not in _seg["_start_sig_loop"]
+   "과장" in _seg["_sig_loop_body"] and "루프는 늘 하나다" not in _seg["_start_sig_loop"]
    and "_sig_seen" in _seg["_start_sig_loop"])
 
 
@@ -766,8 +768,9 @@ run_loop(me, 1, [T(14, 0, 5)], b)                 # 세대 1: 첫 시도 실패
 me._auto_on, me._auto_gen = True, 2               # 정지→다시 무장: 세대 2
 run_loop(me, 2, [T(14, 1, 10), T(14, 5)], b)
 ck("5 새 세대가 실패 기록을 이어받아 재시도 → 성공", b.flatten_all.call_count == 2, b.flatten_all.call_count)
-ck("5 첫 실패 서버 보고·팝업은 한 번(새 세대가 '첫 실패'로 다시 보내지 않음)",
-   _ctxs(me._report_error) == ["auto_close"] and me.root.after.call_count == 1,
+# 2026-10-20 대표 '팝업 뭐든간에 거래는 드가야': 실패 팝업은 없다(첫 실패 보고가 서버에서 회원 DM, 창이 닫힐 때 _gave_up DM).
+ck("5 첫 실패 서버 보고는 한 번(새 세대가 '첫 실패'로 다시 보내지 않음), 팝업 없음",
+   _ctxs(me._report_error) == ["auto_close"] and me.root.after.call_count == 0,
    (me._report_error.call_args_list, me.root.after.call_count))
 ck("5 성공 후속 보고(autoclose_ok '2번째 시도') 유지(종전: 새 세대에선 빠짐)",
    _ctxs(me._member_alert) == ["autoclose_ok"] and "2번째 시도" in me._member_alert.call_args[0][1],
@@ -779,8 +782,8 @@ b.flatten_all.side_effect = [RuntimeError("HTTP 502"), RuntimeError("HTTP 502")]
 run_loop(me, 1, [T(14, 0, 5)], b)
 me._auto_on, me._auto_gen = True, 2
 run_loop(me, 2, [T(14, 1, 10)], b)
-ck("5 새 세대에서 또 실패해도 실패 팝업·회원 DM이 반복되지 않음",
-   _ctxs(me._report_error) == ["auto_close"] and me.root.after.call_count == 1
+ck("5 새 세대에서 또 실패해도 실패 보고(회원 DM)가 반복되지 않음, 팝업 없음",
+   _ctxs(me._report_error) == ["auto_close"] and me.root.after.call_count == 0
    and me._auto_retry[("NQ", 14, "a1")]["n"] == 2, (me._report_error.call_args_list, me._auto_retry))
 
 me = _me5()
@@ -871,8 +874,9 @@ with fake_clock():
 
 _ea = next(n for n in ast.walk(ast.parse(_src)) if isinstance(n, ast.FunctionDef) and n.name == "_enter_account")
 _calls = [c for c in ast.walk(_ea) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_claim_entry"]
+# 2026.11.11h(검증 P1-1): 크립토는 키 열쇠, 계정 번호 열쇠를 차례로 두 번 잡는다 - 둘 다 종전 mid(per_process 없음)
 ck("6 크립토 경로 클레임은 종전 mid(잔여 청산 뒤 클레임이라 난수를 붙이면 늦은 쪽이 포지션을 닫고 양보)",
-   len(_calls) == 1 and not any(k.arg == "per_process" for k in _calls[0].keywords), [ast.dump(c) for c in _calls])
+   1 <= len(_calls) <= 2 and not any(k.arg == "per_process" for c in _calls for k in c.keywords), [ast.dump(c) for c in _calls])
 
 print()
 print("실패", len(FAIL), FAIL if FAIL else "")

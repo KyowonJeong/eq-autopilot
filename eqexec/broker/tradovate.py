@@ -313,6 +313,11 @@ class TradovateBroker(BrokerAdapter):
                     self._contract_ids[c["name"]] = int(c["contractId"])
         return cands
 
+    def contract_for_month(self, root: str, year: int, month: int, max_age=None):
+        """월물 규칙 R(2026-11-02): Tradovate 이름 '<루트><월코드><연 한 자리>'(예: MNQZ6). /contract/find로 있는지 확인한다. 없으면 None."""
+        name = f"{str(root).upper()}{_MONTH_CODES[int(month) - 1]}{int(year) % 10}"
+        return name if self._resolve_id(name) is not None else None
+
     def _resolve_id(self, contract) -> int | None:
         """계약 인자(계약ID int 또는 심볼명 str)를 Tradovate contractId로."""
         s = str(contract)
@@ -472,11 +477,12 @@ class TradovateBroker(BrokerAdapter):
         return self._post("/order/liquidateposition",
                           {"accountId": int(account_id), "contractId": cid, "admin": False})
 
-    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+    def flatten_all(self, dry_run: bool = True, only=None) -> FlattenResult:
         _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
         if _refuse is not None:
             return _refuse
-        plan = self.list_open_positions()
+        _mine = (lambda sym: True) if only is None else (lambda sym: bool(only(str(sym or ""))))   # 2026-10-17 자산별 청산
+        plan = [p for p in self.list_open_positions() if _mine(p.symbol)]
         res = FlattenResult(dry_run=dry_run, planned=list(plan))
         if dry_run or not plan:
             return res
@@ -491,7 +497,7 @@ class TradovateBroker(BrokerAdapter):
                 res.errors.append(f"{pos.account_name}/{pos.symbol}: {e}")
         # Confirm-after-act: re-read; anything still open is an error to alert on.
         try:
-            still = [p for p in self.list_open_positions()]
+            still = [p for p in self.list_open_positions() if _mine(p.symbol)]
             res.closed = [p for p in plan if not any(
                 s.account_id == p.account_id and s.symbol == p.symbol for s in still)]
             for p in still:

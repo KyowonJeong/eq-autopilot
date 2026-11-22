@@ -76,10 +76,10 @@ ck("OSError 때 원장 그대로(덮어쓰지 않음)", open(P, "rb").read() == 
 _orig_replace = G.os.replace
 G.os.replace = lambda a, b: (_ for _ in ()).throw(PermissionError("locked"))
 try:
-    G._write_json_atomic(P, {"X|y": 내부 기록})
+    G._write_json_atomic(P, {"X|y": [[1.0, 2.0]]})
 finally:
     G.os.replace = _orig_replace
-ck("바꿔 끼우기 실패 → 직접 저장으로 기록 남음", json.load(open(P)) == {"X|y": 내부 기록})
+ck("바꿔 끼우기 실패 → 직접 저장으로 기록 남음", json.load(open(P)) == {"X|y": [[1.0, 2.0]]})
 ck("바꿔 끼우기 실패 → .tmp 남지 않음", not [x for x in os.listdir(G.APP_DIR) if x.endswith(".tmp")])
 print(("실패 %d: %s" % (len(fails), fails)) if fails else "전부 통과")
 sys.exit(1 if fails else 0)

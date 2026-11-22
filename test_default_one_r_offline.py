@@ -31,7 +31,12 @@ ck("새 계좌 만들 때 600 리터럴 없음", "_new_acct(600" not in src and 
 assert eqgui.CFG_PATH.startswith(_H), eqgui.CFG_PATH
 _d0 = eqgui._load()
 _r0 = {a: [x["one_r"] for x in ((_d0.get("assets") or {}).get(a) or {}).get("accounts", [])] for a in ("NQ", "GC", "BTC")}
-ck("새 설치 _load() 첫 계좌 1R = 500(리뷰 P1-1)", all(v and all(r == 500.0 for r in v) for v in _r0.values()), _r0)
-ck("버전 2026.10.12e", eqgui.App._APP_VER == "2026.10.12e")
+# 2026-11-06(대표 "브로커가 비어 있으면 사용 계좌도 비워 놔야지"): 새 설치는 계좌 행이 없다 - 첫 행은 브로커를 연결한 뒤 [계좌 추가]가
+# 새 계좌 기본 1R(500)로 만든다(종전: _load가 1R 500 빈 행 하나를 만들었다, 리뷰 P1-1).
+ck("새 설치 _load() = 계좌 행 없음(첫 행은 [계좌 추가])", _r0 == {"NQ": [], "GC": [], "BTC": []}, _r0)
+_add_src = inspect.getsource(eqgui.App._add_acct)
+ck("[계좌 추가] 새 행 1R = 새 계좌 기본(DEFAULT_ONE_R, 리뷰 P1-1)", _add_src.count("_new_acct(DEFAULT_ONE_R,") == 2
+   and "_LEGACY_ONE_R" not in _add_src, _add_src.count("_new_acct(DEFAULT_ONE_R,"))
+ck("버전 2026.10.12e 이상", eqgui.App._APP_VER >= "2026.10.12e")
 print("FAIL %d" % len(FAIL) if FAIL else "ALL PASS")
 sys.exit(1 if FAIL else 0)

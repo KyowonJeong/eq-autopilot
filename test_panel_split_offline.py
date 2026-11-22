@@ -368,7 +368,9 @@ def run_s4():
         elif a == "lang":
             app.langbox.set("English" if app.lang == "ko" else "한국어"); app._set_lang()
         elif a == "conntest":
-            app._save_creds_and_test()
+            # 21h: 쓰이지 않던 [저장 + 연결 테스트](_save_creds_and_test)를 지웠다 - 그 함수의 첫 단계(지금 칸 저장)만 남긴다.
+            # 연결 테스트는 panelconn(자산 줄 [연결 테스트])이 본다.
+            app._save_current_asset()
         elif a == "panelconn":
             app._panel_conn_test(app._asset)
         elif a == "restart":

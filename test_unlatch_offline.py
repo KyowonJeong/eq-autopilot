@@ -59,16 +59,20 @@ chk("_live_ctx.perm_auto 갱신(가동 중 자산 추가 무장도 자동 진입
 chk("로그 줄 '자동 진입 권한 반영'(DM·웹 문구가 이름으로 가리키는 줄)", any("자동 진입 권한 반영" in m for m in logs))
 _w = [m for m in logs if "1R 미설정" in m]
 chk("1R 미설정 계좌만 경고(prop·manual 계좌 제외)", _w and "GC B" in _w[0] and "GC C" not in _w[0] and "BTC D" not in _w[0])
-chk("안내창 1회", len(shown) == 1 and "자동 진입 권한이 반영" in shown[0] and "GC B" in shown[0])
+# 2026-10-20 대표 '팝업 뭐든간에 거래는 드가야', '차라리 dm을 쏴': 안내창 없음, 1R 미설정 계좌가 있으면 회원 DM 한 번
+_dm = app._member_alert.call_args_list
+chk("안내창 없음 + 회원 DM 1회(1R 미설정 계좌 이름)", not shown and len(_dm) == 1 and "자동 진입 권한이 반영" in _dm[0][0][1]
+    and "GC B" in _dm[0][0][1])
 logs.clear(); shown.clear()
 eqgui.App._apply_gating(app)
-chk("같은 상태 재호출 = 반복 알림 없음", not shown and not any("권한 반영" in m for m in logs))
+chk("같은 상태 재호출 = 반복 알림 없음", not shown and not any("권한 반영" in m for m in logs)
+    and app._member_alert.call_count == 1)
 app._gate["caps"]["autoentry"] = False
 eqgui.App._apply_gating(app)
 chk("강등 하트비트 → 확인 모드 복귀(종전 분기 그대로)", app._watch_only is True and not shown)
 app._gate["caps"]["autoentry"] = True
 eqgui.App._apply_gating(app)
-chk("재승급 → 다시 해제 + 알림 1회", app._watch_only is False and len(shown) == 1)
+chk("재승급 → 다시 해제 + 알림 1회(DM)", app._watch_only is False and not shown and app._member_alert.call_count == 2)
 app2 = _app()
 app2._sig_on = False
 shown.clear(); logs.clear()
@@ -83,7 +87,7 @@ app4 = _app(lang="en")
 shown.clear(); logs.clear()
 eqgui.App._apply_gating(app4)
 chk("EN 로그 줄 'Auto-entry permission applied'", any("Auto-entry permission applied" in m for m in logs)
-    and shown and "Auto-entry permission applied" in shown[0])
+    and not shown and "Auto-entry permission applied" in app4._member_alert.call_args[0][2])
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"), encoding="utf-8").read()
 chk("정적: 해제 분기가 강등 분기 뒤 elif로 존재", "perm_auto and getattr(self, \"_watch_only\", False)" in src)
 chk("버전 23f 이상", eqgui.App._APP_VER >= "2026.09.23f")

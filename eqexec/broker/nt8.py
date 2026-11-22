@@ -31,7 +31,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .base import BrokerAdapter, FlattenResult, Position, refuse_flatten_without_accounts
+from .base import BrokerAdapter, FlattenResult, Position, entry_px_walk, refuse_flatten_without_accounts
 
 log = logging.getLogger("eqexec.nt8")
 
@@ -134,7 +134,15 @@ def _make_handler(state: _BridgeState, token: str):
                         state.acks[tid] = body
                 return self._send(200, {"ok": True})
             if self.path == "/v1/state":
+                # 애드온 자동 교체 뒤 NT8 안에 옛 인스턴스가 남아 함께 push할 수 있다(검토 P1-2) - 이 실행에서 본 가장 높은 bridge_ver보다
+                # 낮은 push는 버린다(버전 표기 없는 아주 옛 애드온은 높은 버전을 본 뒤에만 버린다).
+                _bv = str(body.get("bridge_ver") or "")
                 with state.lock:
+                    _top = getattr(state, "max_bridge_ver", "")
+                    if _top and _bv < _top:
+                        return self._send(200, {"ok": True, "ignored": "older_bridge"})
+                    if _bv > _top:
+                        state.max_bridge_ver = _bv
                     state.last_state = body
                     state.last_state_ts = time.time()
                 return self._send(200, {"ok": True})
@@ -148,6 +156,37 @@ def _make_handler(state: _BridgeState, token: str):
             return self._send(404, {"error": "not found"})
 
     return Handler
+
+
+def _nt8_entry_map(rows) -> dict:
+    """애드온 executions(반턴들) → {id(청산 반턴 행): 진입가 또는 None}(트랙레코드 영수증, R57 #7, 2026-11-08).
+    (계좌, 종목)마다 시간순, side BUY = +qty, SELL = -qty, 진입과 청산은 부호로 가른다 - 애드온 장부(EQAutopilotBridge.cs 실현손익 부기)와
+    같은 규칙(base.entry_px_walk). 시각을 못 읽는 행이 있는 (계좌, 종목)은 전부 None. 어떤 실패든 {} - 진입가 없이 종전대로."""
+    try:
+        from datetime import datetime
+        recs, bad = [], set()
+        for i, e in enumerate(rows or []):
+            if not isinstance(e, dict):
+                continue
+            con = (str(e.get("account") or ""), str(e.get("instrument") or ""))
+            try:
+                ts = datetime.fromisoformat(str(e.get("time") or "").replace("Z", "+00:00")).timestamp()
+            except Exception:
+                bad.add(con)
+                continue
+            _sd = str(e.get("side") or "").upper()
+            try:
+                q = abs(float(e.get("qty") or 0)) * (1 if _sd == "BUY" else (-1 if _sd == "SELL" else 0))
+            except (TypeError, ValueError):
+                q = 0.0
+            recs.append(((ts, i), con, id(e), q, e.get("price"), None))
+        m = entry_px_walk(recs)
+        for r in recs:
+            if r[1] in bad:
+                m[r[2]] = None
+        return m
+    except Exception:
+        return {}
 
 
 class NT8Broker(BrokerAdapter):
@@ -230,6 +269,17 @@ class NT8Broker(BrokerAdapter):
         while time.time() < deadline:
             age = time.time() - self._state.last_state_ts
             if self._state.last_state_ts > 0 and age <= _HEARTBEAT_MAX_S:
+                # 계좌 연결까지(대표 2026-11-02 "닌자 트레이더 끊겨도 워닝 안 와"): 애드온은 NT8이 켜져 있으면 하트비트를
+                # 계속 보내고, 접속이 끊긴 계좌는 accounts에서 뺀다. 하트비트만 보면 NT8 안의 접속(Lucid, Tradovate)이
+                # 끊겨도 정상으로 판정했다. 이 인스턴스의 계좌가 정해져 있으면 그 계좌가 목록에 있어야 정상이다.
+                want = {str(a).strip().casefold() for a in (self.accounts or []) if str(a).strip()}
+                if want:
+                    have = {str(a.get("name", "")).strip().casefold() for a in self._snapshot().get("accounts", []) or []}
+                    miss = sorted(a for a in (self.accounts or []) if str(a).strip().casefold() in want - have)
+                    if miss:
+                        raise RuntimeError(
+                            "NT8 계좌 연결 끊김: " + ", ".join(miss) + " - NinjaTrader 연결(Connections) 상태를 확인하세요"
+                            " / NT8 account disconnected - check the connection in NinjaTrader")
                 return True
             time.sleep(0.2)
         raise RuntimeError(
@@ -315,12 +365,46 @@ class NT8Broker(BrokerAdapter):
                 return a
         return None
 
+    def _attached_state(self):
+        """공유 브리지 상태(없으면 붙인다). 붙이지 못하면(토큰 없음, 토큰 다름, 포트 사용 중) None.
+        2026-10-15 대표 PC 실사고: 평가 계좌 감시가 _build_broker로 새로 만든 인스턴스로 맨 먼저 snapshot_fresh()를 불렀는데,
+        이 메서드만 authenticate()를 부르지 않아 _state가 None인 채로 늘 False였다 - 감시가 NT8 계좌를 매번 말없이 건너뛰었다
+        (Sim101 +$204 미정리, Lucid '오늘 남은' 줄 없음). 다른 조회처럼 먼저 붙인다(closed_fills 2026-09-08과 같은 구멍)."""
+        if self._state is None:
+            try:
+                self.authenticate()
+            except Exception:
+                return None
+        return self._state
+
     def snapshot_fresh(self, max_age: float = 10.0) -> bool:
         """push 신선도(2026-08-20 D1) - NT8이 죽으면 last_state가 고착되므로, 무인 판정
-        (통과 익절)은 이 게이트를 통과한 스냅샷만 믿는다."""
-        st = self._state
+        (통과 익절)은 이 게이트를 통과한 스냅샷만 믿는다. 아직 브리지에 안 붙은 인스턴스면 먼저 붙는다."""
+        st = self._attached_state()
         return bool(st and st.last_state_ts
                     and (time.time() - st.last_state_ts) <= max_age)
+
+    def state_ts(self) -> float:
+        """마지막 push를 받은 시각(time.time 초, 없으면 0). 평가 계좌 감시가 서로 다른 두 스냅샷에서만 정리를 확정하는 데 쓴다
+        (3차 리뷰 P0 - NetLiq 한 번 튄 값으로 닫지 않게). 아직 브리지에 안 붙은 인스턴스면 먼저 붙는다."""
+        st = self._attached_state()
+        return float(st.last_state_ts) if (st and st.last_state_ts) else 0.0
+
+    def snapshot_pair(self, acct):
+        """한 스냅샷에서 (push 시각, 현금, NetLiq, 미실현, [포지션 dict]) - 이 계좌만. 현금과 NetLiq, 포지션을 서로 다른 push에서 섞어
+        읽지 않게(3차 리뷰 P0). 계좌가 없으면 None."""
+        self.authenticate()
+        with self._state.lock:
+            snap = dict(self._state.last_state)
+            ts = float(self._state.last_state_ts or 0.0)
+        want = str(acct or "").strip().lower()
+        row = next((a for a in snap.get("accounts", []) or []
+                    if str(a.get("name") or "").strip().lower() == want), None)
+        if row is None:
+            return None
+        poss = [dict(p) for p in snap.get("positions", []) or []
+                if str(p.get("account") or "").strip().lower() == want and int(p.get("net_qty") or 0)]
+        return ts, row.get("cash_value"), row.get("net_liq"), row.get("unrealized_pnl"), poss
 
     def account_connected(self, acct) -> bool:
         """이 계정이 현재 push에 존재(=NT8 연결됨)하는가(2026-08-20 D2) - 연결 blip 중엔
@@ -332,6 +416,22 @@ class NT8Broker(BrokerAdapter):
         이 필드를 안 보내므로 None → 호출부가 '애드온 업데이트 필요'로 안내하고 쉰다."""
         a = self._acct_row(acct)
         return a.get("net_liq") if a else None
+
+    def account_margin_avail(self, acct):
+        """주문에 쓸 수 있는 증거금 어림(달러, 출처) - 증거금에 맞춰 계약 줄이기(2026-10-16). 새 애드온의 장중 증거금 여유(excess_margin)가
+        0보다 크면 그 값('broker'), 아니면 현금(cash_value, 'cash'), 둘 다 없으면 (None, None). 0이나 음수인 브로커 값 하나로 진입을 막지 않는다
+        (접속에 따라 0이 온다)."""
+        a = self._acct_row(acct)
+        if not a:
+            return None, None
+        for k, src in (("excess_margin", "broker"), ("cash_value", "cash")):
+            try:
+                v = float(a.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v > 0:                                   # 0 이하는 '모름'(접속 직후, 재접속 중 NT8이 0을 준다 - 검토 P1-1)
+                return v, src
+        return None, None
 
     def account_unrealized(self, acct):
         a = self._acct_row(acct)
@@ -384,6 +484,11 @@ class NT8Broker(BrokerAdapter):
         if " " in c:
             return c                                  # 이미 "MNQ 09-26" 완전 표기
         return self._front_month(c) or c
+
+    def contract_for_month(self, root: str, year: int, month: int, max_age=None):
+        """월물 규칙 R(2026-11-02): NT8 표기 '<루트> MM-YY'. 계약 조회 API가 없어 그대로 만든다(없는 월물이면 애드온이 주문을 거절한다).
+        symbol_map(회원 덮어쓰기)보다 서버 신호의 월물이 먼저다 - 서버 가격과 다른 월물로 주문하지 않게."""
+        return f"{str(root).upper()} {int(month):02d}-{int(year) % 100:02d}"
 
     def search_contracts(self, text: str, live: bool = False) -> list[dict]:
         """ProjectX/Tradovate와 동일 호출 계약. NT8은 계약 조회 API가 없어 정적 해석
@@ -476,6 +581,7 @@ class NT8Broker(BrokerAdapter):
             return []
         st = (self._state.last_state if self._state else {}) or {}
         rows = st.get("executions") or []
+        _epx = _nt8_entry_map(rows)            # 청산 반턴마다 그 포지션의 진입가(하나뿐일 때만, R57 #7)
         out = []
         for e in rows:
             try:
@@ -501,21 +607,53 @@ class NT8Broker(BrokerAdapter):
                     "acct": str(e.get("account") or ""),
                     "acct_name": str(e.get("account") or ""),
                     # 청산 체결가(브리지가 execution마다 price를 보낸다) - 트랙레코드
-                    # 영수증이 회원 실체결가를 쓰게 하는 재료(2026-09-06). 진입가는 이
-                    # 페이로드에 없어 서버가 신호 기준가로 채운다.
+                    # 영수증이 회원 실체결가를 쓰게 하는 재료(2026-09-06).
                     "exit_px": float(e.get("price") or 0.0) or None,
+                    # 진입가(R57 #7, 2026-11-08): 같은 executions의 진입 반턴에서, 그 포지션의 진입 가격이 하나뿐일 때만. 모르면 None
+                    # (NT8을 다시 켜 진입 체결이 목록에 없으면 None - 서버는 종전대로 신호 기준가를 쓴다).
+                    "entry_px": _epx.get(id(e)),
                 })
             except (TypeError, ValueError):
                 continue
         return out
 
-    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
+    def flatten_all(self, dry_run: bool = True, only=None) -> FlattenResult:
         _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
         if _refuse is not None:
             return _refuse
         planned = self.list_open_positions()
+        if only is not None:                       # 2026-10-17 자산별 청산: 그 종목 포지션만
+            planned = [p for p in planned if only(str(p.symbol or ""))]
         res = FlattenResult(dry_run=dry_run, planned=planned)
         if dry_run:
+            return res
+        if only is not None:
+            # 브리지가 끊긴(또는 아직 push가 없는) 스냅샷은 '포지션 없음'이 아니라 모름이다(적대 검토 2026-10-17 P1): 종전 flatten은 ack 시간
+            # 초과로 실패를 알렸는데, 종목별 경로는 빈 목록이면 명령을 하나도 안 보내 '완료 0개'로 끝났다.
+            if not self.snapshot_fresh():
+                res.errors.append("nt8 bridge not connected (no recent state push) - positions unknown, nothing closed")
+                return res
+            # 브리지는 살아 있어도 그 계좌만 연결이 끊기면(Rithmic 끊김 등) 애드온이 그 계좌를 push에서 뺀다 - 빈 포지션은 '없음'이 아니라
+            # 모름이다(앱 출시 전 검토 2026-10-20 P1: 마감 청산이 '포지션 없음'으로 끝나 재시도도 알림도 없었다). 오류로 돌려 호출부가 다시 시도한다.
+            _gone = [a for a in (self.accounts or []) if not self.account_connected(a)]
+            if _gone:
+                res.errors.append(f"nt8 account not connected in NinjaTrader ({', '.join(str(a)[-4:] for a in _gone)}) - "
+                                  "positions unknown, nothing closed")
+                return res
+            # 애드온 'close'(2026-07-30 첫 브리지부터 있음) = Account.Flatten([그 종목]) - 그 종목의 주문 취소 포함, 다른 종목은 그대로.
+            _dead = None
+            for p in planned:
+                if _dead is not None:                      # 첫 시간 초과 뒤 남은 종목은 기다리지 않는다(종목마다 20초씩 막히지 않게)
+                    res.errors.append(f"{p.account_name}/{p.symbol}: not sent - {_dead}")
+                    continue
+                try:
+                    self.close_contract((p.raw or {}).get("_accountId") or p.account_id, p.symbol)
+                    res.closed.append(p)
+                except TimeoutError as ex:
+                    _dead = f"bridge timeout ({ex})"
+                    res.errors.append(f"{p.account_name}/{p.symbol}: {ex}")
+                except Exception as ex:                  # noqa: BLE001 — 전부 보고
+                    res.errors.append(f"{p.account_name}/{p.symbol}: {ex}")
             return res
         cmd = {"op": "flatten", "tid": f"eqf-{uuid.uuid4().hex[:12]}",
                "accounts": self.accounts or None}

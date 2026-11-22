@@ -6,7 +6,7 @@
 #
 # 브로커 → 심볼 매트릭스(대표 2026-07-10, MBTC 제거):
 #   Topstep·IBKR : MNQ(NQ) · MGC(GC)               — 선물(정수 계약)
-#   Bybit·Bitget : BTCUSDT.P (BTC만)               — 크립토(분수 수량, 랏 0.001)
+#   Bybit·Bitget·OKX : BTCUSDT.P (BTC만)           — 크립토(분수 수량, 랏 0.001; OKX는 어댑터가 계약 수로 변환)
 #      MBTC로 돌리면 실행 성과가 크게 훼손됨. BTC는 크립토 전용.
 #
 # 수량 공식:
@@ -46,7 +46,7 @@ MIN_STOP_FRAC = {"MNQ": 0.00025, "MGC": 0.00025}
 MAX_MICRO_EQ = {"MNQ": 400, "MGC": 400}
 
 _FUTURES_BROKERS = ("projectx", "ibkr", "nt8")   # projectx == Topstep, nt8 == Lucid 브리지
-_CRYPTO_BROKERS = ("bybit", "bitget")
+_CRYPTO_BROKERS = ("bybit", "bitget", "okx")
 _FUT_SYMBOL = {"NQ": "MNQ", "GC": "MGC"}   # BTC 선물 없음(MBTC 제거) — BTC는 크립토 전용
 
 

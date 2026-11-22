@@ -95,6 +95,8 @@ eqgui.messagebox.askyesno = lambda *a, **k: (MSG.append(("ask",) + tuple(str(x) 
 eqgui.messagebox.showinfo = lambda *a, **k: MSG.append(("info",) + tuple(str(x) for x in a))
 eqgui.messagebox.showwarning = lambda *a, **k: MSG.append(("warn",) + tuple(str(x) for x in a))
 eqgui.messagebox.showerror = lambda *a, **k: MSG.append(("error",) + tuple(str(x) for x in a))
+# 모달 아닌 알림 창(2026-10-20, 작업 줄에서 넘어온 결과 창) - 기록만
+eqgui.App._notice = lambda self, t, m, buttons=None: MSG.append(("notice", str(t), str(m)))
 eqgui.simpledialog.askstring = lambda *a, **k: (PINS.pop(0) if PINS else None)
 
 EMAIL, PXKEY, TOKEN = "member@mail.com", "PX-API-KEY-777", "TOK-bridge-abcdef123456"
@@ -154,7 +156,7 @@ def _fake_build(broker, f1, f2, f3, accounts):
         return FakePX(f1, f2)
     if broker == "nt8":
         return FakeNT8(f1)
-    if broker in ("bybit", "bitget"):
+    if broker in ("bybit", "bitget", "okx"):
         return FakeCrypto(broker, f1, f2)
     raise RuntimeError("not in test")
 
@@ -872,7 +874,8 @@ MSG.clear()
 ASK[0] = True
 eqgui.App._send_log(app); flush()
 _rq.post = _orig_post
-ck("R-P3 [로그 보내기] 실패 창이 뜸(ConnectionError)", any(m[0] == "warn" and "ConnectionError" in m[2] for m in MSG), MSG)
+ck("R-P3 [로그 보내기] 실패 창이 뜸(ConnectionError, 모달 아닌 알림 창)", any(m[0] == "notice" and "ConnectionError" in m[2]
+                                                                       for m in MSG), MSG)
 
 # R-P3 가져오기 거름 로그 = 표시 이름(내부 키 아님)
 seed(RB, {EMAIL: PXKEY})
@@ -905,15 +908,15 @@ _pt = _panel_texts(app)
 ck("PANEL 제목 = 브로커 연결 설정", str(app._cfg_hdr.cget("text")).endswith("브로커 연결 설정"), app._cfg_hdr.cget("text"))
 ck("PANEL 자산 탭 버튼 없음(나스닥·금·비트코인)", not any(k == "Button" and t in ("나스닥 (NQ)", "금 (GC)", "비트코인 (BTC)")
                                                  for k, t in _pt), [t for k, t in _pt if k == "Button"])
-ck("PANEL 드롭다운 = 브로커 다섯 전부", tuple(app.brokerbox.cget("values")) == tuple(eqgui._broker_label(b) for b in
-   ("projectx", "nt8", "ibkr", "bybit", "bitget")), app.brokerbox.cget("values"))
+ck("PANEL 드롭다운 = 브로커 여섯 전부(OKX 2026-11-03)", tuple(app.brokerbox.cget("values")) == tuple(eqgui._broker_label(b) for b in
+   ("projectx", "nt8", "ibkr", "bybit", "bitget", "okx")), app.brokerbox.cget("values"))
 ck("PANEL 기동 기본 = NQ 첫 켜진 행 브로커(Topstep)", app._broker_name == "projectx" and app._panel_asset == "NQ")
 _snap = lambda a: ({x: a._acfg[x]["broker"] for x in eqgui._ASSETS},
                    {x: [a._acct_broker(x, r) for r in a._acfg[x]["accounts"]] for x in eqgui._ASSETS})
 _s0 = _snap(app)
 for _tab in ("NQ", "GC", "BTC"):
     app._on_asset(_tab); flush()
-    for _b in ("projectx", "nt8", "ibkr", "bybit", "bitget", "projectx"):
+    for _b in ("projectx", "nt8", "ibkr", "bybit", "bitget", "okx", "projectx"):
         app.brokerbox.set(eqgui._broker_label(_b)); app._on_broker(); flush()
 _s1 = _snap(app)
 ck("PANEL 브로커를 어느 탭에서 무엇으로 골라도 자산·행 실행 브로커 그대로", _s1 == _s0, (_s0, _s1))
@@ -978,68 +981,79 @@ ck("PANEL 기동 기본 = NQ 첫 켜진 행 브로커(Lucid)", app._broker_name 
 # 11e(대표 2026-10-09 확정): 로그 아래 = 일괄 청산 경고(warn_mix) → 트랙레코드 → 주의 사항(접이식) → 회색 한 줄(caut_foot).
 # 창을 실제로 띄워야(deiconify) 캔버스 안 위젯 높이·위치가 진짜 값이 된다 - 숨긴 창에선 캔버스 창 항목 크기가 안 맞춰져
 # 옛 시험이 미표시(rooty 67 등)를 잘못 읽었다.
-_CAUT_KEYS = ["caut_auto_h", "caut_auto_1", "caut_auto_2", "caut_stop_h", "caut_stop_1", "caut_stop_2",
+_CAUT_KEYS = ["caut_auto_h", "caut_auto_1", "caut_auto_2", "caut_auto_3", "caut_stop_h", "caut_stop_1", "caut_stop_2",
               "caut_conn_h", "caut_conn_1", "caut_conn_2", "caut_risk_h", "caut_risk_1", "caut_risk_2", "caut_risk_3"]
 ck("LIVE 옛 문구 키 정리(consent_detail·live_note·live_1r_note·subtitle 없음)",
    not any(k in eqgui.T for k in ("consent_detail", "live_note", "live_1r_note", "subtitle")))
-ck("LIVE 동의 문안 버전 11f", eqgui._CONSENT_VER == "golive-6item-2026-10-09f", eqgui._CONSENT_VER)
+ck("LIVE 동의 문안 버전(10-28 직접 연 포지션도 닫힘 한 줄)", eqgui._CONSENT_VER == "golive-6item-2026-10-28a", eqgui._CONSENT_VER)
 ck("LIVE warn_mix 확정 문안(KO/EN)",
-   eqgui.T["warn_mix"]["ko"] == "⚠ 청산하면 그 계좌의 포지션이 모두 닫힙니다. 다른 거래는 섞지 말고 전용 계좌를 쓰세요."
-   and eqgui.T["warn_mix"]["en"] == "⚠ Closing flattens every position on that account. Keep other trades off it and use a dedicated account.")
+   eqgui.T["warn_mix"]["ko"] == ("⚠ 안전을 위해 앱은 연결한 모든 계좌의 포지션을 자산과 상관없이, 본인이 수동으로 직접 연 포지션까지 닫을 수 있습니다. "
+                                 "다른 거래는 이 계좌들과 섞지 말고 따로 관리하세요.")
+   and eqgui.T["warn_mix"]["en"] == ("⚠ For safety, the app may close positions on every connected account, whatever the asset, including positions "
+                                     "you opened manually yourself. Keep other trades off these accounts and manage them separately."))
 ROOT.deiconify()
 ROOT.geometry("1000x900")
 for _lang in ("ko", "en"):
     seed(T1, {EMAIL: PXKEY, "eq:NQ:nt8:f1": TOKEN, "eq:GC:nt8:f1": TOKEN}, cs_token=TOKEN, extra={"lang": _lang})
     app = start()
     flush()
-    ck(f"LIVE[{_lang}] 동의 꺼진 채 처음 그리면 주의 사항 펼침", app._caut_open and bool(app._caut_body.winfo_ismapped()))
+    # 왼쪽 메뉴(2026-11-02): 주의 사항은 제 쪽에 늘 펼친 채, 경고 묶음은 실행 쪽 로그 아래, 트랙레코드는 제 쪽.
+    ck(f"LIVE[{_lang}] 처음 그리면 실행 쪽", app._page == "run" and app._pages["run"].winfo_ismapped()
+       and not app._pages["notes"].winfo_ismapped())
+    app._show_page("notes"); flush()
+    ck(f"LIVE[{_lang}] 주의 사항 쪽: 펼친 채", app._caut_open and bool(app._caut_body.winfo_ismapped()))
     _bt = [str(w.cget("text")) for w in app._caut_body.winfo_children()]
     _want = [eqgui.T[k][_lang] for k in _CAUT_KEYS]
     ck(f"LIVE[{_lang}] 주의 사항 = 머리 + 소제목 넷과 줄(확정 문안 순서 그대로)",
        _bt == _want and str(app._caut_hdr.cget("text")) == "▾ " + eqgui.T["caut_head"][_lang], _bt)
-    ck(f"LIVE[{_lang}] 회색 마지막 줄 = caut_foot(접이식 밖)",
+    ck(f"LIVE[{_lang}] 회색 마지막 줄 = caut_foot(접이식 밖), 주의 사항 아래",
        str(app._caut_foot.cget("text")) == eqgui.T["caut_foot"][_lang]
-       and app._caut_foot.master is not app._caut_body and app._caut_foot.master is not app._caut_box)
+       and app._caut_foot.master is not app._caut_body and app._caut_foot.master is not app._caut_box
+       and app._caut_foot.winfo_ismapped() and app._caut_foot.winfo_rooty() > app._caut_box.winfo_rooty())
     _all = []
 
     def _w2(w):
         for c in w.winfo_children():
             try:
-                _all.append((str(c.cget("text")), c.winfo_rooty()))
+                _all.append((str(c.cget("text")), c))
             except Exception:
                 pass
             _w2(c)
     _w2(app._scroll_host)
-    _btn_y = app.b_live_start.winfo_rooty()
     _txt = _want + [eqgui.T["caut_foot"][_lang], eqgui.T["warn_mix"][_lang]]
-    ck(f"LIVE[{_lang}] 주의 사항·경고 글은 버튼 줄 아래에만(라이브 제목과 버튼 줄 사이에 설명 없음, 각 한 번)",
-       all(y > _btn_y for t, y in _all if t in _txt)
-       and all(sum(1 for t, y in _all if t == x) == 1 for x in _txt), [(t[:20], y) for t, y in _all if t in _txt])
-    for _state in ("펼침", "접힘", "다시 펼침"):
-        if _state != "펼침":
-            app._toggle_caut()
-        flush()
-        _boxes = [app.out, app._hdr_note_box, app._tr_box, app._caut_box, app._caut_foot]
-        _ys = [w.winfo_rooty() for w in _boxes]
-        _geo = [(w.winfo_rooty(), w.winfo_height(), w.winfo_reqheight(), w.winfo_ismapped()) for w in _boxes]
-        print(f"  geo[{_lang} {_state}] out/warn/tr/caut/foot (rooty,h,req,mapped) =", _geo)
-        ck(f"LIVE[{_lang} {_state}] 로그 < 경고 < 트랙레코드 < 주의 사항 < 회색 줄, 모두 보임·안 눌림",
-           all(w.winfo_ismapped() for w in _boxes)
-           and all(w.winfo_height() >= w.winfo_reqheight() for w in _boxes)
-           and _ys == sorted(_ys) and len(set(_ys)) == len(_ys)
-           and app._caut_body.winfo_ismapped() == (_state != "접힘")
-           and str(app._caut_hdr.cget("text")).startswith("▸ " if _state == "접힘" else "▾ "), _geo)
-    ck(f"LIVE[{_lang}] 경고 묶음 = warn_mix 확정 문안",
-       eqgui.T["warn_mix"][_lang] in [str(w.cget("text")) for w in app._hdr_note_box.winfo_children()])
+    ck(f"LIVE[{_lang}] 주의 사항·경고 글은 각 한 번, 실행 쪽에는 경고 묶음만",
+       all(sum(1 for t, w in _all if t == x) == 1 for x in _txt)
+       and all(str(w).startswith(str(app._pages["notes"])) for t, w in _all if t in _txt[:-1])
+       and all(str(w).startswith(str(app._pages["run"])) for t, w in _all if t == _txt[-1]))
+    app._toggle_caut(); flush()
+    ck(f"LIVE[{_lang}] 주의 사항 접기", not app._caut_body.winfo_ismapped() and str(app._caut_hdr.cget("text")).startswith("▸ "))
+    app._toggle_caut(); flush()
+    ck(f"LIVE[{_lang}] 주의 사항 다시 펼침", bool(app._caut_body.winfo_ismapped()) and str(app._caut_hdr.cget("text")).startswith("▾ "))
+    app._show_page("tr"); flush()
+    ck(f"LIVE[{_lang}] 트랙레코드 쪽", app._tr_box.winfo_ismapped() and not app.out.winfo_ismapped())
+    app._show_page("run"); flush()
+    _boxes = [app.out, app._hdr_note_box]
+    _geo = [(w.winfo_rooty(), w.winfo_height(), w.winfo_reqheight(), w.winfo_ismapped()) for w in _boxes]
+    ck(f"LIVE[{_lang}] 실행 쪽: 로그 < 경고, 모두 보임·안 눌림",
+       all(w.winfo_ismapped() for w in _boxes) and all(w.winfo_height() >= w.winfo_reqheight() for w in _boxes)
+       and app.out.winfo_rooty() < app._hdr_note_box.winfo_rooty(), _geo)
+    _btn_y = app.b_live_stop.winfo_rooty()          # 실행 쪽 버튼 줄([라이브 시작]은 2026-11-11 왼쪽 메뉴로)
+    ck(f"LIVE[{_lang}] 경고 묶음 = warn_mix 확정 문안, 버튼 줄 아래",
+       eqgui.T["warn_mix"][_lang] in [str(w.cget("text")) for w in app._hdr_note_box.winfo_children()]
+       and app._hdr_note_box.winfo_rooty() > _btn_y)
     ck(f"LIVE[{_lang}] 버튼 줄 아래 한 줄 = 다음 할 일", bool(str(app._live_next_lbl.cget("text")).strip())
        and app._live_next_lbl.winfo_rooty() > _btn_y and app._live_next_lbl.winfo_rooty() < app.out.winfo_rooty())
-    # 동의 켠 채 다시 그리면(회원이 안 만졌으면) 접힘, 회원이 만졌으면 그 세션 상태 유지
-    app._caut_user_set = False
-    app.consent.set(1); app._build(); flush()
-    ck(f"LIVE[{_lang}] 동의 켠 채 다시 그리면 접힘", not app._caut_open and not app._caut_body.winfo_ismapped()
-       and app._caut_box.winfo_ismapped() and app._caut_foot.winfo_ismapped())
-    app._toggle_caut(); app._build(); flush()
-    ck(f"LIVE[{_lang}] 회원이 펼친 상태는 다시 그려도 유지", app._caut_open and bool(app._caut_body.winfo_ismapped()))
+    # 청산 버튼과 언어는 어느 쪽에서든 보인다
+    for _pk in eqgui._PAGE_KEYS:
+        app._show_page(_pk); flush()
+        ck(f"LIVE[{_lang}] 쪽 {_pk}: 라이브 시작, 청산 두 버튼, 언어 보임",
+           app.b_live_start.winfo_ismapped() and app._flat_btn.winfo_ismapped() and app._flat_asset_mb.winfo_ismapped()
+           and app.langbox.winfo_ismapped()
+           and app._pages[_pk].winfo_ismapped() and sum(p.winfo_ismapped() for p in app._pages.values()) == 1)
+    # 다시 그려도 보던 쪽 그대로
+    app._show_page("acct"); app._build(); flush()
+    ck(f"LIVE[{_lang}] 다시 그려도 보던 쪽 유지", app._page == "acct" and app._pages["acct"].winfo_ismapped())
+    app._show_page("run"); flush()
 ROOT.withdraw()
 
 # ═════ 1b 반박 리뷰(2026-10-08) 수리 ═════
@@ -1081,7 +1095,7 @@ ck("P0 꺼 둔 행만 있는 NQ → 라이브 시작 무장 0(켜진 계좌 없�
    and any("켜진 계좌 없음" in m[-1] for m in MSG if m[0] == "warn"), MSG)
 _pick(app, "projectx")
 app._on_asset("BTC"); flush()
-ck("P0 패널 Topstep + 계좌 탭 BTC: 크립토 모양", any(t.startswith("② 계좌") for t in _acct_texts(app))
+ck("P0 패널 Topstep + 계좌 탭 BTC: 크립토 모양", any(t.startswith("계좌: 거래소별") for t in _acct_texts(app))   # 번호(②) 뺌(21h), em 대시 뺌(11h)
    and not any(t.startswith("사용 계좌") for t in _acct_texts(app)), _acct_texts(app))
 
 # P1: 새 설치에서 Lucid / Tradovate를 처음 고른 회원 - 브리지 버튼으로 토큰·.cs, 빈 슬롯이 Lucid 행으로
@@ -1395,6 +1409,9 @@ def _enter_crypto(app, b, key, sec, f3=None):
 seed({}, {})
 app = start()
 _enter_crypto(app, "bitget", "BGKEY-123456789012", "BGSECRET-12345", "BGPASS")
+# 대표 2026-11-06 "브로커가 비어 있으면 사용 계좌도 비워 놔야지": 새 설치 BTC는 빈 목록이고 키를 넣어도 행이 저절로 생기지 않는다 -
+# 회원이 [계좌 추가]로 키를 넣은 거래소 행을 만든다(종전: 빈 기본 행이 Bitget을 따라감).
+app._on_asset("BTC"); flush(); app._add_acct(); flush(); app._on_asset("NQ"); flush()
 app._live_include["BTC"].set(1); app._acfg["BTC"]["include"] = True
 app._master_start(); flush()
 ck("F 첫 라이브 시작 = Bitget 무장", _armed_bk(app).get(("BTC", 0)) == "bitget", _armed_bk(app))
@@ -1718,11 +1735,6 @@ app = start()
 app._on_asset("NQ"); flush()
 app._golive_busy_mark(True)
 MSG.clear()
-app._toggle_acct_edit(); flush()
-ck("P0 테스트 중 [계좌 수정] 열기 거절", not getattr(app, "_acct_edit", False) and any("계좌 설정을" in m[-1] for m in MSG), MSG)
-app._golive_busy_mark(False)
-app._toggle_acct_edit(); flush()                     # 열어 둔 뒤
-app._golive_busy_mark(True)
 _rows0 = copy.deepcopy(app._acfg["NQ"]["accounts"])
 MSG.clear()
 app._del_acct("NQ", 0); flush()
@@ -1759,6 +1771,10 @@ app._golive_busy_mark(False)
 # P1: BTC 탭을 Bitget 키 전에 그려 두면(콤보 표시 = Bybit) 박아 둔 Bitget이 다음 _collect_acct_widgets에서 Bybit로 덮였다
 P1S = {"NQ": {"broker": "projectx", "include": True, "creds": {"projectx": {"f1": EMAIL, "f3": "", "avail": ["150KTC-A"]}},
               "accounts": [row("150KTC-A", "projectx")]}}
+# 2026-11-06(대표 "브로커가 비어 있으면 사용 계좌도 비워 놔야지"): 새 BTC는 빈 목록이라 그려 둘 빈 행이 없다. 이 갈래(브로커 칸이 빈 행 +
+# 낡은 콤보)는 옛 빈 행에 1R만 넣어 둔 기존 회원 설정에 그대로 남는다 - 그 행(기동 때 빼지 않는다)으로 같은 시험을 한다.
+P1B = {**P1S, "BTC": {"broker": "bybit", "include": True, "creds": {"bybit": {"f1": "", "f3": ""}},
+                      "accounts": [row("", "", one_r=150, label=eqgui._broker_label("bybit"))]}}
 
 
 def _btc_rows(app):
@@ -1779,7 +1795,7 @@ def _golive(app, assets):
 
 
 # b3: 칸마다 따로 붙여넣기(사이마다 자동 저장), 계좌 탭 = BTC
-seed(P1S, {EMAIL: PXKEY})
+seed(P1B, {EMAIL: PXKEY})
 app = start()
 app._on_asset("BTC"); flush()
 _pick(app, "bitget")
@@ -1797,7 +1813,7 @@ ck("P1 b3 디스크 BTC 행 = bitget 또는 빈 칸(Bitget으로 해석)",
 app._master_stop(); flush()
 # b2: Passphrase를 틀렸다가 고침(두 번째 자동 저장)
 for _step2 in ("pass", "keys"):
-    seed(P1S, {EMAIL: PXKEY})
+    seed(P1B, {EMAIL: PXKEY})
     app = start()
     app._on_asset("BTC"); flush()
     _pick(app, "bitget")
@@ -1818,7 +1834,7 @@ for _step2 in ("pass", "keys"):
        app._acfg["BTC"]["accounts"])
     app._master_stop(); flush()
 # b4: NQ 가동 중 BTC 탭에서 Bitget 키 → BTC 체크(가동 중 무장) → 탭을 NQ로 옮겨도 행은 Bitget
-seed(P1S, {EMAIL: PXKEY})
+seed(P1B, {EMAIL: PXKEY})
 app = start()
 _golive(app, ["NQ"])
 app._on_asset("BTC"); flush()
@@ -1836,7 +1852,7 @@ ck("P1 b4 신호 때 판정: 무장 사본과 행이 일치(진입함)", app._li
    app._live_acct_cfg(("BTC", 0), app._sig_accts[("BTC", 0)]))
 app._master_stop(); flush()
 # 둘째 방어(위젯 동기가 빠진 경로): 그린 뒤 행 브로커가 바뀌었는데 콤보는 옛 값 - 수집은 회원이 바꾼 값만 쓴다
-seed(P1S, {EMAIL: PXKEY})
+seed(P1B, {EMAIL: PXKEY})
 app = start()
 app._on_asset("BTC"); flush()
 _shown0 = app._acct_widgets[0]["broker"].get()
@@ -2034,10 +2050,12 @@ app = start()
 app._acfg["BTC"]["accounts"][0]["broker"] = ""            # 빈 행(자산 기본 bybit로 해석)
 _pick(app, "bybit")
 ck("P3 [연결 지우기] Bybit 반환 True", app._clear_broker_conn(confirm=False) is True)
-ck("P3 지운 뒤 BTC 행 = Bybit 그대로(Bitget으로 넘어가지 않음)", app._acct_broker("BTC", app._acfg["BTC"]["accounts"][0]) == "bybit",
+# 2026-11-06(대표 "브로커가 비어 있으면 사용 계좌도 비워 놔야지"): 지운 거래소의 행은 목록에서 빠진다(종전: Bybit로 박힌 채 남아 '키 미설정').
+# 지키는 것은 같다 - 그 행이 남은 Bitget으로 넘어가 조용히 무장하지 않는다.
+ck("P3 지운 뒤 BTC 행 = Bybit 행이 빠짐(Bitget 행으로 넘어가지 않음)", app._acfg["BTC"]["accounts"] == [],
    app._acfg["BTC"]["accounts"])
 _w = _golive(app, ["BTC"])
-ck("P3 지운 뒤 [라이브 시작]은 'Bybit 키 미설정'으로 멈춤(확인창 문장대로)", not app._sig_accts and any("키 미설정" in m[-1] for m in _w),
+ck("P3 지운 뒤 [라이브 시작]은 'BTC: 켜진 계좌 없음'으로 멈춤(Bitget으로 무장 안 함)", not app._sig_accts and any("BTC: 켜진 계좌 없음" in m[-1] for m in _w),
    (_w, app._sig_accts))
 
 # P2-2: BTC [계좌 추가]는 키를 넣은 거래소 행만 만든다 + 사전점검은 '이 행을 지우거나 끄세요'부터
@@ -2065,7 +2083,7 @@ seed({**P0S, "BTC": {"broker": "bybit", "include": True, "creds": {"bybit": {"f1
 app = start()
 _w = _golive(app, ["BTC"])
 ck("11a 재확인1 다른 행이 이미 쓰는 거래소(Bybit)로는 바꾸라고 하지 않음 = 두 행이면 '이 행을 지우거나 끄세요'",
-   any("BTC Bitget (USDT-F): 키 미설정 - 이 행을 지우거나 끄세요(행 거래소는 [계좌 수정]에서 바꿉니다)" in m[-1] for m in _w)
+   any("BTC Bitget (USDT-F): 키 미설정 - 이 행을 지우거나 끄세요(행 거래소는 [계좌 설정]에서 바꿉니다)" in m[-1] for m in _w)
    and not any("Bybit으로 바꾸거나" in m[-1] for m in _w), _w)
 app._acfg["BTC"]["accounts"][1]["on"] = False             # 안내대로 그 행을 끔
 _w = _golive(app, ["BTC"])
@@ -2074,19 +2092,22 @@ app._master_stop(); flush()
 
 # ═════ 1008b 후속(2026-10-08b, a6432591 집중 리뷰) ═════
 # P2-1: 키 넣기 전 BTC [계좌 추가] → 기본 행을 키 없는 Bybit로 박지 않음 → Bitget 키만 넣어도 시작됨, '다음:' 줄은 사실대로
+# 2026-11-06(대표 "여기서 계좌 추가 누르면 가능한 브로커가 없다, 브로커 먼저 해라"): 키 없을 때 [계좌 추가] = '가능한 브로커가 없습니다' 알림,
+# 행 없음. 키를 넣은 뒤 [계좌 추가]가 Bitget 행을 만든다(종전: 빈 기본 행 하나 + '키를 넣으면 이 행이 그 거래소를 씁니다').
 seed(P1S, {EMAIL: PXKEY})
 app = start()
 app._on_asset("BTC"); flush()
 _pick(app, "bitget")
 MSG.clear()
 app._add_acct(); flush()
-ck("8b P2-1 키 없을 때 BTC [계좌 추가] → 행 추가 안 함·빈 행 안 박음·'키를 넣으면 이 행이 그 거래소로' 안내",
-   [r.get("broker") for r in app._acfg["BTC"]["accounts"]] == [""]
-   and any("이 행이 그 거래소를 씁니다" in m[-1] for m in MSG if m[0] == "info"), (app._acfg["BTC"]["accounts"], MSG))
+ck("8b P2-1 키 없을 때 BTC [계좌 추가] → 행 없음·'가능한 브로커가 없습니다' 안내",
+   app._acfg["BTC"]["accounts"] == []
+   and any("가능한 브로커가 없습니다. 브로커 연결을 먼저 하세요." == m[-1] for m in MSG if m[0] == "info"), (app._acfg["BTC"]["accounts"], MSG))
 app._f1_unlocked = True; app.user.config(state="normal"); type_into(app.user, "BGKEY-123456789012")
 app._unlocked = True; app.key.config(state="normal"); type_into(app.key, "BGSECRET-12345")
 type_into(app.f3, "PASS"); _autosave(app)
 app._on_asset("BTC"); flush()
+app._add_acct(); flush()
 _nx = str(app._next_lbl.cget("text"))
 _w = _golive(app, ["BTC"])
 ck("8b P2-1 그 뒤 Bitget 키만 넣으면 [라이브 시작] 통과·Bitget 무장", not _w and _armed_bk(app).get(("BTC", 0)) == "bitget",
@@ -2098,7 +2119,7 @@ app._test_ok = {"BTC"}
 app._refresh_next_action(); flush()
 _nx = str(app._next_lbl.cget("text"))
 ck("8b P2-1 사전점검이 막히는 BTC는 _test_ok가 있어도 '준비 완료' 아님 + 할 일(행 거래소를 Bitget으로)", "준비 완료" not in _nx
-   and "다음: [계좌 수정]에서 이 행 거래소를 Bitget으로 바꾸거나 Bybit 키를 브로커 연결 설정에 넣으세요" in _nx, _nx)
+   and "다음: [계좌 설정]에서 이 행 거래소를 Bitget으로 바꾸거나 Bybit 키를 브로커 연결 설정에 넣으세요" in _nx, _nx)
 
 # P2-2: 크립토 키 미설정 문구 - 행 하나 KO/EN, 행 둘은 종전
 for _lg, _exp, _exp2 in (("ko", "BTC Bybit (USDT perp): 키 미설정 - Bybit 키를 브로커 연결 설정에 넣거나 라이브 패널에서 BTC 체크를 끄세요",
@@ -2137,7 +2158,7 @@ for _lg in ("ko", "en"):
     app._master_stop(); flush()
 
 # P3(a): 거절된 행 콤보는 그릴 때 값이 아니라 지금 값으로 되돌아가고, 다음 수집이 그걸 회원 변경으로 적용하지 않는다
-seed(P1S, {EMAIL: PXKEY})
+seed(P1B, {EMAIL: PXKEY})                                  # 2026-11-06: 새 BTC는 빈 목록 - 기존 회원의 빈 행(1R 150)으로(P1B 설명)
 app = start()
 app._on_asset("BTC"); flush()
 app._acct_edit = True; app._build(); flush()           # 키 없을 때 그림(콤보 = Bybit)
@@ -2213,19 +2234,34 @@ ck("8b P3(e) 서버 잠금 시작 거절 문구에 em 대시 없음", "잠갔습
 
 # ═════ 2026-10-11a(32730827 재리뷰) ═════
 # P2: BTC 거래소를 옮기는 회원(Bybit 연결 지우기 → Bitget 키 → 라이브 시작) - 행 거래소를 바꾸라는 안내 + 그대로 하면 시작
-for _lg, _exp in (("ko", "BTC Bybit (USDT perp): 키 미설정 - [계좌 수정]에서 이 행 거래소를 Bitget으로 바꾸거나 Bybit 키를 브로커 연결 설정에 넣으세요"),
-                  ("en", "BTC Bybit (USDT perp): key missing - switch this row to Bitget with [Edit accounts], or add your Bybit key in Broker connections")):
+# 2026-11-06(대표 "브로커가 비어 있으면 사용 계좌도 비워 놔야지"): [연결 지우기]가 Bybit 행을 목록에서 뺀다 → Bitget 키 → [계좌 추가]로 Bitget 행 →
+# 시작(종전: Bybit로 박힌 행이 남아 '이 행 거래소를 Bitget으로 바꾸라'). 그 안내는 키 없는 거래소로 박힌 채 남은 행(옛 빌드가 남긴 설정)에
+# 그대로 남아 있어 그 행으로 따로 시험한다.
+for _lg, _exp in (("ko", "BTC Bybit (USDT perp): 키 미설정 - [계좌 설정]에서 이 행 거래소를 Bitget으로 바꾸거나 Bybit 키를 브로커 연결 설정에 넣으세요"),
+                  ("en", "BTC Bybit (USDT perp): key missing - switch this row to Bitget in Accounts, or add your Bybit key in Broker connections")):
     seed({**P0S, "BTC": {"broker": "bybit", "include": True, "creds": {"bybit": {"f1": "BYKEY-123456789012", "f3": ""}},
                          "accounts": [row("", "", label="")]}}, {EMAIL: PXKEY, "BYKEY-123456789012": "S1"}, extra={"lang": _lg})
     app = start()
     _pick(app, "bybit")
     app._clear_broker_conn(confirm=False)
+    ck(f"11a P2[{_lg}] 거래소 옮기기: Bybit 연결을 지우면 Bybit 행도 목록에서 빠짐", app._acfg["BTC"]["accounts"] == [], app._acfg["BTC"]["accounts"])
     _pick(app, "bitget")
     app._f1_unlocked = True; app.user.config(state="normal"); type_into(app.user, "BGKEY-123456789012")
     app._unlocked = True; app.key.config(state="normal"); type_into(app.key, "BGSECRET-12345")
     type_into(app.f3, "PASS"); _autosave(app)
+    app._on_asset("BTC"); flush(); app._refresh_next_action()
+    _nx = str(app._next_lbl.cget("text"))
+    ck(f"11a P2[{_lg}] 계좌 칸 '다음:' 줄 = [계좌 추가]로 거래소 행", ("[계좌 추가]로 거래소 행을 만드세요" if _lg == "ko" else
+                                                                  "press [Add] to add the exchange row") in _nx, _nx)
+    app._add_acct(); flush()
     _w = _golive(app, ["BTC"])
-    ck(f"11a P2[{_lg}] 거래소 옮기기: 사전점검 = 행 거래소를 바꾸거나 옛 키를 넣으라고", any(_exp in m[-1] for m in _w) and not app._sig_accts, _w)
+    ck(f"11a P2[{_lg}] Bitget 키 → [계좌 추가] → 시작·Bitget 무장", not _w and _armed_bk(app).get(("BTC", 0)) == "bitget", (_w, _armed_bk(app)))
+    app._master_stop(); flush()
+    seed({**P0S, "BTC": {"broker": "bybit", "include": True, "creds": {"bitget": {"f1": "BGKEY-123456789012", "f3": "P"}},
+                         "accounts": [row("", "bybit", label="")]}}, {EMAIL: PXKEY, "BGKEY-123456789012": "S2"}, extra={"lang": _lg})
+    app = start()
+    _w = _golive(app, ["BTC"])
+    ck(f"11a P2[{_lg}] 키 없는 Bybit로 박힌 행 + Bitget 키: 사전점검 = 행 거래소를 바꾸거나 옛 키를 넣으라고", any(_exp in m[-1] for m in _w) and not app._sig_accts, _w)
     app._on_asset("BTC"); flush(); app._refresh_next_action()
     _nx = str(app._next_lbl.cget("text"))
     ck(f"11a P2[{_lg}] 계좌 칸 '다음:' 줄도 같은 할 일", ("이 행 거래소를 Bitget으로" if _lg == "ko" else "switch this row to Bitget") in _nx, _nx)
@@ -2235,7 +2271,10 @@ for _lg, _exp in (("ko", "BTC Bybit (USDT perp): 키 미설정 - [계좌 수정]
     ck(f"11a P2[{_lg}] 안내대로 행 거래소를 Bitget으로 → 시작·Bitget 무장", not _w and _armed_bk(app).get(("BTC", 0)) == "bitget", (_w, _armed_bk(app)))
     app._master_stop(); flush()
 # P3: PIN 보관분을 못 연 세션 = PIN 안내
-seed({**P0S, "BTC": {"broker": "bybit", "include": True, "creds": {}, "accounts": [row("", "")]}}, {EMAIL: PXKEY})
+# 2026-11-06: 기동 때도 그 세션 모양(키 저장 실패 목록에 BTC API Key)으로 띄운다 - 그래야 연결 없는 자산의 빈 행 빼기(_prune_blank_rows)가
+# 실제 PIN 잠김 기동처럼 그 행을 건드리지 않는다(종전엔 기동 뒤에 잠김을 흉내 냈다).
+seed({**P0S, "BTC": {"broker": "bybit", "include": True, "creds": {}, "accounts": [row("", "")]}}, {EMAIL: PXKEY},
+     extra={"kc_failed": [f"BTC/{eqgui._broker_label('bybit')}/f1"]})
 app = start()
 app._enc_locked = True
 app._kc_failed = [f"BTC/{eqgui._broker_label('bybit')}/f1"]     # 그 자산 API Key가 블롭에(재확인 3)
@@ -2358,7 +2397,7 @@ def _func_at(pos):
 
 
 _asg = [(m.start(), _func_at(m.start())) for m in
-        re.finditer(r'(\["creds"\]|\.setdefault\("creds", \{\}\))\내부 기록+\]\s*=(?!=)', SRC)]
+        re.finditer(r'(\["creds"\]|\.setdefault\("creds", \{\}\))\[[^\]]+\]\s*=(?!=)', SRC)]
 ck("T16 creds[브로커] = 대입은 _load·_unify_creds·_creds_of 안에서만",
    all(fn in ("_load", "_unify_creds", "_creds_of") for _, fn in _asg) and len(_asg) >= 2, _asg)
 _ini = SRC[SRC.index("    def __init__(self, root):"):]

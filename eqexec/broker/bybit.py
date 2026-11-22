@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json as _json
+import threading
 import time
 
 import requests
@@ -19,6 +20,43 @@ from .base import BrokerAdapter, FlattenResult, Position
 _RECV = "5000"
 _TIMEOUT = (10, 30)
 
+# 서버 시각 보정(2026-10-17): Bybit은 요청 시각이 서버보다 1초 넘게 앞서면 retCode 10002로 거절한다(늦은 쪽은 recv_window 5초까지 받는다).
+# 회원 PC 시계가 1.1초 빨라 잔고, 포지션 읽기가 모두 거절되고 연결 실패 알림이 반복된 사례(10/17). 윈도 시계는 기본 동기화가 드물어
+# 1초쯤은 다시 벌어진다. 그래서 서버 시각(/v5/market/time)과의 차이를 재서 서명 시각에 더하고, 서버보다 0.3초 늦게 맞춘다.
+# 10분마다 다시 재고, 10002가 오면 바로 다시 재서 한 번만 다시 보낸다(10002는 서버가 처리 전에 거절한 것이라 주문이 두 번 나가지 않는다).
+# 시각을 못 재면 보정 0 = 종전과 같다(0.3초 늦추기만 남는다).
+_CLOCK: dict = {}                  # base → (보정 ms, 잰 시각)
+_CLOCK_LOCK = threading.Lock()
+_CLOCK_TTL_S = 600
+_CLOCK_FAIL_RETRY_S = 60
+_CLOCK_FORCE_MIN_S = 5
+_BEHIND_MS = 300
+
+
+def _clock_offset_ms(base: str, force: bool = False) -> int:
+    """Bybit 서버 시각 - 이 PC 시각(ms). 같은 base는 프로세스 공용, 10분 캐시. 실패면 마지막 값(없으면 0)."""
+    now = time.time()
+    with _CLOCK_LOCK:
+        c = _CLOCK.get(base)
+    if c is not None and now - c[1] < (_CLOCK_FORCE_MIN_S if force else _CLOCK_TTL_S):
+        return c[0]
+    try:
+        t0 = time.time()
+        r = requests.get(f"{base}/v5/market/time", timeout=(5, 5))
+        t1 = time.time()
+        d = r.json()
+        srv = d.get("time")
+        if not srv:
+            srv = int((d.get("result") or {}).get("timeNano")) // 1_000_000
+        off = int(srv) - int((t0 + t1) / 2 * 1000)          # 왕복의 가운데 시각과 비교
+        at = t1
+    except Exception:
+        off = c[0] if c is not None else 0
+        at = now - _CLOCK_TTL_S + _CLOCK_FAIL_RETRY_S       # 실패면 1분 뒤 다시(요청마다 재지 않게)
+    with _CLOCK_LOCK:
+        _CLOCK[base] = (off, at)
+    return off
+
 
 class BybitBroker(BrokerAdapter):
     name = "bybit"
@@ -27,7 +65,9 @@ class BybitBroker(BrokerAdapter):
         self.cfg = cfg                       # eqexec.config.BybitCfg
         self.key = cfg.api_key
         self.secret = cfg.api_secret
-        self.base = ("https://api-testnet.bybit.com" if getattr(cfg, "testnet", False)
+        # 데모 트레이딩(2026-11-13, 앱 --demo) = 본 계정의 데모 모드에서 만든 키 + api-demo 주소. 테스트넷(별도 사이트 계정)과 다르다.
+        self.base = ("https://api-demo.bybit.com" if getattr(cfg, "demo", False)
+                     else "https://api-testnet.bybit.com" if getattr(cfg, "testnet", False)
                      else "https://api.bybit.com")
         self.category = getattr(cfg, "category", "linear")     # linear = USDT perps
         self.settle = getattr(cfg, "settle_coin", "USDT")
@@ -36,8 +76,9 @@ class BybitBroker(BrokerAdapter):
         return hmac.new(self.secret.encode(), f"{ts}{self.key}{_RECV}{payload}".encode(),
                         hashlib.sha256).hexdigest()
 
-    def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None):
-        ts = str(int(time.time() * 1000))
+    def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None,
+             _retry: bool = True):
+        ts = str(int(time.time() * 1000) + _clock_offset_ms(self.base) - _BEHIND_MS)
         if method == "GET":
             qs = "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
             sign = self._sign(ts, qs)
@@ -51,6 +92,9 @@ class BybitBroker(BrokerAdapter):
                               timeout=_TIMEOUT)
         r.raise_for_status()
         d = r.json()
+        if d.get("retCode") == 10002 and _retry:          # 시각 거절 = 다시 재고 한 번만 다시
+            _clock_offset_ms(self.base, force=True)
+            return self._req(method, path, params, body, _retry=False)
         # Bybit v5는 성공 시 항상 retCode=0. retCode 부재(None)를 성공으로 치던 예전 코드는
         # 코드 없는 변형 200 응답을 '주문 성공'으로 오판할 수 있어 명시적으로 0만 통과시킨다.
         if d.get("retCode") != 0:
@@ -178,8 +222,10 @@ class BybitBroker(BrokerAdapter):
                                 symbol=str(p.get("symbol")), net_qty=net, raw=p))
         return out
 
-    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
-        plan = self.list_open_positions()
+    def flatten_all(self, dry_run: bool = True, only=None) -> FlattenResult:
+        # only = 그 자산 종목만(2026-10-17 자산별 청산 - 비트코인 청산이 같은 계좌의 다른 코인 선물까지 닫았다)
+        _mine = (lambda sym: True) if only is None else (lambda sym: bool(only(str(sym or ""))))
+        plan = [p for p in self.list_open_positions() if _mine(p.symbol)]
         res = FlattenResult(dry_run=dry_run, planned=list(plan))
         if dry_run or not plan:
             return res
@@ -199,7 +245,7 @@ class BybitBroker(BrokerAdapter):
                 res.errors.append(f"{pos.symbol}: {e}")
         time.sleep(1)
         try:
-            still = self.list_open_positions()
+            still = [s for s in self.list_open_positions() if _mine(s.symbol)]
             res.closed = [p for p in plan if not any(s.symbol == p.symbol for s in still)]
             for p in still:
                 res.errors.append(f"STILL OPEN after flatten: {p.symbol} net={p.net_qty}")
@@ -492,6 +538,15 @@ class BybitBroker(BrokerAdapter):
         except Exception:
             pass
         return out
+
+    def account_uid(self):
+        """이 키의 거래소 계정 ID(GET /v5/user/query-api의 userID). 진입 클레임을 계정 단위로 묶는 재료(11h 감사 A/D P1-1) - 연결 테스트,
+        사전 점검에서만 부른다(진입 경로 아님). 못 읽으면 None."""
+        try:
+            d = self._req("GET", "/v5/user/query-api") or {}
+            return str(d.get("userID") or "").strip() or None
+        except Exception:
+            return None
 
     def key_info(self) -> list:
         """API 키 사전 점검 경고 목록(빈 리스트 = 이상 없음). GET /v5/user/query-api:

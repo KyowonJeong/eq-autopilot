@@ -312,6 +312,24 @@ class IBKRBroker(BrokerAdapter):
                 cands[0]["activeContract"] = True
             return cands
 
+    def contract_for_month(self, root: str, year: int, month: int, max_age=None):
+        """월물 규칙 R(2026-11-02): 계약 목록(search_contracts가 _front_ok와 상관없이 _contracts에 모두 담는다)에서 그 계약월의 localSymbol. 없으면 None."""
+        r = _root(root)
+        ym = f"{int(year):04d}{int(month):02d}"
+        try:
+            self.search_contracts(r)
+        except Exception:
+            return None
+        for lsym, c in list(self._contracts.items()):
+            try:
+                if str(c.symbol).upper() != r and str(getattr(c, "tradingClass", "") or "").upper() != r:
+                    continue
+                if str(c.lastTradeDateOrContractMonth or "")[:6] == ym:
+                    return lsym
+            except Exception:
+                continue
+        return None
+
     def _contract(self, contract):
         """계약 인자(localSymbol str 또는 conId int)를 qualified Contract로."""
         s = str(contract).strip()
@@ -660,15 +678,22 @@ class IBKRBroker(BrokerAdapter):
             cancelled = self._cancel_for(ib, aid, c)              # 플랫 확인 뒤에만 우리 스탑을 걷는다
             return {"closed": qty, "cancelled": cancelled, "symbol": lsym, "order": self._odict(t)}
 
-    def flatten_all(self, dry_run: bool = True) -> FlattenResult:
-        """계좌(들) 전체 청산: 미체결 전부 취소 → 포지션마다 시장가 반대 주문 → 재확인."""
+    def flatten_all(self, dry_run: bool = True, only=None) -> FlattenResult:
+        """계좌(들) 전체 청산: 미체결 전부 취소 → 포지션마다 시장가 반대 주문 → 재확인.
+        only(2026-10-17 자산별 청산)를 주면 그 종목 포지션과 그 종목의 우리 주문만 다룬다."""
         _refuse = refuse_flatten_without_accounts(self, dry_run)   # 빈 계좌 목록 = 로그인 전 계좌 청산 금지(2026-10-08 P0)
         if _refuse is not None:
             return _refuse
         ibi = _ib_classes()
         with self._lock:
             ib = self._connect()
-            plan = self.list_open_positions()
+            def _mine(sym) -> bool:
+                return only is None or bool(only(str(sym or "")))
+
+            def _tsym(t) -> str:                        # 주문의 종목(포지션 symbol과 같은 localSymbol, 없으면 symbol)
+                c = getattr(t, "contract", None)
+                return str(getattr(c, "localSymbol", "") or getattr(c, "symbol", "") or "")
+            plan = [p for p in self.list_open_positions() if _mine(p.symbol)]
             res = FlattenResult(dry_run=dry_run, planned=list(plan))
             want = {a["id"] for a in (self._acct_cache or self._accounts())}
             if dry_run:
@@ -683,6 +708,8 @@ class IBKRBroker(BrokerAdapter):
                     for t in list(ib.openTrades()):
                         _o = t.order
                         if want and str(_o.account or "") not in want:
+                            continue
+                        if not _mine(_tsym(t)):
                             continue
                         if str(getattr(_o, "orderRef", "") or "").startswith("EQ-AP-"):
                             ib.cancelOrder(_o)
@@ -699,6 +726,8 @@ class IBKRBroker(BrokerAdapter):
                     _o = t.order
                     if want and str(_o.account or "") not in want:
                         continue
+                    if not _mine(_tsym(t)):
+                        continue                             # 다른 종목 - 이번 청산 대상 아님
                     if not str(getattr(_o, "orderRef", "") or "").startswith("EQ-AP-"):
                         continue                             # 회원 본인 주문 - 건드리지 않는다
                     ib.cancelOrder(_o)
@@ -718,7 +747,7 @@ class IBKRBroker(BrokerAdapter):
             ib.sleep(2)                           # let the market orders fill / positions update
             # Confirm-after-act: re-read; anything still open is a loud error.
             try:
-                still = self.list_open_positions()
+                still = [s for s in self.list_open_positions() if _mine(s.symbol)]
                 res.closed = [p for p in plan if not any(
                     s.account_id == p.account_id and s.symbol == p.symbol for s in still)]
                 for p in still:

@@ -41,7 +41,7 @@ file we published. The app also shows both values on its own screen, side by sid
 |---|---|
 | `eqgui.py` | the app itself: screens, signal handling, order placement, stop management |
 | `eqexec/` | sizing, scheduling, consent, broker adapters |
-| `eqexec/broker/` | Topstep (ProjectX), Tradovate, Interactive Brokers, Bybit, Bitget, NinjaTrader |
+| `eqexec/broker/` | Topstep (ProjectX), Tradovate, Interactive Brokers, Bybit, Bitget, OKX, NinjaTrader |
 | `nt8_addon/` | the NinjaTrader 8 add-on used for brokers without an API |
 | `test_*.py` | offline tests, including the stop-protection suite |
 
@@ -68,15 +68,26 @@ what happens to your account after a signal arrives.
 - What the app does send to EdgeQuant (`app.edgequant.app`), so you can see exactly what leaves
   your machine (all in `eqgui.py`):
   - when it downloads your encrypted signal and status files: a hash of your token in the file
-    name (`_heartbeat`, `_sig_loop`);
+    name (`_heartbeat`, `_sig_loop`); the same hash and the instrument when it asks for the current
+    price to show an open position's profit and loss (`_pos_px_fetch`);
   - a keep-alive while the app runs: your membership token, the app version, a random device ID,
-    which assets are armed, the broker name per asset, and your consent version and time, plus
-    status events such as a failed pre-entry check with its error text (`_alive_ping`, `_send_ev`);
-  - after each automated entry: the instrument, total quantity, number of accounts, and the
-    reference price against the fill price (`_send_fill`, `_send_gap`), plus a one-way hash of
-    the account name so two machines cannot enter twice on one account (`_claim_entry`);
-  - for Autopilot members, an encrypted daily summary of results in R units, no dollar amounts
-    (`push_profile`);
+    the app language, which assets are connected and armed, the broker name per asset, the
+    NinjaTrader bridge state, for an account recognised as a 150K prop account its broker, prop
+    firm and last four characters, and your consent version and time, plus status events such as
+    a failed pre-entry check with its error text (`_alive_ping`, `_send_ev`);
+  - after each automated entry and each close: the instrument, total quantity, number of
+    accounts, the quantity ordered and filled per account (broker and the account's last four
+    characters only), and the reference price against the fill price (`_send_fill`, `_send_gap`),
+    plus a one-way hash so two machines cannot enter twice on one account: of the account name
+    for futures, of the API key ID or the exchange account number for crypto, never the key
+    itself (`_claim_entry`);
+  - for Autopilot members, an encrypted summary per day and asset: the result in R, a size
+    multiple against your own baseline, the broker names, the entry and exit price when there is
+    a single one, and how the app closed the trade. No dollar amounts or balances
+    (`push_profile`). It goes once a day, three minutes after each close, and when you press the
+    sync button;
+  - when you press Send log: the app log of the last 48 hours, masked like error text below.
+    Amounts (balance, $) are included only if you choose to include them (`_send_log`);
   - error reports: the app version, the OS name and the error text with long digit runs masked
     (`_report_error`; set `EQ_ERR_REPORT=0` to turn them off);
   - alerts meant for you, such as a missed entry or a lost broker connection, relayed through
@@ -84,7 +95,12 @@ what happens to your account after a signal arrives.
   - on a PIN reset you ask for: your token and the four-digit code (`/eqpin`).
   - backup 5-minute price bars, sent to the server only from the operator's own device; member
     installations do not send these bars (`_bar_backup_tick` returns unless the tier is `admin`,
-    and the server stores bars only from the owner's token).
+    and the server stores bars only from the owner's token);
+  - evaluation-account watch events (when a daily limit or a pass target is reached: the prop
+    firm and account size, the limit, the day's profit and loss, the balance, the open positions
+    and the account's last four characters): only when the server turns them on for a token,
+    which today is the operator's own token only. Member installations do not send them
+    (`_dce_note`, `_dce_on`).
 
   In error text, alerts and status events the app cuts the account IDs you configured to their
   last four characters and masks long digit runs; a message your broker returned can still contain

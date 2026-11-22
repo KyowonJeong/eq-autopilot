@@ -75,7 +75,7 @@ def main():
     done = dict(funded, payouts=5)
     w2 = _app(T, {"NQ": [_acct(600, funded), _acct(600, done)],
                   "GC": [_acct(600, funded)]})._portfolio_risk_weights()
-    ck("5발완료 제외", w2 and w2["NQ"] == w2["GC"], f"{w2}")
+    ck("5발 중단 폐지(2026-10-21): 출금 5번 계좌도 진입하므로 비중에 들어감", w2 and abs(w2["NQ"] / w2["GC"] - 2.0) < 1e-9, f"{w2}")
 
     # ③ 프롭이 아닌 계좌는 회원이 확정한 설정값 그대로(2026-08-13 잔고 연동 폐지).
     w3 = _app(T, {"NQ": [_acct(800)], "GC": [_acct(400)]})._portfolio_risk_weights()
@@ -86,8 +86,8 @@ def main():
     t.log = lambda *a, **k: None
     ck("테스트기 r_test", t._planned_one_r(_acct(600, {"on": True, "type": "test",
                                                       "r_test": 1200.0})) == 1200.0)
-    ck("라이브 초기 r_live", t._planned_one_r(_acct(600, {"on": True, "type": "live",
-                                                         "r_live": 100.0})) == 100.0)
+    ck("옛 라이브 초기 = 펀디드 1R(2026-10-21 유형 둘)", t._planned_one_r(_acct(600, {"on": True, "type": "live", "mode": "own",
+                                                         "r_live": 100.0, "r_steady": 450.0})) == 450.0)
 
     # ⑤ 자산이 하나뿐이면 '비중'이 성립하지 않는다 → None(종전 규약 유지).
     ck("단일 자산=None", _app(T, {"NQ": [_acct(600)]})._portfolio_risk_weights() is None)

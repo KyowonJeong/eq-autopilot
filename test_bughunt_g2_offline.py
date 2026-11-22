@@ -93,6 +93,8 @@ class Stub:
 
     def __getattr__(self, n):
         return lambda *a, **k: None
+for _n in ("_ui", "_on_main", "_dm_kind"):   # 2026-10-20 화면 줄 대기열(_ui) - 가짜 객체의 __getattr__가 삼키지 않게
+    setattr(Stub, _n, eqgui.App.__dict__[_n])
 
 
 def run(b, legs, direction="LONG", stop=19900.0, acct="ACC1"):
@@ -460,15 +462,21 @@ def run_crypto(err):
     return me, evs
 
 
+# 2026-10-20 대표 '팝업 뭐든간에 거래는 드가야', '차라리 dm을 쏴': 팝업 대신 회원 DM. '미확인'과 '거절'의 구분은 DM 문구가 지킨다.
 me, evs = run_crypto("HTTPSConnectionPool(host='api.bybit.com', port=443): Read timed out. (read timeout=15)")
-_w = eqgui.messagebox.showwarning.call_args
-chk("C2 크립토 타임아웃 → '진입 결과 미확인' 경고(거절 팝업 아님)·서버 사유 error",
-    _w is not None and _w[0][0] == "진입 결과 미확인" and "손절은 주문에 함께 붙어" in _w[0][1]
+_w = me._member_alert.call_args
+chk("C2 크립토 타임아웃 → '결과를 확인하지 못했습니다' DM(거절 아님, 손절 붙음, 재진입 주의)·서버 사유 error, 팝업 없음",
+    _w is not None and "결과를 확인하지 못했습니다" in _w[0][1] and "손절은 주문에 함께 붙어" in _w[0][1]
+    and "거절" not in _w[0][1] and "두 배" in _w[0][1] and not eqgui.messagebox.showwarning.called
     and not eqgui.messagebox.showerror.called and evs == ["error"], (_w, evs))
+chk("C2 서버 일반 실행 오류 DM은 건너뜀(보고에 member_dm=False)", me._report_error.call_args.kwargs.get("member_dm") is False,
+    me._report_error.call_args)
 chk("C2 미확인 경로는 체결 보고·감시 기억 안 함(종전과 같음)", not me._note_fill.called and not me._remember_open.called)
 me, evs = run_crypto("Bybit /v5/order/create failed: retCode=110007 ab not enough for new order")
-_e = eqgui.messagebox.showerror.call_args
-chk("C3 거래소 거절은 종전대로 '거절'", _e is not None and "거절되었습니다" in _e[0][1] and evs == ["rejected"], (_e, evs))
+_e = me._member_alert.call_args
+chk("C3 거래소 거절은 종전대로 '거절' + 원인 안내(증거금), 원문 오류는 DM에 없음",
+    _e is not None and "거절되었습니다" in _e[0][1] and "증거금" in _e[0][1] and "110007" not in _e[0][1]
+    and evs == ["rejected"], (_e, evs))
 
 
 # ══ M: NT8 포지션을 그 인스턴스 계좌로 거름 ═══════════════════════════════════════

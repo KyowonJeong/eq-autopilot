@@ -1,4 +1,5 @@
 requests>=2.31
+websocket-client>=1.6   # ProjectX 실시간 허브(평가 계좌 감시 시세, 2026-10-16). 없으면 앱은 종전 REST로 돈다.
 PyYAML>=6.0
 cryptography>=42   # signal/heartbeat payloads (AES-256-GCM). Without it the app still runs on the legacy format.
 # IBKR only (broker: ibkr). Skip if you don't use Interactive Brokers.

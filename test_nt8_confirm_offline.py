@@ -84,6 +84,8 @@ class Stub:
 
     def __getattr__(self, n):
         return lambda *a, **k: None
+for _n in ("_ui", "_on_main", "_dm_kind"):   # 2026-10-20 화면 줄 대기열(_ui) - 가짜 객체의 __getattr__가 삼키지 않게
+    setattr(Stub, _n, eqgui.App.__dict__[_n])
 
 
 def run(b):

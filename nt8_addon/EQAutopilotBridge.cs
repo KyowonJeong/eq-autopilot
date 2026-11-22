@@ -42,11 +42,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         // ── 설정(앱과 동일해야 함) ──
         private const string BaseUrl = "http://127.0.0.1:8377";
         private const string Token   = "CHANGE-ME-SHARED-TOKEN";   // 앱 config의 nt8.token
-        private const int    PollMs  = 1000;
+        private const int    PollMs  = 500;     // 2026-10-16: 1000 → 500(진입 1초 목표, 평가 계좌 익절 감시 0.5초)
+        private const int    KickMs  = 200;     // 계좌, 포지션, 체결, 주문이 바뀌면 이 시간 안에 상태를 한 번 더 민다(포지션 보유 중 틱마다 오는 이벤트를 모아 초당 5번 안)
+        private const int    CmdMs   = 100;     // 앱 명령(주문, 청산) 확인 주기 - 같은 PC 안 호출이라 가볍다(주문이 애드온에 닿는 대기 평균 0.25초 → 0.05초)
 
-        private const string BridgeVer = "2026.09.23a";   // 앱이 구/신 애드온 판별(orders 지원)
+        private const string BridgeVer = "2026.10.16c";   // 앱이 구/신 애드온 판별(orders 지원, 0.5초 + 바뀌면 바로 push, 증거금 여유)
 
         private DispatcherTimer timer;
+        private DispatcherTimer kick;                      // 변경 이벤트 → 짧게 모아 한 번 push(이벤트 폭주에도 100ms에 한 번)
+        private Dispatcher uiDispatcher;
+        private bool pushing;
+        private bool pushAgain;
+        private DispatcherTimer cmdTimer;
+        private bool draining;
+        private volatile bool kickQueued;                 // UI 큐에 kick 켜기가 이미 들어가 있다(이벤트 폭주 때 BeginInvoke를 한 번만)
         private static readonly HttpClient http = new HttpClient();
         private readonly HashSet<string> doneTids = new HashSet<string>();
         private bool busy;
@@ -79,14 +88,43 @@ namespace NinjaTrader.NinjaScript.AddOns
                 http.DefaultRequestHeaders.Add("X-EQ-Bridge-Token", Token);
                 http.Timeout = TimeSpan.FromSeconds(3);
             }
+            else if (State == State.Terminated)
+            {
+                // 다시 컴파일되거나 NT8이 끝날 때: 타이머와 계좌 이벤트를 풀어 옛 인스턴스가 새 인스턴스와 함께 돌지 않게(2026-10-16 검토).
+                try
+                {
+                    if (timer != null) timer.Stop();
+                    if (cmdTimer != null) cmdTimer.Stop();
+                    if (kick != null) kick.Stop();
+                    lock (Account.All)
+                    {
+                        foreach (Account a in Account.All)
+                        {
+                            if (!subscribedAccounts.Contains(a.Name)) continue;
+                            a.OrderUpdate -= OnOrderUpdate;
+                            a.AccountItemUpdate -= OnAnyUpdate;
+                            a.PositionUpdate -= OnAnyUpdate;
+                            a.ExecutionUpdate -= OnAnyUpdate;
+                        }
+                    }
+                    subscribedAccounts.Clear();
+                }
+                catch (Exception) { }
+            }
         }
 
         protected override void OnWindowCreated(System.Windows.Window window)
         {
             if (timer != null) return;                    // 창마다 중복 기동 방지
+            uiDispatcher = window.Dispatcher;
             timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PollMs) };
             timer.Tick += async (s, e) => await TickAsync();
             timer.Start();
+            cmdTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CmdMs) };
+            cmdTimer.Tick += async (s, e) => { try { await DrainOnceAsync(); } catch (Exception) { } };
+            cmdTimer.Start();
+            kick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(KickMs) };
+            kick.Tick += async (s, e) => { kick.Stop(); try { await PushStateOnceAsync(); } catch (Exception) { } };
             Print("[EQBridge] started, polling " + BaseUrl);
         }
 
@@ -106,6 +144,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (subscribedAccounts.Contains(a.Name)) continue;
                     subscribedAccounts.Add(a.Name);
                     a.OrderUpdate += OnOrderUpdate;
+                    // 바뀌면 바로 push(2026-10-16): 잔고, 손익, 포지션, 체결. 핸들러는 표시만 하고 push는 UI 스레드의 kick 타이머가 한다.
+                    a.AccountItemUpdate += OnAnyUpdate;
+                    a.PositionUpdate += OnAnyUpdate;
+                    a.ExecutionUpdate += OnAnyUpdate;
                 }
             }
         }
@@ -115,8 +157,24 @@ namespace NinjaTrader.NinjaScript.AddOns
         //    대기 = 알몸 진입 지뢰(9/4 실사고의 고아 스탑).
         //  · 스탑(EQS-)이 거절되면 그 종목을 Flatten한다 - 알몸 포지션 불가 원칙(동기
         //    경로의 catch와 동일한 규칙을 비동기 거절에도 적용).
+        private void OnAnyUpdate(object sender, EventArgs e) { Kick(); }
+
+        // 변경 이벤트(NT8 스레드) → UI 스레드의 kick 타이머를 켠다. 이미 켜져 있으면 그대로(100ms 안 여러 이벤트 = push 한 번).
+        private void Kick()
+        {
+            try
+            {
+                var d = uiDispatcher;
+                if (d == null || kick == null || kickQueued) return;
+                kickQueued = true;
+                d.BeginInvoke(new Action(() => { kickQueued = false; if (!kick.IsEnabled) kick.Start(); }));
+            }
+            catch (Exception) { /* 이벤트 핸들러는 NT8 스레드 - 절대 던지지 않는다 */ }
+        }
+
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
+            Kick();
             try
             {
                 if (e == null || e.Order == null) return;
@@ -183,8 +241,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             try
             {
                 EnsureOrderSubscriptions();
-                await PushStateAsync();
-                await DrainCommandsAsync();
+                await PushStateOnceAsync();
+                await DrainOnceAsync();
                 if (++tickN % BarsEveryTicks == 0) await PushBarsAsync();
             }
             catch (Exception ex)
@@ -192,6 +250,31 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Print("[EQBridge] tick error: " + ex.Message);   // 앱 꺼짐 = 조용히 대기
             }
             finally { busy = false; }
+        }
+
+        // 명령 확인 한 번(주기 tick과 0.1초 cmdTimer가 같이 쓴다) - 겹쳐 돌지 않게.
+        private async Task DrainOnceAsync()
+        {
+            if (draining) return;
+            draining = true;
+            try { await DrainCommandsAsync(); }
+            finally { draining = false; }
+        }
+
+        // 상태 push 한 번(주기 tick과 kick이 같이 쓴다): 이미 보내는 중이면 끝난 뒤 한 번 더 보낸다(최신 상태를 놓치지 않게, 겹쳐 보내지 않게).
+        private async Task PushStateOnceAsync()
+        {
+            if (pushing) { pushAgain = true; return; }
+            pushing = true;
+            try
+            {
+                do
+                {
+                    pushAgain = false;
+                    await PushStateAsync();
+                } while (pushAgain);
+            }
+            finally { pushing = false; }
         }
 
         // ── ① 상태 push: 계정·포지션·잔고 + 하트비트 ──
@@ -213,6 +296,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         // 모른 채 무시하므로 호환에 영향 없음.
                         { "net_liq", a.Get(AccountItem.NetLiquidation, Currency.UsDollar) },
                         { "unrealized_pnl", a.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar) },
+                        // 증거금에 맞춰 계약 줄이기(2026-10-16): 장중 증거금 여유. 접속에 따라 0이 올 수 있어 앱은 0보다 클 때만 쓴다.
+                        { "excess_margin", a.Get(AccountItem.ExcessIntradayMargin, Currency.UsDollar) },
                     });
                     foreach (var p in a.Positions)
                     {

@@ -99,7 +99,8 @@ b.flatten_all.side_effect = [RuntimeError("HTTP 502"), _res()]
 lg = run_loop(me, [T(14, 0, 5), T(14, 0, 30), T(14, 1, 10), T(14, 1, 40), T(14, 5)], b)
 ck("F① 실패 뒤 재시도(60초 전엔 안 함) → 성공 후 소진: flatten 2회", b.flatten_all.call_count == 2, b.flatten_all.call_count)
 ck("F① 서버 보고는 첫 실패 1회(auto_close)", _ctxs(me._report_error) == ["auto_close"], me._report_error.call_args_list)
-ck("F① 첫 실패 팝업 1회", me.root.after.call_count == 1, me.root.after.call_count)
+# 2026-10-20 대표 '팝업 뭐든간에 거래는 드가야': 자동 청산 실패 팝업은 없다(첫 실패 보고 = 서버 회원 DM)
+ck("F① 실패 팝업 없음(첫 실패 보고가 회원 DM)", me.root.after.call_count == 0 and not me._ui.called, me.root.after.call_count)
 ck("F① 재시도로 끝나면 회원에게 결과(autoclose_ok)", _ctxs(me._member_alert) == ["autoclose_ok"], me._member_alert.call_args_list)
 ck("F① 로그: 재시도 예고·재시도 표시", "60초 뒤 다시 시도" in lg and "재시도 1" in lg, lg)
 _ko = me._member_alert.call_args[0][1]
@@ -111,7 +112,7 @@ b = MagicMock()
 b.flatten_all.return_value = _res(errors=["STILL OPEN after flatten: X/MNQ net=2"])
 lg = run_loop(me, [T(14, 0, 5), T(14, 1, 10), T(14, 29, 30), T(14, 30, 5), T(14, 31), T(14, 45)], b)
 ck("F② 창 안에서만 재시도(14:00·14:01·14:29 = 3회)", b.flatten_all.call_count == 3, b.flatten_all.call_count)
-ck("F② 팝업은 첫 실패 1회", me.root.after.call_count == 1, me.root.after.call_count)
+ck("F② 팝업 없음", me.root.after.call_count == 0 and not me._ui.called, me.root.after.call_count)
 ck("F② 서버 보고: 첫 실패 + 포기 1회씩", _ctxs(me._report_error) == ["auto_close", "auto_close_gaveup"],
    me._report_error.call_args_list)
 ck("F② 회원 포기 알림 1회", _ctxs(me._member_alert) == ["autoclose_gaveup"], me._member_alert.call_args_list)
@@ -258,7 +259,7 @@ def px(plan, rechecks, orders, close_fail=None):
 ORD = {11: [{"id": 1, "contractId": NQC, "type": 4}, {"id": 2, "contractId": GCC, "type": 4},
             {"id": 3, "contractId": ESC, "type": 4}]}
 # G① NQ 청산 두 번 다 실패(포지션 남음), GC 성공 → NQ 손절(1)은 남기고 GC(2)·고아(3)만 취소
-res, lg = px([_pos(NQC), _pos(GCC)], 내부 기록, ORD, close_fail={NQC: 2})
+res, lg = px([_pos(NQC), _pos(GCC)], [[_pos(NQC)]], ORD, close_fail={NQC: 2})
 ck("G① 청산 실패 계약의 보호 손절은 취소 안 함", 1 not in lg["cancel"], lg)
 ck("G① 플랫 확인된 계약·포지션 없던 계약의 주문은 취소", sorted(lg["cancel"]) == [2, 3], lg)
 ck("G① closeContract 1회 재시도(NQ 2번 호출)", lg["close"].count(NQC) == 2 and lg["close"].count(GCC) == 1, lg)
@@ -341,22 +342,22 @@ def close_all(outcome):
 
 _ok = FlattenResult(dry_run=False, planned=[_pos(NQC)], closed=[_pos(NQC)])
 me, lines = close_all(_ok)
-ck("X① 전부 성공 → '✅ 전체 청산 완료', 팝업 없음", "전체 청산 완료" in lines[-1] and me.root.after.call_count == 0, lines)
+ck("X① 전부 성공 → '✅ 전체 청산 완료', 팝업 없음", "전체 청산 완료" in lines[-1] and me.root.after.call_count == 0 and not me._ui.called, lines)
 _bad = FlattenResult(dry_run=False, planned=[_pos(NQC)], closed=[],
                      errors=["ACC11/MNQ: closeContract failed", "STILL OPEN after flatten: ACC11/MNQ net=2"])
 me, lines = close_all(_bad)
 ck("X② 오류 있으면 마지막 줄이 '완료'가 아님", "전체 청산 완료" not in lines[-1] and "미완료" in lines[-1]
    and "NQ, 1234" in lines[-1], lines)
-ck("X② 실패 팝업", me.root.after.call_count == 1, me.root.after.call_count)
+ck("X② 실패 알림 창(회원이 누른 [전체 청산]의 결과 - 화면 줄 대기열로, 모달 아님)", me._ui.call_count == 1, me._ui.call_count)
 ck("X② errors 경로도 서버 보고(close_all)", _ctxs(me._report_error) == ["close_all"], me._report_error.call_args_list)
 me, lines = close_all(RuntimeError("auth failed"))
-ck("X③ 예외 → '미완료' + 팝업", "미완료" in lines[-1] and me.root.after.call_count == 1, lines)
+ck("X③ 예외 → '미완료' + 알림 창(화면 줄 대기열)", "미완료" in lines[-1] and me._ui.call_count == 1, lines)
 me, lines = close_all(AttributeError("no flatten"))
 ck("X④ 일괄 청산 미지원(건너뜀)도 완료로 세지 않음", "미완료" in lines[-1], lines)
 # 팝업 문구: 사실만(지시형 없음), KO/EN 한 쌍
 _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "eqgui.py"), encoding="utf-8").read()
-_x = _src[_src.index("전체 청산이 다 끝나지 않았습니다"):][:600]
-ck("X⑤ 팝업 KO/EN 둘 다, 지시형 없음", "Close-all did not fully finish" in _x and "하세요" not in _x
+_x = _src[_src.index("이 다 끝나지 않았습니다"):][:600]          # 2026-10-17: 제목이 '전체 청산' 또는 '{자산} 청산'(자산별 청산)
+ck("X⑤ 팝업 KO/EN 둘 다, 지시형 없음", "did not fully finish" in _x and "하세요" not in _x
    and "하십시오" not in _x, _x)
 
 print("\n" + ("전부 통과" if not FAIL else f"실패 {len(FAIL)}: {FAIL}"))

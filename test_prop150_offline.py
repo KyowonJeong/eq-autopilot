@@ -18,7 +18,7 @@ class S:
     _P150_BROKERS = eqgui.App._P150_BROKERS
 
     def __init__(self, tier, p150=None):
-        p150 = {"projectx": 내부 기록} if p150 is None else p150
+        p150 = {"projectx": [[r"^150KTC", "topstep"]]} if p150 is None else p150
         self._gate = {"ok": True, "tier": tier, "p150": p150}
         self._acc = {
             "NQ": [{"id": "150KTC-V2-11112222", "on": True, "broker": "projectx"},
@@ -49,7 +49,7 @@ chk("① Operator·Preview도 보고(2026-10-02 선적용 - 할인은 서버가 
 chk("① Preview도 같은 보고", rep(S("public")) == rep(S("royal")), rep(S("public")))
 g = S("royal"); g._gate["ok"] = False
 chk("① 게이트 ok=False면 없음", rep(g) == [], rep(g))
-r3 = rep(S("royal", {"projectx": [[r"^150KTC", "topstep"], [r"^EXPRESS-150K", "topstep"]], "nt8": 내부 기록}))
+r3 = rep(S("royal", {"projectx": [[r"^150KTC", "topstep"], [r"^EXPRESS-150K", "topstep"]], "nt8": [[r"^LFE150K", "lucid"]]}))
 chk("③ 서버 패턴으로 XFA·Lucid 확장", sorted((x["f"], x["k"]) for x in r3) == [("lucid", "0000"), ("topstep", "2222"), ("topstep", "8888")], r3)
 chk("④ 필드는 b·f·k뿐, 끝4만", all(set(x) == {"b", "f", "k"} and len(x["k"]) == 4 for x in r3) and "150KTC" not in json.dumps(r3), r3)
 chk("⑤ 50K·꺼진 계좌·크립토 브로커 제외", all(x["k"] not in ("4444", "6666", "1212") for x in r3), r3)

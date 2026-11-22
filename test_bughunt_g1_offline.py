@@ -359,8 +359,9 @@ eqgui.App._apply_gating(me)
 ck("E 복구: 신호 대기를 되살림(같은 키, 새 루프 하나)",
    me._sig_on is True and ("NQ", 0) in me._sig_accts and me._start_sig_loop.call_count == 1
    and not me._sig_parked, (me._sig_accts, me._start_sig_loop.call_count))
-ck("E 복구: 사실 한 줄 + 안내창 1회", "신호 대기를 다시 켰습니다" in logs(me)
-   and sum(1 for s in SHOWN if "다시 켰습니다" in str(s)) == 1, logs(me))
+# 2026-10-20 대표 '팝업 뭐든간에 거래는 드가야': 되살림은 로그 한 줄(과 맥 알림), 안내창 없음
+ck("E 복구: 사실 한 줄, 안내창 없음", "신호 대기를 다시 켰습니다" in logs(me)
+   and not any("다시 켰습니다" in str(s) for s in SHOWN), logs(me))
 ck("E 복구: Autopilot은 자동 진입 문장, 확인 모드 아님", me._watch_only is False and "자동 진입합니다" in logs(me))
 eqgui.App._apply_gating(me)
 ck("E 같은 상태로 다시 불려도 루프를 또 띄우지 않음", me._start_sig_loop.call_count == 1)
@@ -420,9 +421,10 @@ me._sig_accts = {}
 me._sig_parked = {("NQ", 0): snap()}
 SHOWN.clear()
 eqgui.App._notify_disarmed(me, first=True)
-_w = " ".join(str(s) for s in SHOWN)
-ck("E 불통 경보 = '서버 연결이 돌아오면 앱이 다시 켭니다'(따를 수 없는 Go Live 안내 아님)",
-   "다시 켭니다" in _w and "Go Live" not in _w, _w)
+_w = logs(me)
+ck("E 불통 경보 = '서버 연결이 돌아오면 앱이 다시 켭니다'(따를 수 없는 Go Live 안내 아님) - 로그 한 줄, 경보창 없음, 회원 DM 없음"
+   "(서버에 못 닿는다 - 서버의 앱 응답 없음 DM이 대신)",
+   "다시 켭니다" in _w and "Go Live" not in _w and not SHOWN and not me._member_alert.called, (_w, SHOWN))
 me._sig_accts = {("NQ", 0): snap()}
 me._gate = dict(OPER)                            # Operator(autoentry 없음)도 다시 무장되면 반복 경보 끝
 me._disarmed_reason = "신호 확인"

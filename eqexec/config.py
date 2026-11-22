@@ -56,6 +56,7 @@ class BybitCfg:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = False
+    demo: bool = False                # 데모 트레이딩(api-demo.bybit.com, 2026-11-13) - 앱 --demo
     category: str = "linear"          # linear = USDT perps
     settle_coin: str = "USDT"
 
@@ -66,6 +67,18 @@ class BitgetCfg:
     api_secret: str = ""
     passphrase: str = ""
     product_type: str = "USDT-FUTURES"
+    demo: bool = False                # 데모 트레이딩(paptrading 헤더, 2026-11-13) - 앱 --demo
+
+
+@dataclass
+class OkxCfg:
+    """OKX USDT 스왑(broker/okx.py). demo = 데모 트레이딩(x-simulated-trading 헤더) - 환경 변수 EQ_OKX_DEMO=1로도 켠다.
+    host = 'www'|'eea'|'us' 또는 https:// 주소(빈 값 = 자동, 환경 변수 EQ_OKX_HOST)."""
+    api_key: str = ""
+    api_secret: str = ""
+    passphrase: str = ""
+    demo: bool = False
+    host: str = ""
 
 
 

@@ -53,7 +53,7 @@ def ck(n, c, d=""):
         FAIL.append(n)
 
 
-ck("0 버전 2026.10.12e", eqgui.App._APP_VER == "2026.10.12e", eqgui.App._APP_VER)
+ck("0 버전 2026.10.12e 이상", eqgui.App._APP_VER >= "2026.10.12e", eqgui.App._APP_VER)
 
 # ── 1 NT8 풀사이즈 표기 ───────────────────────────────────────────────────────
 fa = eqgui.App._fill_asset
@@ -130,6 +130,8 @@ class Stub:
         if n.startswith("__"):
             raise AttributeError(n)
         return lambda *a, **k: None
+for _n in ("_ui", "_on_main", "_dm_kind"):   # 2026-10-20 화면 줄 대기열(_ui) - 가짜 객체의 __getattr__가 삼키지 않게
+    setattr(Stub, _n, eqgui.App.__dict__[_n])
 
 
 for _n in ("_unconf_watch_add", "_unconf_watch_drop", "_unconf_save", "_unconf_key", "_remember_open",
@@ -197,6 +199,8 @@ class SyncStub:
         if n.startswith("__"):
             raise AttributeError(n)
         return lambda *a, **k: None
+for _n in ("_ui", "_on_main", "_dm_kind"):   # 2026-10-20 화면 줄 대기열(_ui) - 가짜 객체의 __getattr__가 삼키지 않게
+    setattr(SyncStub, _n, eqgui.App.__dict__[_n])
 
 
 for _n in ("push_profile", "_fill_asset", "_fill_is_eq", "_fill_entry"):
@@ -263,7 +267,7 @@ ck("2a 초기화 뒤 체결은 그대로 올라가고 R은 그 진입의 1R로(�
 # 2b: 12d가 이미 손상 파일을 .corrupt-로 옮기고 새 줄만 쌓은 경우(초기화 표식 없음)
 _clean_ledgers()
 T = now - 4 * DAY
-json.dump({"BTC|bybit": 내부 기록}, open(P, "w"))
+json.dump({"BTC|bybit": [[T + 100, 50.0]]}, open(P, "w"))
 open(P + f".corrupt-{int(T)}", "wb").write(b"\x00" * 246)
 FILLS[:] = [fill(now - 6 * DAY, -64.5), fill(now - 2 * DAY, -25.0)]
 tr, lg = run_sync()
@@ -288,7 +292,7 @@ _clean_ledgers()
 open(P, "wb").write(b"\x00" * 246)
 eqgui._record_real_r("NQ", "A1", 600.0)
 ck("2d 진입 때 손상 발견(백업 없음) → 초기화 표식 + 새 줄 기록",
-   os.path.exists(RESET) and json.load(open(P)).get("NQ|A1", 내부 기록)[0][1] == 600.0, os.listdir(eqgui.APP_DIR))
+   os.path.exists(RESET) and json.load(open(P)).get("NQ|A1", [[0, 0]])[0][1] == 600.0, os.listdir(eqgui.APP_DIR))
 _r = float(open(RESET).read())
 eqgui._rledger_mark_reset(_r - 1000)
 ck("2d 더 이른 시각으로는 표식이 되돌아가지 않음", float(open(RESET).read()) == _r)
@@ -405,7 +409,7 @@ ck("4a 다시 성공하면 초록 '✓ 저장됨'", me2._saved_lbl.kw.get("text"
    and me2._saved_lbl.kw.get("foreground") == "#15803d", me2._saved_lbl.kw)
 
 # 4b 신호 루프: 주소를 폴마다 지금 토큰으로
-_src = inspect.getsource(eqgui.App._sig_loop)
+_src = inspect.getsource(eqgui.App._sig_loop_body)
 ck("4b 신호 루프가 폴마다 지금 토큰으로 주소를 만들고 같은 토큰으로 복호화",
    "_url_now = _feed_url(_tok_now)" in _src and "requests.get(_url_now" in _src
    and "decrypt(_tok_now, r.text)" in _src and "requests.get(url," not in _src)
@@ -507,7 +511,8 @@ try:
        not any("접수됐으나" in m for m in st.logs)
        and any("진입 거절" in m and "daily loss limit" in m for m in st.logs), st.logs)
     ck("4d 확정 거절: 미확인 DM 대신 진입 실패 DM(사유 포함, KO/EN), 미확인 감시 없음",
-       _kinds == ["entry_miss"] and "거절" in st.alerts[0][1] and "rejected" in st.alerts[0][2]
+       len(_kinds) == 1 and _kinds[0].startswith("entry_miss_")      # 계좌마다 종류(앱 출시 전 검토 2026-10-20)
+       and "거절" in st.alerts[0][1] and "rejected" in st.alerts[0][2]
        and not st._unconf_watch, (st.alerts, st._unconf_watch))
     ck("4d 확정 거절: 거래 원장에 유령 진입 없음, entry_fail(rejected) 보고",
        eqgui._ledger_load() == [] and ("entry_fail", {"why": "rejected", "err": b and st.evs[-1][1]["err"]}) in st.evs

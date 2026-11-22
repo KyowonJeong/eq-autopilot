@@ -7,7 +7,7 @@
 # O 설정 폴더별 단일 실행 잠금(같은 폴더 두 번째는 거절, 다른 폴더는 허용)
 # Y BTC 사전점검 시각 = 일요일 22:00 UTC만
 # W 신호 나이 = 서버 시각(응답 Date) 기준, 시계 30초 넘게 어긋나면 자동 진입 보류, 미래 발행 거부
-# size_mult0 명시적 0은 진입 안 함, 필드 없을 때만 1.0
+# size_mult0 명시적 0은 진입 안 함. 필드가 없으면 21l(2026-10-27 실행 경로 리뷰 P2)부터 진입 안 함(확인 모드는 확인 카드 그대로)
 import datetime as _dt
 import os
 import subprocess
@@ -127,7 +127,9 @@ ck("D-4 BTC [계좌 추가] → Bitget 행(같은 Bybit 행 아님)", len(rows) 
    and rows[0]["broker"] == "bybit", [(r["broker"], r["label"]) for r in rows])
 eqgui.App._add_acct(me)
 ck("D-4 두 거래소 다 있으면 추가 거절(행 수 그대로, 이유 표시)", len(rows) == 2
-   and "거래소마다 하나" in str(eqgui.messagebox.showinfo.call_args), (len(rows), eqgui.messagebox.showinfo.call_args))
+   # OKX(2026-11-03)가 셋째 거래소로 붙은 뒤엔 키 없는 OKX 안내까지 붙은 문구('거래소마다 행이 하나')가 나온다 - 거절·행 수는 같다
+   and ("거래소마다 하나" in str(eqgui.messagebox.showinfo.call_args)
+        or "거래소마다 행이 하나" in str(eqgui.messagebox.showinfo.call_args)), (len(rows), eqgui.messagebox.showinfo.call_args))
 rows = [eqgui._new_acct(600, "", True, "b", broker="bitget")]
 me = mk_btc(rows, broker="bitget")
 eqgui.App._add_acct(me)
@@ -385,13 +387,14 @@ import requests  # noqa: E402
 import autopilot_crypto  # noqa: E402
 
 
-def loop_once(pc_fast=0.0, pub_ago=5.0, with_date=True, size_mult="absent", pub_abs=None, age_hdr=None):
-    """_sig_loop 한 바퀴. pc_fast = PC 시계가 서버보다 빠른 초. 반환 (진입 호출들, 스킵 코드들, 로그)."""
+def loop_once(pc_fast=0.0, pub_ago=5.0, with_date=True, size_mult=1.0, pub_abs=None, age_hdr=None, watch=False):
+    """_sig_loop 한 바퀴. pc_fast = PC 시계가 서버보다 빠른 초. 반환 (진입 호출들, 스킵 코드들, 로그).
+    size_mult 기본 1.0(서버는 자동 진입 토큰에 늘 싣는다), "absent" = 필드 없음(21l). watch = 확인 모드(Operator)."""
     me = MagicMock()
     me.lang = "ko"
     me._sig_on = True
     me._token = "tok"
-    me._watch_only = False
+    me._watch_only = bool(watch)
     me._feed_errs = 0
     me._clock_skew, me._clock_skew_ts = None, 0.0
     me._clock_bad, me._clock_popped, me._clock_warn_at = False, False, 0.0
@@ -421,11 +424,14 @@ def loop_once(pc_fast=0.0, pub_ago=5.0, with_date=True, size_mult="absent", pub_
 
 
 ent, sk, lg, _m = loop_once(pc_fast=0.0)
-ck("W-2 시계 정상·5초 전 발행 → 진입, size_mult 없으면 1.0", len(ent) == 1 and ent[0][0][5] == 1.0 and not sk, (ent, sk, lg))
+ck("W-2 시계 정상, 5초 전 발행 → 진입(size_mult 1.0)", len(ent) == 1 and ent[0][0][5] == 1.0 and not sk, (ent, sk, lg))
 ent, sk, lg, _m = loop_once(pc_fast=90.0)
 ck("W-3 PC 시계 90초 빠름: '오래됨'으로 버리지 않고(서버 시각 나이 5초) 자동 진입 보류 + clock_skew 보고",
    not ent and sk == ["clock_skew"] and "오래됨" not in lg and "자동 진입 보류" in lg and "90초 빠름" in lg, (sk, lg))
-ck("W-3 무장 중이면 시계 경고 창 한 번", _m.root.after.call_count >= 1)
+# 2026-10-20 대표 '차라리 dm을 쏴': 경고 창 대신 회원 DM(KO/EN), 창 없음
+_ck = [c for c in _m._member_alert.call_args_list if c[0][0] == "clock"]
+ck("W-3 무장 중이면 시계 회원 DM 한 번(경고 창 없음)", len(_ck) == 1 and "90초 빠릅니다" in _ck[0][0][1]
+   and "90 s ahead" in _ck[0][0][2] and _m.root.after.call_count == 0, (_ck, _m.root.after.call_count))
 ent, sk, lg, _m = loop_once(pc_fast=-90.0)
 ck("W-4 PC 시계 90초 느림 → 자동 진입 보류", not ent and sk == ["clock_skew"] and "90초 느림" in lg, (sk, lg))
 ent, sk, lg, _m = loop_once(pc_fast=0.0, pub_ago=120.0)
@@ -445,8 +451,21 @@ ent, sk, lg, _m = loop_once(size_mult="abc")
 ck("size_mult0-3 못 읽는 값 → 진입 안 함", not ent and sk == ["size_mult0"])
 ent, sk, lg, _m = loop_once(size_mult=2.5)
 ck("size_mult0-4 2.5 → 2.5배 진입", len(ent) == 1 and ent[0][0][5] == 2.5, ent)
+# 21l(2026-10-27 실행 경로 리뷰 P2): 필드가 없거나 값이 비면 1.0으로 넣지 않고 건너뛴다(서버는 자동 진입 권한이 없는 토큰에 수량 재료를 뺀다)
 ent, sk, lg, _m = loop_once(size_mult=None)
-ck("size_mult0-5 None(필드 값 없음) → 1.0 진입", len(ent) == 1 and ent[0][0][5] == 1.0, ent)
+ck("size_mult0-5 None(필드 값 없음) → 진입 안 함(size_mult0, 이유 한 줄)", not ent and sk == ["size_mult0"]
+   and "수량 배수(size_mult)가 없습니다" in lg and "1배로 넣지 않고" in lg, (ent, sk, lg))
+ent, sk, lg, _m = loop_once(size_mult="absent")
+ck("size_mult0-5b 필드 없음 → 진입 안 함(size_mult0)", not ent and sk == ["size_mult0"] and "size_mult" in lg, (ent, sk, lg))
+ent, sk, lg, _m = loop_once(size_mult="  ")
+ck("size_mult0-5c 빈 문자열 → 진입 안 함(size_mult0)", not ent and sk == ["size_mult0"], (ent, sk))
+ent, sk, lg, _m = loop_once(size_mult="0.78")
+ck("size_mult0-5d 숫자 문자열 '0.78' → 0.78배 진입", len(ent) == 1 and abs(ent[0][0][5] - 0.78) < 1e-12 and not sk, (ent, sk))
+ent, sk, lg, _m = loop_once(size_mult=float("nan"))
+ck("size_mult0-5e NaN → 진입 안 함(size_mult0)", not ent and sk == ["size_mult0"], (ent, sk))
+ent, sk, lg, _m = loop_once(size_mult="absent", watch=True)
+ck("size_mult0-5f 확인 모드(Operator)는 필드가 없어도 확인 카드 그대로(건너뜀 없음, 주문 없음)",
+   not ent and not sk and _m._watch_ticket.call_count == 1, (ent, sk, _m._watch_ticket.call_args_list))
 ent, sk, lg, _m = loop_once(size_mult=9)
 ck("size_mult0-6 3 초과는 3으로 클램프(종전 그대로)", len(ent) == 1 and ent[0][0][5] == 3.0, ent)
 
